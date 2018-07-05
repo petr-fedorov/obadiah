@@ -9,8 +9,11 @@ import signal
 
 def listener_configurer():
     root = logging.getLogger()
-    h = logging.handlers.RotatingFileHandler('obanalyticsdb.log', 'a', 300, 10)
-    f = logging.Formatter('%(asctime)s %(processName)-10s %(name)s'
+    h = logging.handlers.RotatingFileHandler('obanalyticsdb.log',
+                                             'a',
+                                             2**20,
+                                             10)
+    f = logging.Formatter('%(asctime)s %(processName)-10s %(name)s '
                           '%(levelname)-8s %(message)s')
     h.setFormatter(f)
     root.addHandler(h)
