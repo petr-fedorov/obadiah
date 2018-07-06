@@ -129,6 +129,104 @@ $$;
 
 ALTER FUNCTION bitfinex.bf_depth_summary_before_episode_v(snapshot_id integer, first_episode_no integer, last_episode_no integer, bps_step numeric) OWNER TO "ob-analytics";
 
+--
+-- Name: bf_order_book_events_fun_after_insert(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_order_book_events_fun_after_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+BEGIN 
+	UPDATE bitfinex.bf_order_book_events
+	SET order_next_event_id = NEW.event_id
+	WHERE snapshot_id = NEW.snapshot_id 
+	  AND order_id = NEW.order_id 
+	  AND event_id != NEW.event_id
+	  AND order_next_event_id IS NULL;
+	RETURN NULL;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_order_book_events_fun_after_insert() OWNER TO "ob-analytics";
+
+--
+-- Name: bf_order_book_events_fun_before_insert(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_order_book_events_fun_before_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+	precision bitfinex.bf_pairs.precision%TYPE;
+	previous_order bitfinex.bf_order_book_events%ROWTYPE;
+	
+BEGIN
+	
+	IF NEW.event_price != 0 THEN 
+	
+		SELECT bf_pairs.precision INTO precision 
+		FROM bitfinex.bf_pairs
+		WHERE pair = NEW.pair;
+
+		NEW.event_price = round(NEW.event_price, precision);
+		NEW.order_price = NEW.event_price;
+		
+		SELECT * INTO previous_order
+		FROM bitfinex.bf_order_book_events
+		WHERE order_id = NEW.order_id AND snapshot_id = NEW.snapshot_id
+		ORDER BY event_id DESC
+		LIMIT 1;
+		
+		IF FOUND THEN
+			NEW.event_qty = NEW.order_qty - previous_order.order_qty;
+		ELSE
+			NEW.event_qty = NEW.order_qty;
+		END IF;
+		
+	ELSE
+	
+		SELECT * INTO previous_order
+		FROM bitfinex.bf_order_book_events
+		WHERE order_id = NEW.order_id AND snapshot_id = NEW.snapshot_id
+		ORDER BY event_id DESC
+		LIMIT 1;
+		
+		IF FOUND THEN
+			NEW.order_price = previous_order.order_price;
+			NEW.event_qty = -previous_order.order_qty;
+			NEW.order_qty = 0;
+		ELSE
+			RAISE EXCEPTION 'Requested removal of order: %  which is not in the order book!', NEW.order_id;
+		END IF;
+		
+	END IF;
+	
+	RETURN NEW;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_order_book_events_fun_before_insert() OWNER TO "ob-analytics";
+
+--
+-- Name: bf_order_book_events_event_id_seq; Type: SEQUENCE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE SEQUENCE bitfinex.bf_order_book_events_event_id_seq
+    START WITH 10
+    INCREMENT BY 10
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE bitfinex.bf_order_book_events_event_id_seq OWNER TO "ob-analytics";
+
 SET default_tablespace = '';
 
 SET default_with_oids = false;
@@ -143,7 +241,7 @@ CREATE TABLE bitfinex.bf_order_book_events (
     order_qty numeric,
     local_timestamp timestamp(3) with time zone,
     pair character varying(12),
-    event_id bigint NOT NULL,
+    event_id bigint DEFAULT nextval('bitfinex.bf_order_book_events_event_id_seq'::regclass) NOT NULL,
     order_price numeric,
     event_qty numeric,
     snapshot_id integer,
@@ -399,6 +497,13 @@ ALTER TABLE ONLY bitfinex.bf_trades
 
 
 --
+-- Name: bf_order_book_events_idx_order_id_snapshot_id; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_order_book_events_idx_order_id_snapshot_id ON bitfinex.bf_order_book_events USING btree (order_id, snapshot_id);
+
+
+--
 -- Name: bf_order_book_events_idx_order_next_event_id; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -427,6 +532,35 @@ CREATE INDEX bf_trades_idx_snapshot_id ON bitfinex.bf_trades USING btree (snapsh
 
 
 --
+-- Name: fki_bf_trades_fkey_pair; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX fki_bf_trades_fkey_pair ON bitfinex.bf_trades USING btree (pair);
+
+
+--
+-- Name: bf_order_book_events after_insert; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TRIGGER after_insert AFTER INSERT ON bitfinex.bf_order_book_events FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_events_fun_after_insert();
+
+
+--
+-- Name: bf_order_book_events before_insert; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TRIGGER before_insert BEFORE INSERT ON bitfinex.bf_order_book_events FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_events_fun_before_insert();
+
+
+--
+-- Name: bf_order_book_events bf_order_book_events_fkey_pair; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_order_book_events
+    ADD CONSTRAINT bf_order_book_events_fkey_pair FOREIGN KEY (pair) REFERENCES bitfinex.bf_pairs(pair) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+
+
+--
 -- Name: bf_order_book_events bf_order_book_events_fkey_snapshot_id; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -440,6 +574,14 @@ ALTER TABLE ONLY bitfinex.bf_order_book_events
 
 ALTER TABLE ONLY bitfinex.bf_trades
     ADD CONSTRAINT bf_trades_fkey_event_id FOREIGN KEY (event_id) REFERENCES bitfinex.bf_order_book_events(event_id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE;
+
+
+--
+-- Name: bf_trades bf_trades_fkey_pair; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_trades
+    ADD CONSTRAINT bf_trades_fkey_pair FOREIGN KEY (pair) REFERENCES bitfinex.bf_pairs(pair) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --
