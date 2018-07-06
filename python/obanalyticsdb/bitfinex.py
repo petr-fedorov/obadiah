@@ -11,7 +11,7 @@ def connect_db():
 
 
 def process_trade(q, stop_flag, pair, snapshot_id):
-    logger = logging.getLogger("process_trade")
+    logger = logging.getLogger("trade")
     with connect_db() as con:
         con.set_session(autocommit=True)
         with con.cursor() as curr:
@@ -42,6 +42,34 @@ def process_trade(q, stop_flag, pair, snapshot_id):
                     except Exception as e:
                         logger.exception('An exception caught while trying to'
                                          ' insert trade: %s', e)
+
+
+def process_raw_order_book(q, stop_flag, pair, snapshot_id):
+    logger = logging.getLogger("order.book.event")
+    with connect_db() as con:
+        con.set_session(autocommit=True)
+        with con.cursor() as curr:
+            while not stop_flag.is_set():
+                data, lts = q.get()
+                logger.debug("%i %s" % (snapshot_id, data))
+                *data, rts = data
+                lts = datetime.datetime.fromtimestamp(lts)
+                if isinstance(data[0][0], list):
+                    data = data[0]
+                for d in data:
+                    try:
+                        curr.execute("INSERT INTO "
+                                     "bitfinex.bf_order_book_events "
+                                     "(local_timestamp, pair, order_id,"
+                                     "event_price, order_qty, snapshot_id,"
+                                     "exchange_timestamp)"
+                                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                                     (lts, pair, d[0], d[1], d[2], snapshot_id,
+                                      datetime.datetime.fromtimestamp(rts/1000)
+                                      ))
+                    except Exception as e:
+                        logger.exception('An exception caught while trying to'
+                                         ' insert order book event: %s', e)
 
 
 def start_new_snapshot(ob_len, pair):
@@ -82,12 +110,15 @@ def capture(logging_queue, configurer, stop_flag):
         time.sleep(1)
 
     wss.config(ts=True)
-    # wss.subscribe_to_raw_order_book(pair, len=100)
+    wss.subscribe_to_raw_order_book(pair, len=ob_len)
     wss.subscribe_to_trades(pair)
-    time.sleep(10)
+
+    time.sleep(5)
 
     ts = [Process(target=process_trade,
                   args=(wss.trades(pair), stop_flag, pair, snapshot_id)),
+          Process(target=process_raw_order_book,
+                  args=(wss.raw_books(pair), stop_flag, pair, snapshot_id)),
           ]
 
     for t in ts:
@@ -95,5 +126,10 @@ def capture(logging_queue, configurer, stop_flag):
 
     for t in ts:
         t.join()
+
+    wss.unsubscribe_from_trades(pair)
+    wss.unsubscribe_from_raw_order_book(pair)
+
+    time.sleep(5)
 
     wss.stop()
