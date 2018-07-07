@@ -137,6 +137,17 @@ CREATE FUNCTION bitfinex.bf_order_book_events_fun_after_insert() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 
+DECLARE 
+
+	trade_match_single CURSOR  FOR	SELECT qty 
+									FROM bitfinex.bf_trades t
+									WHERE t.price		= NEW.order_price
+									  AND t.qty 		= NEW.event_qty
+									  AND t.snapshot_id = NEW.snapshot_id
+									  AND t.event_id IS NULL
+									  AND t.exchange_timestamp >= NEW.exchange_timestamp - 1*interval '1 second'
+									ORDER BY id;
+
 BEGIN 
 	UPDATE bitfinex.bf_order_book_events
 	SET order_next_event_id = NEW.event_id
@@ -144,6 +155,17 @@ BEGIN
 	  AND order_id = NEW.order_id 
 	  AND event_id != NEW.event_id
 	  AND order_next_event_id IS NULL;
+	  
+	FOR qty IN trade_match_single LOOP
+	
+		UPDATE bitfinex.bf_trades 
+		SET event_id = NEW.event_id
+		WHERE CURRENT OF trade_match_single;
+		
+		RETURN NULL;
+	
+	END LOOP;
+
 	RETURN NULL;
 END;
 
@@ -212,6 +234,31 @@ $$;
 
 
 ALTER FUNCTION bitfinex.bf_order_book_events_fun_before_insert() OWNER TO "ob-analytics";
+
+--
+-- Name: bf_trades_fun_before_insert(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_trades_fun_before_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+	precision bitfinex.bf_pairs.precision%TYPE;
+
+BEGIN
+	SELECT bf_pairs.precision INTO precision 
+	FROM bitfinex.bf_pairs
+	WHERE pair = NEW.pair;
+
+	NEW.price = round(NEW.price, precision);
+	RETURN NEW;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_trades_fun_before_insert() OWNER TO "ob-analytics";
 
 --
 -- Name: bf_order_book_events_event_id_seq; Type: SEQUENCE; Schema: bitfinex; Owner: ob-analytics
@@ -439,8 +486,8 @@ CREATE VIEW bitfinex.bf_trades_v AS
     t.id,
     t.qty,
     round(t.price, bf_pairs."precision") AS price,
-    t.event_id AS ob_event_id,
-    count(*) OVER (PARTITION BY t.event_id, t.snapshot_id) AS mc,
+    t.event_id,
+    count(*) OVER (PARTITION BY t.event_id, t.snapshot_id) AS matched_count,
     t.trade_timestamp,
     t.pair,
     t.snapshot_id,
@@ -532,13 +579,6 @@ CREATE INDEX bf_trades_idx_snapshot_id ON bitfinex.bf_trades USING btree (snapsh
 
 
 --
--- Name: fki_bf_trades_fkey_pair; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE INDEX fki_bf_trades_fkey_pair ON bitfinex.bf_trades USING btree (pair);
-
-
---
 -- Name: bf_order_book_events after_insert; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -550,6 +590,13 @@ CREATE TRIGGER after_insert AFTER INSERT ON bitfinex.bf_order_book_events FOR EA
 --
 
 CREATE TRIGGER before_insert BEFORE INSERT ON bitfinex.bf_order_book_events FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_events_fun_before_insert();
+
+
+--
+-- Name: bf_trades before_insert; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TRIGGER before_insert BEFORE INSERT ON bitfinex.bf_trades FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_trades_fun_before_insert();
 
 
 --
