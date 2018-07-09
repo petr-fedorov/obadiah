@@ -16,7 +16,10 @@ Imports:
     DBI,
     RPostgreSQL,
     magrittr,
-    dplyr
+    dplyr,
+    plyr,
+    reshape2,
+    zoo
 Suggests: testthat,
     knitr,
     rmarkdown
