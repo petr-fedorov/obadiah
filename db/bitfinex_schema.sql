@@ -309,7 +309,8 @@ CREATE VIEW bitfinex.bf_order_book_episodes_v AS
     bf_order_book_events.episode_no,
     bf_order_book_events.event_id,
     bf_order_book_events.exchange_timestamp,
-    bf_order_book_events.pair
+    bf_order_book_events.pair,
+    bf_order_book_events.local_timestamp
    FROM bitfinex.bf_order_book_events
   ORDER BY bf_order_book_events.snapshot_id, bf_order_book_events.episode_no, bf_order_book_events.event_id;
 
@@ -326,6 +327,18 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
     ob.order_id,
     ob.event_id AS order_event_id,
     ob.order_qty,
+        CASE
+            WHEN (ob.order_qty < (0)::numeric) THEN sum(ob.order_qty) OVER asks
+            ELSE sum(ob.order_qty) OVER bids
+        END AS cumm_qty,
+        CASE
+            WHEN (ob.order_qty < (0)::numeric) THEN round((((10000)::numeric * (ob.order_price - first_value(ob.order_price) OVER asks)) / first_value(ob.order_price) OVER asks), 6)
+            ELSE round((((10000)::numeric * (first_value(ob.order_price) OVER bids - ob.order_price)) / first_value(ob.order_price) OVER bids), 6)
+        END AS bps,
+        CASE
+            WHEN (ob.order_qty < (0)::numeric) THEN dense_rank() OVER ask_prices
+            ELSE dense_rank() OVER bid_prices
+        END AS lvl,
     e.snapshot_id,
     e.event_id,
     e.pair,
@@ -339,7 +352,9 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
             ob_1.order_id,
             ob_1.exchange_timestamp
            FROM bitfinex.bf_order_book_events ob_1
-          WHERE ((ob_1.snapshot_id = e.snapshot_id) AND (ob_1.event_id < e.event_id) AND (ob_1.event_price <> (0)::numeric) AND (COALESCE(ob_1.order_next_event_id, e.event_id) >= e.event_id))) ob;
+          WHERE ((ob_1.snapshot_id = e.snapshot_id) AND (ob_1.event_id < e.event_id) AND (ob_1.event_price <> (0)::numeric) AND (COALESCE(ob_1.order_next_event_id, e.event_id) >= e.event_id))) ob
+  WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC)
+  ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * sign(ob.order_qty));
 
 
 ALTER TABLE bitfinex.bf_active_orders_before_episode_v OWNER TO "ob-analytics";
