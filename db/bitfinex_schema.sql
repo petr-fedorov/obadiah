@@ -305,14 +305,23 @@ ALTER TABLE bitfinex.bf_order_book_events OWNER TO "ob-analytics";
 --
 
 CREATE VIEW bitfinex.bf_order_book_episodes_v AS
- SELECT DISTINCT ON (bf_order_book_events.snapshot_id, bf_order_book_events.episode_no) bf_order_book_events.snapshot_id,
-    bf_order_book_events.episode_no,
-    bf_order_book_events.event_id,
-    bf_order_book_events.exchange_timestamp,
-    bf_order_book_events.pair,
-    bf_order_book_events.local_timestamp
-   FROM bitfinex.bf_order_book_events
-  ORDER BY bf_order_book_events.snapshot_id, bf_order_book_events.episode_no, bf_order_book_events.event_id;
+ SELECT a.snapshot_id,
+    a.episode_no,
+    a.event_id,
+    a.exchange_timestamp,
+    a.pair,
+    a.local_timestamp,
+    lag(a.local_timestamp) OVER e AS starts_local_timestamp,
+    lag(a.exchange_timestamp) OVER e AS starts_exchange_timestamp
+   FROM ( SELECT DISTINCT ON (bf_order_book_events.snapshot_id, bf_order_book_events.episode_no) bf_order_book_events.snapshot_id,
+            bf_order_book_events.episode_no,
+            bf_order_book_events.event_id,
+            bf_order_book_events.exchange_timestamp,
+            bf_order_book_events.pair,
+            bf_order_book_events.local_timestamp
+           FROM bitfinex.bf_order_book_events
+          ORDER BY bf_order_book_events.snapshot_id, bf_order_book_events.episode_no, bf_order_book_events.event_id) a
+  WINDOW e AS (PARTITION BY a.snapshot_id ORDER BY a.episode_no);
 
 
 ALTER TABLE bitfinex.bf_order_book_episodes_v OWNER TO "ob-analytics";
@@ -342,7 +351,7 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
     e.snapshot_id,
     e.event_id,
     e.pair,
-    e.exchange_timestamp,
+    (e.starts_exchange_timestamp)::timestamp(3) with time zone AS starts_exchange_timestamp,
     ob.exchange_timestamp AS order_exchange_timestamp
    FROM bitfinex.bf_order_book_episodes_v e,
     LATERAL ( SELECT ob_1.event_id,

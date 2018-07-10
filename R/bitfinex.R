@@ -1,4 +1,4 @@
-#' @importFrom dplyr filter full_join select
+#' @importFrom dplyr filter full_join select mutate
 #' @importFrom plyr .
 #' @importFrom magrittr  %>%
 #' @importFrom zoo na.locf
@@ -13,7 +13,7 @@ bfEpisodes <- function(conn, snapshot_id) {
 
 #' @export
 bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647) {
-  df <- dbGetQuery(conn, paste0(  " SELECT exchange_timestamp AS \"timestamp\"",
+  df <- dbGetQuery(conn, paste0(  " SELECT starts_exchange_timestamp AS \"timestamp\"",
                                   " ,order_price AS price ",
                                   " ,qty AS vol ",
                                   " ,direction ",
@@ -21,7 +21,7 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
                                   " SELECT *, COALESCE(lag(order_price) OVER p, -1) AS lag_order_price, ",
                                             " COALESCE(lag(qty) OVER p, -1) AS lag_qty ",
                                   " FROM (",
-                                        " SELECT snapshot_id, episode_no, exchange_timestamp, order_price, ",
+                                        " SELECT snapshot_id, episode_no, starts_exchange_timestamp, order_price, ",
                                         " ABS(SUM(order_qty)) AS qty,",
                                         " CASE WHEN SUM(order_qty) <0 THEN 'ask'::text ",
                                               "ELSE 'bid'::text ",
@@ -30,7 +30,7 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
                                         " WHERE snapshot_id = ", snapshot_id,
                                               " AND lvl = 1 ",
                                               " AND episode_no BETWEEN ", min.episode_no," AND ", max.episode_no,
-                                        " GROUP BY snapshot_id, episode_no, exchange_timestamp, order_price ",
+                                        " GROUP BY snapshot_id, episode_no, starts_exchange_timestamp, order_price ",
                                         ") a ",
                                     " WINDOW p AS (PARTITION BY snapshot_id, direction ORDER BY episode_no) ",
                                     ") b ",
@@ -94,7 +94,7 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
 
 #' @export
 bfTrades <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647) {
-  dbGetQuery(conn, paste0(" SELECT 	exchange_timestamp AS \"timestamp\", ",
+  dbGetQuery(conn, paste0(" SELECT 	event_exchange_timestamp AS \"timestamp\", ",
                                   " price, ",
                                   " qty AS volume, ",
                                   " CASE WHEN qty < 0 THEN 'sell'::text ",
