@@ -497,24 +497,43 @@ ALTER SEQUENCE bitfinex.bf_snapshots_snapshot_id_seq OWNED BY bitfinex.bf_snapsh
 --
 
 CREATE VIEW bitfinex.bf_trades_v AS
- SELECT t.exchange_timestamp,
-    t.id,
-    t.qty,
-    round(t.price, bf_pairs."precision") AS price,
-    t.event_id,
-    count(*) OVER (PARTITION BY t.event_id, t.snapshot_id) AS matched_count,
-    t.trade_timestamp,
-    t.pair,
-    t.snapshot_id,
-    e.episode_no,
-    t.local_timestamp,
-    (t.exchange_timestamp - t.trade_timestamp) AS sdelay,
-    (e.exchange_timestamp - t.exchange_timestamp) AS edelay,
-    (t.local_timestamp - t.exchange_timestamp) AS ndelay
-   FROM ((bitfinex.bf_trades t
-     JOIN bitfinex.bf_pairs USING (pair))
-     LEFT JOIN bitfinex.bf_order_book_events e ON (((t.event_id = e.event_id) AND (t.snapshot_id = e.snapshot_id))))
-  WHERE (t.local_timestamp IS NOT NULL);
+ SELECT a.id,
+    a.qty,
+    a.price,
+    a.event_id,
+    a.matched_count,
+    a.pair,
+    a.snapshot_id,
+        CASE
+            WHEN (a.episode_no IS NOT NULL) THEN a.episode_no
+            ELSE ( SELECT min(i.episode_no) AS min
+               FROM bitfinex.bf_order_book_episodes_v i
+              WHERE ((i.snapshot_id = a.snapshot_id) AND (i.exchange_timestamp >= a.event_exchange_timestamp)))
+        END AS episode_no,
+    a.trade_timestamp,
+    a.exchange_timestamp,
+    a.event_exchange_timestamp,
+    a.local_timestamp
+   FROM ( SELECT t.id,
+            t.qty,
+            round(t.price, bf_pairs."precision") AS price,
+            t.event_id,
+            count(*) OVER (PARTITION BY t.event_id, t.snapshot_id) AS matched_count,
+            t.pair,
+            t.snapshot_id,
+            e.episode_no,
+            t.trade_timestamp,
+            t.exchange_timestamp,
+                CASE
+                    WHEN (e.exchange_timestamp IS NOT NULL) THEN e.exchange_timestamp
+                    ELSE (max(e.exchange_timestamp) OVER o + (t.trade_timestamp - max(t.trade_timestamp) FILTER (WHERE (e.exchange_timestamp IS NOT NULL)) OVER o))
+                END AS event_exchange_timestamp,
+            t.local_timestamp
+           FROM ((bitfinex.bf_trades t
+             JOIN bitfinex.bf_pairs USING (pair))
+             LEFT JOIN bitfinex.bf_order_book_events e ON (((t.event_id = e.event_id) AND (t.snapshot_id = e.snapshot_id))))
+          WHERE (t.local_timestamp IS NOT NULL)
+          WINDOW o AS (PARTITION BY t.snapshot_id ORDER BY t.id)) a;
 
 
 ALTER TABLE bitfinex.bf_trades_v OWNER TO "ob-analytics";
