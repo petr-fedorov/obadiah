@@ -92,3 +92,17 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
   list(timestamp=ts, asks=asks, bids=bids)
 }
 
+#' @export
+bfTrades <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647) {
+  dbGetQuery(conn, paste0(" SELECT 	exchange_timestamp AS \"timestamp\", ",
+                                  " price, ",
+                                  " qty AS volume, ",
+                                  " CASE WHEN qty < 0 THEN 'sell'::text ",
+                                       " ELSE 'buy'::text ",
+                                  " END AS direction ",
+                          " FROM bitfinex.bf_trades_v ",
+                          " WHERE  event_exchange_timestamp IS NOT NULL ",
+                            " AND snapshot_id = ", snapshot_id,
+                            " AND episode_no BETWEEN ", min.episode_no, " AND ", max.episode_no,
+                          " ORDER BY id "))
+}
