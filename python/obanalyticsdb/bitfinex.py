@@ -11,7 +11,7 @@ def connect_db():
 
 
 def process_trade(q, stop_flag, pair, snapshot_id):
-    logger = logging.getLogger("trade")
+    logger = logging.getLogger("bitfinex.trade")
     with connect_db() as con:
         con.set_session(autocommit=True)
         with con.cursor() as curr:
@@ -45,7 +45,7 @@ def process_trade(q, stop_flag, pair, snapshot_id):
 
 
 def process_raw_order_book(q, stop_flag, pair, snapshot_id):
-    logger = logging.getLogger("order.book.event")
+    logger = logging.getLogger("bitfinex.order.book.event")
     with connect_db() as con:
         con.set_session(autocommit=True)
         with con.cursor() as curr:
@@ -89,10 +89,20 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                                          ' insert an order book event: %s', e)
 
 
-def start_new_snapshot(ob_len, pair):
-    logger = logging.getLogger()
+def check_pair(pair):
     with connect_db() as con:
-        # con.set_session(autocommit=True)
+        with con.cursor() as curr:
+            curr.execute(" SELECT * "
+                         " FROM bitfinex.bf_pairs "
+                         " WHERE pair = %s", (pair, ))
+            if curr.fetchone() is None:
+                print('Pair %s has not been set up in the database' % pair)
+                raise KeyError(pair)
+
+
+def start_new_snapshot(ob_len, pair):
+    logger = logging.getLogger("bitfinex.new.snapshot")
+    with connect_db() as con:
         with con.cursor() as curr:
             try:
                 curr.execute("insert into bitfinex.bf_snapshots (len)"
@@ -109,15 +119,16 @@ def start_new_snapshot(ob_len, pair):
     return snapshot_id
 
 
-def capture(logging_queue, configurer, stop_flag):
-    configurer(logging_queue)
+def capture(pair, stop_flag):
 
+    logger = logging.getLogger("bitfinex.capture")
     ob_len = 100
-    pair = 'BTCUSD'
 
     try:
+        check_pair(pair)
         snapshot_id = start_new_snapshot(ob_len, pair)
-    except Exception:
+    except Exception as e:
+        logger.exception(e)
         return
 
     wss = BtfxWss(log_level=logging.INFO)
@@ -150,3 +161,4 @@ def capture(logging_queue, configurer, stop_flag):
     time.sleep(2)
 
     wss.stop()
+    logger.info("Finished!")

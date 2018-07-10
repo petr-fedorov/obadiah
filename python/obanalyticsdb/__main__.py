@@ -5,11 +5,12 @@ import multiprocessing
 import sys
 import traceback
 import signal
+import argparse
 
 
-def listener_configurer():
+def listener_process(queue, log_file_name):
     root = logging.getLogger()
-    h = logging.handlers.RotatingFileHandler('obanalyticsdb.log',
+    h = logging.handlers.RotatingFileHandler(log_file_name,
                                              'a',
                                              2**20,
                                              10)
@@ -17,10 +18,6 @@ def listener_configurer():
                           '%(levelname)-8s %(message)s')
     h.setFormatter(f)
     root.addHandler(h)
-
-
-def listener_process(queue, configurer):
-    configurer()
     while True:
         try:
             record = queue.get()
@@ -33,14 +30,16 @@ def listener_process(queue, configurer):
             traceback.print_exc(file=sys.stderr)
 
 
-def worker_configurer(queue):
-    h = logging.handlers.QueueHandler(queue)
-    root = logging.getLogger()
-    root.addHandler(h)
-    root.setLevel(logging.DEBUG)
-
-
 def main():
+    parser = argparse.ArgumentParser(description="Gather high-frequency trade "
+                                     "data for a pair from a cryptocurrency "
+                                     "exchange and store it.")
+    parser.add_argument("--stream", help="where STREAM  must be in the format "
+                        "PAIR:EXCHANGE (default: BTCUSD:BITFINEX)",
+                        default="BTCUSD:BITFINEX")
+
+    args = parser.parse_args()
+    stream = args.stream.split(':')
 
     stop_flag = multiprocessing.Event()
 
@@ -48,14 +47,27 @@ def main():
         stop_flag.set()
 
     signal.signal(signal.SIGINT, handler)
-    print("Press Ctrl-C to stop ...")
 
     queue = multiprocessing.Queue(-1)
     listener = multiprocessing.Process(target=listener_process,
-                                       args=(queue, listener_configurer))
+                                       args=(queue,
+                                             "oba%s_%s.log" % tuple(stream)))
     listener.start()
 
-    bf.capture(queue, worker_configurer, stop_flag)
+    h = logging.handlers.QueueHandler(queue)
+    root = logging.getLogger()
+    root.addHandler(h)
+    root.setLevel(logging.INFO)
+
+    exchanges = {'BITFINEX': bf.capture}
+
+    try:
+        capture = exchanges[stream[1]]
+        print("Press Ctrl-C to stop ...")
+        capture(stream[0], stop_flag)
+    except KeyError as e:
+        root.exception(e)
+        print('Exchange %s is not supported (yet)' % stream[1])
 
     queue.put_nowait(None)
     listener.join()
