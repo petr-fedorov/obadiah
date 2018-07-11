@@ -3,7 +3,7 @@ import logging
 import time
 from btfxwss import BtfxWss
 import psycopg2
-import datetime
+from datetime import datetime
 
 
 def connect_db():
@@ -15,78 +15,138 @@ def process_trade(q, stop_flag, pair, snapshot_id):
     with connect_db() as con:
         con.set_session(autocommit=True)
         with con.cursor() as curr:
-            while not stop_flag.is_set():
-                data, lts = q.get()
-                logger.debug("%i %s" % (snapshot_id, data))
-                *data, rts = data
-                lts = datetime.datetime.fromtimestamp(lts)
-                if data[0] == 'tu':
-                    data = [data[1]]
-                elif data[0] == 'te':
-                    data = []
-                else:
-                    data = data[0]  # it's an initial snapshot of trades
-                for d in data:
-                    try:
+            try:
+                while not stop_flag.is_set():
+                    data, lts = q.get()
+                    logger.debug("%i %s" % (snapshot_id, data))
+                    *data, rts = data
+                    lts = datetime.fromtimestamp(lts)
+                    if data[0] == 'tu':
+                        data = [data[1]]
+                    elif data[0] == 'te':
+                        data = []
+                    else:
+                        data = data[0]  # it's an initial snapshot of trades
+                    for d in data:
                         curr.execute("INSERT INTO bitfinex.bf_trades"
                                      "(id, pair, trade_timestamp, qty, price,"
                                      "local_timestamp, snapshot_id,"
                                      "exchange_timestamp)"
                                      "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                                      (d[0], pair,
-                                      datetime.datetime.fromtimestamp(
-                                          d[1]/1000), d[2], d[3], lts,
-                                      snapshot_id,
-                                      datetime.datetime.fromtimestamp(
-                                          rts/1000)))
-                    except Exception as e:
-                        logger.exception('An exception caught while trying to'
-                                         ' insert a trade: %s', e)
+                                      datetime.fromtimestamp(d[1]/1000),
+                                      d[2], d[3], lts, snapshot_id,
+                                      datetime.fromtimestamp(rts/1000)))
+            except Exception as e:
+                logger.exception('An exception caught while '
+                                 'processing a trade: %s', e)
+                stop_flag.set()
+
+
+def insert_event(curr, lts, pair, order_id, event_price, order_qty,
+                 snapshot_id, exchange_timestamp, episode_no, id=False):
+    curr.execute("INSERT INTO bitfinex."
+                 "bf_order_book_events "
+                 "(local_timestamp,pair,"
+                 "order_id,"
+                 "event_price, order_qty, "
+                 "snapshot_id,"
+                 "exchange_timestamp, "
+                 "episode_no)"
+                 "VALUES (%s, %s, %s, %s, %s,"
+                 "%s,%s, %s) " " RETURNING event_id",
+                 (lts, pair, order_id, event_price, order_qty, snapshot_id,
+                  exchange_timestamp, episode_no))
+    if id:
+        return curr.fetchone()[0]
+
+
+def insert_episode(curr, episode_event_id, snapshot_id, episode_no,
+                   episode_starts, rts):
+
+    curr.execute("INSERT INTO bitfinex.bf_order_book_episodes "
+                 "(event_id, snapshot_id, episode_no,"
+                 "starts_exchange_timestamp,ends_exchange_timestamp) "
+                 "VALUES (%s, %s, %s, %s, %s)",
+                 (episode_event_id, snapshot_id,
+                  episode_no, episode_starts, rts))
 
 
 def process_raw_order_book(q, stop_flag, pair, snapshot_id):
     logger = logging.getLogger("bitfinex.order.book.event")
-    with connect_db() as con:
-        con.set_session(autocommit=True)
-        with con.cursor() as curr:
-            episode_no = 0
-            increase_episode_no = True
+    try:
+        with connect_db() as con:
+            con.set_session(autocommit=False, deferrable=True)
+            with con.cursor() as curr:
+                episode_no = 0
+                episode_starts = None
 
-            while True:
-                data, lts = q.get()
-                logger.debug("%i %s" % (snapshot_id, data))
-                *data, rts = data
-                lts = datetime.datetime.fromtimestamp(lts)
-                if isinstance(data[0][0], list):
-                    data = data[0]
-                for d in data:
-                    if not float(d[1]):
-                        if increase_episode_no:
-                            increase_episode_no = False
-                            if stop_flag.is_set():
-                                return
-                            else:
+                increase_episode_no = False  # The first 'addition' event
+
+                while not stop_flag.is_set():
+                    data, lts = q.get()
+                    logger.debug("%i %s" % (snapshot_id, data))
+                    *data, rts = data
+                    rts = datetime.fromtimestamp(rts/1000)
+                    lts = datetime.fromtimestamp(lts)
+                    if isinstance(data[0][0], list):
+                        data = data[0]
+                    for d in data:
+                        if not float(d[1]):  # it is a 'removal' event
+                            if increase_episode_no:
+                                # it is the first one for an episode
+                                con.commit()
+                                increase_episode_no = False
                                 episode_no += 10
+                                episode_event_id = insert_event(curr, lts,
+                                                                pair, d[0],
+                                                                d[1], d[2],
+                                                                snapshot_id,
+                                                                rts,
+                                                                episode_no,
+                                                                id=True)
+                                insert_episode(curr, episode_event_id,
+                                               snapshot_id, episode_no,
+                                               episode_starts, rts)
+                                # the end time of this episode will be
+                                # the start time for the next one
+                                episode_starts = rts
                                 logger.debug("Unprocessed queue size: %i" %
                                              (q.qsize(),))
-                    elif not increase_episode_no:
-                        increase_episode_no = True
+                                continue
+                        elif not increase_episode_no:
+                            # it is the first 'addition' event of an episode
+                            increase_episode_no = True
 
-                    try:
-                        curr.execute("INSERT INTO "
-                                     "bitfinex.bf_order_book_events "
-                                     "(local_timestamp, pair, order_id,"
-                                     "event_price, order_qty, snapshot_id,"
-                                     "exchange_timestamp, episode_no)"
-                                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                                     (lts, pair, d[0], d[1], d[2], snapshot_id,
-                                      datetime.datetime.fromtimestamp(
-                                          rts/1000),
-                                      episode_no
-                                      ))
-                    except Exception as e:
-                        logger.exception('An exception caught while trying to'
-                                         ' insert an order book event: %s', e)
+                            if episode_no == 0:
+                                # Need to insert the anomalous '0' episode
+                                # for it is the only episode starting from
+                                # an 'addition' event. The others start from
+                                # a 'removal' event
+                                episode_starts = rts
+                                episode_event_id = insert_event(curr,
+                                                                lts, pair,
+                                                                d[0], d[1],
+                                                                d[2],
+                                                                snapshot_id,
+                                                                rts,
+                                                                episode_no,
+                                                                id=True)
+                                insert_episode(curr, episode_event_id,
+                                               snapshot_id, episode_no,
+                                               episode_starts, rts)
+                                continue
+
+                        # The event is not a special one - just save it
+                        insert_event(curr, lts, pair, d[0], d[1], d[2],
+                                     snapshot_id, rts, episode_no)
+
+            # the latest uncommitted episode will be rolled back
+            con.rollback()
+    except Exception as e:
+        logger.exception('An exception caught while processing '
+                         'an order book event: %s', e)
+        stop_flag.set()
 
 
 def check_pair(pair):
