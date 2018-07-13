@@ -28,15 +28,19 @@ def process_trade(q, stop_flag, pair, snapshot_id):
                     else:
                         data = data[0]  # it's an initial snapshot of trades
                     for d in data:
-                        curr.execute("INSERT INTO bitfinex.bf_trades"
-                                     "(id, pair, trade_timestamp, qty, price,"
-                                     "local_timestamp, snapshot_id,"
-                                     "exchange_timestamp)"
-                                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                                     (d[0], pair,
-                                      datetime.fromtimestamp(d[1]/1000),
-                                      d[2], d[3], lts, snapshot_id,
-                                      datetime.fromtimestamp(rts/1000)))
+                        try:
+                            curr.execute("INSERT INTO bitfinex.bf_trades"
+                                         "(id, pair, trade_timestamp, qty,"
+                                         "price,local_timestamp, snapshot_id,"
+                                         "exchange_timestamp)"
+                                         "VALUES (%s, %s, %s, %s, %s, %s,"
+                                         "%s, %s)",
+                                         (d[0], pair,
+                                          datetime.fromtimestamp(d[1]/1000),
+                                          d[2], d[3], lts, snapshot_id,
+                                          datetime.fromtimestamp(rts/1000)))
+                        except psycopg2.IntegrityError as e:
+                            logger.warn('Skipping %s', e)
             except Exception as e:
                 logger.exception('An exception caught while '
                                  'processing a trade: %s', e)
@@ -61,15 +65,13 @@ def insert_event(curr, lts, pair, order_id, event_price, order_qty,
         return curr.fetchone()[0]
 
 
-def insert_episode(curr, episode_event_id, snapshot_id, episode_no,
-                   episode_starts, rts):
+def insert_episode(curr, snapshot_id, episode_no, episode_starts, rts):
 
     curr.execute("INSERT INTO bitfinex.bf_order_book_episodes "
-                 "(event_id, snapshot_id, episode_no,"
+                 "(snapshot_id, episode_no,"
                  "starts_exchange_timestamp,ends_exchange_timestamp) "
-                 "VALUES (%s, %s, %s, %s, %s)",
-                 (episode_event_id, snapshot_id,
-                  episode_no, episode_starts, rts))
+                 "VALUES (%s, %s, %s, %s)",
+                 (snapshot_id, episode_no, episode_starts, rts))
 
 
 def process_raw_order_book(q, stop_flag, pair, snapshot_id):
@@ -98,22 +100,13 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                                 con.commit()
                                 increase_episode_no = False
                                 episode_no += 10
-                                episode_event_id = insert_event(curr, lts,
-                                                                pair, d[0],
-                                                                d[1], d[2],
-                                                                snapshot_id,
-                                                                rts,
-                                                                episode_no,
-                                                                id=True)
-                                insert_episode(curr, episode_event_id,
-                                               snapshot_id, episode_no,
+                                insert_episode(curr, snapshot_id, episode_no,
                                                episode_starts, rts)
                                 # the end time of this episode will be
                                 # the start time for the next one
                                 episode_starts = rts
                                 logger.debug("Unprocessed queue size: %i" %
                                              (q.qsize(),))
-                                continue
                         elif not increase_episode_no:
                             # it is the first 'addition' event of an episode
                             increase_episode_no = True
@@ -122,22 +115,12 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                                 # Need to insert the anomalous '0' episode
                                 # for it is the only episode starting from
                                 # an 'addition' event. The others start from
-                                # a 'removal' event
+                                # a 'removal' event and are inserted by the
+                                # code above
                                 episode_starts = rts
-                                episode_event_id = insert_event(curr,
-                                                                lts, pair,
-                                                                d[0], d[1],
-                                                                d[2],
-                                                                snapshot_id,
-                                                                rts,
-                                                                episode_no,
-                                                                id=True)
-                                insert_episode(curr, episode_event_id,
-                                               snapshot_id, episode_no,
+                                insert_episode(curr, snapshot_id, episode_no,
                                                episode_starts, rts)
-                                continue
 
-                        # The event is not a special one - just save it
                         insert_event(curr, lts, pair, d[0], d[1], d[2],
                                      snapshot_id, rts, episode_no)
 

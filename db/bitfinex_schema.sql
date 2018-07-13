@@ -150,11 +150,11 @@ DECLARE
 
 BEGIN 
 	UPDATE bitfinex.bf_order_book_events
-	SET order_next_event_id = NEW.event_id
+	SET order_next_episode_no = NEW.episode_no
 	WHERE snapshot_id = NEW.snapshot_id 
 	  AND order_id = NEW.order_id 
-	  AND event_id != NEW.event_id
-	  AND order_next_event_id IS NULL;
+	  AND episode_no != NEW.episode_no
+	  AND order_next_episode_no IS NULL;
 	  
 	FOR qty IN trade_match_single LOOP
 	
@@ -272,8 +272,7 @@ CREATE TABLE bitfinex.bf_order_book_episodes (
     snapshot_id integer NOT NULL,
     episode_no integer NOT NULL,
     starts_exchange_timestamp timestamp with time zone NOT NULL,
-    ends_exchange_timestamp timestamp with time zone NOT NULL,
-    event_id bigint NOT NULL
+    ends_exchange_timestamp timestamp with time zone NOT NULL
 );
 
 
@@ -309,7 +308,8 @@ CREATE TABLE bitfinex.bf_order_book_events (
     snapshot_id integer,
     episode_no integer,
     exchange_timestamp timestamp(3) with time zone,
-    order_next_event_id bigint
+    order_next_event_id bigint,
+    order_next_episode_no integer
 );
 
 
@@ -323,7 +323,7 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
  SELECT e.episode_no,
     ob.order_price,
     ob.order_id,
-    ob.event_id AS order_event_id,
+    ob.episode_no AS order_episode_no,
     ob.order_qty,
         CASE
             WHEN (ob.order_qty < (0)::numeric) THEN sum(ob.order_qty) OVER asks
@@ -338,18 +338,10 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
             ELSE dense_rank() OVER bid_prices
         END AS lvl,
     e.snapshot_id,
-    e.event_id,
     (e.starts_exchange_timestamp)::timestamp(3) with time zone AS starts_exchange_timestamp,
     ob.exchange_timestamp AS order_exchange_timestamp
-   FROM bitfinex.bf_order_book_episodes e,
-    LATERAL ( SELECT ob_1.event_id,
-            ob_1.order_price,
-            ob_1.order_qty,
-            ob_1.event_price,
-            ob_1.order_id,
-            ob_1.exchange_timestamp
-           FROM bitfinex.bf_order_book_events ob_1
-          WHERE ((ob_1.snapshot_id = e.snapshot_id) AND (ob_1.event_id < e.event_id) AND (ob_1.event_price <> (0)::numeric) AND (COALESCE(ob_1.order_next_event_id, e.event_id) >= e.event_id))) ob
+   FROM (bitfinex.bf_order_book_episodes e
+     JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no < e.episode_no) AND (ob.event_price <> (0)::numeric) AND ((ob.order_next_episode_no >= e.episode_no) OR (ob.order_next_episode_no IS NULL)))))
   WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC)
   ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * sign(ob.order_qty));
 
@@ -503,14 +495,14 @@ CREATE VIEW bitfinex.bf_snapshots_v AS
     date_trunc('seconds'::text, GREATEST(e.max_e_et, t.max_t_et)) AS ends,
     t.matched_trades
    FROM ((bitfinex.bf_snapshots
-     JOIN ( SELECT bf_order_book_events.snapshot_id,
+     LEFT JOIN ( SELECT bf_order_book_events.snapshot_id,
             count(*) AS events,
             min(bf_order_book_events.exchange_timestamp) AS min_e_et,
             max(bf_order_book_events.exchange_timestamp) AS max_e_et,
             max(bf_order_book_events.episode_no) AS last_episode
            FROM bitfinex.bf_order_book_events
           GROUP BY bf_order_book_events.snapshot_id) e USING (snapshot_id))
-     JOIN ( SELECT bf_trades.snapshot_id,
+     LEFT JOIN ( SELECT bf_trades.snapshot_id,
             count(*) AS trades,
             count(*) FILTER (WHERE (bf_trades.event_id IS NOT NULL)) AS matched_trades,
             min(bf_trades.exchange_timestamp) AS min_t_et,
@@ -630,17 +622,17 @@ CREATE INDEX bf_order_book_events_idx_order_id_snapshot_id ON bitfinex.bf_order_
 
 
 --
--- Name: bf_order_book_events_idx_order_next_event_id; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE UNIQUE INDEX bf_order_book_events_idx_order_next_event_id ON bitfinex.bf_order_book_events USING btree (order_next_event_id);
-
-
---
 -- Name: bf_order_book_events_idx_snapshot_id; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
 CREATE INDEX bf_order_book_events_idx_snapshot_id ON bitfinex.bf_order_book_events USING btree (snapshot_id);
+
+
+--
+-- Name: bf_order_book_events_idx_snapshot_id_episode_no; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_order_book_events_idx_snapshot_id_episode_no ON bitfinex.bf_order_book_events USING btree (snapshot_id, episode_no);
 
 
 --
@@ -700,6 +692,14 @@ ALTER TABLE ONLY bitfinex.bf_order_book_events
 
 ALTER TABLE ONLY bitfinex.bf_order_book_events
     ADD CONSTRAINT bf_order_book_events_fkey_snapshot_id FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: bf_order_book_events bf_order_book_events_fkey_snapshot_id_episode_no; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_order_book_events
+    ADD CONSTRAINT bf_order_book_events_fkey_snapshot_id_episode_no FOREIGN KEY (snapshot_id, episode_no) REFERENCES bitfinex.bf_order_book_episodes(snapshot_id, episode_no) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --
