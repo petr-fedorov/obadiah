@@ -61,10 +61,10 @@ bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147
 #' @export
 bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range = 0, min.bid = 0, max.ask = Inf) {
 
-  ts <- dbGetQuery(conn, paste0(" SELECT exchange_timestamp ",
-                                " FROM bitfinex.bf_order_book_episodes_v ",
+  ts <- dbGetQuery(conn, paste0(" SELECT starts_exchange_timestamp",
+                                " FROM bitfinex.bf_order_book_episodes ",
                                 " WHERE snapshot_id = ", snapshot_id,
-                                " AND episode_no = ", episode_no ))$exchange_timestamp
+                                " AND episode_no = ", episode_no ))$starts_exchange_timestamp
 
   where_cond <- paste0(" WHERE snapshot_id = ", snapshot_id,
                        " AND episode_no = ", episode_no )

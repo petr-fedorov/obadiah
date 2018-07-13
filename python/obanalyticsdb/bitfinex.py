@@ -48,7 +48,7 @@ def process_trade(q, stop_flag, pair, snapshot_id):
 
 
 def insert_event(curr, lts, pair, order_id, event_price, order_qty,
-                 snapshot_id, exchange_timestamp, episode_no, id=False):
+                 snapshot_id, exchange_timestamp, episode_no, event_no):
     curr.execute("INSERT INTO bitfinex."
                  "bf_order_book_events "
                  "(local_timestamp,pair,"
@@ -56,13 +56,11 @@ def insert_event(curr, lts, pair, order_id, event_price, order_qty,
                  "event_price, order_qty, "
                  "snapshot_id,"
                  "exchange_timestamp, "
-                 "episode_no)"
+                 "episode_no, event_no)"
                  "VALUES (%s, %s, %s, %s, %s,"
-                 "%s,%s, %s) " " RETURNING event_id",
+                 "%s,%s, %s, %s) ",
                  (lts, pair, order_id, event_price, order_qty, snapshot_id,
-                  exchange_timestamp, episode_no))
-    if id:
-        return curr.fetchone()[0]
+                  exchange_timestamp, episode_no, event_no))
 
 
 def insert_episode(curr, snapshot_id, episode_no, episode_starts, rts):
@@ -81,6 +79,7 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
             con.set_session(autocommit=False, deferrable=True)
             with con.cursor() as curr:
                 episode_no = 0
+                event_no = 1
                 episode_starts = None
 
                 increase_episode_no = False  # The first 'addition' event
@@ -100,6 +99,7 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                                 con.commit()
                                 increase_episode_no = False
                                 episode_no += 10
+                                event_no = 1
                                 insert_episode(curr, snapshot_id, episode_no,
                                                episode_starts, rts)
                                 # the end time of this episode will be
@@ -122,7 +122,8 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                                                episode_starts, rts)
 
                         insert_event(curr, lts, pair, d[0], d[1], d[2],
-                                     snapshot_id, rts, episode_no)
+                                     snapshot_id, rts, episode_no, event_no)
+                        event_no += 1
 
             # the latest uncommitted episode will be rolled back
             con.rollback()
