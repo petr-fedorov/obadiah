@@ -5,6 +5,8 @@ from btfxwss import BtfxWss
 import psycopg2
 from datetime import datetime
 
+MAX_EPISODE_NO = 2147483647
+
 
 def connect_db():
     return psycopg2.connect("dbname=ob-analytics user=ob-analytics")
@@ -56,11 +58,11 @@ def insert_event(curr, lts, pair, order_id, event_price, order_qty,
                  "event_price, order_qty, "
                  "snapshot_id,"
                  "exchange_timestamp, "
-                 "episode_no, event_no)"
+                 "episode_no, event_no, order_next_episode_no)"
                  "VALUES (%s, %s, %s, %s, %s,"
-                 "%s,%s, %s, %s) ",
+                 "%s, %s, %s, %s, %s) ",
                  (lts, pair, order_id, event_price, order_qty, snapshot_id,
-                  exchange_timestamp, episode_no, event_no))
+                  exchange_timestamp, episode_no, event_no, MAX_EPISODE_NO))
 
 
 def insert_episode(curr, snapshot_id, episode_no, episode_starts, rts):
@@ -99,6 +101,9 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                                 con.commit()
                                 increase_episode_no = False
                                 episode_no += 10
+                                if episode_no == MAX_EPISODE_NO:
+                                    stop_flag.set()
+                                    break
                                 event_no = 1
                                 insert_episode(curr, snapshot_id, episode_no,
                                                episode_starts, rts)

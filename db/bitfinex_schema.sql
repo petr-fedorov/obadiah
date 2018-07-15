@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 9.6.8
--- Dumped by pg_dump version 9.6.8
+-- Dumped from database version 10.4
+-- Dumped by pg_dump version 10.4
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -153,8 +153,8 @@ BEGIN
 	SET order_next_episode_no = NEW.episode_no
 	WHERE snapshot_id = NEW.snapshot_id 
 	  AND order_id = NEW.order_id 
-	  AND episode_no != NEW.episode_no
-	  AND order_next_episode_no IS NULL;
+	  AND episode_no < NEW.episode_no
+	  AND order_next_episode_no > NEW.episode_no;
 	  
 	FOR qty IN trade_match_single LOOP
 	
@@ -294,8 +294,7 @@ CREATE TABLE bitfinex.bf_order_book_events (
     snapshot_id integer NOT NULL,
     episode_no integer NOT NULL,
     exchange_timestamp timestamp(3) with time zone,
-    order_next_event_id bigint,
-    order_next_episode_no integer,
+    order_next_episode_no integer NOT NULL,
     event_no smallint NOT NULL
 );
 
@@ -328,7 +327,7 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
     (e.starts_exchange_timestamp)::timestamp(3) with time zone AS starts_exchange_timestamp,
     ob.exchange_timestamp AS order_exchange_timestamp
    FROM (bitfinex.bf_order_book_episodes e
-     JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no < e.episode_no) AND (ob.event_price <> (0)::numeric) AND ((ob.order_next_episode_no >= e.episode_no) OR (ob.order_next_episode_no IS NULL)))))
+     JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no < e.episode_no) AND (ob.event_price <> (0)::numeric) AND (ob.order_next_episode_no >= e.episode_no))))
   WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC)
   ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * sign(ob.order_qty));
 
