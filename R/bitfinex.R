@@ -44,17 +44,30 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
 #' @export
 bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647) {
 
-  df <- dbGetQuery(conn, paste0(" SELECT 	exchange_timestamp AS timestamp ",
-                                " , order_price AS price ",
-                                " , ABS(SUM(order_qty)) AS volume, ",
-                                " CASE WHEN ABS(SUM(order_qty)) < 0 THEN 'ask'::text ",
-                                      " ELSE 'bid'::text ",
-                                " END AS side",
-                                " FROM bitfinex.bf_order_book_events_v ",
-                                " WHERE snapshot_id = ", snapshot_id,
-                                  " AND episode_no BETWEEN ", min.episode_no, " AND ", max.episode_no,
-                                " GROUP BY exchange_timestamp,  order_price, pair ",
-                                " ORDER BY 1" ))
+  df <- dbGetQuery(conn, paste0(" SELECT 	exchange_timestamp AS timestamp
+                                          , order_price AS price
+                                          , ABS(SUM(order_qty)) AS volume
+                                          , CASE WHEN SUM(order_qty) < 0 THEN 'ask'::text
+                                                 ELSE 'bid'::text
+                                            END AS side
+                                  FROM (
+                                    SELECT exchange_timestamp, order_price, order_qty
+                                    FROM bitfinex.bf_order_book_events
+                                    WHERE snapshot_id = ", snapshot_id,
+                                    " AND episode_no BETWEEN ", min.episode_no," AND ", max.episode_no,
+                                " UNION ALL
+                                    SELECT exchange_timestamp,  prev_order_price AS order_price, 0::numeric AS order_qty
+                                    FROM (
+                                      SELECT exchange_timestamp, order_price,  COALESCE(lag(order_price) OVER o , order_price) AS prev_order_price
+                                      FROM bitfinex.bf_order_book_events
+                                      WHERE snapshot_id = ", snapshot_id,
+                                    "   AND episode_no BETWEEN ", min.episode_no," AND ", max.episode_no,
+                                    " WINDOW o AS (PARTITION BY snapshot_id, order_id ORDER BY episode_no)
+                                        ) b
+                                    WHERE order_price != prev_order_price
+                                  ) a
+                                  GROUP BY exchange_timestamp,  order_price
+                                  ORDER BY 1" ))
   df
 }
 
