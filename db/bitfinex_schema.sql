@@ -140,8 +140,21 @@ DECLARE
 									  AND t.event_no IS NULL	-- trade has not been associated with 
 																-- event. But could be associated with 
 																-- episode_no, so episode_no might be NOT NULL
-									  AND t.exchange_timestamp >= NEW.exchange_timestamp - 1*interval '1 second'
+									  AND t.exchange_timestamp BETWEEN NEW.exchange_timestamp - 1*interval '1 second' AND
+																		NEW.exchange_timestamp
 									ORDER BY id;
+									
+	trade_match_multiple CURSOR FOR	SELECT id
+									FROM ( 	SELECT id, SUM(qty) OVER (PARTITION BY t.snapshot_id, t.price ORDER BY t.id) AS total_qty  
+										   	FROM bitfinex.bf_trades t
+											WHERE t.price		= NEW.order_price
+									  		  AND t.snapshot_id = NEW.snapshot_id
+									  		  AND t.event_no IS NULL
+									  		  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
+																				AND NEW.exchange_timestamp
+										) t
+									WHERE t.total_qty = -NEW.event_qty
+									;									
 
 BEGIN 
 	UPDATE bitfinex.bf_order_book_events
@@ -162,6 +175,22 @@ BEGIN
 			RETURN NULL;
 
 		END LOOP;
+				
+		FOR last_trade IN trade_match_multiple LOOP
+		
+			UPDATE bitfinex.bf_trades t
+			SET episode_no = NEW.episode_no, 
+				event_no = NEW.event_no	
+			WHERE t.price		= NEW.order_price
+			  AND t.snapshot_id = NEW.snapshot_id
+			  AND t.event_no IS NULL
+			  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
+			  									AND NEW.exchange_timestamp 
+			  AND t.id <= last_trade.id;
+						
+			RETURN NULL;
+		END LOOP;
+		
 	END IF;
 
 	RETURN NULL;

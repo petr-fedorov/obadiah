@@ -27,8 +27,11 @@ def process_trade(q, stop_flag, pair, snapshot_id):
                         data = [data[1]]
                     elif data[0] == 'te':
                         data = []
-                    else:
-                        data = data[0]  # it's an initial snapshot of trades
+                    else:  # it's an initial snapshot of trades
+                        # skip initial snapshot of trades
+                        # since they usually can't be matched to any events
+                        continue
+                        # data = data[0]
                     for d in data:
                         try:
                             curr.execute("INSERT INTO bitfinex.bf_trades"
