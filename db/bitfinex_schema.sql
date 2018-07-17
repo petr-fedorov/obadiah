@@ -28,100 +28,93 @@ ALTER SCHEMA bitfinex OWNER TO "ob-analytics";
 -- Name: bf_depth_summary_before_episode_v(integer, integer, integer, numeric); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.bf_depth_summary_before_episode_v(snapshot_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647, bps_step numeric DEFAULT 25) RETURNS TABLE(event_id bigint, volume numeric, bps_level integer, bps_price numeric, bps_vwap numeric, direction character varying, pair character varying, exchange_timestamp timestamp with time zone, episode_no integer, snapshot_id integer)
+CREATE FUNCTION bitfinex.bf_depth_summary_before_episode_v(snapshot_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647, bps_step numeric DEFAULT 25) RETURNS TABLE(volume numeric, bps_level integer, bps_price numeric, bps_vwap numeric, direction character varying, pair character varying, starts_exchange_timestamp timestamp with time zone, episode_no integer, snapshot_id integer)
     LANGUAGE sql
     AS $$
 
-SELECT  event_id,
-		abs(sum(order_qty)) AS volume,
+SELECT  sum(order_qty) AS volume,
 		bps_level,
 		bps_price,
-		round(abs(sum(order_qty*order_price)/sum(order_qty)), "precision") AS bps_vwap,
+		round(sum(order_qty*order_price)/sum(order_qty), "precision") AS bps_vwap,
 		direction,
 		pair,
-		exchange_timestamp,
+		starts_exchange_timestamp,
 		episode_no,
 		snapshot_id
 FROM (
-SELECT 	event_id, 
-		order_price,
+SELECT 	order_price,
 		order_qty, 
 		(bf_depth_summary_before_episode_v.bps_step*bps_level)::integer AS bps_level,
 		round(best_bid*(1 - bps_level*bf_depth_summary_before_episode_v.bps_step/10000), bf_pairs."precision") AS bps_price,
 		'bid' AS direction,
 		pair,
-		exchange_timestamp,
+		starts_exchange_timestamp,
 		episode_no,
 		snapshot_id,
 		"precision"
 FROM (		
-	SELECT 	event_id, 
-			order_price, 
+	SELECT 	order_price, 
 			order_qty, 
 			ceiling((best_bid - order_price)/best_bid/bf_depth_summary_before_episode_v.bps_step*10000)::integer AS bps_level,
 			best_bid,
 			pair,
-			exchange_timestamp,
+			starts_exchange_timestamp,
 			episode_no,
 			snapshot_id
 	FROM (
-			SELECT 	event_id,
-					order_price, 
+			SELECT 	order_price, 
 					order_qty,
 					first_value(order_price) OVER w AS best_bid, 
 					pair,
-					exchange_timestamp,
+					starts_exchange_timestamp,
 					episode_no,
 					snapshot_id
 			FROM bitfinex.bf_active_orders_before_episode_v
 			WHERE snapshot_id = bf_depth_summary_before_episode_v.snapshot_id
 			  AND episode_no BETWEEN bf_depth_summary_before_episode_v.first_episode_no 
 											AND bf_depth_summary_before_episode_v.last_episode_no
-			  AND bitfinex.bf_active_orders_before_episode_v.order_qty > 0
+			  AND bitfinex.bf_active_orders_before_episode_v.side = 'B'
 			WINDOW w AS (PARTITION BY episode_no ORDER BY order_price DESC)
 	) r1
 ) r2 JOIN bf_pairs USING (pair)
 UNION ALL
-SELECT 	event_id, 
-		order_price,
+SELECT 	order_price,
 		order_qty, 
 		(bf_depth_summary_before_episode_v.bps_step*bps_level)::integer AS bps_level,
 		round(best_ask*(1 + bps_level*bf_depth_summary_before_episode_v.bps_step/10000), bf_pairs."precision") AS bps_price,
 		'ask' AS direction,
 		pair,
-		exchange_timestamp,
+		starts_exchange_timestamp,
 		episode_no,
 		snapshot_id,
 		"precision"
 FROM (		
-	SELECT 	event_id, 
-			order_price, 
+	SELECT 	order_price, 
 			order_qty, 
 			ceiling((order_price-best_ask)/best_ask/bf_depth_summary_before_episode_v.bps_step*10000)::integer AS bps_level,
 			best_ask,
 			pair,
-			exchange_timestamp,
+			starts_exchange_timestamp,
 			episode_no,
 			snapshot_id
 	FROM (
-			SELECT 	event_id,
-					order_price, 
+			SELECT 	order_price, 
 					order_qty,
 					first_value(order_price) OVER w AS best_ask, 
 					pair,
-					exchange_timestamp,
+					starts_exchange_timestamp,
 					episode_no,
 					snapshot_id
 			FROM bitfinex.bf_active_orders_before_episode_v
 			WHERE snapshot_id = bf_depth_summary_before_episode_v.snapshot_id
 			  AND episode_no BETWEEN bf_depth_summary_before_episode_v.first_episode_no 
 									AND bf_depth_summary_before_episode_v.last_episode_no
-			  AND bitfinex.bf_active_orders_before_episode_v.order_qty < 0
+			  AND bitfinex.bf_active_orders_before_episode_v.side = 'A'
 			WINDOW w AS (PARTITION BY episode_no ORDER BY order_price)
 	) r1
 ) r2 JOIN bf_pairs USING (pair)
 ) u 
-GROUP BY event_id, pair, bps_level, bps_price, direction, exchange_timestamp, episode_no, snapshot_id, "precision";
+GROUP BY pair, bps_level, bps_price, direction, starts_exchange_timestamp, episode_no, snapshot_id, "precision";
 	
 
 $$;
@@ -142,9 +135,11 @@ DECLARE
 	trade_match_single CURSOR  FOR	SELECT qty 
 									FROM bitfinex.bf_trades t
 									WHERE t.price		= NEW.order_price
-									  AND t.qty 		= NEW.event_qty
+									  AND t.qty 		= -NEW.event_qty
 									  AND t.snapshot_id = NEW.snapshot_id
-									  AND t.episode_no IS NULL
+									  AND t.event_no IS NULL	-- trade has not been associated with 
+																-- event. But could be associated with 
+																-- episode_no, so episode_no might be NOT NULL
 									  AND t.exchange_timestamp >= NEW.exchange_timestamp - 1*interval '1 second'
 									ORDER BY id;
 
@@ -156,16 +151,18 @@ BEGIN
 	  AND episode_no < NEW.episode_no
 	  AND order_next_episode_no > NEW.episode_no;
 	  
-	FOR qty IN trade_match_single LOOP
-	
-		UPDATE bitfinex.bf_trades 
-		SET episode_no = NEW.episode_no, 
-			event_no = NEW.event_no
-		WHERE CURRENT OF trade_match_single;
-		
-		RETURN NULL;
-	
-	END LOOP;
+	IF NEW.event_qty < 0 THEN 
+		FOR qty IN trade_match_single LOOP
+
+			UPDATE bitfinex.bf_trades 
+			SET episode_no = NEW.episode_no, 
+				event_no = NEW.event_no
+			WHERE CURRENT OF trade_match_single;
+
+			RETURN NULL;
+
+		END LOOP;
+	END IF;
 
 	RETURN NULL;
 END;
@@ -188,6 +185,7 @@ DECLARE
 	previous_order bitfinex.bf_order_book_events%ROWTYPE;
 	
 BEGIN
+
 	
 	IF NEW.event_price != 0 THEN 
 	
@@ -197,6 +195,13 @@ BEGIN
 
 		NEW.event_price = round(NEW.event_price, precision);
 		NEW.order_price = NEW.event_price;
+		
+		IF NEW.order_qty < 0 THEN 
+			NEW.order_qty = -NEW.order_qty;
+			NEW.side = 'A';
+		ELSE
+			NEW.side = 'B';
+		END IF;
 		
 		SELECT * INTO previous_order
 		FROM bitfinex.bf_order_book_events
@@ -220,6 +225,7 @@ BEGIN
 		
 		IF FOUND THEN
 			NEW.order_price = previous_order.order_price;
+			NEW.side = previous_order.side;
 			NEW.event_qty = -previous_order.order_qty;
 			NEW.order_qty = 0;
 		ELSE
@@ -253,6 +259,13 @@ BEGIN
 	WHERE pair = NEW.pair;
 
 	NEW.price = round(NEW.price, precision);
+	IF NEW.qty < 0 THEN
+		NEW.direction = 'S';
+		NEW.qty = -NEW.qty;
+	ELSE
+		NEW.direction  = 'B';
+	END IF;
+	
 	RETURN NEW;
 END;
 
@@ -295,7 +308,8 @@ CREATE TABLE bitfinex.bf_order_book_events (
     episode_no integer NOT NULL,
     exchange_timestamp timestamp(3) with time zone,
     order_next_episode_no integer NOT NULL,
-    event_no smallint NOT NULL
+    event_no smallint NOT NULL,
+    side character(1) NOT NULL
 );
 
 
@@ -306,30 +320,36 @@ ALTER TABLE bitfinex.bf_order_book_events OWNER TO "ob-analytics";
 --
 
 CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
- SELECT e.episode_no,
+ SELECT ob.side,
     ob.order_price,
     ob.order_id,
-    ob.episode_no AS order_episode_no,
     ob.order_qty,
         CASE
-            WHEN (ob.order_qty < (0)::numeric) THEN sum(ob.order_qty) OVER asks
+            WHEN (ob.side = 'A'::bpchar) THEN sum(ob.order_qty) OVER asks
             ELSE sum(ob.order_qty) OVER bids
         END AS cumm_qty,
         CASE
-            WHEN (ob.order_qty < (0)::numeric) THEN round((((10000)::numeric * (ob.order_price - first_value(ob.order_price) OVER asks)) / first_value(ob.order_price) OVER asks), 6)
+            WHEN (ob.side = 'A'::bpchar) THEN round((((10000)::numeric * (ob.order_price - first_value(ob.order_price) OVER asks)) / first_value(ob.order_price) OVER asks), 6)
             ELSE round((((10000)::numeric * (first_value(ob.order_price) OVER bids - ob.order_price)) / first_value(ob.order_price) OVER bids), 6)
         END AS bps,
         CASE
-            WHEN (ob.order_qty < (0)::numeric) THEN dense_rank() OVER ask_prices
+            WHEN (ob.side = 'A'::bpchar) THEN dense_rank() OVER ask_prices
             ELSE dense_rank() OVER bid_prices
         END AS lvl,
     e.snapshot_id,
+    e.episode_no,
     (e.starts_exchange_timestamp)::timestamp(3) with time zone AS starts_exchange_timestamp,
-    ob.exchange_timestamp AS order_exchange_timestamp
+    ob.episode_no AS order_episode_no,
+    ob.exchange_timestamp AS order_exchange_timestamp,
+    ob.pair
    FROM (bitfinex.bf_order_book_episodes e
      JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no < e.episode_no) AND (ob.event_price <> (0)::numeric) AND (ob.order_next_episode_no >= e.episode_no))))
-  WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, (sign(ob.order_qty)) ORDER BY ob.order_price DESC)
-  ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * sign(ob.order_qty));
+  WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC)
+  ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * (
+        CASE
+            WHEN (ob.side = 'A'::bpchar) THEN '-1'::integer
+            ELSE 1
+        END)::numeric);
 
 
 ALTER TABLE bitfinex.bf_active_orders_before_episode_v OWNER TO "ob-analytics";
@@ -348,7 +368,8 @@ CREATE TABLE bitfinex.bf_trades (
     snapshot_id integer,
     exchange_timestamp timestamp(3) with time zone,
     episode_no integer,
-    event_no smallint
+    event_no smallint,
+    direction character(1) NOT NULL
 );
 
 
@@ -400,7 +421,9 @@ CREATE VIEW bitfinex.bf_order_book_events_v AS
     i.order_id,
     i.pair,
     t.last_trade_exchange_timestamp,
-    i.local_timestamp
+    i.local_timestamp,
+    i.order_next_episode_no,
+    i.side
    FROM (bitfinex.bf_order_book_events i
      LEFT JOIN ( SELECT bf_trades.snapshot_id,
             bf_trades.episode_no,
@@ -522,7 +545,8 @@ CREATE VIEW bitfinex.bf_trades_v AS
     a.trade_timestamp,
     a.exchange_timestamp,
     a.event_exchange_timestamp,
-    a.local_timestamp
+    a.local_timestamp,
+    a.direction
    FROM (( SELECT t.id,
             t.qty,
             round(t.price, bf_pairs."precision") AS price,
@@ -537,7 +561,8 @@ CREATE VIEW bitfinex.bf_trades_v AS
                     WHEN (e.exchange_timestamp IS NOT NULL) THEN e.exchange_timestamp
                     ELSE (max(e.exchange_timestamp) OVER o + (t.trade_timestamp - max(t.trade_timestamp) FILTER (WHERE (e.exchange_timestamp IS NOT NULL)) OVER o))
                 END AS event_exchange_timestamp,
-            t.local_timestamp
+            t.local_timestamp,
+            t.direction
            FROM ((bitfinex.bf_trades t
              JOIN bitfinex.bf_pairs USING (pair))
              LEFT JOIN bitfinex.bf_order_book_events e ON (((t.snapshot_id = e.snapshot_id) AND (t.episode_no = e.episode_no) AND (t.event_no = e.event_no))))
