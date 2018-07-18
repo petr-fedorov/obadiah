@@ -123,85 +123,6 @@ $$;
 ALTER FUNCTION bitfinex.bf_depth_summary_before_episode_v(snapshot_id integer, first_episode_no integer, last_episode_no integer, bps_step numeric) OWNER TO "ob-analytics";
 
 --
--- Name: bf_order_book_events_fun_after_insert(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE FUNCTION bitfinex.bf_order_book_events_fun_after_insert() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-
-DECLARE 
-
-	trade_match_single CURSOR  FOR	SELECT qty 
-									FROM bitfinex.bf_trades t
-									WHERE t.price		= NEW.order_price
-									  AND t.qty 		= -NEW.event_qty
-									  AND t.snapshot_id = NEW.snapshot_id
-									  AND t.event_no IS NULL	-- trade has not been associated with 
-																-- event. But could be associated with 
-																-- episode_no, so episode_no might be NOT NULL
-									  AND t.exchange_timestamp BETWEEN NEW.exchange_timestamp - 1*interval '1 second' AND
-																		NEW.exchange_timestamp
-									ORDER BY id;
-									
-	trade_match_multiple CURSOR FOR	SELECT id
-									FROM ( 	SELECT id, SUM(qty) OVER (PARTITION BY t.snapshot_id, t.price ORDER BY t.id) AS total_qty  
-										   	FROM bitfinex.bf_trades t
-											WHERE t.price		= NEW.order_price
-									  		  AND t.snapshot_id = NEW.snapshot_id
-									  		  AND t.event_no IS NULL
-									  		  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
-																				AND NEW.exchange_timestamp
-										) t
-									WHERE t.total_qty = -NEW.event_qty
-									;									
-
-BEGIN 
-	UPDATE bitfinex.bf_order_book_events
-	SET order_next_episode_no = NEW.episode_no
-	WHERE snapshot_id = NEW.snapshot_id 
-	  AND order_id = NEW.order_id 
-	  AND episode_no < NEW.episode_no
-	  AND order_next_episode_no > NEW.episode_no;
-	  
-	IF NEW.event_qty < 0 THEN 
-		FOR qty IN trade_match_single LOOP
-
-			UPDATE bitfinex.bf_trades 
-			SET episode_no = NEW.episode_no, 
-				event_no = NEW.event_no
-			WHERE CURRENT OF trade_match_single;
-
-			RETURN NULL;
-
-		END LOOP;
-				
-		FOR last_trade IN trade_match_multiple LOOP
-		
-			UPDATE bitfinex.bf_trades t
-			SET episode_no = NEW.episode_no, 
-				event_no = NEW.event_no	
-			WHERE t.price		= NEW.order_price
-			  AND t.snapshot_id = NEW.snapshot_id
-			  AND t.event_no IS NULL
-			  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
-			  									AND NEW.exchange_timestamp 
-			  AND t.id <= last_trade.id;
-						
-			RETURN NULL;
-		END LOOP;
-		
-	END IF;
-
-	RETURN NULL;
-END;
-
-$$;
-
-
-ALTER FUNCTION bitfinex.bf_order_book_events_fun_after_insert() OWNER TO "ob-analytics";
-
---
 -- Name: bf_order_book_events_fun_before_insert(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -211,11 +132,11 @@ CREATE FUNCTION bitfinex.bf_order_book_events_fun_before_insert() RETURNS trigge
 
 DECLARE
 	precision bitfinex.bf_pairs.precision%TYPE;
-	previous_order bitfinex.bf_order_book_events%ROWTYPE;
+	e bitfinex.bf_order_book_events%ROWTYPE;
+	tr_id bigint;
 	
 BEGIN
 
-	
 	IF NEW.event_price != 0 THEN 
 	
 		SELECT bf_pairs.precision INTO precision 
@@ -232,35 +153,89 @@ BEGIN
 			NEW.side = 'B';
 		END IF;
 		
-		SELECT * INTO previous_order
+		SELECT * INTO e
 		FROM bitfinex.bf_order_book_events
-		WHERE order_id = NEW.order_id AND snapshot_id = NEW.snapshot_id
-		ORDER BY episode_no DESC
-		LIMIT 1;
+		WHERE snapshot_id = NEW.snapshot_id 
+		  AND order_id = NEW.order_id 
+		  AND episode_no < NEW.episode_no
+		  AND order_next_episode_no > NEW.episode_no;
 		
 		IF FOUND THEN
-			NEW.event_qty = NEW.order_qty - previous_order.order_qty;
+			NEW.event_qty = NEW.order_qty - e.order_qty;
 		ELSE
 			NEW.event_qty = NEW.order_qty;
 		END IF;
 		
 	ELSE
-	
-		SELECT * INTO previous_order
+		
+		SELECT * INTO e
 		FROM bitfinex.bf_order_book_events
-		WHERE order_id = NEW.order_id AND snapshot_id = NEW.snapshot_id
-		ORDER BY episode_no DESC
-		LIMIT 1;
+		WHERE snapshot_id = NEW.snapshot_id 
+		  AND order_id = NEW.order_id 
+		  AND episode_no < NEW.episode_no
+		  AND order_next_episode_no > NEW.episode_no;
 		
 		IF FOUND THEN
-			NEW.order_price = previous_order.order_price;
-			NEW.side = previous_order.side;
-			NEW.event_qty = -previous_order.order_qty;
+			NEW.order_price = e.order_price;
+			NEW.side = e.side;
+			NEW.event_qty = -e.order_qty;
 			NEW.order_qty = 0;
 		ELSE
 			RAISE EXCEPTION 'Requested removal of order: %  which is not in the order book!', NEW.order_id;
 		END IF;
 		
+	END IF;
+	
+	
+	IF NEW.event_qty < 0 THEN 
+	 	-- WARNING: SET CONSTRAINT ALL DEFERRED is assumed.
+		-- Otherwise both UPDATEs below will fail
+		
+		SELECT id INTO tr_id
+		FROM bitfinex.bf_trades t
+		WHERE t.price		= NEW.order_price
+		  AND t.qty 		= -NEW.event_qty
+		  AND t.snapshot_id = NEW.snapshot_id
+		  AND t.event_no IS NULL	
+		  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' AND
+											NEW.exchange_timestamp
+		ORDER BY id
+		LIMIT 1;
+		
+		IF FOUND THEN
+			
+			UPDATE bitfinex.bf_trades 
+			SET episode_no = NEW.episode_no, 
+				event_no = NEW.event_no
+			WHERE id = tr_id;		
+			
+		ELSE
+		
+			SELECT id INTO tr_id
+			FROM ( 	SELECT id, SUM(qty) OVER (PARTITION BY t.snapshot_id, t.price ORDER BY t.id) AS total_qty  
+				   	FROM bitfinex.bf_trades t
+					WHERE t.price		= NEW.order_price
+			  		  AND t.snapshot_id = NEW.snapshot_id
+			  		  AND t.event_no IS NULL 	-- trade has not been associated with 
+												-- event. But could be associated with 
+												-- episode_no, so episode_no might be NOT NULL
+			  		  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
+														AND NEW.exchange_timestamp
+					) t
+			WHERE t.total_qty = -NEW.event_qty;
+			
+			IF FOUND THEN
+				UPDATE bitfinex.bf_trades t
+				SET episode_no = NEW.episode_no, 
+					event_no = NEW.event_no	
+				WHERE t.price		= NEW.order_price
+			  	  AND t.snapshot_id = NEW.snapshot_id
+			  	  AND t.event_no IS NULL
+			  	  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
+			  										AND NEW.exchange_timestamp 
+			  	  AND t.id <= tr_id;			
+			END IF;
+		END IF;
 	END IF;
 	
 	RETURN NEW;
@@ -367,7 +342,8 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
         END AS lvl,
     e.snapshot_id,
     e.episode_no,
-    (e.starts_exchange_timestamp)::timestamp(3) with time zone AS starts_exchange_timestamp,
+    e.starts_exchange_timestamp,
+    e.ends_exchange_timestamp,
     ob.episode_no AS order_episode_no,
     ob.exchange_timestamp AS order_exchange_timestamp,
     ob.pair
@@ -669,13 +645,6 @@ CREATE INDEX bf_order_book_events_idx_order_id_snapshot_id ON bitfinex.bf_order_
 --
 
 CREATE INDEX bf_trades_idx_snapshot_id_episode_no_event_no ON bitfinex.bf_trades USING btree (snapshot_id, episode_no, event_no);
-
-
---
--- Name: bf_order_book_events after_insert; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE TRIGGER after_insert AFTER INSERT ON bitfinex.bf_order_book_events FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_events_fun_after_insert();
 
 
 --

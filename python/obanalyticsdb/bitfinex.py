@@ -102,6 +102,7 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                             if increase_episode_no:
                                 # it is the first one for an episode
                                 con.commit()
+                                curr.execute("SET CONSTRAINTS ALL DEFERRED")
                                 increase_episode_no = False
                                 episode_no += 10
                                 if episode_no == MAX_EPISODE_NO:
