@@ -137,6 +137,7 @@ DECLARE
 	
 BEGIN
 
+
 	IF NEW.event_price != 0 THEN 
 	
 		SELECT bf_pairs.precision INTO precision 
@@ -186,6 +187,13 @@ BEGIN
 		
 	END IF;
 	
+	UPDATE bitfinex.bf_order_book_events
+	SET order_next_episode_no = NEW.episode_no,
+		order_next_event_price = NEW.event_price
+	WHERE snapshot_id = NEW.snapshot_id 
+	  AND order_id = NEW.order_id 
+	  AND episode_no < NEW.episode_no
+	  AND order_next_episode_no > NEW.episode_no;
 	
 	IF NEW.event_qty < 0 THEN 
 	 	-- WARNING: SET CONSTRAINT ALL DEFERRED is assumed.
@@ -313,17 +321,18 @@ CREATE TABLE bitfinex.bf_order_book_events (
     exchange_timestamp timestamp(3) with time zone,
     order_next_episode_no integer NOT NULL,
     event_no smallint NOT NULL,
-    side character(1) NOT NULL
+    side character(1) NOT NULL,
+    order_next_event_price numeric DEFAULT '-1'::integer NOT NULL
 );
 
 
 ALTER TABLE bitfinex.bf_order_book_events OWNER TO "ob-analytics";
 
 --
--- Name: bf_active_orders_before_episode_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_active_orders_after_episode_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
+CREATE VIEW bitfinex.bf_active_orders_after_episode_starts_v AS
  SELECT ob.side,
     ob.order_price,
     ob.order_id,
@@ -348,7 +357,7 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
     ob.exchange_timestamp AS order_exchange_timestamp,
     ob.pair
    FROM (bitfinex.bf_order_book_episodes e
-     JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no < e.episode_no) AND (ob.event_price <> (0)::numeric) AND (ob.order_next_episode_no >= e.episode_no))))
+     JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no <= e.episode_no) AND (ob.event_price <> (0)::numeric) AND (ob.order_next_episode_no > e.episode_no))))
   WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC)
   ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * (
         CASE
@@ -357,7 +366,47 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_v AS
         END)::numeric);
 
 
-ALTER TABLE bitfinex.bf_active_orders_before_episode_v OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.bf_active_orders_after_episode_starts_v OWNER TO "ob-analytics";
+
+--
+-- Name: bf_active_orders_before_episode_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE VIEW bitfinex.bf_active_orders_before_episode_starts_v AS
+ SELECT ob.side,
+    ob.order_price,
+    ob.order_id,
+    ob.order_qty,
+        CASE
+            WHEN (ob.side = 'A'::bpchar) THEN sum(ob.order_qty) OVER asks
+            ELSE sum(ob.order_qty) OVER bids
+        END AS cumm_qty,
+        CASE
+            WHEN (ob.side = 'A'::bpchar) THEN round((((10000)::numeric * (ob.order_price - first_value(ob.order_price) OVER asks)) / first_value(ob.order_price) OVER asks), 6)
+            ELSE round((((10000)::numeric * (first_value(ob.order_price) OVER bids - ob.order_price)) / first_value(ob.order_price) OVER bids), 6)
+        END AS bps,
+        CASE
+            WHEN (ob.side = 'A'::bpchar) THEN dense_rank() OVER ask_prices
+            ELSE dense_rank() OVER bid_prices
+        END AS lvl,
+    e.snapshot_id,
+    e.episode_no,
+    e.starts_exchange_timestamp,
+    e.ends_exchange_timestamp,
+    ob.episode_no AS order_episode_no,
+    ob.exchange_timestamp AS order_exchange_timestamp,
+    ob.pair
+   FROM (bitfinex.bf_order_book_episodes e
+     JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no < e.episode_no) AND (ob.event_price <> (0)::numeric) AND ((ob.order_next_episode_no > e.episode_no) OR ((ob.order_next_episode_no = e.episode_no) AND (ob.order_next_event_price > (0)::numeric))))))
+  WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC)
+  ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * (
+        CASE
+            WHEN (ob.side = 'A'::bpchar) THEN '-1'::integer
+            ELSE 1
+        END)::numeric);
+
+
+ALTER TABLE bitfinex.bf_active_orders_before_episode_starts_v OWNER TO "ob-analytics";
 
 --
 -- Name: bf_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
@@ -675,6 +724,14 @@ ALTER TABLE ONLY bitfinex.bf_order_book_episodes
 
 ALTER TABLE ONLY bitfinex.bf_order_book_events
     ADD CONSTRAINT bf_order_book_events_fkey_pair FOREIGN KEY (pair) REFERENCES bitfinex.bf_pairs(pair) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+
+
+--
+-- Name: bf_order_book_events bf_order_book_events_fkey_snapshot_id; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_order_book_events
+    ADD CONSTRAINT bf_order_book_events_fkey_snapshot_id FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --

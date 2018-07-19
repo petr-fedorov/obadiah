@@ -86,7 +86,7 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                 episode_no = 0
                 event_no = 1
                 episode_starts = None
-
+                curr.execute("SET CONSTRAINTS ALL DEFERRED")
                 increase_episode_no = False  # The first 'addition' event
 
                 while not stop_flag.is_set():
@@ -100,7 +100,10 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                     for d in data:
                         if not float(d[1]):  # it is a 'removal' event
                             if increase_episode_no:
-                                # it is the first one for an episode
+                                # it is the first event for an episode
+                                # so insert PREVIOUS episode
+                                insert_episode(curr, snapshot_id, episode_no,
+                                               episode_starts, rts)
                                 con.commit()
                                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
                                 increase_episode_no = False
@@ -109,8 +112,6 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                                     stop_flag.set()
                                     break
                                 event_no = 1
-                                insert_episode(curr, snapshot_id, episode_no,
-                                               episode_starts, rts)
                                 # the end time of this episode will be
                                 # the start time for the next one
                                 episode_starts = rts
@@ -121,14 +122,8 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                             increase_episode_no = True
 
                             if episode_no == 0:
-                                # Need to insert the anomalous '0' episode
-                                # for it is the only episode starting from
-                                # an 'addition' event. The others start from
-                                # a 'removal' event and are inserted by the
-                                # code above
+                                # episode 0 starts and ends at the same time
                                 episode_starts = rts
-                                insert_episode(curr, snapshot_id, episode_no,
-                                               episode_starts, rts)
 
                         insert_event(curr, lts, pair, d[0], d[1], d[2],
                                      snapshot_id, rts, episode_no, event_no)
