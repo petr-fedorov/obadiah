@@ -264,6 +264,9 @@ CREATE FUNCTION bitfinex.bf_trades_fun_before_insert() RETURNS trigger
 
 DECLARE
 	precision bitfinex.bf_pairs.precision%TYPE;
+	last_episode bitfinex.bf_trades.episode_no%TYPE;
+	trade_episode_no bitfinex.bf_order_book_events.episode_no%TYPE;
+	trade_event_no bitfinex.bf_order_book_events.event_no%TYPE;
 
 BEGIN
 	SELECT bf_pairs.precision INTO precision 
@@ -276,6 +279,26 @@ BEGIN
 		NEW.qty = -NEW.qty;
 	ELSE
 		NEW.direction  = 'B';
+	END IF;
+	
+	SELECT max(episode_no) INTO last_episode
+	FROM bitfinex.bf_trades
+	WHERE snapshot_id = NEW.snapshot_id;
+	
+	SELECT episode_no, event_no INTO trade_episode_no, trade_event_no
+	FROM bitfinex.bf_order_book_events 
+	WHERE snapshot_id = NEW.snapshot_id
+	  AND order_price = NEW.price
+	  AND event_qty = -NEW.qty 
+	  AND exchange_timestamp BETWEEN NEW.exchange_timestamp - '1 sec'::interval AND NEW.exchange_timestamp
+	  AND episode_no >= last_episode
+	ORDER BY exchange_timestamp DESC, 	-- look for the event in the near past first
+			 order_id 					-- but earliest order takes priority
+	LIMIT 1;
+	
+	IF FOUND THEN
+		NEW.episode_no = trade_episode_no;
+		NEW.event_no = trade_event_no;
 	END IF;
 	
 	RETURN NEW;
@@ -682,6 +705,13 @@ ALTER TABLE ONLY bitfinex.bf_snapshots
 
 ALTER TABLE ONLY bitfinex.bf_trades
     ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: bf_order_book_events_idx_order_id_snapshot_id; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_order_book_events_idx_order_id_snapshot_id ON bitfinex.bf_order_book_events USING btree (order_id, snapshot_id);
 
 
 --
