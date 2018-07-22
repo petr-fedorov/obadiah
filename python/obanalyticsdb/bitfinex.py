@@ -1,4 +1,4 @@
-from multiprocessing import Process
+from multiprocessing import Process, Queue
 import logging
 import time
 from btfxwss import BtfxWss
@@ -12,12 +12,13 @@ def connect_db():
     return psycopg2.connect("dbname=ob-analytics user=ob-analytics")
 
 
-def process_trade(q, stop_flag, pair, snapshot_id):
+def process_trade(q, stop_flag, pair, sq):
     logger = logging.getLogger("bitfinex.trade")
     with connect_db() as con:
         con.set_session(autocommit=True)
         with con.cursor() as curr:
             try:
+                snapshot_id = 0
                 while not stop_flag.is_set():
                     data, lts = q.get()
                     logger.debug("%i %s" % (snapshot_id, data))
@@ -27,9 +28,11 @@ def process_trade(q, stop_flag, pair, snapshot_id):
                         data = [data[1]]
                     elif data[0] == 'te':
                         data = []
-                    else:  # it's an initial snapshot of trades
+                    else:  # A new snapshot has started after (re)connect
                         # skip initial snapshot of trades
                         # since they usually can't be matched to any events
+                        # get new snapshot_id from process_raw_order_book()
+                        snapshot_id = sq.get()
                         continue
                         # data = data[0]
                     for d in data:
@@ -77,7 +80,7 @@ def insert_episode(curr, snapshot_id, episode_no, episode_starts, rts):
                  (snapshot_id, episode_no, episode_starts, rts))
 
 
-def process_raw_order_book(q, stop_flag, pair, snapshot_id):
+def process_raw_order_book(q, stop_flag, pair, sq, ob_len):
     logger = logging.getLogger("bitfinex.order.book.event")
     try:
         with connect_db() as con:
@@ -88,6 +91,7 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                 episode_starts = None
                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
                 increase_episode_no = False  # The first 'addition' event
+                snapshot_id = 0
 
                 while not stop_flag.is_set():
                     data, lts = q.get()
@@ -95,7 +99,13 @@ def process_raw_order_book(q, stop_flag, pair, snapshot_id):
                     *data, rts = data
                     rts = datetime.fromtimestamp(rts/1000)
                     lts = datetime.fromtimestamp(lts)
-                    if isinstance(data[0][0], list):
+                    if isinstance(data[0][0], list):  # A new snapshot started
+                        snapshot_id = start_new_snapshot(ob_len, pair)
+                        sq.put(snapshot_id)  # process_trade() will wait for it
+                        episode_no = 0
+                        event_no = 1
+                        episode_starts = None
+                        increase_episode_no = False
                         data = data[0]
                     for d in data:
                         if not float(d[1]):  # it is a 'removal' event
@@ -174,7 +184,6 @@ def capture(pair, stop_flag):
 
     try:
         check_pair(pair)
-        snapshot_id = start_new_snapshot(ob_len, pair)
     except Exception as e:
         logger.exception(e)
         return
@@ -191,10 +200,12 @@ def capture(pair, stop_flag):
 
     time.sleep(5)
 
+    sq = Queue()
+
     ts = [Process(target=process_trade,
-                  args=(wss.trades(pair), stop_flag, pair, snapshot_id)),
+                  args=(wss.trades(pair), stop_flag, pair, sq)),
           Process(target=process_raw_order_book,
-                  args=(wss.raw_books(pair), stop_flag, pair, snapshot_id)),
+                  args=(wss.raw_books(pair), stop_flag, pair, sq, ob_len)),
           ]
 
     for t in ts:
