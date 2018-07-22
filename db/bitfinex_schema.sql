@@ -329,10 +329,10 @@ CREATE TABLE bitfinex.bf_order_book_events (
 ALTER TABLE bitfinex.bf_order_book_events OWNER TO "ob-analytics";
 
 --
--- Name: bf_active_orders_after_episode_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_active_orders_after_period_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE VIEW bitfinex.bf_active_orders_after_episode_starts_v AS
+CREATE VIEW bitfinex.bf_active_orders_after_period_starts_v AS
  SELECT ob.side,
     ob.order_price,
     ob.order_id,
@@ -366,13 +366,13 @@ CREATE VIEW bitfinex.bf_active_orders_after_episode_starts_v AS
         END)::numeric);
 
 
-ALTER TABLE bitfinex.bf_active_orders_after_episode_starts_v OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.bf_active_orders_after_period_starts_v OWNER TO "ob-analytics";
 
 --
--- Name: bf_active_orders_before_episode_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_active_orders_before_period_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE VIEW bitfinex.bf_active_orders_before_episode_starts_v AS
+CREATE VIEW bitfinex.bf_active_orders_before_period_starts_v AS
  SELECT ob.side,
     ob.order_price,
     ob.order_id,
@@ -406,7 +406,7 @@ CREATE VIEW bitfinex.bf_active_orders_before_episode_starts_v AS
         END)::numeric);
 
 
-ALTER TABLE bitfinex.bf_active_orders_before_episode_starts_v OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.bf_active_orders_before_period_starts_v OWNER TO "ob-analytics";
 
 --
 -- Name: bf_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
@@ -559,7 +559,8 @@ CREATE VIEW bitfinex.bf_snapshots_v AS
     t.trades,
     date_trunc('seconds'::text, LEAST(e.min_e_et, t.min_t_et)) AS starts,
     date_trunc('seconds'::text, GREATEST(e.max_e_et, t.max_t_et)) AS ends,
-    t.matched_trades
+    t.matched_to_episode,
+    t.matched_to_event
    FROM ((bitfinex.bf_snapshots
      LEFT JOIN ( SELECT bf_order_book_events.snapshot_id,
             count(*) AS events,
@@ -570,7 +571,8 @@ CREATE VIEW bitfinex.bf_snapshots_v AS
           GROUP BY bf_order_book_events.snapshot_id) e USING (snapshot_id))
      LEFT JOIN ( SELECT bf_trades.snapshot_id,
             count(*) AS trades,
-            count(*) FILTER (WHERE (bf_trades.event_no IS NOT NULL)) AS matched_trades,
+            count(*) FILTER (WHERE (bf_trades.event_no IS NOT NULL)) AS matched_to_event,
+            count(*) FILTER (WHERE (bf_trades.episode_no IS NOT NULL)) AS matched_to_episode,
             min(bf_trades.exchange_timestamp) AS min_t_et,
             max(bf_trades.exchange_timestamp) AS max_t_et
            FROM bitfinex.bf_trades
@@ -680,13 +682,6 @@ ALTER TABLE ONLY bitfinex.bf_snapshots
 
 ALTER TABLE ONLY bitfinex.bf_trades
     ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (id);
-
-
---
--- Name: bf_order_book_events_idx_order_id_snapshot_id; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE INDEX bf_order_book_events_idx_order_id_snapshot_id ON bitfinex.bf_order_book_events USING btree (order_id, snapshot_id);
 
 
 --

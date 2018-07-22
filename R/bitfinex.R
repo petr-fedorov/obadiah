@@ -26,7 +26,7 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
                                                 CASE WHEN side = 'A' THEN 'ask'::text
                                                      ELSE 'bid'::text
                                                 END AS direction
-                                         FROM bitfinex.bf_active_orders_before_episode_starts_v
+                                         FROM bitfinex.bf_active_orders_before_period_starts_v
                                          WHERE snapshot_id = ", snapshot_id,
                                              " AND lvl = 1
                                                AND episode_no BETWEEN ", min.episode_no," AND ", max.episode_no,
@@ -37,7 +37,7 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
                                                 CASE WHEN side = 'A' THEN 'ask'::text
                                                      ELSE 'bid'::text
                                                 END AS direction
-                                         FROM bitfinex.bf_active_orders_after_episode_starts_v
+                                         FROM bitfinex.bf_active_orders_after_period_starts_v
                                          WHERE snapshot_id = ", snapshot_id,
                                          " AND lvl = 1
                                            AND episode_no BETWEEN ", min.episode_no," AND ", max.episode_no,
@@ -58,7 +58,7 @@ bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147
   query <- paste0(" SELECT starts_exchange_timestamp AS \"timestamp\",
                             order_price AS price,
                             sum(order_qty) AS volume
-                    FROM bitfinex.bf_active_orders_after_episode_starts_v
+                    FROM bitfinex.bf_active_orders_after_period_starts_v
                     WHERE snapshot_id = ",snapshot_id ,
                   "   AND episode_no BETWEEN ",min.episode_no, " AND ", max.episode_no,
                   " GROUP BY starts_exchange_timestamp, order_price " )
@@ -95,7 +95,7 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
                                               , order_qty AS volume
                                               , cumm_qty AS liquidity
                                               , bps
-                                        FROM bitfinex.bf_active_orders_after_episode_starts_v ",
+                                        FROM bitfinex.bf_active_orders_after_period_starts_v ",
                                      where_cond, " AND side = 'B' AND order_price >= ", min.bid))
 
   asks  <-    dbGetQuery(conn, paste0(" SELECT order_id AS id
@@ -103,7 +103,7 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
                                               , order_qty AS volume
                                               , cumm_qty AS liquidity
                                               , bps
-                                        FROM bitfinex.bf_active_orders_after_episode_starts_v ",
+                                        FROM bitfinex.bf_active_orders_after_period_starts_v ",
                                       where_cond, " AND side = 'A' AND order_price <= ", max.ask))
 
   list(timestamp=ts, asks=asks, bids=bids)
