@@ -12,7 +12,6 @@ def listener_process(queue, log_file_name):
     root = logging.getLogger()
     h = logging.handlers.RotatingFileHandler(log_file_name,
                                              'a',
-                                             2**20,
                                              2**22,
                                              10)
     f = logging.Formatter('%(asctime)s %(process)-6d %(name)s '
