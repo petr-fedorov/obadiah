@@ -135,8 +135,9 @@ DECLARE
 	e bitfinex.bf_order_book_events%ROWTYPE;
 	tr_id bigint;
 	
+	last_matched_trade bitfinex.bf_trades.id%TYPE;
+	
 BEGIN
-
 
 	IF NEW.event_price != 0 THEN 
 	
@@ -199,14 +200,25 @@ BEGIN
 	 	-- WARNING: SET CONSTRAINT ALL DEFERRED is assumed.
 		-- Otherwise both UPDATEs below will fail
 		
+		-- Let's find the last trade which was matched to some event from the PREVIOUS episode
+		-- All trades after such trade can be matched to an event from the current episode 
+		SELECT max(id) INTO last_matched_trade
+		FROM bitfinex.bf_trades t
+		WHERE snapshot_id = NEW.snapshot_id
+		  AND episode_no < NEW.episode_no;
+		
+		IF last_matched_trade IS NULL THEN
+			last_matched_trade = -1;
+		END IF;
+		
 		SELECT id INTO tr_id
 		FROM bitfinex.bf_trades t
 		WHERE t.price		= NEW.order_price
 		  AND t.qty 		= -NEW.event_qty
 		  AND t.snapshot_id = NEW.snapshot_id
-		  AND t.event_no IS NULL	
-		  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' AND
-											NEW.exchange_timestamp
+		  AND t.event_no IS NULL -- we consider only unmatched trades
+		  AND t.exchange_timestamp <= NEW.exchange_timestamp
+		  AND t.id > last_matched_trade
 		ORDER BY id
 		LIMIT 1;
 		
@@ -215,7 +227,7 @@ BEGIN
 			UPDATE bitfinex.bf_trades 
 			SET episode_no = NEW.episode_no, 
 				event_no = NEW.event_no
-			WHERE id = tr_id;		
+			WHERE id = tr_id AND bf_trades.snapshot_id = NEW.snapshot_id;		
 			
 		ELSE
 		
@@ -224,11 +236,9 @@ BEGIN
 				   	FROM bitfinex.bf_trades t
 					WHERE t.price		= NEW.order_price
 			  		  AND t.snapshot_id = NEW.snapshot_id
-			  		  AND t.event_no IS NULL 	-- trade has not been associated with 
-												-- event. But could be associated with 
-												-- episode_no, so episode_no might be NOT NULL
-			  		  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
-														AND NEW.exchange_timestamp
+					  AND t.event_no IS NULL -- we consider only unmatched trades
+			  		  AND t.exchange_timestamp <= NEW.exchange_timestamp
+					  AND t.id > last_matched_trade
 					) t
 			WHERE t.total_qty = -NEW.event_qty;
 			
@@ -239,8 +249,8 @@ BEGIN
 				WHERE t.price		= NEW.order_price
 			  	  AND t.snapshot_id = NEW.snapshot_id
 			  	  AND t.event_no IS NULL
-			  	  AND t.exchange_timestamp BETWEEN 	NEW.exchange_timestamp - 1*interval '1 second' 
-			  										AND NEW.exchange_timestamp 
+		  		  AND t.exchange_timestamp <= NEW.exchange_timestamp
+				  AND t.id > last_matched_trade
 			  	  AND t.id <= tr_id;			
 			END IF;
 		END IF;
@@ -253,6 +263,50 @@ $$;
 
 
 ALTER FUNCTION bitfinex.bf_order_book_events_fun_before_insert() OWNER TO "ob-analytics";
+
+--
+-- Name: bf_trades_check_episode_no_order(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_trades_check_episode_no_order() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+
+	ep_no bitfinex.bf_trades.episode_no%TYPE;
+
+BEGIN
+	SELECT max(episode_no) INTO ep_no
+	FROM bitfinex.bf_trades
+	WHERE snapshot_id = NEW.snapshot_id 
+	  AND id < NEW.id;
+	  
+	IF FOUND THEN 
+		IF ep_no > NEW.episode_no THEN
+			RAISE EXCEPTION 'episode_no % of trade % is less than % in some earlier trade', 
+				NEW.episode_no, NEW.id, ep_no;
+		END IF;
+	END IF;
+	
+	SELECT min(episode_no) INTO ep_no
+	FROM bitfinex.bf_trades
+	WHERE snapshot_id = NEW.snapshot_id 
+	  AND id > NEW.id;
+	  
+	IF FOUND THEN 
+		IF ep_no < NEW.episode_no THEN
+			RAISE EXCEPTION 'episode_no % of trade % is greater than % in some later trade', 
+				NEW.episode_no, NEW.id, ep_no;
+		END IF;
+	END IF;
+	RETURN NULL;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_trades_check_episode_no_order() OWNER TO "ob-analytics";
 
 --
 -- Name: bf_trades_fun_before_insert(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
@@ -437,13 +491,13 @@ ALTER TABLE bitfinex.bf_active_orders_before_period_starts_v OWNER TO "ob-analyt
 
 CREATE TABLE bitfinex.bf_trades (
     id bigint NOT NULL,
-    trade_timestamp timestamp(3) with time zone,
-    qty numeric,
-    price numeric,
-    pair character varying(12),
-    local_timestamp timestamp(3) with time zone,
-    snapshot_id integer,
-    exchange_timestamp timestamp(3) with time zone,
+    trade_timestamp timestamp(3) with time zone NOT NULL,
+    qty numeric NOT NULL,
+    price numeric NOT NULL,
+    pair character varying(12) NOT NULL,
+    local_timestamp timestamp(3) with time zone NOT NULL,
+    snapshot_id integer NOT NULL,
+    exchange_timestamp timestamp(3) with time zone NOT NULL,
     episode_no integer,
     event_no smallint,
     direction character(1) NOT NULL
@@ -668,11 +722,11 @@ ALTER TABLE ONLY bitfinex.bf_order_book_episodes
 
 
 --
--- Name: bf_order_book_episodes bf_order_book_episodes_unq_starts_ends; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_order_book_episodes bf_order_book_episodes_uni_snapshot_id_starts_ends; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitfinex.bf_order_book_episodes
-    ADD CONSTRAINT bf_order_book_episodes_unq_starts_ends UNIQUE (starts_exchange_timestamp, ends_exchange_timestamp) DEFERRABLE;
+    ADD CONSTRAINT bf_order_book_episodes_uni_snapshot_id_starts_ends UNIQUE (snapshot_id, starts_exchange_timestamp, ends_exchange_timestamp) DEFERRABLE;
 
 
 --
@@ -704,7 +758,7 @@ ALTER TABLE ONLY bitfinex.bf_snapshots
 --
 
 ALTER TABLE ONLY bitfinex.bf_trades
-    ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (id);
+    ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (snapshot_id, id);
 
 
 --
@@ -733,6 +787,13 @@ CREATE TRIGGER before_insert BEFORE INSERT ON bitfinex.bf_order_book_events FOR 
 --
 
 CREATE TRIGGER before_insert BEFORE INSERT ON bitfinex.bf_trades FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_trades_fun_before_insert();
+
+
+--
+-- Name: bf_trades check_episode_no; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE CONSTRAINT TRIGGER check_episode_no AFTER INSERT OR UPDATE OF episode_no ON bitfinex.bf_trades NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW WHEN ((new.episode_no IS NOT NULL)) EXECUTE PROCEDURE bitfinex.bf_trades_check_episode_no_order();
 
 
 --

@@ -50,12 +50,12 @@ class Episode(DatabaseInsertion):
         self.next_episode_starts = next_episode_starts
 
     def __repr__(self):
-        return "Ep-de e:%s p:%i s:%i l:%s no: %i" % (
+        return "Ep-de no: %i e:%s p:%i s:%i l:%s" % (
+            self.episode_no,
             self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.priority,
             self.seq_no,
             self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
-            self.episode_no,
         )
 
     def save(self, curr):
@@ -91,16 +91,18 @@ class OrderBookEvent(DatabaseInsertion):
         self.event_no = event_no
 
     def __repr__(self):
-        return ("Event e:%s p:%i s:%i l:%s id: %s ep: %i ev: %i pr: %s qty:%s "
-                % (self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
-                   self.priority, self.seq_no,
-                   self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
-                   self.order_id,
+        return ("Event id: %s ep: %i ev: %i pr: %s qty:%s e:%s p:%i s:%i l:%s"
+                % (self.order_id,
                    self.episode_no,
                    self.event_no,
                    self.event_price,
                    self.order_qty,
-                   ))
+                   self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
+                   self.priority,
+                   self.seq_no,
+                   self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+                   )
+                )
 
     def save(self, curr):
         curr.execute("INSERT INTO bitfinex."
@@ -138,14 +140,14 @@ class Trade(DatabaseInsertion):
         self.snapshot_id = snapshot_id
 
     def __repr__(self):
-        return "Trade e:%s p:%i s:%i l:%s id: %s p: %s qty: %s" % (
+        return "Trade id: %s p: %s qty: %s e:%s p:%i s:%i l:%s" % (
+            self.id,
+            self.price,
+            self.qty,
             self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.priority,
             self.seq_no,
             self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
-            self.id,
-            self.price,
-            self.qty
         )
 
     def save(self, curr):
@@ -264,6 +266,7 @@ def save_all(q_out, stop_flag):
                 while not stop_flag.is_set():
                     try:
                         obj = q_out.get(timeout=1)
+                        logger.debug('%r' % obj)
                     except Empty:
                         continue
 
