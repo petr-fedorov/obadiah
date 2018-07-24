@@ -13,6 +13,7 @@ def listener_process(queue, log_file_name):
     h = logging.handlers.RotatingFileHandler(log_file_name,
                                              'a',
                                              2**20,
+                                             2**22,
                                              10)
     f = logging.Formatter('%(asctime)s %(process)-6d %(name)s '
                           '%(levelname)-8s %(message)s')
@@ -28,6 +29,7 @@ def listener_process(queue, log_file_name):
         except Exception:
             print('Whoops! Problem:', file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+    print('listener_process() is done.', file=sys.stdout)
 
 
 def main():

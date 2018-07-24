@@ -92,9 +92,11 @@ class OrderBookEvent(DatabaseInsertion):
 
     def __repr__(self):
         return ("Event e:%s p:%i s:%i l:%s ep: %i ev: %i pr: %s qty:%s id: %s"
+        return ("Event e:%s p:%i s:%i l:%s id: %s ep: %i ev: %i pr: %s qty:%s "
                 % (self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
                    self.priority, self.seq_no,
                    self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+                   self.order_id,
                    self.episode_no,
                    self.event_no,
                    self.event_price,
@@ -139,10 +141,14 @@ class Trade(DatabaseInsertion):
 
     def __repr__(self):
         return "Trade e:%s p:%i s:%i l:%s " % (
+        return "Trade e:%s p:%i s:%i l:%s id: %s p: %s qty: %s" % (
             self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.priority,
             self.seq_no,
             self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+            self.id,
+            self.price,
+            self.qty
         )
 
     def save(self, curr):
