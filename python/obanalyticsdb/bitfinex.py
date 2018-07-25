@@ -177,6 +177,7 @@ class Orderer:
         self.seq_no = 0
         self.alogger = logging.getLogger("bitfinex.Orderer.arrive")
         self.dlogger = logging.getLogger("bitfinex.Orderer.depart")
+        self.latest_departed_seq_no = -1
 
     def __repr__(self):
         return "Orderer a:%s d: %s b:%s" % (self.latest_arrived.strftime(
@@ -187,8 +188,11 @@ class Orderer:
         return (self.latest_arrived - self.latest_departed)
 
     def _arrive_from_exchange(self):
-        self.alogger.debug('i l_a %s' % self.latest_arrived.strftime(
-            "%H-%M-%S.%f")[:-3])
+        self.alogger.debug('Start arrive - current delay %f, l_a %s' %
+                           (self._current_delay().total_seconds(),
+                            self.latest_arrived.strftime("%H-%M-%S.%f")[:-3])
+                           )
+
         while self._current_delay() < self.delay:
             self.alogger.debug('current_delay %f ' %
                                self._current_delay().total_seconds())
@@ -210,14 +214,19 @@ class Orderer:
                 self.alogger.debug('l_a(time-out) %s' %
                                    self.latest_arrived.strftime(
                                        "%H-%M-%S.%f")[:-3])
-        self.alogger.debug('current_delay %f ' %
-                           self._current_delay().total_seconds())
+        self.alogger.debug('Suspend arrive - current_delay %f, l_a %s ' %
+                           (self._current_delay().total_seconds(),
+                            self.latest_arrived.strftime("%H-%M-%S.%f")[:-3]))
         self.alogger.debug('Unprocessed q_in size: %i' % self.q_in.qsize())
 
     def _depart_to_database(self):
-        self.dlogger.debug('i l_d %s' % self.latest_departed.strftime(
-            "%H-%M-%S.%f")[:-3])
+        self.dlogger.debug('Start depart - current delay %f, l_d %s' %
+                           (self._current_delay().total_seconds(),
+                            self.latest_departed.strftime("%H-%M-%S.%f")[:-3])
+                           )
         while True:
+            self.dlogger.debug('current_delay %f ' %
+                               self._current_delay().total_seconds())
             try:
                 if self.buffer[0].local_timestamp > self.latest_departed:
                     self.latest_departed = self.buffer[0].local_timestamp
@@ -227,7 +236,11 @@ class Orderer:
 
                 if self._current_delay() >= self.delay:
                     obj = heappop(self.buffer)
-                    self.dlogger.debug('%r' % obj)
+                    if obj.seq_no > self.latest_departed_seq_no:
+                        self.dlogger.debug('%r' % obj)
+                        self.latest_departed_seq_no = obj.seq_no
+                    else:
+                        self.dlogger.debug('DELAYED %r' % obj)
                     self.q_out.put(obj)
                 else:
                     break
@@ -237,8 +250,9 @@ class Orderer:
                                    self.latest_departed.strftime(
                                        "%H-%M-%S.%f")[:-3])
                 break
-        self.dlogger.debug('current_delay %f ' %
-                           self._current_delay().total_seconds())
+        self.dlogger.debug('Suspend depart - current_delay %f, l_d %s ' %
+                           (self._current_delay().total_seconds(),
+                            self.latest_departed.strftime("%H-%M-%S.%f")[:-3]))
         self.dlogger.debug('Unprocessed q_out size: %i' % self.q_out.qsize())
 
     def __call__(self):
@@ -275,8 +289,7 @@ def save_all(q_out, stop_flag):
                         con.commit()
                         curr.execute("SET CONSTRAINTS ALL DEFERRED")
             except Exception as e:
-                logger.exception('An exception caught while '
-                                 'saving to a database: %s', e)
+                logger.exception('%s', e)
                 stop_flag.set()
     logger.info("Exit")
 
@@ -320,8 +333,7 @@ def process_trade(q, stop_flag, pair, sq, q_in):
                     d[1]/1000), d[2], d[3], snapshot_id))
 
     except Exception as e:
-        logger.exception('An exception caught while '
-                         'processing a trade: %s', e)
+        logger.exception('%s', e)
         stop_flag.set()
     logger.info('Exit')
 
@@ -384,8 +396,7 @@ def process_raw_order_book(q, stop_flag, pair, sq, ob_len, q_in):
                 event_no += 1
 
     except Exception as e:
-        logger.exception('An exception caught while processing '
-                         'an order book event: %s', e)
+        logger.exception('%s', e)
         stop_flag.set()
     logger.info('Exit')
 
@@ -413,8 +424,7 @@ def start_new_snapshot(ob_len, pair):
                 logger.info("A new snapshot started: %i, pair: %s, len: %i" %
                             (snapshot_id, pair, ob_len))
             except Exception as e:
-                logger.exception('An exception caught while trying to start'
-                                 'a new snapshot: %s', e)
+                logger.exception('%s', e)
                 raise e
 
     return snapshot_id
@@ -428,7 +438,7 @@ def capture(pair, stop_flag):
     try:
         check_pair(pair)
     except Exception as e:
-        logger.exception(e)
+        logger.exception('%s', e)
         return
 
     wss = BtfxWss(log_level=logging.INFO)
