@@ -29,12 +29,13 @@ ALTER SCHEMA bitfinex OWNER TO "ob-analytics";
 --
 
 CREATE TYPE bitfinex.bf_spread AS (
-	snapshot_id integer,
 	episode_no integer,
+	best_bid_price numeric,
+	best_bid_qty numeric,
 	best_ask_price numeric,
 	best_ask_qty numeric,
-	best_bid_price numeric,
-	best_bid_qty numeric
+	snapshot_id integer,
+	exchange_timestamp timestamp with time zone
 );
 
 
@@ -371,45 +372,79 @@ $$;
 ALTER FUNCTION bitfinex.bf_order_book_events_fun_before_insert() OWNER TO "ob-analytics";
 
 --
+-- Name: bf_spread_after_period_starts_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_spread_after_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spread
+    LANGUAGE sql
+    AS $$
+
+WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty, a.starts_exchange_timestamp
+				FROM (
+					SELECT 	v.snapshot_id, 
+							v.starts_exchange_timestamp,
+							v.episode_no, 
+							side, 
+							order_price AS price, 
+							SUM(order_qty) AS qty,
+							min(order_price) FILTER (WHERE side = 'A') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_ask,
+							max(order_price) FILTER (WHERE side = 'B') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_bid
+					FROM bitfinex.bf_active_orders_after_period_starts_v v
+					WHERE v.snapshot_id = s_id AND v.episode_no BETWEEN first_episode_no AND last_episode_no
+					GROUP BY v.snapshot_id, v.starts_exchange_timestamp, v.episode_no, side, order_price
+					) a
+				WHERE price = min_ask OR price = min_bid
+				ORDER BY episode_no, side
+			)
+SELECT 	episode_no, 
+		bids.price AS best_bid_price,
+		bids.qty AS best_bid_qty,
+		asks.price AS best_ask_price, 
+		asks.qty AS best_ask_qty,
+		snapshot_id,
+		starts_exchange_timestamp
+FROM 	(SELECT * FROM base WHERE side = 'A' ) asks JOIN 
+		(SELECT * FROM base WHERE side = 'B' ) bids USING (snapshot_id, episode_no, starts_exchange_timestamp);
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_spread_after_period_starts_v(s_id integer, first_episode_no integer, last_episode_no integer) OWNER TO "ob-analytics";
+
+--
 -- Name: bf_spread_before_period_starts_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
 CREATE FUNCTION bitfinex.bf_spread_before_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spread
-    LANGUAGE plpgsql
+    LANGUAGE sql
     AS $$
 
-DECLARE 
-	r record;
-	o bf_spread%ROWTYPE;
-BEGIN
-
-	o.snapshot_id := s_id;
-
-	FOR r IN 	SELECT a.episode_no, side, price, qty
+WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty, a.starts_exchange_timestamp
 				FROM (
-					SELECT 	v.episode_no, side, order_price AS price, SUM(order_qty) AS qty,
-							min(order_price) FILTER (WHERE side = 'A') OVER (PARTITION BY v.episode_no, side) AS min_ask,
-							max(order_price) FILTER (WHERE side = 'B') OVER (PARTITION BY v.episode_no, side) AS min_bid
-					FROM bf_active_orders_before_period_starts_v v
+					SELECT 	v.snapshot_id, 
+							v.starts_exchange_timestamp,
+							v.episode_no, 
+							side, 
+							order_price AS price, 
+							SUM(order_qty) AS qty,
+							min(order_price) FILTER (WHERE side = 'A') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_ask,
+							max(order_price) FILTER (WHERE side = 'B') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_bid
+					FROM bitfinex.bf_active_orders_before_period_starts_v v
 					WHERE v.snapshot_id = s_id AND v.episode_no BETWEEN first_episode_no AND last_episode_no
-					GROUP BY v.episode_no, side, order_price
+					GROUP BY v.snapshot_id, v.starts_exchange_timestamp, v.episode_no, side, order_price
 					) a
-					WHERE price = min_ask OR price = min_bid
-					ORDER BY episode_no, side
-				LOOP
-		IF r.side = 'A' THEN
-			o.episode_no := r.episode_no;
-			o.best_ask_price := r.price;
-			o.best_ask_qty := r.qty;
-		ELSE
-			o.best_bid_price := r.price;
-			o.best_bid_qty := r.qty;			
-			RETURN NEXT o;
-		END IF; 
-	END LOOP;
-    RETURN;
-END;
-	
+				WHERE price = min_ask OR price = min_bid
+				ORDER BY episode_no, side
+			)
+SELECT 	episode_no, 
+		bids.price AS best_bid_price,
+		bids.qty AS best_bid_qty,
+		asks.price AS best_ask_price, 
+		asks.qty AS best_ask_qty,
+		snapshot_id,
+		starts_exchange_timestamp
+FROM 	(SELECT * FROM base WHERE side = 'A' ) asks JOIN 
+		(SELECT * FROM base WHERE side = 'B' ) bids USING (snapshot_id, episode_no, starts_exchange_timestamp);
 
 $$;
 

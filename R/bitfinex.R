@@ -12,43 +12,38 @@ bfEpisodes <- function(conn, snapshot_id) {
 
 
 #' @export
-bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647) {
-  df <- dbGetQuery(conn, paste0(  " SELECT starts_exchange_timestamp AS \"timestamp\"
-                                   ,order_price AS price
-                                   ,qty AS vol
-                                   ,direction
-                                   FROM (
-                                   SELECT *, COALESCE(lag(order_price) OVER p, -1) AS lag_order_price,
-                                             COALESCE(lag(qty) OVER p, -1) AS lag_qty
-                                   FROM (
-                                         SELECT snapshot_id, episode_no, starts_exchange_timestamp, order_price,
-                                                SUM(order_qty) AS qty,
-                                                CASE WHEN side = 'A' THEN 'ask'::text
-                                                     ELSE 'bid'::text
-                                                END AS direction
-                                         FROM bitfinex.bf_active_orders_before_period_starts_v
-                                         WHERE snapshot_id = ", snapshot_id,
-                                             " AND lvl = 1
-                                               AND episode_no BETWEEN ", min.episode_no," AND ", max.episode_no,
-                                        " GROUP BY snapshot_id, episode_no, starts_exchange_timestamp, order_price, side
-                                         UNION ALL
-                                         SELECT snapshot_id, episode_no, starts_exchange_timestamp + 0.001*'1 sec'::interval, order_price,
-                                                SUM(order_qty) AS qty,
-                                                CASE WHEN side = 'A' THEN 'ask'::text
-                                                     ELSE 'bid'::text
-                                                END AS direction
-                                         FROM bitfinex.bf_active_orders_after_period_starts_v
-                                         WHERE snapshot_id = ", snapshot_id,
-                                         " AND lvl = 1
-                                           AND episode_no BETWEEN ", min.episode_no," AND ", max.episode_no,
-                                         " GROUP BY snapshot_id, episode_no, starts_exchange_timestamp, order_price, side
-                                         ) a
-                                     WINDOW p AS (PARTITION BY snapshot_id, direction ORDER BY episode_no)
-                                    ) b
-                                   WHERE order_price != lag_order_price OR qty != lag_qty
-                                   ORDER BY episode_no ") )
+bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647, debug.query = FALSE) {
+  query <- paste0(
+" SELECT 	exchange_timestamp AS \"timestamp\",
+		      best_bid_price AS \"best.bid.price\",
+		      best_bid_qty AS \"best.bid.vol\",
+		      best_ask_price AS \"best.ask.price\",
+		      best_ask_qty AS \"best.ask.vol\",
+		      episode_no,
+		      snapshot_id
+  FROM (
+    SELECT *, COALESCE(lag(best_bid_price) OVER p, -1) AS lag_bbp,
+              COALESCE(lag(best_bid_qty) OVER p, -1) AS lag_bbq,
+		          COALESCE(lag(best_ask_price) OVER p, -1) AS lag_bap,
+              COALESCE(lag(best_ask_qty) OVER p, -1) AS lag_baq
+    FROM ( SELECT episode_no, best_bid_price, best_bid_qty, best_ask_price,
+	  		        best_ask_qty, snapshot_id, exchange_timestamp
+           FROM bitfinex.bf_spread_before_period_starts_v(", snapshot_id, " , ",min.episode_no, " , ", max.episode_no, ")
+           UNION ALL
+           SELECT episode_no, best_bid_price, best_bid_qty, best_ask_price,
+	  		        best_ask_qty, snapshot_id, exchange_timestamp + 0.001*'1 sec'::interval
+           FROM bitfinex.bf_spread_after_period_starts_v(", snapshot_id, " , ",min.episode_no, " , ", max.episode_no, ")
+         ) v
+    WINDOW p AS (PARTITION BY snapshot_id  ORDER BY episode_no)
+  ) a
+  WHERE best_bid_price != lag_bbp
+     OR best_bid_qty != lag_bbq
+     OR best_ask_price != lag_bap
+     OR best_ask_qty != lag_baq
+  ")
+  if(debug.query) cat(query)
+  dbGetQuery(conn,query)
 
-  na.locf(dcast((select(df, -vol)), list(.(timestamp), .(paste0("best.",direction,".price"))), value.var="price") %>% full_join(dcast((select(df, -price)), list(.(timestamp), .(paste0("best.",direction,".vol"))), value.var="vol"), by="timestamp"))
 }
 
 
