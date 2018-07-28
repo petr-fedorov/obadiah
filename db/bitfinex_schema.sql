@@ -25,23 +25,6 @@ CREATE SCHEMA bitfinex;
 ALTER SCHEMA bitfinex OWNER TO "ob-analytics";
 
 --
--- Name: bf_spread; Type: TYPE; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE TYPE bitfinex.bf_spread AS (
-	episode_no integer,
-	best_bid_price numeric,
-	best_bid_qty numeric,
-	best_ask_price numeric,
-	best_ask_qty numeric,
-	snapshot_id integer,
-	exchange_timestamp timestamp with time zone
-);
-
-
-ALTER TYPE bitfinex.bf_spread OWNER TO "ob-analytics";
-
---
 -- Name: bf_depth_summary_before_episode_v(integer, integer, integer, numeric); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -140,10 +123,34 @@ $$;
 ALTER FUNCTION bitfinex.bf_depth_summary_before_episode_v(snapshot_id integer, first_episode_no integer, last_episode_no integer, bps_step numeric) OWNER TO "ob-analytics";
 
 --
--- Name: bf_order_book_episodes_match_trades_backward(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_order_book_episodes_capture_spreads(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.bf_order_book_episodes_match_trades_backward() RETURNS trigger
+CREATE FUNCTION bitfinex.bf_order_book_episodes_capture_spreads() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+BEGIN 
+
+	INSERT INTO bitfinex.bf_spreads
+	SELECT * FROM bitfinex.bf_spread_before_period_starts_v(NEW.snapshot_id, NEW.episode_no, NEW.episode_no);
+
+	INSERT INTO bitfinex.bf_spreads
+	SELECT * FROM bitfinex.bf_spread_after_period_starts_v(NEW.snapshot_id, NEW.episode_no, NEW.episode_no);
+	
+	RETURN NULL;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_order_book_episodes_capture_spreads() OWNER TO "ob-analytics";
+
+--
+-- Name: bf_order_book_episodes_update_trades(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_order_book_episodes_update_trades() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 
@@ -175,12 +182,13 @@ DECLARE
 BEGIN
 
 	SELECT 	array_agg(episode_no), 
-			array_agg(starts_exchange_timestamp)
+			array_agg(exchange_timestamp)
 			INTO episodes, ts
 	FROM (
-		SELECT episode_no, starts_exchange_timestamp
+		SELECT episode_no, exchange_timestamp
 		FROM bitfinex.bf_order_book_episodes
 		WHERE snapshot_id = NEW.snapshot_id
+		  AND episode_no < NEW.episode_no
 		ORDER BY episode_no DESC
 		LIMIT behind
 	) a;
@@ -217,14 +225,32 @@ BEGIN
 		END LOOP;
 	END IF; 
 	
-	RETURN NEW;
+	
+	UPDATE bitfinex.bf_trades t
+	SET episode_no = a.b_e
+	FROM (
+			SELECT *
+			FROM (
+				SELECT 	t.id,
+						t.episode_no,
+						max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.id) AS b_e,
+						min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.id DESC) AS a_e
+				FROM bitfinex.bf_trades t
+				WHERE t.snapshot_id = NEW.snapshot_id
+			) a
+			WHERE a.episode_no IS NULL AND a.b_e = a.a_e
+		) a
+	WHERE t.episode_no IS NULL AND t.id = a.id;
+	
+	
+	RETURN NULL;
 
 END;
 
 $$;
 
 
-ALTER FUNCTION bitfinex.bf_order_book_episodes_match_trades_backward() OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.bf_order_book_episodes_update_trades() OWNER TO "ob-analytics";
 
 --
 -- Name: bf_order_book_events_fun_before_insert(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
@@ -371,18 +397,38 @@ $$;
 
 ALTER FUNCTION bitfinex.bf_order_book_events_fun_before_insert() OWNER TO "ob-analytics";
 
+SET default_tablespace = '';
+
+SET default_with_oids = false;
+
+--
+-- Name: bf_spreads; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.bf_spreads (
+    best_bid_price numeric NOT NULL,
+    best_ask_price numeric NOT NULL,
+    best_bid_qty numeric NOT NULL,
+    best_ask_qty numeric NOT NULL,
+    snapshot_id integer NOT NULL,
+    episode_no integer NOT NULL,
+    timing character(1) NOT NULL
+);
+
+
+ALTER TABLE bitfinex.bf_spreads OWNER TO "ob-analytics";
+
 --
 -- Name: bf_spread_after_period_starts_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.bf_spread_after_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spread
+CREATE FUNCTION bitfinex.bf_spread_after_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
     LANGUAGE sql
     AS $$
 
-WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty, a.starts_exchange_timestamp
+WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
 				FROM (
 					SELECT 	v.snapshot_id, 
-							v.starts_exchange_timestamp,
 							v.episode_no, 
 							side, 
 							order_price AS price, 
@@ -391,20 +437,20 @@ WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty, a.starts_ex
 							max(order_price) FILTER (WHERE side = 'B') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_bid
 					FROM bitfinex.bf_active_orders_after_period_starts_v v
 					WHERE v.snapshot_id = s_id AND v.episode_no BETWEEN first_episode_no AND last_episode_no
-					GROUP BY v.snapshot_id, v.starts_exchange_timestamp, v.episode_no, side, order_price
+					GROUP BY v.snapshot_id, v.episode_no, side, order_price
 					) a
 				WHERE price = min_ask OR price = min_bid
 				ORDER BY episode_no, side
 			)
-SELECT 	episode_no, 
-		bids.price AS best_bid_price,
-		bids.qty AS best_bid_qty,
+SELECT 	bids.price AS best_bid_price,
 		asks.price AS best_ask_price, 
+		bids.qty AS best_bid_qty,
 		asks.qty AS best_ask_qty,
 		snapshot_id,
-		starts_exchange_timestamp
+		episode_no,
+		'A'::char(1)
 FROM 	(SELECT * FROM base WHERE side = 'A' ) asks JOIN 
-		(SELECT * FROM base WHERE side = 'B' ) bids USING (snapshot_id, episode_no, starts_exchange_timestamp);
+		(SELECT * FROM base WHERE side = 'B' ) bids USING (snapshot_id, episode_no);
 
 $$;
 
@@ -415,14 +461,13 @@ ALTER FUNCTION bitfinex.bf_spread_after_period_starts_v(s_id integer, first_epis
 -- Name: bf_spread_before_period_starts_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.bf_spread_before_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spread
+CREATE FUNCTION bitfinex.bf_spread_before_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
     LANGUAGE sql
     AS $$
 
-WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty, a.starts_exchange_timestamp
+WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
 				FROM (
 					SELECT 	v.snapshot_id, 
-							v.starts_exchange_timestamp,
 							v.episode_no, 
 							side, 
 							order_price AS price, 
@@ -431,20 +476,20 @@ WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty, a.starts_ex
 							max(order_price) FILTER (WHERE side = 'B') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_bid
 					FROM bitfinex.bf_active_orders_before_period_starts_v v
 					WHERE v.snapshot_id = s_id AND v.episode_no BETWEEN first_episode_no AND last_episode_no
-					GROUP BY v.snapshot_id, v.starts_exchange_timestamp, v.episode_no, side, order_price
+					GROUP BY v.snapshot_id, v.episode_no, side, order_price
 					) a
 				WHERE price = min_ask OR price = min_bid
 				ORDER BY episode_no, side
 			)
-SELECT 	episode_no, 
-		bids.price AS best_bid_price,
-		bids.qty AS best_bid_qty,
+SELECT 	bids.price AS best_bid_price,
 		asks.price AS best_ask_price, 
+		bids.qty AS best_bid_qty,
 		asks.qty AS best_ask_qty,
 		snapshot_id,
-		starts_exchange_timestamp
+		episode_no,
+		'B'::char(1)
 FROM 	(SELECT * FROM base WHERE side = 'A' ) asks JOIN 
-		(SELECT * FROM base WHERE side = 'B' ) bids USING (snapshot_id, episode_no, starts_exchange_timestamp);
+		(SELECT * FROM base WHERE side = 'B' ) bids USING (snapshot_id, episode_no);
 
 $$;
 
@@ -530,10 +575,6 @@ $$;
 
 ALTER FUNCTION bitfinex.bf_trades_fun_before_insert() OWNER TO "ob-analytics";
 
-SET default_tablespace = '';
-
-SET default_with_oids = false;
-
 --
 -- Name: bf_order_book_episodes; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
@@ -541,8 +582,7 @@ SET default_with_oids = false;
 CREATE TABLE bitfinex.bf_order_book_episodes (
     snapshot_id integer NOT NULL,
     episode_no integer NOT NULL,
-    starts_exchange_timestamp timestamp with time zone NOT NULL,
-    ends_exchange_timestamp timestamp with time zone NOT NULL
+    exchange_timestamp timestamp with time zone NOT NULL
 );
 
 
@@ -596,8 +636,7 @@ CREATE VIEW bitfinex.bf_active_orders_after_period_starts_v AS
         END AS lvl,
     e.snapshot_id,
     e.episode_no,
-    e.starts_exchange_timestamp,
-    e.ends_exchange_timestamp,
+    e.exchange_timestamp,
     ob.episode_no AS order_episode_no,
     ob.exchange_timestamp AS order_exchange_timestamp,
     ob.pair
@@ -636,8 +675,7 @@ CREATE VIEW bitfinex.bf_active_orders_before_period_starts_v AS
         END AS lvl,
     e.snapshot_id,
     e.episode_no,
-    e.starts_exchange_timestamp,
-    e.ends_exchange_timestamp,
+    e.exchange_timestamp,
     ob.episode_no AS order_episode_no,
     ob.exchange_timestamp AS order_exchange_timestamp,
     ob.pair
@@ -832,44 +870,23 @@ ALTER TABLE bitfinex.bf_snapshots_v OWNER TO "ob-analytics";
 --
 
 CREATE VIEW bitfinex.bf_trades_v AS
- SELECT a.id,
-    a.qty,
-    a.price,
-    a.matched_count,
-    a.pair,
-    a.snapshot_id,
-        CASE
-            WHEN (a.episode_no IS NOT NULL) THEN a.episode_no
-            ELSE i.episode_no
-        END AS episode_no,
-    a.event_no,
-    a.trade_timestamp,
-    a.exchange_timestamp,
-    a.event_exchange_timestamp,
-    a.local_timestamp,
-    a.direction
-   FROM (( SELECT t.id,
-            t.qty,
-            round(t.price, bf_pairs."precision") AS price,
-            count(*) OVER (PARTITION BY t.snapshot_id, t.episode_no, t.event_no) AS matched_count,
-            t.pair,
-            t.snapshot_id,
-            t.episode_no,
-            t.event_no,
-            t.trade_timestamp,
-            t.exchange_timestamp,
-                CASE
-                    WHEN (e.exchange_timestamp IS NOT NULL) THEN e.exchange_timestamp
-                    ELSE (max(e.exchange_timestamp) OVER o + (t.trade_timestamp - max(t.trade_timestamp) FILTER (WHERE (e.exchange_timestamp IS NOT NULL)) OVER o))
-                END AS event_exchange_timestamp,
-            t.local_timestamp,
-            t.direction
-           FROM ((bitfinex.bf_trades t
-             JOIN bitfinex.bf_pairs USING (pair))
-             LEFT JOIN bitfinex.bf_order_book_events e ON (((t.snapshot_id = e.snapshot_id) AND (t.episode_no = e.episode_no) AND (t.event_no = e.event_no))))
-          WHERE (t.local_timestamp IS NOT NULL)
-          WINDOW o AS (PARTITION BY t.snapshot_id ORDER BY t.id)) a
-     LEFT JOIN bitfinex.bf_order_book_episodes i ON (((a.episode_no IS NULL) AND (i.snapshot_id = a.snapshot_id) AND (a.event_exchange_timestamp > i.starts_exchange_timestamp) AND (a.event_exchange_timestamp <= i.ends_exchange_timestamp))));
+ SELECT t.id,
+    t.qty,
+    round(t.price, bf_pairs."precision") AS price,
+    count(*) OVER (PARTITION BY t.snapshot_id, t.episode_no, t.event_no) AS matched_count,
+    t.pair,
+    t.snapshot_id,
+    t.episode_no,
+    t.event_no,
+    t.trade_timestamp,
+    t.exchange_timestamp,
+    e.exchange_timestamp AS episode_exchange_timestamp,
+    t.local_timestamp,
+    t.direction
+   FROM ((bitfinex.bf_trades t
+     JOIN bitfinex.bf_pairs USING (pair))
+     LEFT JOIN bitfinex.bf_order_book_episodes e USING (snapshot_id, episode_no))
+  WHERE (t.local_timestamp IS NOT NULL);
 
 
 ALTER TABLE bitfinex.bf_trades_v OWNER TO "ob-analytics";
@@ -887,14 +904,6 @@ ALTER TABLE ONLY bitfinex.bf_snapshots ALTER COLUMN snapshot_id SET DEFAULT next
 
 ALTER TABLE ONLY bitfinex.bf_order_book_episodes
     ADD CONSTRAINT bf_order_book_episodes_pkey PRIMARY KEY (snapshot_id, episode_no);
-
-
---
--- Name: bf_order_book_episodes bf_order_book_episodes_uni_snapshot_id_starts_ends; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitfinex.bf_order_book_episodes
-    ADD CONSTRAINT bf_order_book_episodes_uni_snapshot_id_starts_ends UNIQUE (snapshot_id, starts_exchange_timestamp, ends_exchange_timestamp) DEFERRABLE;
 
 
 --
@@ -922,6 +931,14 @@ ALTER TABLE ONLY bitfinex.bf_snapshots
 
 
 --
+-- Name: bf_spreads bf_spreads_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_spreads
+    ADD CONSTRAINT bf_spreads_pkey PRIMARY KEY (snapshot_id, episode_no, timing);
+
+
+--
 -- Name: bf_trades bf_trades_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -941,6 +958,20 @@ CREATE INDEX bf_order_book_events_idx_order_id_snapshot_id ON bitfinex.bf_order_
 --
 
 CREATE INDEX bf_trades_idx_snapshot_id_episode_no_event_no ON bitfinex.bf_trades USING btree (snapshot_id, episode_no, event_no);
+
+
+--
+-- Name: bf_order_book_episodes a_update_trades; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TRIGGER a_update_trades AFTER INSERT ON bitfinex.bf_order_book_episodes FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_episodes_update_trades();
+
+
+--
+-- Name: bf_order_book_episodes b_capture_spreads; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TRIGGER b_capture_spreads AFTER INSERT ON bitfinex.bf_order_book_episodes FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_episodes_capture_spreads();
 
 
 --
@@ -965,13 +996,6 @@ CREATE CONSTRAINT TRIGGER check_episode_no AFTER INSERT OR UPDATE OF episode_no 
 
 
 --
--- Name: bf_order_book_episodes match_trades_backward; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE TRIGGER match_trades_backward BEFORE INSERT ON bitfinex.bf_order_book_episodes FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_episodes_match_trades_backward();
-
-
---
 -- Name: bf_order_book_episodes bf_order_book_episodes_fkey_snapshot_id; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -993,6 +1017,22 @@ ALTER TABLE ONLY bitfinex.bf_order_book_events
 
 ALTER TABLE ONLY bitfinex.bf_order_book_events
     ADD CONSTRAINT bf_order_book_events_fkey_snapshot_id FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+
+
+--
+-- Name: bf_spreads bf_spreads_fkey_episode_no; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_spreads
+    ADD CONSTRAINT bf_spreads_fkey_episode_no FOREIGN KEY (snapshot_id, episode_no) REFERENCES bitfinex.bf_order_book_episodes(snapshot_id, episode_no) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+
+
+--
+-- Name: bf_spreads bf_spreads_fkey_snapshot_id; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_spreads
+    ADD CONSTRAINT bf_spreads_fkey_snapshot_id FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --

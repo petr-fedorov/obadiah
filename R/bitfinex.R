@@ -28,11 +28,13 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
               COALESCE(lag(best_ask_qty) OVER p, -1) AS lag_baq
     FROM ( SELECT episode_no, best_bid_price, best_bid_qty, best_ask_price,
 	  		        best_ask_qty, snapshot_id, exchange_timestamp
-           FROM bitfinex.bf_spread_before_period_starts_v(", snapshot_id, " , ",min.episode_no, " , ", max.episode_no, ")
+           FROM bitfinex.bf_spreads JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no)
+           WHERE timing = 'B' AND snapshot_id = ", snapshot_id, " AND episode_no BETWEEN ",min.episode_no, " AND ", max.episode_no, "
            UNION ALL
            SELECT episode_no, best_bid_price, best_bid_qty, best_ask_price,
 	  		        best_ask_qty, snapshot_id, exchange_timestamp + 0.001*'1 sec'::interval
-           FROM bitfinex.bf_spread_after_period_starts_v(", snapshot_id, " , ",min.episode_no, " , ", max.episode_no, ")
+           FROM bitfinex.bf_spreads JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no)
+           WHERE timing = 'A' AND snapshot_id = ", snapshot_id, " AND episode_no BETWEEN ",min.episode_no, " AND ", max.episode_no, "
          ) v
     WINDOW p AS (PARTITION BY snapshot_id  ORDER BY episode_no)
   ) a
@@ -52,7 +54,7 @@ bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147
 
   precision <- switch(price.aggregation, P0=0.01, P1=0.1, P2=1.0, P3=10.0, 0.01)
 
-  query <- paste0(" SELECT starts_exchange_timestamp AS \"timestamp\",
+  query <- paste0(" SELECT exchange_timestamp AS \"timestamp\",
                             CASE WHEN side = 'A' THEN ceiling(order_price/", precision,")*",precision,
 								          "     ELSE floor(order_price/", precision," )* ", precision,
               						" END AS price,
@@ -72,10 +74,10 @@ bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147
 #' @export
 bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range = 0, min.bid = 0, max.ask = "'Infinity'::float") {
 
-  ts <- dbGetQuery(conn, paste0(" SELECT starts_exchange_timestamp",
+  ts <- dbGetQuery(conn, paste0(" SELECT exchange_timestamp",
                                 " FROM bitfinex.bf_order_book_episodes ",
                                 " WHERE snapshot_id = ", snapshot_id,
-                                " AND episode_no = ", episode_no ))$starts_exchange_timestamp
+                                " AND episode_no = ", episode_no ))$exchange_timestamp
 
   where_cond <- paste0(" WHERE snapshot_id = ", snapshot_id,
                        " AND episode_no = ", episode_no )
@@ -110,14 +112,14 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
 
 #' @export
 bfTrades <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647) {
-  dbGetQuery(conn, paste0(" SELECT 	event_exchange_timestamp AS \"timestamp\", ",
+  dbGetQuery(conn, paste0(" SELECT 	episode_exchange_timestamp AS \"timestamp\", ",
                                   " price, ",
                                   " qty AS volume, ",
                                   " CASE WHEN direction = 'S' THEN 'sell'::text ",
                                        " ELSE 'buy'::text ",
                                   " END AS direction ",
                           " FROM bitfinex.bf_trades_v ",
-                          " WHERE  event_exchange_timestamp IS NOT NULL ",
+                          " WHERE  episode_exchange_timestamp IS NOT NULL ",
                             " AND snapshot_id = ", snapshot_id,
                             " AND episode_no BETWEEN ", min.episode_no, " AND ", max.episode_no,
                           " ORDER BY id "))

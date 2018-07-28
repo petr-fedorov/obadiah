@@ -61,10 +61,10 @@ class Episode(DatabaseInsertion):
     def save(self, curr):
         curr.execute("INSERT INTO bitfinex.bf_order_book_episodes "
                      "(snapshot_id, episode_no,"
-                     "starts_exchange_timestamp,ends_exchange_timestamp) "
-                     "VALUES (%s, %s, %s, %s)",
+                     "exchange_timestamp) "
+                     "VALUES (%s, %s, %s)",
                      (self.snapshot_id, self.episode_no,
-                      self.exchange_timestamp, self.next_episode_starts))
+                      self.exchange_timestamp))
 
 
 class OrderBookEvent(DatabaseInsertion):
