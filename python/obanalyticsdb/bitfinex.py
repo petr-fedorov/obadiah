@@ -2,11 +2,13 @@ from multiprocessing import Process, Queue
 from queue import Empty
 import logging
 import time
-from heapq import heappush, heappop, heapify
+import signal
+from heapq import heappush, heappop
 from btfxwss import BtfxWss
 import psycopg2
 from datetime import datetime, timedelta
 from functools import total_ordering
+from obanalyticsdb.utils import logging_configurer
 
 
 @total_ordering
@@ -163,20 +165,29 @@ class Trade(DatabaseInsertion):
                       self.exchange_timestamp))
 
 
-class Orderer:
+class Spawned:
 
-    def __init__(self, q_in, q_out, stop_flag, delay=1):
+    def __init__(self, logging_queue, stop_flag):
+        self.logging_queue = logging_queue
+        self.stop_flag = stop_flag
+
+    def _call_init(self):
+        logging_configurer(self.logging_queue)
+
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+class Orderer(Spawned):
+
+    def __init__(self, q_in, q_out, stop_flag, logging_queue, delay=1):
+        super().__init__(logging_queue, stop_flag)
         self.q_in = q_in
         self.q_out = q_out
-        self.stop_flag = stop_flag
         self.delay = timedelta(seconds=delay)
         self.buffer = []
-        heapify(self.buffer)
         self.latest_arrived = datetime.now()
         self.latest_departed = datetime.now()
         self.seq_no = 0
-        self.alogger = logging.getLogger("bitfinex.Orderer.arrive")
-        self.dlogger = logging.getLogger("bitfinex.Orderer.depart")
         self.latest_departed_seq_no = -1
 
     def __repr__(self):
@@ -256,149 +267,191 @@ class Orderer:
         self.dlogger.debug('Unprocessed q_out size: %i' % self.q_out.qsize())
 
     def __call__(self):
+        self._call_init()
 
         logger = logging.getLogger("bitfinex.Orderer.__call")
+        self.alogger = logging.getLogger("bitfinex.Orderer.arrive")
+        self.dlogger = logging.getLogger("bitfinex.Orderer.depart")
         logger.debug('S %r ' % (self,))
         while not self.stop_flag.is_set():
             self._arrive_from_exchange()
             self._depart_to_database()
             logger.debug("Unprocessed heap size: %i" % len(self.buffer))
-        logger.debug('F %r ' % (self,))
+        self.q_in.cancel_join_thread()
+        logger.debug('Exit %r ' % (self,))
 
 
 def connect_db():
     return psycopg2.connect("dbname=ob-analytics user=ob-analytics")
 
 
-def save_all(q_out, stop_flag):
-    logger = logging.getLogger("bitfinex.save_all")
-    with connect_db() as con:
-        con.set_session(autocommit=False)
-        with con.cursor() as curr:
-            curr.execute("SET CONSTRAINTS ALL DEFERRED")
-            try:
-                while not stop_flag.is_set():
-                    try:
-                        obj = q_out.get(timeout=1)
-                        logger.debug('%r' % obj)
-                    except Empty:
-                        continue
+class Stockkeeper(Spawned):
 
-                    obj.save(curr)
-                    if isinstance(obj, Episode):
-                        con.commit()
-                        curr.execute("SET CONSTRAINTS ALL DEFERRED")
-            except Exception as e:
-                logger.exception('%s', e)
-                stop_flag.set()
-    logger.info("Exit")
+    def __init__(self, q_out, stop_flag, logging_queue):
+        super().__init__(logging_queue, stop_flag)
+        self.q_out = q_out
 
+    def __call__(self):
+        self._call_init()
 
-def process_trade(q, stop_flag, pair, sq, q_in):
-    logger = logging.getLogger("bitfinex.trade")
-    try:
-        snapshot_id = 0
-        while not stop_flag.is_set():
-            try:
-                logger.debug("Waiting for trades ...")
-                data, lts = q.get(timeout=1)
-            except Empty:
-                logger.debug("Timeout waiting for trades, restarting ..")
-                continue
-            logger.debug("%i %s" % (snapshot_id, data))
-            *data, rts = data
-            lts = datetime.fromtimestamp(lts)
-            rts = datetime.fromtimestamp(rts/1000)
+        logger = logging.getLogger("bitfinex.Stockkeeper")
+        with connect_db() as con:
+            con.set_session(autocommit=False)
+            with con.cursor() as curr:
+                curr.execute("SET CONSTRAINTS ALL DEFERRED")
+                try:
+                    while not self.stop_flag.is_set():
+                        try:
+                            obj = self.q_out.get(timeout=1)
+                            logger.debug('%r' % obj)
+                        except Empty:
+                            continue
 
-            if data[0] == 'tu':
-                data = [data[1]]
-            elif data[0] == 'te':
-                data = []
-            else:
-                # A new snapshot has started after (re)connect
-                # get new snapshot_id from process_raw_order_book()
-                while not stop_flag.is_set():
-                    try:
-                        snapshot_id = sq.get(timeout=1)
-                        logger.debug("New snapshot_id: %i" % snapshot_id)
-                        break
-                    except Empty:
-                        continue
-                # skip initial snapshot of trades
-                # since they usually can't be matched to any events
-                continue
-                # data = data[0]
-            for d in data:
-                q_in.put(Trade(lts, rts,  d[0], pair, datetime.fromtimestamp(
-                    d[1]/1000), d[2], d[3], snapshot_id))
-
-    except Exception as e:
-        logger.exception('%s', e)
-        stop_flag.set()
-    logger.info('Exit')
+                        obj.save(curr)
+                        if isinstance(obj, Episode):
+                            con.commit()
+                            curr.execute("SET CONSTRAINTS ALL DEFERRED")
+                except Exception as e:
+                    logger.exception('%s', e)
+                    self.stop_flag.set()
+        self.q_out.cancel_join_thread()
+        logger.info("Exit")
 
 
-def process_raw_order_book(q, stop_flag, pair, sq, ob_len, q_in):
-    logger = logging.getLogger("bitfinex.order.book.event")
-    try:
-        episode_no = 0
-        event_no = 1
-        episode_starts = None
-        increase_episode_no = False  # The first 'addition' event
-        snapshot_id = 0
+class TradeConverter(Spawned):
 
-        while not stop_flag.is_set():
-            try:
-                data, lts = q.get(timeout=1)
-            except Empty:
-                continue
-            logger.debug("%i %s" % (snapshot_id, data))
-            *data, rts = data
-            rts = datetime.fromtimestamp(rts/1000)
-            lts = datetime.fromtimestamp(lts)
-            if isinstance(data[0][0], list):  # A new snapshot started
-                snapshot_id = start_new_snapshot(ob_len, pair)
-                logger.debug("Started new snapshot: %i" % snapshot_id)
-                sq.put(snapshot_id)  # process_trade() will wait for it
-                episode_no = 0
-                event_no = 1
-                episode_starts = None
-                increase_episode_no = False
-                data = data[0]
-            for d in data:
-                if not float(d[1]):  # it is a 'removal' event
-                    if increase_episode_no:
-                        # it is the first event for an episode
-                        # so insert PREVIOUS episode
-                        q_in.put(Episode(datetime.now(), episode_starts,
-                                         snapshot_id, episode_no, rts))
-                        increase_episode_no = False
-                        episode_no += 10
-                        if episode_no == OrderBookEvent.MAX_EPISODE_NO:
-                            stop_flag.set()
+    def __init__(self, q, stop_flag, pair, sq, q_in, logging_queue):
+        super().__init__(logging_queue, stop_flag)
+        self.q = q
+        self.pair = pair
+        self.q_in = q_in
+        self.sq = sq
+
+    def __call__(self):
+        self._call_init()
+
+        logger = logging.getLogger("bitfinex.TradeConverter")
+        try:
+            snapshot_id = 0
+            while not self.stop_flag.is_set():
+                try:
+                    logger.debug("Waiting for trades ...")
+                    data, lts = self.q.get(timeout=1)
+                except Empty:
+                    logger.debug("Timeout waiting for trades, restarting ..")
+                    continue
+                logger.debug("%i %s" % (snapshot_id, data))
+                *data, rts = data
+                lts = datetime.fromtimestamp(lts)
+                rts = datetime.fromtimestamp(rts/1000)
+
+                if data[0] == 'tu':
+                    data = [data[1]]
+                elif data[0] == 'te':
+                    data = []
+                else:
+                    # A new snapshot has started after (re)connect
+                    # get new snapshot_id from process_raw_order_book()
+                    while not self.stop_flag.is_set():
+                        try:
+                            snapshot_id = self.sq.get(timeout=1)
+                            logger.debug("New snapshot_id: %i" % snapshot_id)
                             break
-                        event_no = 1
-                        # the end time of this episode will be
-                        # the start time for the next one
-                        episode_starts = rts
-                        logger.debug("Unprocessed queue size: %i" %
-                                     (q.qsize(),))
-                elif not increase_episode_no:
-                    # it is the first 'addition' event of an episode
-                    increase_episode_no = True
+                        except Empty:
+                            continue
+                    # skip initial snapshot of trades
+                    # since they usually can't be matched to any events
+                    continue
+                    # data = data[0]
+                for d in data:
+                    self.q_in.put(Trade(lts, rts,  d[0], self.pair,
+                                        datetime.fromtimestamp(
+                                            d[1]/1000),
+                                        d[2], d[3], snapshot_id))
 
-                    if episode_no == 0:
-                        # episode 0 starts and ends at the same time
-                        episode_starts = rts
+        except Exception as e:
+            logger.exception('%s', e)
+            self.stop_flag.set()
+        self.q.cancel_join_thread()
+        logger.info('Exit')
 
-                q_in.put(OrderBookEvent(lts, rts, pair, d[0], d[1], d[2],
-                                        snapshot_id, episode_no, event_no))
-                event_no += 1
 
-    except Exception as e:
-        logger.exception('%s', e)
-        stop_flag.set()
-    logger.info('Exit')
+class EventConverter(Spawned):
+
+    def __init__(self, q, stop_flag, pair, sq, ob_len, q_in, logging_queue):
+        super().__init__(logging_queue, stop_flag)
+        self.q = q
+        self.pair = pair
+        self.ob_len = ob_len
+        self.q_in = q_in
+        self.sq = sq
+
+    def __call__(self):
+        self._call_init()
+        logger = logging.getLogger("bitfinex.EventConverter")
+        try:
+            episode_no = 0
+            event_no = 1
+            episode_starts = None
+            increase_episode_no = False  # The first 'addition' event
+            snapshot_id = 0
+
+            while not self.stop_flag.is_set():
+                try:
+                    data, lts = self.q.get(timeout=1)
+                except Empty:
+                    continue
+                logger.debug("%i %s" % (snapshot_id, data))
+                *data, rts = data
+                rts = datetime.fromtimestamp(rts/1000)
+                lts = datetime.fromtimestamp(lts)
+                if isinstance(data[0][0], list):  # A new snapshot started
+                    snapshot_id = start_new_snapshot(self.ob_len, self.pair)
+                    logger.debug("Started new snapshot: %i" % snapshot_id)
+                    self.sq.put(snapshot_id)
+                    episode_no = 0
+                    event_no = 1
+                    episode_starts = None
+                    increase_episode_no = False
+                    data = data[0]
+                for d in data:
+                    if not float(d[1]):  # it is a 'removal' event
+                        if increase_episode_no:
+                            # it is the first event for an episode
+                            # so insert PREVIOUS episode
+                            self.q_in.put(Episode(datetime.now(),
+                                                  episode_starts,
+                                                  snapshot_id,
+                                                  episode_no, rts))
+                            increase_episode_no = False
+                            episode_no += 10
+                            if episode_no == OrderBookEvent.MAX_EPISODE_NO:
+                                self.stop_flag.set()
+                                break
+                            event_no = 1
+                            # the end time of this episode will be
+                            # the start time for the next one
+                            episode_starts = rts
+                            logger.debug("Unprocessed queue size: %i" %
+                                         (self.q.qsize(),))
+                    elif not increase_episode_no:
+                        # it is the first 'addition' event of an episode
+                        increase_episode_no = True
+
+                        if episode_no == 0:
+                            # episode 0 starts and ends at the same time
+                            episode_starts = rts
+
+                    self.q_in.put(OrderBookEvent(lts, rts, self.pair, d[0],
+                                                 d[1], d[2], snapshot_id,
+                                                 episode_no, event_no))
+                    event_no += 1
+
+        except Exception as e:
+            logger.exception('%s', e)
+            self.stop_flag.set()
+        self.q.cancel_join_thread()
+        logger.info('Exit')
 
 
 def check_pair(pair):
@@ -430,7 +483,7 @@ def start_new_snapshot(ob_len, pair):
     return snapshot_id
 
 
-def capture(pair, stop_flag):
+def capture(pair, stop_flag, logging_queue):
 
     logger = logging.getLogger("bitfinex.capture")
     ob_len = 100
@@ -441,7 +494,7 @@ def capture(pair, stop_flag):
         logger.exception('%s', e)
         return
 
-    wss = BtfxWss(log_level=logging.INFO)
+    wss = BtfxWss(log_level=logging.DEBUG)
     wss.start()
 
     while not wss.conn.connected.is_set():
@@ -457,13 +510,12 @@ def capture(pair, stop_flag):
     q_in = Queue()
     q_out = Queue()
 
-    ts = [Process(target=process_trade,
-                  args=(wss.trades(pair), stop_flag, pair, sq, q_in)),
-          Process(target=process_raw_order_book,
-                  args=(wss.raw_books(pair), stop_flag, pair, sq,
-                        ob_len, q_in)),
-          Process(target=Orderer(q_in, q_out, stop_flag)),
-          Process(target=save_all, args=(q_out, stop_flag)),
+    ts = [Process(target=TradeConverter(wss.trades(pair), stop_flag,
+                                        pair, sq, q_in, logging_queue)),
+          Process(target=EventConverter(wss.raw_books(pair), stop_flag, pair,
+                                        sq, ob_len, q_in, logging_queue)),
+          Process(target=Orderer(q_in, q_out, stop_flag, logging_queue)),
+          Process(target=Stockkeeper(q_out, stop_flag, logging_queue)),
           ]
 
     for t in ts:
