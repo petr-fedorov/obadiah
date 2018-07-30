@@ -240,7 +240,7 @@ BEGIN
 			) a
 			WHERE a.episode_no IS NULL AND a.b_e = a.a_e
 		) a
-	WHERE t.episode_no IS NULL AND t.id = a.id;
+	WHERE t.snapshot_id = NEW.snapshot_id AND t.episode_no IS NULL AND t.id = a.id;
 	
 	
 	RETURN NULL;
@@ -320,7 +320,7 @@ BEGIN
 	
 	UPDATE bitfinex.bf_order_book_events
 	SET order_next_episode_no = NEW.episode_no,
-		order_next_event_price = NEW.event_price
+		order_next_episode_deactivates = CASE WHEN NEW.event_price = 0 THEN True ELSE False END
 	WHERE snapshot_id = NEW.snapshot_id 
 	  AND order_id = NEW.order_id 
 	  AND episode_no < NEW.episode_no
@@ -606,8 +606,8 @@ CREATE TABLE bitfinex.bf_order_book_events (
     order_next_episode_no integer NOT NULL,
     event_no smallint NOT NULL,
     side character(1) NOT NULL,
-    order_next_event_price numeric DEFAULT '-1'::integer NOT NULL,
-    matched boolean DEFAULT false NOT NULL
+    matched boolean DEFAULT false NOT NULL,
+    order_next_episode_deactivates boolean DEFAULT false
 );
 
 
@@ -680,7 +680,39 @@ CREATE VIEW bitfinex.bf_active_orders_before_period_starts_v AS
     ob.exchange_timestamp AS order_exchange_timestamp,
     ob.pair
    FROM (bitfinex.bf_order_book_episodes e
-     JOIN bitfinex.bf_order_book_events ob ON (((ob.snapshot_id = e.snapshot_id) AND (ob.episode_no < e.episode_no) AND (ob.event_price <> (0)::numeric) AND ((ob.order_next_episode_no > e.episode_no) OR ((ob.order_next_episode_no = e.episode_no) AND (ob.order_next_event_price > (0)::numeric))))))
+     JOIN LATERAL ( SELECT ob_1.order_id,
+            ob_1.event_price,
+            ob_1.order_qty,
+            ob_1.local_timestamp,
+            ob_1.pair,
+            ob_1.order_price,
+            ob_1.event_qty,
+            ob_1.snapshot_id,
+            ob_1.episode_no,
+            ob_1.exchange_timestamp,
+            ob_1.event_no,
+            ob_1.side,
+            ob_1.matched,
+            ob_1.order_next_episode_deactivates
+           FROM bitfinex.bf_order_book_events ob_1
+          WHERE ((ob_1.snapshot_id = e.snapshot_id) AND (ob_1.event_price <> (0)::numeric) AND (ob_1.episode_no < e.episode_no) AND (ob_1.order_next_episode_no > e.episode_no))
+        UNION ALL
+         SELECT ob_1.order_id,
+            ob_1.event_price,
+            ob_1.order_qty,
+            ob_1.local_timestamp,
+            ob_1.pair,
+            ob_1.order_price,
+            ob_1.event_qty,
+            ob_1.snapshot_id,
+            ob_1.episode_no,
+            ob_1.exchange_timestamp,
+            ob_1.event_no,
+            ob_1.side,
+            ob_1.matched,
+            ob_1.order_next_episode_deactivates
+           FROM bitfinex.bf_order_book_events ob_1
+          WHERE ((ob_1.snapshot_id = e.snapshot_id) AND (ob_1.event_price <> (0)::numeric) AND (ob_1.episode_no < e.episode_no) AND (ob_1.order_next_episode_no = e.episode_no) AND (NOT ob_1.order_next_episode_deactivates))) ob USING (snapshot_id))
   WINDOW asks AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price, ob.order_id), bids AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC, ob.order_id), ask_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price), bid_prices AS (PARTITION BY e.snapshot_id, e.episode_no, ob.side ORDER BY ob.order_price DESC)
   ORDER BY ob.order_price DESC, ((ob.order_id)::numeric * (
         CASE
@@ -947,10 +979,17 @@ ALTER TABLE ONLY bitfinex.bf_trades
 
 
 --
--- Name: bf_order_book_events_idx_order_id_snapshot_id; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_order_book_events_idx_active_orders; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE INDEX bf_order_book_events_idx_order_id_snapshot_id ON bitfinex.bf_order_book_events USING btree (order_id, snapshot_id);
+CREATE INDEX bf_order_book_events_idx_active_orders ON bitfinex.bf_order_book_events USING btree (snapshot_id, episode_no, order_next_episode_no, order_next_episode_deactivates) WHERE (event_price <> (0)::numeric);
+
+
+--
+-- Name: bf_order_book_events_idx_update_next_episode_no; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_order_book_events_idx_update_next_episode_no ON bitfinex.bf_order_book_events USING btree (snapshot_id, order_id);
 
 
 --
