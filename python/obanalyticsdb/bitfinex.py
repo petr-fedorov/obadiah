@@ -1,5 +1,5 @@
-from multiprocessing import Process, Queue
 from queue import Empty
+from multiprocessing import Process, Queue
 import logging
 import time
 import signal
@@ -167,22 +167,24 @@ class Trade(DatabaseInsertion):
 
 class Spawned:
 
-    def __init__(self, logging_queue, stop_flag):
-        self.logging_queue = logging_queue
+    def __init__(self, log_queue, stop_flag, log_level=logging.INFO):
+        self.log_queue = log_queue
         self.stop_flag = stop_flag
+        self.log_level = log_level
 
     def _call_init(self):
-        logging_configurer(self.logging_queue)
+        logging_configurer(self.log_queue, self.log_level)
 
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 class Orderer(Spawned):
 
-    def __init__(self, q_in, q_out, stop_flag, logging_queue, delay=1):
-        super().__init__(logging_queue, stop_flag)
-        self.q_in = q_in
-        self.q_out = q_out
+    def __init__(self, q_unordered, q_ordered, stop_flag, log_queue,
+                 log_level=logging.INFO, delay=1):
+        super().__init__(log_queue, stop_flag, log_level)
+        self.q_unordered = q_unordered
+        self.q_ordered = q_ordered
         self.delay = timedelta(seconds=delay)
         self.buffer = []
         self.latest_arrived = datetime.now()
@@ -208,9 +210,10 @@ class Orderer(Spawned):
             self.alogger.debug('current_delay %f ' %
                                self._current_delay().total_seconds())
             try:
-                obj = self.q_in.get(True,
-                                    (self.delay -
-                                     self._current_delay()).total_seconds())
+                obj = self.q_unordered.get(True,
+                                           (self.delay -
+                                            self._current_delay()
+                                            ).total_seconds())
                 obj.seq_no = self.seq_no
                 self.alogger.debug('%r' % obj)
                 self.seq_no += 1
@@ -228,7 +231,8 @@ class Orderer(Spawned):
         self.alogger.debug('Suspend arrive - current_delay %f, l_a %s ' %
                            (self._current_delay().total_seconds(),
                             self.latest_arrived.strftime("%H-%M-%S.%f")[:-3]))
-        self.alogger.debug('Unprocessed q_in size: %i' % self.q_in.qsize())
+        self.alogger.debug('Unprocessed q_unordered size: %i' %
+                           self.q_unordered.qsize())
 
     def _depart_to_database(self):
         self.dlogger.debug('Start depart - current delay %f, l_d %s' %
@@ -252,7 +256,7 @@ class Orderer(Spawned):
                         self.latest_departed_seq_no = obj.seq_no
                     else:
                         self.dlogger.debug('DELAYED %r' % obj)
-                    self.q_out.put(obj)
+                    self.q_ordered.put(obj)
                 else:
                     break
             except IndexError:
@@ -264,7 +268,8 @@ class Orderer(Spawned):
         self.dlogger.debug('Suspend depart - current_delay %f, l_d %s ' %
                            (self._current_delay().total_seconds(),
                             self.latest_departed.strftime("%H-%M-%S.%f")[:-3]))
-        self.dlogger.debug('Unprocessed q_out size: %i' % self.q_out.qsize())
+        self.dlogger.debug('Unprocessed q_ordered size: %i' %
+                           self.q_ordered.qsize())
 
     def __call__(self):
         self._call_init()
@@ -272,13 +277,15 @@ class Orderer(Spawned):
         logger = logging.getLogger("bitfinex.Orderer.__call")
         self.alogger = logging.getLogger("bitfinex.Orderer.arrive")
         self.dlogger = logging.getLogger("bitfinex.Orderer.depart")
-        logger.debug('S %r ' % (self,))
-        while not self.stop_flag.is_set():
+        logger.info('Started %r ' % (self,))
+        while not (self.stop_flag.is_set()
+                   and self.q_unordered.qsize() == 0
+                   and len(self.buffer) == 0
+                   and self.q_ordered.qsize() == 0):
             self._arrive_from_exchange()
             self._depart_to_database()
             logger.debug("Unprocessed heap size: %i" % len(self.buffer))
-        self.q_in.cancel_join_thread()
-        logger.debug('Exit %r ' % (self,))
+        logger.info('Exit %r ' % (self,))
 
 
 def connect_db():
@@ -287,26 +294,30 @@ def connect_db():
 
 class Stockkeeper(Spawned):
 
-    def __init__(self, q_out, stop_flag, logging_queue):
-        super().__init__(logging_queue, stop_flag)
-        self.q_out = q_out
+    def __init__(self, q_ordered, stop_flag, log_queue,
+                 log_level=logging.INFO):
+        super().__init__(log_queue, stop_flag, log_level)
+        self.q_ordered = q_ordered
 
     def __call__(self):
         self._call_init()
 
         logger = logging.getLogger("bitfinex.Stockkeeper")
+        logger.info('Started')
         with connect_db() as con:
             con.set_session(autocommit=False)
             with con.cursor() as curr:
                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
                 try:
-                    while not self.stop_flag.is_set():
+                    while True:
                         try:
-                            obj = self.q_out.get(timeout=1)
+                            obj = self.q_ordered.get(timeout=5)
                             logger.debug('%r' % obj)
                         except Empty:
-                            continue
-
+                            if not self.stop_flag.is_set():
+                                continue
+                            else:
+                                break
                         obj.save(curr)
                         if isinstance(obj, Episode):
                             con.commit()
@@ -314,32 +325,34 @@ class Stockkeeper(Spawned):
                 except Exception as e:
                     logger.exception('%s', e)
                     self.stop_flag.set()
-        self.q_out.cancel_join_thread()
         logger.info("Exit")
 
 
 class TradeConverter(Spawned):
 
-    def __init__(self, q, stop_flag, pair, sq, q_in, logging_queue):
-        super().__init__(logging_queue, stop_flag)
+    def __init__(self, q, stop_flag, pair, q_snapshots, q_unordered,
+                 log_queue, log_level=logging.INFO):
+        super().__init__(log_queue, stop_flag, log_level)
         self.q = q
         self.pair = pair
-        self.q_in = q_in
-        self.sq = sq
+        self.q_unordered = q_unordered
+        self.q_snapshots = q_snapshots
 
     def __call__(self):
         self._call_init()
 
         logger = logging.getLogger("bitfinex.TradeConverter")
+        logger.info('Started')
         try:
             snapshot_id = 0
-            while not self.stop_flag.is_set():
+            while True:
                 try:
-                    logger.debug("Waiting for trades ...")
-                    data, lts = self.q.get(timeout=1)
+                    data, lts = self.q.get(timeout=5)
                 except Empty:
-                    logger.debug("Timeout waiting for trades, restarting ..")
-                    continue
+                    if not self.stop_flag.is_set():
+                        continue
+                    else:
+                        break
                 logger.debug("%i %s" % (snapshot_id, data))
                 *data, rts = data
                 lts = datetime.fromtimestamp(lts)
@@ -354,7 +367,7 @@ class TradeConverter(Spawned):
                     # get new snapshot_id from process_raw_order_book()
                     while not self.stop_flag.is_set():
                         try:
-                            snapshot_id = self.sq.get(timeout=1)
+                            snapshot_id = self.q_snapshots.get(timeout=1)
                             logger.debug("New snapshot_id: %i" % snapshot_id)
                             break
                         except Empty:
@@ -364,31 +377,33 @@ class TradeConverter(Spawned):
                     continue
                     # data = data[0]
                 for d in data:
-                    self.q_in.put(Trade(lts, rts,  d[0], self.pair,
-                                        datetime.fromtimestamp(
-                                            d[1]/1000),
-                                        d[2], d[3], snapshot_id))
+                    self.q_unordered.put(Trade(lts, rts,  d[0],
+                                               self.pair,
+                                               datetime.fromtimestamp(
+                                                   d[1]/1000),
+                                               d[2], d[3], snapshot_id))
 
         except Exception as e:
             logger.exception('%s', e)
             self.stop_flag.set()
-        self.q.cancel_join_thread()
         logger.info('Exit')
 
 
 class EventConverter(Spawned):
 
-    def __init__(self, q, stop_flag, pair, sq, ob_len, q_in, logging_queue):
-        super().__init__(logging_queue, stop_flag)
+    def __init__(self, q, stop_flag, pair, q_snapshots, ob_len, q_unordered,
+                 log_queue, log_level=logging.INFO):
+        super().__init__(log_queue, stop_flag, log_level)
         self.q = q
         self.pair = pair
         self.ob_len = ob_len
-        self.q_in = q_in
-        self.sq = sq
+        self.q_unordered = q_unordered
+        self.q_snapshots = q_snapshots
 
     def __call__(self):
         self._call_init()
         logger = logging.getLogger("bitfinex.EventConverter")
+        logger.info('Started')
         try:
             episode_no = 0
             event_no = 1
@@ -396,11 +411,14 @@ class EventConverter(Spawned):
             increase_episode_no = False  # The first 'addition' event
             snapshot_id = 0
 
-            while not self.stop_flag.is_set():
+            while True:
                 try:
-                    data, lts = self.q.get(timeout=1)
+                    data, lts = self.q.get(timeout=2)
                 except Empty:
-                    continue
+                    if not self.stop_flag.is_set():
+                        continue
+                    else:
+                        break
                 logger.debug("%i %s" % (snapshot_id, data))
                 *data, rts = data
                 rts = datetime.fromtimestamp(rts/1000)
@@ -408,7 +426,7 @@ class EventConverter(Spawned):
                 if isinstance(data[0][0], list):  # A new snapshot started
                     snapshot_id = start_new_snapshot(self.ob_len, self.pair)
                     logger.debug("Started new snapshot: %i" % snapshot_id)
-                    self.sq.put(snapshot_id)
+                    self.q_snapshots.put(snapshot_id)
                     episode_no = 0
                     event_no = 1
                     episode_starts = None
@@ -419,10 +437,10 @@ class EventConverter(Spawned):
                         if increase_episode_no:
                             # it is the first event for an episode
                             # so insert PREVIOUS episode
-                            self.q_in.put(Episode(datetime.now(),
-                                                  episode_starts,
-                                                  snapshot_id,
-                                                  episode_no, rts))
+                            self.q_unordered.put(Episode(datetime.now(),
+                                                         episode_starts,
+                                                         snapshot_id,
+                                                         episode_no, rts))
                             increase_episode_no = False
                             episode_no += 10
                             if episode_no == OrderBookEvent.MAX_EPISODE_NO:
@@ -442,15 +460,15 @@ class EventConverter(Spawned):
                             # episode 0 starts and ends at the same time
                             episode_starts = rts
 
-                    self.q_in.put(OrderBookEvent(lts, rts, self.pair, d[0],
-                                                 d[1], d[2], snapshot_id,
-                                                 episode_no, event_no))
+                    self.q_unordered.put(OrderBookEvent(lts, rts, self.pair,
+                                                        d[0], d[1], d[2],
+                                                        snapshot_id,
+                                                        episode_no, event_no))
                     event_no += 1
 
         except Exception as e:
             logger.exception('%s', e)
             self.stop_flag.set()
-        self.q.cancel_join_thread()
         logger.info('Exit')
 
 
@@ -483,7 +501,7 @@ def start_new_snapshot(ob_len, pair):
     return snapshot_id
 
 
-def capture(pair, stop_flag, logging_queue):
+def capture(pair, stop_flag, log_queue):
 
     logger = logging.getLogger("bitfinex.capture")
     ob_len = 100
@@ -494,7 +512,7 @@ def capture(pair, stop_flag, logging_queue):
         logger.exception('%s', e)
         return
 
-    wss = BtfxWss(log_level=logging.DEBUG)
+    wss = BtfxWss(log_level=logging.INFO)
     wss.start()
 
     while not wss.conn.connected.is_set():
@@ -506,28 +524,38 @@ def capture(pair, stop_flag, logging_queue):
 
     time.sleep(5)
 
-    sq = Queue()
-    q_in = Queue()
-    q_out = Queue()
+    q_snapshots = Queue()
+    q_unordered = Queue()
+    q_ordered = Queue()
 
-    ts = [Process(target=TradeConverter(wss.trades(pair), stop_flag,
-                                        pair, sq, q_in, logging_queue)),
+    ts = [Process(target=TradeConverter(wss.trades(pair), stop_flag, pair,
+                                        q_snapshots, q_unordered,
+                                        log_queue, logging.DEBUG)),
           Process(target=EventConverter(wss.raw_books(pair), stop_flag, pair,
-                                        sq, ob_len, q_in, logging_queue)),
-          Process(target=Orderer(q_in, q_out, stop_flag, logging_queue)),
-          Process(target=Stockkeeper(q_out, stop_flag, logging_queue)),
+                                        q_snapshots, ob_len, q_unordered,
+                                        log_queue, logging.DEBUG)),
+          Process(target=Orderer(q_unordered, q_ordered, stop_flag,
+                                 log_queue, logging.DEBUG, delay=2)),
+          Process(target=Stockkeeper(q_ordered, stop_flag, log_queue,
+                                     logging.DEBUG)),
           ]
 
     for t in ts:
         t.start()
 
-    for t in ts:
-        t.join()
+    while not stop_flag.is_set():
+        time.sleep(1)
+
+    logger.info('Ctrl-C has been pressed, exiting from the application ...')
 
     wss.unsubscribe_from_trades(pair)
     wss.unsubscribe_from_raw_order_book(pair)
-
     time.sleep(2)
-
     wss.stop()
-    logger.info("Finished!")
+####
+    for t in ts:
+        pid = t.pid
+        t.join()
+        logger.debug('Process %i terminated, exitcode %i' % (pid, t.exitcode))
+
+    logger.info("Exit")

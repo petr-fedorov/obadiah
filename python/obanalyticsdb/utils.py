@@ -26,11 +26,11 @@ def listener_process(logging_queue, log_file_name):
         except Exception:
             print('Whoops! Problem:', file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-    print('Exit - listener_process()', file=sys.stdout)
+    #  print('Exit - listener_process()', file=sys.stdout)
 
 
-def logging_configurer(logging_queue):
+def logging_configurer(logging_queue, logging_level=logging.DEBUG):
     h = logging.handlers.QueueHandler(logging_queue)
     root = logging.getLogger()
     root.addHandler(h)
-    root.setLevel(logging.DEBUG)
+    root.setLevel(logging_level)

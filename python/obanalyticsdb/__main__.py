@@ -1,6 +1,6 @@
 import logging
 import logging.handlers
-import multiprocessing
+from multiprocessing import set_start_method, Event, Process, Queue
 import signal
 import argparse
 import obanalyticsdb.bitfinex as bf
@@ -17,31 +17,34 @@ def main():
 
     args = parser.parse_args()
     stream = args.stream.split(':')
+    # We have to use the default context since BtfxWss uses it to create Queues
+    set_start_method('spawn')
 
-    multiprocessing.set_start_method('spawn')
-    stop_flag = multiprocessing.Event()
+    stop_flag = Event()
 
     signal.signal(signal.SIGINT, lambda n, f: stop_flag.set())
 
-    logging_queue = multiprocessing.Queue(-1)
-    listener = multiprocessing.Process(target=listener_process,
-                                       args=(logging_queue,
-                                             "oba%s_%s.log" % tuple(stream)))
+    log_queue = Queue(-1)
+    listener = Process(target=listener_process,
+                       args=(log_queue, "oba%s_%s.log" % tuple(stream)))
     listener.start()
 
-    logging_configurer(logging_queue)
+    logging_configurer(log_queue)
+    logger = logging.getLogger("obanalyticsdb.main")
+    logger.info('Started')
 
     exchanges = {'BITFINEX': bf.capture}
 
     try:
         capture = exchanges[stream[1]]
         print("Press Ctrl-C to stop ...")
-        capture(stream[0], stop_flag, logging_queue)
+        capture(stream[0], stop_flag, log_queue)
     except KeyError as e:
         logging.getLogger("bitfinex.main").exception(e)
         print('Exchange %s is not supported (yet)' % stream[1])
 
-    logging_queue.put_nowait(None)
+    logger.info('Exit')
+    log_queue.put_nowait(None)
     listener.join()
 
 
