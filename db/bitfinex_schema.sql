@@ -123,30 +123,6 @@ $$;
 ALTER FUNCTION bitfinex.bf_depth_summary_before_episode_v(snapshot_id integer, first_episode_no integer, last_episode_no integer, bps_step numeric) OWNER TO "ob-analytics";
 
 --
--- Name: bf_order_book_episodes_capture_spreads(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE FUNCTION bitfinex.bf_order_book_episodes_capture_spreads() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-
-BEGIN 
-
-	INSERT INTO bitfinex.bf_spreads
-	SELECT * FROM bitfinex.bf_spread_before_period_starts_v(NEW.snapshot_id, NEW.episode_no, NEW.episode_no);
-
-	INSERT INTO bitfinex.bf_spreads
-	SELECT * FROM bitfinex.bf_spread_after_period_starts_v(NEW.snapshot_id, NEW.episode_no, NEW.episode_no);
-	
-	RETURN NULL;
-END;
-
-$$;
-
-
-ALTER FUNCTION bitfinex.bf_order_book_episodes_capture_spreads() OWNER TO "ob-analytics";
-
---
 -- Name: bf_order_book_episodes_update_trades(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -867,8 +843,8 @@ ALTER SEQUENCE bitfinex.bf_snapshots_snapshot_id_seq OWNED BY bitfinex.bf_snapsh
 --
 
 CREATE VIEW bitfinex.bf_snapshots_v AS
- SELECT bf_snapshots.snapshot_id,
-    bf_snapshots.len,
+ SELECT s.snapshot_id,
+    s.len,
     e.events,
     e.last_episode,
     t.trades,
@@ -876,23 +852,25 @@ CREATE VIEW bitfinex.bf_snapshots_v AS
     date_trunc('seconds'::text, GREATEST(e.max_e_et, t.max_t_et)) AS ends,
     t.matched_to_episode,
     t.matched_to_event
-   FROM ((bitfinex.bf_snapshots
-     LEFT JOIN ( SELECT bf_order_book_events.snapshot_id,
+   FROM ((bitfinex.bf_snapshots s
+     LEFT JOIN LATERAL ( SELECT bf_order_book_events.snapshot_id,
             count(*) AS events,
             min(bf_order_book_events.exchange_timestamp) AS min_e_et,
             max(bf_order_book_events.exchange_timestamp) AS max_e_et,
             max(bf_order_book_events.episode_no) AS last_episode
            FROM bitfinex.bf_order_book_events
+          WHERE (bf_order_book_events.snapshot_id = s.snapshot_id)
           GROUP BY bf_order_book_events.snapshot_id) e USING (snapshot_id))
-     LEFT JOIN ( SELECT bf_trades.snapshot_id,
+     LEFT JOIN LATERAL ( SELECT bf_trades.snapshot_id,
             count(*) AS trades,
             count(*) FILTER (WHERE (bf_trades.event_no IS NOT NULL)) AS matched_to_event,
             count(*) FILTER (WHERE (bf_trades.episode_no IS NOT NULL)) AS matched_to_episode,
             min(bf_trades.exchange_timestamp) AS min_t_et,
             max(bf_trades.exchange_timestamp) AS max_t_et
            FROM bitfinex.bf_trades
+          WHERE (bf_trades.snapshot_id = s.snapshot_id)
           GROUP BY bf_trades.snapshot_id) t USING (snapshot_id))
-  ORDER BY bf_snapshots.snapshot_id DESC;
+  ORDER BY s.snapshot_id DESC;
 
 
 ALTER TABLE bitfinex.bf_snapshots_v OWNER TO "ob-analytics";
@@ -1004,13 +982,6 @@ CREATE INDEX bf_trades_idx_snapshot_id_episode_no_event_no ON bitfinex.bf_trades
 --
 
 CREATE TRIGGER a_update_trades AFTER INSERT ON bitfinex.bf_order_book_episodes FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_episodes_update_trades();
-
-
---
--- Name: bf_order_book_episodes b_capture_spreads; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE TRIGGER b_capture_spreads AFTER INSERT ON bitfinex.bf_order_book_episodes FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_episodes_capture_spreads();
 
 
 --

@@ -68,6 +68,16 @@ class Episode(DatabaseInsertion):
                      (self.snapshot_id, self.episode_no,
                       self.exchange_timestamp))
 
+    def insert_spread(self, curr):
+        curr.execute("INSERT INTO bitfinex.bf_spreads "
+                     "SELECT * "
+                     "FROM bitfinex.bf_spread_before_period_starts_v"
+                     "(%(s_id)s, %(episode)s, %(episode)s) UNION ALL "
+                     "SELECT * "
+                     "FROM bitfinex.bf_spread_after_period_starts_v"
+                     "(%(s_id)s, %(episode)s, %(episode)s) ",
+                     {'s_id': self.snapshot_id, 'episode': self.episode_no})
+
 
 class OrderBookEvent(DatabaseInsertion):
     MAX_EPISODE_NO = 2147483647
@@ -231,8 +241,8 @@ class Orderer(Spawned):
         self.alogger.debug('Suspend arrive - current_delay %f, l_a %s ' %
                            (self._current_delay().total_seconds(),
                             self.latest_arrived.strftime("%H-%M-%S.%f")[:-3]))
-        self.alogger.debug('Unprocessed q_unordered size: %i' %
-                           self.q_unordered.qsize())
+        self.alogger.info('Unprocessed q_unordered size: %i' %
+                          self.q_unordered.qsize())
 
     def _depart_to_database(self):
         self.dlogger.debug('Start depart - current delay %f, l_d %s' %
@@ -268,8 +278,8 @@ class Orderer(Spawned):
         self.dlogger.debug('Suspend depart - current_delay %f, l_d %s ' %
                            (self._current_delay().total_seconds(),
                             self.latest_departed.strftime("%H-%M-%S.%f")[:-3]))
-        self.dlogger.debug('Unprocessed q_ordered size: %i' %
-                           self.q_ordered.qsize())
+        self.dlogger.info('Unprocessed q_ordered size: %i' %
+                          self.q_ordered.qsize())
 
     def __call__(self):
         self._call_init()
@@ -284,7 +294,7 @@ class Orderer(Spawned):
                    and self.q_ordered.qsize() == 0):
             self._arrive_from_exchange()
             self._depart_to_database()
-            logger.debug("Unprocessed heap size: %i" % len(self.buffer))
+            logger.info("Unprocessed heap size: %i" % len(self.buffer))
         logger.info('Exit %r ' % (self,))
 
 
@@ -294,10 +304,11 @@ def connect_db():
 
 class Stockkeeper(Spawned):
 
-    def __init__(self, q_ordered, stop_flag, log_queue,
+    def __init__(self, q_ordered, q_spreader, stop_flag, log_queue,
                  log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q_ordered = q_ordered
+        self.q_spreader = q_spreader
 
     def __call__(self):
         self._call_init()
@@ -322,6 +333,42 @@ class Stockkeeper(Spawned):
                         if isinstance(obj, Episode):
                             con.commit()
                             curr.execute("SET CONSTRAINTS ALL DEFERRED")
+                            self.q_spreader.put(obj)
+                except Exception as e:
+                    logger.exception('%s', e)
+                    self.stop_flag.set()
+        logger.info("Exit")
+
+
+class Spreader(Spawned):
+
+    def __init__(self, n, q_spreader, stop_flag, log_queue,
+                 log_level=logging.INFO):
+        super().__init__(log_queue, stop_flag, log_level)
+        self.q_spreader = q_spreader
+        self.n = n
+
+    def __call__(self):
+        self._call_init()
+
+        logger = logging.getLogger("bitfinex.Spreader_%i" % self.n)
+        logger.info('Started')
+        with connect_db() as con:
+            con.set_session(autocommit=True)
+            with con.cursor() as curr:
+                try:
+                    while True:
+                        try:
+                            episode = self.q_spreader.get(timeout=5)
+                            logger.debug('%r' % episode)
+                            logger.info('Unprocessed q_spreader size %i' %
+                                        self.q_spreader.qsize())
+                        except Empty:
+                            if not self.stop_flag.is_set():
+                                continue
+                            else:
+                                break
+                        episode.insert_spread(curr)
                 except Exception as e:
                     logger.exception('%s', e)
                     self.stop_flag.set()
@@ -450,8 +497,8 @@ class EventConverter(Spawned):
                             # the end time of this episode will be
                             # the start time for the next one
                             episode_starts = rts
-                            logger.debug("Unprocessed queue size: %i" %
-                                         (self.q.qsize(),))
+                            logger.info("Unprocessed queue size: %i" %
+                                        (self.q.qsize(),))
                     elif not increase_episode_no:
                         # it is the first 'addition' event of an episode
                         increase_episode_no = True
@@ -527,18 +574,20 @@ def capture(pair, stop_flag, log_queue):
     q_snapshots = Queue()
     q_unordered = Queue()
     q_ordered = Queue()
+    q_spreader = Queue()
 
     ts = [Process(target=TradeConverter(wss.trades(pair), stop_flag, pair,
                                         q_snapshots, q_unordered,
-                                        log_queue, logging.DEBUG)),
+                                        log_queue)),
           Process(target=EventConverter(wss.raw_books(pair), stop_flag, pair,
                                         q_snapshots, ob_len, q_unordered,
-                                        log_queue, logging.DEBUG)),
+                                        log_queue)),
           Process(target=Orderer(q_unordered, q_ordered, stop_flag,
-                                 log_queue, logging.DEBUG, delay=2)),
-          Process(target=Stockkeeper(q_ordered, stop_flag, log_queue,
-                                     logging.DEBUG)),
-          ]
+                                 log_queue, delay=2)),
+          Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag,
+                                     log_queue)),
+          ] + [Process(target=Spreader(n, q_spreader, stop_flag, log_queue))
+               for n in range(2)]
 
     for t in ts:
         t.start()
