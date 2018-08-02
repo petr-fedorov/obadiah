@@ -43,13 +43,11 @@ class Episode(DatabaseInsertion):
                  local_timestamp,
                  exchange_timestamp,
                  snapshot_id,
-                 episode_no,
-                 next_episode_starts):
+                 episode_no):
         super().__init__(local_timestamp, exchange_timestamp)
         self.priority = 2  # Lower priority than OrderBookEvent below
         self.snapshot_id = snapshot_id
         self.episode_no = episode_no
-        self.next_episode_starts = next_episode_starts
 
     def __repr__(self):
         return "Ep-de no: %i e:%s p:%i s:%i l:%s" % (
@@ -454,7 +452,7 @@ class EventConverter(Spawned):
         try:
             episode_no = 0
             event_no = 1
-            episode_starts = None
+            episode_rts = datetime(1970, 8, 1, 20, 15)
             increase_episode_no = False  # The first 'addition' event
             snapshot_id = 0
 
@@ -476,7 +474,6 @@ class EventConverter(Spawned):
                     self.q_snapshots.put(snapshot_id)
                     episode_no = 0
                     event_no = 1
-                    episode_starts = None
                     increase_episode_no = False
                     data = data[0]
                 for d in data:
@@ -485,33 +482,33 @@ class EventConverter(Spawned):
                             # it is the first event for an episode
                             # so insert PREVIOUS episode
                             self.q_unordered.put(Episode(datetime.now(),
-                                                         episode_starts,
+                                                         episode_rts,
                                                          snapshot_id,
-                                                         episode_no, rts))
+                                                         episode_no))
                             increase_episode_no = False
                             episode_no += 10
                             if episode_no == OrderBookEvent.MAX_EPISODE_NO:
                                 self.stop_flag.set()
                                 break
                             event_no = 1
-                            # the end time of this episode will be
-                            # the start time for the next one
-                            episode_starts = rts
+                            episode_rts = rts
                             logger.info("Unprocessed queue size: %i" %
                                         (self.q.qsize(),))
                     elif not increase_episode_no:
                         # it is the first 'addition' event of an episode
                         increase_episode_no = True
 
-                        if episode_no == 0:
-                            # episode 0 starts and ends at the same time
-                            episode_starts = rts
-
                     self.q_unordered.put(OrderBookEvent(lts, rts, self.pair,
                                                         d[0], d[1], d[2],
                                                         snapshot_id,
                                                         episode_no, event_no))
                     event_no += 1
+
+                    # An episode's exchange_timestamp must be equal to
+                    # MAX(exchange_timestamp) among events that belongs to the
+                    # episode
+                    if rts > episode_rts:
+                        episode_rts = rts
 
         except Exception as e:
             logger.exception('%s', e)
@@ -587,7 +584,7 @@ def capture(pair, stop_flag, log_queue):
           Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag,
                                      log_queue)),
           ] + [Process(target=Spreader(n, q_spreader, stop_flag, log_queue))
-               for n in range(2)]
+               for n in range(3)]
 
     for t in ts:
         t.start()
