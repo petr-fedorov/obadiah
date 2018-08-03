@@ -69,10 +69,10 @@ class Episode(DatabaseInsertion):
     def insert_spread(self, curr):
         curr.execute("INSERT INTO bitfinex.bf_spreads "
                      "SELECT * "
-                     "FROM bitfinex.bf_spread_before_period_starts_v"
+                     "FROM bitfinex.bf_spread_between_episodes_v"
                      "(%(s_id)s, %(episode)s, %(episode)s) UNION ALL "
                      "SELECT * "
-                     "FROM bitfinex.bf_spread_after_period_starts_v"
+                     "FROM bitfinex.bf_spread_after_episode_v"
                      "(%(s_id)s, %(episode)s, %(episode)s) ",
                      {'s_id': self.snapshot_id, 'episode': self.episode_no})
 

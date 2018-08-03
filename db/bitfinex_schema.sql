@@ -395,10 +395,10 @@ CREATE TABLE bitfinex.bf_spreads (
 ALTER TABLE bitfinex.bf_spreads OWNER TO "ob-analytics";
 
 --
--- Name: bf_spread_after_period_starts_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_spread_after_episode_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.bf_spread_after_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
+CREATE FUNCTION bitfinex.bf_spread_after_episode_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
     LANGUAGE sql
     AS $$
 
@@ -411,7 +411,7 @@ WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
 							SUM(order_qty) AS qty,
 							min(order_price) FILTER (WHERE side = 'A') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_ask,
 							max(order_price) FILTER (WHERE side = 'B') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_bid
-					FROM bitfinex.bf_active_orders_after_period_starts_v v
+					FROM bitfinex.bf_active_orders_after_episode_v v
 					WHERE v.snapshot_id = s_id AND v.episode_no BETWEEN first_episode_no AND last_episode_no
 					GROUP BY v.snapshot_id, v.episode_no, side, order_price
 					) a
@@ -431,13 +431,13 @@ FROM 	(SELECT * FROM base WHERE side = 'A' ) asks JOIN
 $$;
 
 
-ALTER FUNCTION bitfinex.bf_spread_after_period_starts_v(s_id integer, first_episode_no integer, last_episode_no integer) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.bf_spread_after_episode_v(s_id integer, first_episode_no integer, last_episode_no integer) OWNER TO "ob-analytics";
 
 --
--- Name: bf_spread_before_period_starts_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_spread_between_episodes_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.bf_spread_before_period_starts_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
+CREATE FUNCTION bitfinex.bf_spread_between_episodes_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
     LANGUAGE sql
     AS $$
 
@@ -450,7 +450,7 @@ WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
 							SUM(order_qty) AS qty,
 							min(order_price) FILTER (WHERE side = 'A') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_ask,
 							max(order_price) FILTER (WHERE side = 'B') OVER (PARTITION BY v.snapshot_id, v.episode_no, side) AS min_bid
-					FROM bitfinex.bf_active_orders_before_period_starts_v v
+					FROM bitfinex.bf_active_orders_between_episodes_v v
 					WHERE v.snapshot_id = s_id AND v.episode_no BETWEEN first_episode_no AND last_episode_no
 					GROUP BY v.snapshot_id, v.episode_no, side, order_price
 					) a
@@ -470,7 +470,7 @@ FROM 	(SELECT * FROM base WHERE side = 'A' ) asks JOIN
 $$;
 
 
-ALTER FUNCTION bitfinex.bf_spread_before_period_starts_v(s_id integer, first_episode_no integer, last_episode_no integer) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.bf_spread_between_episodes_v(s_id integer, first_episode_no integer, last_episode_no integer) OWNER TO "ob-analytics";
 
 --
 -- Name: bf_trades_check_episode_no_order(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
@@ -590,10 +590,10 @@ CREATE TABLE bitfinex.bf_order_book_events (
 ALTER TABLE bitfinex.bf_order_book_events OWNER TO "ob-analytics";
 
 --
--- Name: bf_active_orders_after_period_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_active_orders_after_episode_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE VIEW bitfinex.bf_active_orders_after_period_starts_v AS
+CREATE VIEW bitfinex.bf_active_orders_after_episode_v AS
  SELECT ob.side,
     ob.order_price,
     ob.order_id,
@@ -626,13 +626,20 @@ CREATE VIEW bitfinex.bf_active_orders_after_period_starts_v AS
         END)::numeric);
 
 
-ALTER TABLE bitfinex.bf_active_orders_after_period_starts_v OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.bf_active_orders_after_episode_v OWNER TO "ob-analytics";
 
 --
--- Name: bf_active_orders_before_period_starts_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+-- Name: VIEW bf_active_orders_after_episode_v; Type: COMMENT; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE VIEW bitfinex.bf_active_orders_before_period_starts_v AS
+COMMENT ON VIEW bitfinex.bf_active_orders_after_episode_v IS 'An actual state of an order book after an episode';
+
+
+--
+-- Name: bf_active_orders_between_episodes_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE VIEW bitfinex.bf_active_orders_between_episodes_v AS
  SELECT ob.side,
     ob.order_price,
     ob.order_id,
@@ -688,7 +695,14 @@ CREATE VIEW bitfinex.bf_active_orders_before_period_starts_v AS
         END)::numeric);
 
 
-ALTER TABLE bitfinex.bf_active_orders_before_period_starts_v OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.bf_active_orders_between_episodes_v OWNER TO "ob-analytics";
+
+--
+-- Name: VIEW bf_active_orders_between_episodes_v; Type: COMMENT; Schema: bitfinex; Owner: ob-analytics
+--
+
+COMMENT ON VIEW bitfinex.bf_active_orders_between_episodes_v IS 'A possible state of an order book which might happen between episodes when the spread is widest. ';
+
 
 --
 -- Name: bf_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
@@ -865,6 +879,34 @@ CREATE VIEW bitfinex.bf_snapshots_v AS
 
 
 ALTER TABLE bitfinex.bf_snapshots_v OWNER TO "ob-analytics";
+
+--
+-- Name: bf_trades_beyond_spread_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE VIEW bitfinex.bf_trades_beyond_spread_v AS
+ SELECT t.snapshot_id,
+    t.episode_no,
+    t.id,
+    t.trade_timestamp,
+    t.qty,
+    t.price,
+    t.pair,
+    t.local_timestamp,
+    t.exchange_timestamp,
+    t.event_no,
+    t.direction,
+    s.best_bid_price,
+    s.best_ask_price,
+    s.best_bid_qty,
+    s.best_ask_qty,
+    s.timing
+   FROM (bitfinex.bf_trades t
+     JOIN bitfinex.bf_spreads s USING (snapshot_id, episode_no))
+  WHERE ((s.timing = 'B'::bpchar) AND (NOT ((t.price >= s.best_bid_price) AND (t.price <= s.best_ask_price))));
+
+
+ALTER TABLE bitfinex.bf_trades_beyond_spread_v OWNER TO "ob-analytics";
 
 --
 -- Name: bf_trades_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics

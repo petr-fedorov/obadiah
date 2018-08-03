@@ -59,7 +59,7 @@ bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147
 								          "     ELSE floor(order_price/", precision," )* ", precision,
               						" END AS price,
                             sum(order_qty) AS volume
-                    FROM bitfinex.bf_active_orders_after_period_starts_v
+                    FROM bitfinex.bf_active_orders_after_episode_v
                     WHERE snapshot_id = ",snapshot_id ,
                   "   AND episode_no BETWEEN ",min.episode_no, " AND ", max.episode_no,
                   " GROUP BY 1, 2 ORDER BY 1, 2 DESC" )
@@ -96,7 +96,7 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
                                               , order_qty AS volume
                                               , cumm_qty AS liquidity
                                               , bps
-                                        FROM bitfinex.bf_active_orders_after_period_starts_v ",
+                                        FROM bitfinex.bf_active_orders_after_episode_v ",
                                      where_cond, " AND side = 'B' AND order_price >= ", min.bid))
 
   asks  <-    dbGetQuery(conn, paste0(" SELECT order_id AS id
@@ -104,7 +104,7 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
                                               , order_qty AS volume
                                               , cumm_qty AS liquidity
                                               , bps
-                                        FROM bitfinex.bf_active_orders_after_period_starts_v ",
+                                        FROM bitfinex.bf_active_orders_after_episode_v ",
                                       where_cond, " AND side = 'A' AND order_price <= ", max.ask))
 
   list(timestamp=ts, asks=asks, bids=bids)
