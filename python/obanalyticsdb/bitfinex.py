@@ -326,14 +326,15 @@ class Stockkeeper(Spawned):
                             if not self.stop_flag.is_set():
                                 continue
                             else:
+                                con.rollback()
                                 break
                         obj.save(curr)
                         if isinstance(obj, Episode):
                             con.commit()
                             curr.execute("SET CONSTRAINTS ALL DEFERRED")
                             self.q_spreader.put(obj)
-                except Exception as e:
-                    logger.exception('%s', e)
+                except Exception:
+                    logger.exception('An exception occured')
                     self.stop_flag.set()
         logger.info("Exit")
 

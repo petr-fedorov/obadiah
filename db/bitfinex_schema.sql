@@ -1124,19 +1124,27 @@ ALTER TABLE ONLY bitfinex.bf_order_book_episodes
 
 
 --
--- Name: bf_order_book_events bf_order_book_events_fkey_pair; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_order_book_events bf_order_book_events_fkey_bf_order_book_episodes; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitfinex.bf_order_book_events
-    ADD CONSTRAINT bf_order_book_events_fkey_pair FOREIGN KEY (pair) REFERENCES bitfinex.bf_pairs(pair) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+    ADD CONSTRAINT bf_order_book_events_fkey_bf_order_book_episodes FOREIGN KEY (snapshot_id, episode_no) REFERENCES bitfinex.bf_order_book_episodes(snapshot_id, episode_no) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --
--- Name: bf_order_book_events bf_order_book_events_fkey_snapshot_id; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_order_book_events bf_order_book_events_fkey_bf_pairs; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitfinex.bf_order_book_events
-    ADD CONSTRAINT bf_order_book_events_fkey_snapshot_id FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+    ADD CONSTRAINT bf_order_book_events_fkey_bf_pairs FOREIGN KEY (pair) REFERENCES bitfinex.bf_pairs(pair) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+
+
+--
+-- Name: bf_order_book_events bf_order_book_events_fkey_bf_snapshots; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.bf_order_book_events
+    ADD CONSTRAINT bf_order_book_events_fkey_bf_snapshots FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --
