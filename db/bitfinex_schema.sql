@@ -141,8 +141,8 @@ BEGIN
 			FROM (
 				SELECT 	t.id,
 						t.episode_no,
-						max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.id) AS b_e,
-						min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.id DESC) AS a_e
+						max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp) AS b_e,
+						min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp DESC) AS a_e
 				FROM bitfinex.bf_trades t
 				WHERE t.snapshot_id = NEW.snapshot_id
 			) a
@@ -329,8 +329,8 @@ CREATE FUNCTION bitfinex.bf_order_book_events_match_trades_to_events() RETURNS t
     AS $$
 
 DECLARE
-	tr_id bigint;
-	last_matched_trade bitfinex.bf_trades.id%TYPE;
+	tr_id RECORD;
+	last_matched_trade bitfinex.bf_trades.exchange_timestamp%TYPE;
 	
 BEGIN
 	
@@ -339,13 +339,13 @@ BEGIN
 
 	-- Let's find the last trade which was matched to some event from the PREVIOUS episode
 	-- All trades after such trade can be matched to an event from the current episode 
-	SELECT max(id) INTO last_matched_trade
+	SELECT max(exchange_timestamp) INTO last_matched_trade
 	FROM bitfinex.bf_trades t
 	WHERE snapshot_id = NEW.snapshot_id
 	  AND episode_no < NEW.episode_no;
 
 	IF last_matched_trade IS NULL THEN
-		last_matched_trade = -1;
+		last_matched_trade = '1970-08-01 20:15:00+3'::timestamptz;
 	END IF;
 
 	SELECT id INTO tr_id
@@ -354,9 +354,8 @@ BEGIN
 	  AND t.qty 		= -NEW.event_qty
 	  AND t.snapshot_id = NEW.snapshot_id
 	  AND t.event_no IS NULL -- we consider only unmatched trades
-	  AND t.exchange_timestamp <= NEW.exchange_timestamp
-	  AND t.id > last_matched_trade
-	ORDER BY id
+	  AND t.exchange_timestamp BETWEEN last_matched_trade AND NEW.exchange_timestamp
+	ORDER BY exchange_timestamp
 	LIMIT 1;
 
 	IF FOUND THEN
@@ -364,19 +363,18 @@ BEGIN
 		UPDATE bitfinex.bf_trades 
 		SET episode_no = NEW.episode_no, 
 			event_no = NEW.event_no
-		WHERE id = tr_id AND bf_trades.snapshot_id = NEW.snapshot_id;		
+		WHERE id = tr_id.id AND bf_trades.snapshot_id = NEW.snapshot_id;		
 		NEW.matched = True;
 
 	ELSE
 
-		SELECT id INTO tr_id
-		FROM ( 	SELECT id, SUM(qty) OVER (PARTITION BY t.snapshot_id, t.price ORDER BY t.id) AS total_qty  
+		SELECT id, exchange_timestamp INTO tr_id
+		FROM ( 	SELECT id, exchange_timestamp, SUM(qty) OVER (PARTITION BY t.snapshot_id, t.price ORDER BY t.exchange_timestamp, t.id ) AS total_qty  
 				FROM bitfinex.bf_trades t
 				WHERE t.price		= NEW.order_price
 				AND t.snapshot_id = NEW.snapshot_id
 				AND t.event_no IS NULL -- we consider only unmatched trades
-				AND t.exchange_timestamp <= NEW.exchange_timestamp
-				AND t.id > last_matched_trade
+				AND t.exchange_timestamp BETWEEN last_matched_trade AND NEW.exchange_timestamp
 				) t
 		WHERE t.total_qty = -NEW.event_qty;
 
@@ -387,9 +385,8 @@ BEGIN
 			WHERE t.price		= NEW.order_price
 			AND t.snapshot_id = NEW.snapshot_id
 			AND t.event_no IS NULL
-			AND t.exchange_timestamp <= NEW.exchange_timestamp
-			AND t.id > last_matched_trade
-			AND t.id <= tr_id;
+			AND t.exchange_timestamp BETWEEN last_matched_trade AND tr_id.exchange_timestamp
+			AND t.id <= tr_id.id;
 
 			NEW.matched = True;
 		END IF;
@@ -544,7 +541,7 @@ BEGIN
 	SELECT max(episode_no) INTO ep_no
 	FROM bitfinex.bf_trades
 	WHERE snapshot_id = NEW.snapshot_id 
-	  AND id < NEW.id;
+	  AND exchange_timestamp < NEW.exchange_timestamp;
 	  
 	IF FOUND THEN 
 		IF ep_no > NEW.episode_no THEN
@@ -556,7 +553,7 @@ BEGIN
 	SELECT min(episode_no) INTO ep_no
 	FROM bitfinex.bf_trades
 	WHERE snapshot_id = NEW.snapshot_id 
-	  AND id > NEW.id;
+	  AND exchange_timestamp > NEW.exchange_timestamp;
 	  
 	IF FOUND THEN 
 		IF ep_no < NEW.episode_no THEN
@@ -1064,6 +1061,13 @@ CREATE INDEX bf_order_book_events_idx_update_next_episode_no ON bitfinex.bf_orde
 --
 
 CREATE INDEX bf_trades_idx_snapshot_id_episode_no_event_no ON bitfinex.bf_trades USING btree (snapshot_id, episode_no, event_no);
+
+
+--
+-- Name: bf_trades_idx_snapshot_id_exchange_timestamp; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_trades_idx_snapshot_id_exchange_timestamp ON bitfinex.bf_trades USING btree (snapshot_id, exchange_timestamp);
 
 
 --
