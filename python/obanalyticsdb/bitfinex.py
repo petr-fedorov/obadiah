@@ -43,11 +43,13 @@ class Episode(DatabaseInsertion):
                  local_timestamp,
                  exchange_timestamp,
                  snapshot_id,
-                 episode_no):
+                 episode_no,
+                 is_complete=True):
         super().__init__(local_timestamp, exchange_timestamp)
         self.priority = 2  # Lower priority than OrderBookEvent below
         self.snapshot_id = snapshot_id
         self.episode_no = episode_no
+        self.is_complete = is_complete
 
     def __repr__(self):
         return "Ep-de no: %i e:%s p:%i s:%i l:%s" % (
@@ -75,6 +77,14 @@ class Episode(DatabaseInsertion):
                      "FROM bitfinex.bf_spread_after_episode_v"
                      "(%(s_id)s, %(episode)s, %(episode)s) ",
                      {'s_id': self.snapshot_id, 'episode': self.episode_no})
+
+    def finalize(self, con):
+        if self.is_complete:
+            con.commit()
+            return True
+        else:
+            con.rollback()
+            return False
 
 
 class OrderBookEvent(DatabaseInsertion):
@@ -317,25 +327,32 @@ class Stockkeeper(Spawned):
             con.set_session(autocommit=False)
             with con.cursor() as curr:
                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
-                try:
-                    while True:
-                        try:
-                            obj = self.q_ordered.get(timeout=5)
-                            logger.debug('%r' % obj)
-                        except Empty:
-                            if not self.stop_flag.is_set():
-                                continue
+                while True:
+                    try:
+                        obj = self.q_ordered.get(timeout=5)
+                        if not self.stop_flag.is_set():
+                            obj.save(curr)
+                            if isinstance(obj, Episode):
+                                if obj.finalize(con):
+                                    logger.debug('Commited %r' % obj)
+                                    self.q_spreader.put(obj)
+                                else:
+                                    logger.debug('Rolled back %r' % obj)
+                                curr.execute("SET CONSTRAINTS ALL DEFERRED")
                             else:
-                                con.rollback()
-                                break
-                        obj.save(curr)
-                        if isinstance(obj, Episode):
-                            con.commit()
-                            curr.execute("SET CONSTRAINTS ALL DEFERRED")
-                            self.q_spreader.put(obj)
-                except Exception:
-                    logger.exception('An exception occured')
-                    self.stop_flag.set()
+                                logger.debug('Saved %r' % obj)
+                        else:
+                            logger.debug('Discarded %r' % obj)
+                    except Empty:
+                        if not self.stop_flag.is_set():
+                            continue
+                        else:
+                            con.rollback()
+                            break
+                    except Exception:
+                        logger.exception('An exception occured while '
+                                         'processing %s' % obj)
+                        self.stop_flag.set()
         logger.info("Exit")
 
 
@@ -470,6 +487,15 @@ class EventConverter(Spawned):
                 rts = datetime.fromtimestamp(rts/1000)
                 lts = datetime.fromtimestamp(lts)
                 if isinstance(data[0][0], list):  # A new snapshot started
+                    if episode_no > 0:
+                            # it is a switch to a new snapshot
+                            # so insert the last INCOMPLETE episode of the
+                            # PREVIOUS snapshot
+                        self.q_unordered.put(Episode(datetime.now(),
+                                                     episode_rts,
+                                                     snapshot_id,
+                                                     episode_no,
+                                                     False))
                     snapshot_id = start_new_snapshot(self.ob_len, self.pair)
                     logger.debug("Started new snapshot: %i" % snapshot_id)
                     self.q_snapshots.put(snapshot_id)
