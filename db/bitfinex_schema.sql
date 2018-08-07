@@ -133,24 +133,87 @@ CREATE FUNCTION bitfinex.bf_order_book_episodes_match_trades_to_episodes() RETUR
 DECLARE
 
 BEGIN
-	
-	UPDATE bitfinex.bf_trades t
-	SET episode_no = a.b_e
-	FROM (
-			SELECT *
+
+
+	WITH RECURSIVE 
+		admissible_episode_range AS (
+			SELECT 	t.id,
+					t.price,
+					t.snapshot_id,
+	 				t.exchange_timestamp AS tet,
+					t.episode_no IS NULL AS not_matched,
+					max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp) AS b_e,
+					min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp DESC) AS a_e
+			FROM bitfinex.bf_trades t
+			WHERE t.snapshot_id = NEW.snapshot_id
+		), 
+		between_same_episodes AS (	
+			SELECT id, b_e AS episode_no
+			FROM admissible_episode_range a
+			WHERE not_matched AND a.b_e = a.a_e
+		),
+		nearest_episodes AS (		
+			SELECT * 
 			FROM (
-				SELECT 	t.id,
-						t.episode_no,
-						max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp) AS b_e,
-						min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp DESC) AS a_e
-				FROM bitfinex.bf_trades t
-				WHERE t.snapshot_id = NEW.snapshot_id
-			) a
-			WHERE a.episode_no IS NULL AND a.b_e = a.a_e
-		) a
+				SELECT 	*, 
+			   			lag(candidate_episodes) OVER (ORDER BY tet, id) AS p_candidate_episodes,
+			   			lag(id) OVER (ORDER BY tet, id) AS p_id
+				FROM (
+					SELECT 	id, 
+							tet, 
+							array_agg(episode_no ORDER BY r) AS candidate_episodes
+					FROM (	SELECT 	rank() OVER (PARTITION BY a.snapshot_id, 
+									id ORDER BY abs( EXTRACT( EPOCH FROM tet) - EXTRACT(EPOCH FROM exchange_timestamp))) AS r, 
+		    						a.id, 
+									s.episode_no, 
+									tet
+							FROM (
+									SELECT *
+									FROM admissible_episode_range a  
+									WHERE not_matched AND a.b_e <> a.a_e
+								) a JOIN bitfinex.bf_spreads s ON a.snapshot_id = s.snapshot_id 
+	 			 					 AND s.episode_no BETWEEN b_e AND a_e AND s.timing = 'B'
+	 			 					 AND price BETWEEN s.best_bid_price AND s.best_ask_price 
+									JOIN bitfinex.bf_order_book_episodes p ON s.snapshot_id = p.snapshot_id 
+				 					 AND s.episode_no = p.episode_no 
+						) a
+					GROUP BY tet, id
+					) a
+				)a
+		),
+		nearest_episode (id, episode_no, p_id) AS (
+			SELECT * 
+			FROM (
+					SELECT 	id, 
+							(	SELECT min(episode_no) 
+								FROM unnest(candidate_episodes) episode_no
+							), 
+							p_id
+					FROM nearest_episodes
+					ORDER BY id
+					LIMIT 1
+				) a
+			UNION ALL
+			SELECT 	ps.id, 
+					(	SELECT min(episode_no) 
+						FROM unnest(candidate_episodes) episode_no
+						WHERE episode_no >= p.episode_no
+					), 
+					ps.p_id
+			FROM nearest_episodes ps JOIN nearest_episode p ON  ps.p_id = p.id
+		)
+	UPDATE bitfinex.bf_trades t
+	SET episode_no = a.episode_no
+	FROM (
+		SELECT * 
+		FROM between_same_episodes
+	  	UNION ALL
+	  	SELECT id, episode_no 
+		FROM nearest_episode
+	 )
+	 a
 	WHERE t.snapshot_id = NEW.snapshot_id AND t.episode_no IS NULL AND t.id = a.id;
-	
-	
+
 	RETURN NULL;
 
 END;
@@ -346,6 +409,12 @@ BEGIN
 
 	IF last_matched_trade IS NULL THEN
 		last_matched_trade = '1970-08-01 20:15:00+3'::timestamptz;
+	END IF;
+	
+	-- It is unlikely that an event is delayed more than few second after the trade
+	-- which originated it. 3 seconds should be a resonable delay ? 
+	IF NEW.exchange_timestamp - last_matched_trade > '3 second'::interval THEN
+		last_matched_trade := NEW.exchange_timestamp - '3 second'::interval;
 	END IF;
 
 	SELECT id INTO tr_id
@@ -960,6 +1029,26 @@ CREATE VIEW bitfinex.bf_trades_beyond_spread_v AS
 
 
 ALTER TABLE bitfinex.bf_trades_beyond_spread_v OWNER TO "ob-analytics";
+
+--
+-- Name: bf_trades_matched_episode_delay_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE VIEW bitfinex.bf_trades_matched_episode_delay_v AS
+ SELECT (p.exchange_timestamp - t.exchange_timestamp) AS delay,
+    t.id,
+    t.exchange_timestamp,
+    t.episode_no,
+    t.event_no,
+    t.qty,
+    t.price,
+    t.snapshot_id
+   FROM (bitfinex.bf_trades t
+     JOIN bitfinex.bf_order_book_episodes p USING (snapshot_id, episode_no))
+  ORDER BY t.snapshot_id, (p.exchange_timestamp - t.exchange_timestamp) DESC;
+
+
+ALTER TABLE bitfinex.bf_trades_matched_episode_delay_v OWNER TO "ob-analytics";
 
 --
 -- Name: bf_trades_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
