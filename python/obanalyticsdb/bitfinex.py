@@ -52,12 +52,13 @@ class Episode(DatabaseInsertion):
         self.is_complete = is_complete
 
     def __repr__(self):
-        return "Ep-de no: %i e:%s p:%i s:%i l:%s" % (
+        return "Ep-de no: %i e:%s p:%i s:%i l:%s sn:%s" % (
             self.episode_no,
             self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.priority,
             self.seq_no,
             self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+            self.snapshot_id
         )
 
     def save(self, curr):
@@ -111,7 +112,8 @@ class OrderBookEvent(DatabaseInsertion):
         self.event_no = event_no
 
     def __repr__(self):
-        return ("Event id: %s ep: %i ev: %i pr: %s qty:%s e:%s p:%i s:%i l:%s"
+        return ("Event id: %s ep: %i ev: %i pr: %s qty:%s e:%s p:%i s:%i l:%s "
+                "sn:%s"
                 % (self.order_id,
                    self.episode_no,
                    self.event_no,
@@ -121,6 +123,7 @@ class OrderBookEvent(DatabaseInsertion):
                    self.priority,
                    self.seq_no,
                    self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+                   self.snapshot_id
                    )
                 )
 
@@ -132,13 +135,12 @@ class OrderBookEvent(DatabaseInsertion):
                      "event_price, order_qty, "
                      "snapshot_id,"
                      "exchange_timestamp, "
-                     "episode_no, event_no, order_next_episode_no)"
+                     "episode_no, event_no)"
                      "VALUES (%s, %s, %s, %s, %s,"
-                     "%s, %s, %s, %s, %s) ",
+                     "%s, %s, %s, %s) ",
                      (self.local_timestamp, self.pair, self.order_id,
                       self.event_price, self.order_qty, self.snapshot_id,
-                      self.exchange_timestamp, self.episode_no, self.event_no,
-                      OrderBookEvent.MAX_EPISODE_NO))
+                      self.exchange_timestamp, self.episode_no, self.event_no))
 
 
 class Trade(DatabaseInsertion):
@@ -160,7 +162,7 @@ class Trade(DatabaseInsertion):
         self.snapshot_id = snapshot_id
 
     def __repr__(self):
-        return "Trade id: %s p: %s qty: %s e:%s p:%i s:%i l:%s" % (
+        return "Trade id: %s p: %s qty: %s e:%s p:%i s:%i l:%s sn: %s" % (
             self.id,
             self.price,
             self.qty,
@@ -168,6 +170,7 @@ class Trade(DatabaseInsertion):
             self.priority,
             self.seq_no,
             self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+            self.snapshot_id
         )
 
     def save(self, curr):
