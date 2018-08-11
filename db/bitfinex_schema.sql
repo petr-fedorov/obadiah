@@ -237,11 +237,16 @@ DECLARE
 	
 	behind CONSTANT integer := 2;
 	
-	events CURSOR (ep integer) FOR 	SELECT * 
-									FROM bitfinex.bf_order_book_events
-									WHERE snapshot_id = NEW.snapshot_id 
-									  AND episode_no = ep
-									ORDER BY event_no;
+	events 	CURSOR (p_snapshot_id integer, p_price numeric, p_qty numeric, p_episode_no integer) 
+			FOR SELECT event_no 
+				FROM bitfinex.bf_order_book_events 
+				WHERE snapshot_id = p_snapshot_id
+			  	  AND NOT matched
+			  	  AND order_price = p_price
+			  	  AND event_qty = -p_qty
+			  	  AND episode_no = p_episode_no
+				ORDER BY event_no
+				LIMIT 1 FOR UPDATE;
 									
 	last_matched_episode bitfinex.bf_trades.episode_no%TYPE;
 	
@@ -281,23 +286,18 @@ BEGIN
 	IF episodes[behind] IS NOT NULL AND episodes[behind] >= last_matched_episode THEN 
 	
 		FOR t IN trades(ts[behind], ts[1]) LOOP
-			SELECT event_no INTO trade_event_no
-			FROM bitfinex.bf_order_book_events 
-			WHERE snapshot_id = t.snapshot_id
-			  AND NOT matched
-			  AND order_price = t.price
-			  AND event_qty = -t.qty
-			  AND episode_no = episodes[behind]
-			ORDER BY event_no
-			LIMIT 1;
-			IF FOUND THEN 
+			FOR e IN events(t.snapshot_id, t.price, t.qty, episodes[behind])  LOOP
 			
 				UPDATE bitfinex.bf_trades
 				SET episode_no = episodes[behind],
-					event_no = trade_event_no
+					event_no = e.event_no
 				WHERE CURRENT OF trades;
 				
-			END IF;
+				UPDATE bitfinex.bf_order_book_events
+				SET matched = True
+				WHERE CURRENT OF events;
+				
+			END LOOP;
 			
 		END LOOP;
 	END IF; 
@@ -372,7 +372,7 @@ BEGIN
 			NEW.event_qty = -e.order_qty;
 			NEW.order_qty = 0;
 		ELSE
-			RAISE EXCEPTION 'Requested removal of order: %  which is not in the order book!', NEW.order_id;
+			RAISE WARNING 'Requested removal of order: %  which is not in the order book!', NEW.order_id;
 		END IF;
 		
 		NEW.order_next_episode_no := -1;
