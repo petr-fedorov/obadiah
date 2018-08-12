@@ -94,7 +94,6 @@ class OrderBookEvent(DatabaseInsertion):
     def __init__(self,
                  local_timestamp,
                  exchange_timestamp,
-                 pair,
                  order_id,
                  event_price,
                  order_qty,
@@ -103,7 +102,6 @@ class OrderBookEvent(DatabaseInsertion):
                  event_no):
         super().__init__(local_timestamp, exchange_timestamp)
         self.priority = 1  # Lower priority than Trade below
-        self.pair = pair
         self.order_id = order_id
         self.event_price = event_price
         self.order_qty = order_qty
@@ -130,15 +128,15 @@ class OrderBookEvent(DatabaseInsertion):
     def save(self, curr):
         curr.execute("INSERT INTO bitfinex."
                      "bf_order_book_events "
-                     "(local_timestamp,pair,"
+                     "(local_timestamp,"
                      "order_id,"
                      "event_price, order_qty, "
                      "snapshot_id,"
                      "exchange_timestamp, "
                      "episode_no, event_no)"
-                     "VALUES (%s, %s, %s, %s, %s,"
+                     "VALUES (%s, %s, %s, %s,"
                      "%s, %s, %s, %s) ",
-                     (self.local_timestamp, self.pair, self.order_id,
+                     (self.local_timestamp, self.order_id,
                       self.event_price, self.order_qty, self.snapshot_id,
                       self.exchange_timestamp, self.episode_no, self.event_no))
 
@@ -148,14 +146,12 @@ class Trade(DatabaseInsertion):
                  local_timestamp,
                  exchange_timestamp,
                  id,
-                 pair,
                  trade_timestamp,
                  qty,
                  price,
                  snapshot_id):
         super().__init__(local_timestamp, exchange_timestamp)
         self.id = id
-        self.pair = pair
         self.trade_timestamp = trade_timestamp
         self.qty = qty
         self.price = price
@@ -176,12 +172,12 @@ class Trade(DatabaseInsertion):
     def save(self, curr):
 
         curr.execute("INSERT INTO bitfinex.bf_trades"
-                     "(id, pair, trade_timestamp, qty,"
+                     "(id, trade_timestamp, qty,"
                      "price,local_timestamp, snapshot_id,"
                      "exchange_timestamp)"
-                     "VALUES (%s, %s, %s, %s, %s, %s,"
+                     "VALUES (%s, %s, %s, %s, %s,"
                      "%s, %s)",
-                     (self.id, self.pair, self.trade_timestamp, self.qty,
+                     (self.id, self.trade_timestamp, self.qty,
                       self.price, self.local_timestamp, self.snapshot_id,
                       self.exchange_timestamp))
 
@@ -396,11 +392,10 @@ class Spreader(Spawned):
 
 class TradeConverter(Spawned):
 
-    def __init__(self, q, stop_flag, pair, q_snapshots, q_unordered,
+    def __init__(self, q, stop_flag, q_snapshots, q_unordered,
                  log_queue, log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q = q
-        self.pair = pair
         self.q_unordered = q_unordered
         self.q_snapshots = q_snapshots
 
@@ -444,7 +439,6 @@ class TradeConverter(Spawned):
                     # data = data[0]
                 for d in data:
                     self.q_unordered.put(Trade(lts, rts,  d[0],
-                                               self.pair,
                                                datetime.fromtimestamp(
                                                    d[1]/1000),
                                                d[2], d[3], snapshot_id))
@@ -528,9 +522,8 @@ class EventConverter(Spawned):
                         # it is the first 'addition' event of an episode
                         increase_episode_no = True
 
-                    self.q_unordered.put(OrderBookEvent(lts, rts, self.pair,
-                                                        d[0], d[1], d[2],
-                                                        snapshot_id,
+                    self.q_unordered.put(OrderBookEvent(lts, rts, d[0], d[1],
+                                                        d[2], snapshot_id,
                                                         episode_no, event_no))
                     event_no += 1
 
@@ -562,8 +555,9 @@ def start_new_snapshot(ob_len, pair):
     with connect_db() as con:
         with con.cursor() as curr:
             try:
-                curr.execute("insert into bitfinex.bf_snapshots (len)"
-                             "values (%s) returning snapshot_id", (ob_len,))
+                curr.execute("insert into bitfinex.bf_snapshots (len, pair)"
+                             "values (%s, %s) returning snapshot_id",
+                             (ob_len, pair))
                 snapshot_id = curr.fetchone()[0]
                 con.commit()
                 logger.info("A new snapshot started: %i, pair: %s, len: %i" %
@@ -603,7 +597,7 @@ def capture(pair, stop_flag, log_queue):
     q_ordered = Queue()
     q_spreader = Queue()
 
-    ts = [Process(target=TradeConverter(wss.trades(pair), stop_flag, pair,
+    ts = [Process(target=TradeConverter(wss.trades(pair), stop_flag,
                                         q_snapshots, q_unordered,
                                         log_queue)),
           Process(target=EventConverter(wss.raw_books(pair), stop_flag, pair,
