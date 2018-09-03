@@ -1,4 +1,4 @@
-#' @importFrom dplyr filter full_join select mutate
+#' @importFrom dplyr filter full_join select mutate rename
 #' @importFrom plyr .
 #' @importFrom magrittr  %>%
 #' @importFrom zoo na.locf
@@ -70,6 +70,35 @@ bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147
   depth <- depth[ with(depth, order(timestamp, -price)), ]
   depth
 }
+
+
+#' @export
+bfDepthSummary <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647,  debug.query = FALSE) {
+  query <- paste0("SELECT exchange_timestamp AS timestamp, direction, bps_level, bps_vwap, volume
+                   FROM bitfinex.bf_depth_summary_after_episode_v(",snapshot_id,", ", min.episode_no,", ", max.episode_no,")")
+  if(debug.query) cat(query)
+  df <- dbGetQuery(conn, query)
+  df <- df %>%
+    select(-volume) %>%
+    dcast(list(.(timestamp), .(paste0(direction,'.vwap',bps_level, "bps"))), value.var="bps_vwap")   %>%
+    full_join(df %>%
+           select(-bps_vwap) %>%
+           dcast(list(.(timestamp), .(paste0(direction,'.vol',bps_level, "bps"))), value.var="volume")
+         , by="timestamp" ) %>%  rename(best.ask.price = ask.vwap0bps,
+                                        best.bid.price = bid.vwap0bps,
+                                        best.ask.vol = ask.vol0bps,
+                                        best.bid.vol = bid.vol0bps)
+
+  bid.names <- paste0("bid.vol", seq(from = 25, to = 500, by = 25),
+                      "bps")
+  ask.names <- paste0("ask.vol", seq(from = 25, to = 500, by = 25),
+                      "bps")
+  df[setdiff(bid.names, colnames(df))] <- 0
+  df[setdiff(ask.names, colnames(df))] <- 0
+  df[is.na(df)] <- 0
+  df
+}
+
 
 #' @export
 bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range = 0, min.bid = 0, max.ask = "'Infinity'::float") {
