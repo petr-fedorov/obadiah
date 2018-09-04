@@ -9,4 +9,9 @@ setup(
             'obanalyticsdb = obanalyticsdb.__main__:main'
         ]
     },
+    install_requires=[
+        'psycopg2-binary',
+        'websocket-client',
+        'btfxwss'
+    ]
 )

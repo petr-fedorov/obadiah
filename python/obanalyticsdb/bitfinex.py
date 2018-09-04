@@ -12,7 +12,7 @@ from obanalyticsdb.utils import logging_configurer
 
 
 @total_ordering
-class DatabaseInsertion:
+class OrderedDatabaseInsertion:
     def __init__(self, local_timestamp, exchange_timestamp):
         self.local_timestamp = local_timestamp
         self.exchange_timestamp = exchange_timestamp
@@ -37,7 +37,7 @@ class DatabaseInsertion:
             return False
 
 
-class Episode(DatabaseInsertion):
+class Episode(OrderedDatabaseInsertion):
 
     def __init__(self,
                  local_timestamp,
@@ -88,7 +88,46 @@ class Episode(DatabaseInsertion):
             return False
 
 
-class OrderBookEvent(DatabaseInsertion):
+class ConsBookEpisode:
+
+    def __init__(self,
+                 local_timestamp,
+                 exchange_timestamp,
+                 snapshot_id,
+                 episode_no,
+                 is_complete=True):
+        self.local_timestamp = local_timestamp
+        self.exchange_timestamp = exchange_timestamp
+        self.snapshot_id = snapshot_id
+        self.episode_no = episode_no
+        self.is_complete = is_complete
+
+    def __repr__(self):
+        return "CB Ep-de no: %i e:%s l:%s sn:%s" % (
+            self.episode_no,
+            self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
+            self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+            self.snapshot_id
+        )
+
+    def save(self, curr):
+        curr.execute("INSERT INTO bitfinex.bf_cons_book_episodes "
+                     "(snapshot_id, episode_no,"
+                     "exchange_timestamp) "
+                     "VALUES (%s, %s, %s)",
+                     (self.snapshot_id, self.episode_no,
+                      self.exchange_timestamp))
+
+    def finalize(self, con):
+        if self.is_complete:
+            con.commit()
+            return True
+        else:
+            con.rollback()
+            return False
+
+
+class OrderBookEvent(OrderedDatabaseInsertion):
     MAX_EPISODE_NO = 2147483647
 
     def __init__(self,
@@ -141,7 +180,56 @@ class OrderBookEvent(DatabaseInsertion):
                       self.exchange_timestamp, self.episode_no, self.event_no))
 
 
-class Trade(DatabaseInsertion):
+class ConsBookEvent:
+    MAX_EPISODE_NO = 2147483647
+
+    def __init__(self,
+                 local_timestamp,
+                 exchange_timestamp,
+                 price,
+                 cnt,
+                 qty,
+                 snapshot_id,
+                 episode_no,
+                 event_no):
+        self.local_timestamp = local_timestamp
+        self.exchange_timestamp = exchange_timestamp
+        self.price = price
+        self.cnt = cnt
+        self.qty = qty
+        self.snapshot_id = snapshot_id
+        self.episode_no = episode_no
+        self.event_no = event_no
+
+    def __repr__(self):
+        return ("CB Event pr: %s ep: %i ev: %i cnt: %i qty:%s e:%s l:%s sn:%s"
+                % (self.price,
+                   self.episode_no,
+                   self.event_no,
+                   self.cnt,
+                   self.qty,
+                   self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
+                   self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
+                   self.snapshot_id
+                   )
+                )
+
+    def save(self, curr):
+        curr.execute("INSERT INTO bitfinex."
+                     "bf_cons_book_events "
+                     "(local_timestamp,"
+                     "price, cnt, qty, "
+                     "snapshot_id,"
+                     "exchange_timestamp, "
+                     "episode_no, event_no)"
+                     "VALUES (%s, %s, %s, %s,"
+                     "%s, %s, %s, %s) ",
+                     (self.local_timestamp, self.price, self.cnt, self.qty,
+                      self.snapshot_id, self.exchange_timestamp,
+                      self.episode_no, self.event_no))
+
+
+class Trade(OrderedDatabaseInsertion):
     def __init__(self,
                  local_timestamp,
                  exchange_timestamp,
@@ -311,16 +399,19 @@ def connect_db():
 
 class Stockkeeper(Spawned):
 
-    def __init__(self, q_ordered, q_spreader, stop_flag, log_queue,
+    def __init__(self, q_ordered, q_spreader, stop_flag, pair, log_queue,
                  log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q_ordered = q_ordered
         self.q_spreader = q_spreader
+        self.prec = "R0"
+        self.pair = pair
 
     def __call__(self):
         self._call_init()
 
-        logger = logging.getLogger("bitfinex.Stockkeeper")
+        logger = logging.getLogger("bitfinex.Stockkeeper_%s_%s" % (self.pair,
+                                                                   self.prec))
         logger.info('Started')
         with connect_db() as con:
             con.set_session(autocommit=False)
@@ -539,6 +630,130 @@ class EventConverter(Spawned):
         logger.info('Exit')
 
 
+class ConsEventConverter(Spawned):
+
+    def __init__(self, q, stop_flag, pair, prec, ob_len, log_queue,
+                 log_level=logging.INFO):
+        super().__init__(log_queue, stop_flag, log_level)
+        self.q = q
+        self.ob_len = ob_len
+        self.pair = pair
+        self.prec = prec
+
+    def __call__(self):
+        self._call_init()
+
+        logger = logging.getLogger("bitfinex.ConsEventConverter_%s_%s" %
+                                   (self.pair, self.prec))
+        logger.info('Started')
+        try:
+            episode_no = 0
+            event_no = 1
+            episode_rts = datetime(1970, 8, 1, 20, 15)
+            last_rts = None
+            increase_episode_no = True  # The first 'addition' event
+            snapshot_id = 0
+
+            with connect_db() as con:
+                con.set_session(autocommit=False)
+                with con.cursor() as curr:
+                    curr.execute("SET CONSTRAINTS ALL DEFERRED")
+
+                    while True:
+                        try:
+                            data, lts = self.q.get(timeout=5)
+                        except Empty:
+                            if not self.stop_flag.is_set():
+                                continue
+                            else:
+                                # Rollback saved events from INCOMPLETE episode
+                                con.rollback()
+                                break
+                        logger.debug("%i %s" % (snapshot_id, data,))
+                        *data, rts = data
+                        rts = datetime.fromtimestamp(rts/1000)
+                        lts = datetime.fromtimestamp(lts)
+
+                        # we need to track last_rts in order to catch
+                        # starts of new episodes since for P-precision
+                        # they do not always start from removal events
+                        if not last_rts:
+                            last_rts = rts
+
+                        if isinstance(data[0][0], list):
+                            # A new snapshot started
+                            if episode_no > 0:
+                                    # it is a switch to a new snapshot
+                                    # so rollback the INCOMPLETE episode of the
+                                    # PREVIOUS snapshot
+                                con.rollback()
+                                curr.execute("SET CONSTRAINTS ALL DEFERRED")
+                            snapshot_id = start_new_snapshot(self.ob_len,
+                                                             self.pair,
+                                                             self.prec)
+                            episode_no = 0
+                            event_no = 1
+                            increase_episode_no = True
+                            data = data[0]
+                        for d in data:
+                            if not float(d[1]) or\
+                                    (rts-last_rts) > timedelta(
+                                        milliseconds=200):
+                                if increase_episode_no:
+                                    # it is the first event for an episode
+                                    # so insert PREVIOUS episode
+                                    obj = ConsBookEpisode(datetime.now(),
+                                                          episode_rts,
+                                                          snapshot_id,
+                                                          episode_no)
+                                    obj.save(curr)
+                                    if obj.finalize(con):
+                                        logger.debug('Commited %r' % obj)
+                                    else:
+                                        logger.debug('Rolled back %r' % obj)
+                                    curr.execute(
+                                        "SET CONSTRAINTS ALL DEFERRED")
+
+                                    if not float(d[1]):
+                                        # if this was a 'removal' event
+                                        # we change flag so next 'removal'
+                                        # event if any will not trigger new
+                                        # episode again
+                                        increase_episode_no = False
+
+                                    episode_no += 10
+                                    if episode_no == ConsBookEvent.\
+                                            MAX_EPISODE_NO:
+                                        self.stop_flag.set()
+                                        break
+                                    event_no = 1
+                                    episode_rts = rts
+                                    logger.info("Unprocessed queue size: %i" %
+                                                (self.q.qsize(),))
+                            elif not increase_episode_no:
+                                # it is the first addition event of an episode
+                                increase_episode_no = True
+
+                            obj = ConsBookEvent(lts, rts, d[0], d[1], d[2],
+                                                snapshot_id, episode_no,
+                                                event_no)
+                            obj.save(curr)
+                            logger.debug('Saved %r' % obj)
+                            event_no += 1
+                            last_rts = rts
+
+                            # An episode's exchange_timestamp must be equal to
+                            # MAX(exchange_timestamp) among events that belongs
+                            # to the episode
+                            if rts > episode_rts:
+                                episode_rts = rts
+
+        except Exception as e:
+            logger.exception('%s', e)
+            self.stop_flag.set()
+        logger.info('Exit')
+
+
 def check_pair(pair):
     with connect_db() as con:
         with con.cursor() as curr:
@@ -550,18 +765,20 @@ def check_pair(pair):
                 raise KeyError(pair)
 
 
-def start_new_snapshot(ob_len, pair):
+def start_new_snapshot(ob_len, pair, prec="R0"):
     logger = logging.getLogger("bitfinex.new.snapshot")
     with connect_db() as con:
         with con.cursor() as curr:
             try:
-                curr.execute("insert into bitfinex.bf_snapshots (len, pair)"
-                             "values (%s, %s) returning snapshot_id",
-                             (ob_len, pair))
+                curr.execute("insert into bitfinex.bf_snapshots "
+                             "(len, pair, prec)"
+                             "values (%s, %s, %s) returning snapshot_id",
+                             (ob_len, pair, prec))
                 snapshot_id = curr.fetchone()[0]
                 con.commit()
-                logger.info("A new snapshot started: %i, pair: %s, len: %i" %
-                            (snapshot_id, pair, ob_len))
+                logger.info("A new snapshot started: "
+                            "%i, pair: %s, len: %i, prec: %s" %
+                            (snapshot_id, pair, ob_len, prec))
             except Exception as e:
                 logger.exception('%s', e)
                 raise e
@@ -580,15 +797,25 @@ def capture(pair, stop_flag, log_queue):
         logger.exception('%s', e)
         return
 
-    wss = BtfxWss(log_level=logging.INFO)
-    wss.start()
+    ob_R0 = BtfxWss(log_level=logging.INFO)
 
-    while not wss.conn.connected.is_set():
+    precs = ['P0', 'P1', 'P2', 'P3']
+    obs = [BtfxWss(log_level=logging.INFO) for p in precs]
+
+    for ob in [ob_R0] + obs:
+        ob.start()
+
+    while not all([ob.conn.connected.is_set() for ob in [ob_R0] + obs]):
         time.sleep(1)
 
-    wss.config(ts=True)
-    wss.subscribe_to_raw_order_book(pair, len=ob_len)
-    wss.subscribe_to_trades(pair)
+    for ob in [ob_R0] + obs:
+        ob.config(ts=True)
+
+    ob_R0.subscribe_to_raw_order_book(pair, len=ob_len)
+    ob_R0.subscribe_to_trades(pair)
+
+    for prec, ob in zip(precs, obs):
+        ob.subscribe_to_order_book(pair, prec=prec, len=ob_len)
 
     time.sleep(5)
 
@@ -597,18 +824,23 @@ def capture(pair, stop_flag, log_queue):
     q_ordered = Queue()
     q_spreader = Queue()
 
-    ts = [Process(target=TradeConverter(wss.trades(pair), stop_flag,
+    ts = [Process(target=TradeConverter(ob_R0.trades(pair), stop_flag,
                                         q_snapshots, q_unordered,
                                         log_queue)),
-          Process(target=EventConverter(wss.raw_books(pair), stop_flag, pair,
+          Process(target=EventConverter(ob_R0.raw_books(pair), stop_flag, pair,
                                         q_snapshots, ob_len, q_unordered,
                                         log_queue)),
           Process(target=Orderer(q_unordered, q_ordered, stop_flag,
                                  log_queue, delay=2)),
-          Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag,
-                                     log_queue)),
+          Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag, pair,
+                                     log_queue, log_level=logging.INFO)),
           ] + [Process(target=Spreader(n, q_spreader, stop_flag, log_queue))
-               for n in range(3)]
+               for n in range(3)] + [
+                   Process(target=ConsEventConverter(ob.books(pair),
+                                                     stop_flag, pair,
+                                                     prec, ob_len, log_queue,
+                                                     log_level=logging.DEBUG))
+                   for (prec, ob) in zip(precs, obs)]
 
     for t in ts:
         t.start()
@@ -618,10 +850,17 @@ def capture(pair, stop_flag, log_queue):
 
     logger.info('Ctrl-C has been pressed, exiting from the application ...')
 
-    wss.unsubscribe_from_trades(pair)
-    wss.unsubscribe_from_raw_order_book(pair)
+    ob_R0.unsubscribe_from_trades(pair)
+    ob_R0.unsubscribe_from_raw_order_book(pair)
+
+    for ob in obs:
+        ob.unsubscribe_from_order_book(pair)
+
     time.sleep(2)
-    wss.stop()
+
+    ob_R0.stop()
+    for ob in obs:
+        ob.stop()
 ####
     for t in ts:
         pid = t.pid
