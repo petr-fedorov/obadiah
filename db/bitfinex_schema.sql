@@ -965,7 +965,8 @@ CREATE TABLE bitfinex.bf_cons_book_events (
     active_episode_no integer NOT NULL,
     price_next_episode_no integer NOT NULL,
     side character(1) NOT NULL
-);
+)
+WITH (autovacuum_enabled='true', autovacuum_vacuum_threshold='5000', autovacuum_analyze_threshold='5000', autovacuum_analyze_scale_factor='0.0', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_cost_delay='0');
 
 
 ALTER TABLE bitfinex.bf_cons_book_events OWNER TO "ob-analytics";
@@ -1324,6 +1325,13 @@ ALTER TABLE ONLY bitfinex.bf_spreads
 
 ALTER TABLE ONLY bitfinex.bf_trades
     ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (snapshot_id, id);
+
+
+--
+-- Name: bf_cons_book_events_idx_update_next_episode_no; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_cons_book_events_idx_update_next_episode_no ON bitfinex.bf_cons_book_events USING btree (snapshot_id, price, episode_no);
 
 
 --
