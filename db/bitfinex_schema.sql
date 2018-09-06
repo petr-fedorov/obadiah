@@ -1436,7 +1436,7 @@ CREATE INDEX bf_cons_book_events_idx_update_next_episode_no ON bitfinex.bf_cons_
 -- Name: bf_order_book_events_idx_active_orders; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE INDEX bf_order_book_events_idx_active_orders ON bitfinex.bf_order_book_events USING btree (snapshot_id, active_episode_no, order_next_episode_no) WHERE (event_price > (0)::numeric);
+CREATE INDEX bf_order_book_events_idx_active_orders ON bitfinex.bf_order_book_events USING btree (snapshot_id, order_next_episode_no, active_episode_no) WHERE (event_price > (0)::numeric);
 
 
 --
