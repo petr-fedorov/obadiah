@@ -302,7 +302,7 @@ BEGIN
 					max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp) AS b_e,
 					min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp DESC) AS a_e
 			FROM bitfinex.bf_trades t
-			WHERE t.snapshot_id = NEW.snapshot_id
+			WHERE t.snapshot_id = NEW.snapshot_id AND t.exchange_timestamp > NEW.exchange_timestamp - '1 min'::interval
 		), 
 		between_same_episodes AS (	
 			SELECT id, b_e AS episode_no
