@@ -1065,6 +1065,8 @@ CREATE TABLE bitfinex.bf_cons_book_events (
     side character(1) NOT NULL
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_threshold='5000', autovacuum_analyze_threshold='5000', autovacuum_analyze_scale_factor='0.0', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_cost_delay='0');
+ALTER TABLE ONLY bitfinex.bf_cons_book_events ALTER COLUMN active_episode_no SET STATISTICS 1000;
+ALTER TABLE ONLY bitfinex.bf_cons_book_events ALTER COLUMN price_next_episode_no SET STATISTICS 1000;
 
 
 ALTER TABLE bitfinex.bf_cons_book_events OWNER TO "ob-analytics";
@@ -1433,10 +1435,17 @@ CREATE INDEX bf_cons_book_events_idx_update_next_episode_no ON bitfinex.bf_cons_
 
 
 --
--- Name: bf_order_book_events_idx_active_orders; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_order_book_events_idx_active_next; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE INDEX bf_order_book_events_idx_active_orders ON bitfinex.bf_order_book_events USING btree (snapshot_id, order_next_episode_no, active_episode_no) WHERE (event_price > (0)::numeric);
+CREATE INDEX bf_order_book_events_idx_active_next ON bitfinex.bf_order_book_events USING btree (snapshot_id, active_episode_no, order_next_episode_no) WHERE (event_price > (0)::numeric);
+
+
+--
+-- Name: bf_order_book_events_idx_next_active; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_order_book_events_idx_next_active ON bitfinex.bf_order_book_events USING btree (snapshot_id, order_next_episode_no, active_episode_no) WHERE (event_price > (0)::numeric);
 
 
 --

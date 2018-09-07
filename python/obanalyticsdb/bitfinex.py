@@ -1,4 +1,4 @@
-from queue import Empty
+from queue import Empty, Full
 from multiprocessing import Process, Queue
 import logging
 import time
@@ -68,16 +68,6 @@ class Episode(OrderedDatabaseInsertion):
                      "VALUES (%s, %s, %s)",
                      (self.snapshot_id, self.episode_no,
                       self.exchange_timestamp))
-
-    def insert_spread(self, curr):
-        curr.execute("INSERT INTO bitfinex.bf_spreads "
-                     "SELECT * "
-                     "FROM bitfinex.bf_spread_between_episodes_v"
-                     "(%(s_id)s, %(episode)s, %(episode)s) UNION ALL "
-                     "SELECT * "
-                     "FROM bitfinex.bf_spread_after_episode_v"
-                     "(%(s_id)s, %(episode)s, %(episode)s) ",
-                     {'s_id': self.snapshot_id, 'episode': self.episode_no})
 
     def finalize(self, con):
         if self.is_complete:
@@ -417,6 +407,9 @@ class Stockkeeper(Spawned):
             con.set_session(autocommit=False)
             with con.cursor() as curr:
                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
+                # We'll send ranges of episodes (fi, la) to Spreader
+                fi = None
+                la = None
                 while True:
                     try:
                         obj = self.q_ordered.get(timeout=5)
@@ -425,7 +418,14 @@ class Stockkeeper(Spawned):
                             if isinstance(obj, Episode):
                                 if obj.finalize(con):
                                     logger.debug('Commited %r' % obj)
-                                    self.q_spreader.put(obj)
+                                    if not fi:
+                                        fi = obj
+                                    la = obj
+                                    try:
+                                        self.q_spreader.put_nowait((fi, la))
+                                        fi = None
+                                    except Full:
+                                        pass
                                 else:
                                     logger.debug('Rolled back %r' % obj)
                                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
@@ -454,6 +454,48 @@ class Spreader(Spawned):
         self.q_spreader = q_spreader
         self.n = n
 
+    def _insert_spread(self, curr, fi, la, logger):
+        if fi.snapshot_id == la.snapshot_id:
+            curr.execute("INSERT INTO bitfinex.bf_spreads "
+                         "SELECT * FROM bitfinex.bf_spread_between_episodes_v"
+                         "(%(s_id)s, %(from)s, %(to)s)"
+                         " UNION ALL "
+                         "SELECT * "
+                         "FROM bitfinex.bf_spread_after_episode_v"
+                         "(%(s_id)s, %(from)s, %(to)s)",
+                         {'s_id': fi.snapshot_id, 'from': fi.episode_no,
+                          'to': la.episode_no})
+            logger.debug("New spread: snapshot %i from %i to %i" % (
+                                fi.snapshot_id,
+                                fi.episode_no,
+                                la.episode_no))
+        else:
+            curr.execute("INSERT INTO bitfinex.bf_spreads "
+                         "SELECT * "
+                         "FROM bitfinex.bf_spread_between_episodes_v"
+                         "(%(s_id)s, %(from)s)"
+                         " UNION ALL "
+                         "SELECT * "
+                         "FROM bitfinex.bf_spread_after_episode_v"
+                         "(%(s_id)s, %(from)s)",
+                         {'s_id': fi.snapshot_id, 'from': fi.episode_no})
+            logger.debug("New spread: snapshot %i from %i to ..." % (
+                                fi.snapshot_id, fi.episode_no))
+            curr.execute("INSERT INTO bitfinex.bf_spreads "
+                         "SELECT * "
+                         "FROM bitfinex.bf_spread_between_episodes_v"
+                         "(%(s_id)s, %(from)s, %(to)s)"
+                         " UNION ALL "
+                         "SELECT * "
+                         "FROM bitfinex.bf_spread_after_episode_v"
+                         "(%(s_id)s, %(from)s, %(to)s)",
+                         {'s_id': la.snapshot_id, 'from': 0,
+                          'to': la.episode_no})
+            logger.debug("New spread: snapshot %i from %i to %i" % (
+                                la.snapshot_id,
+                                0,
+                                la.episode_no))
+
     def __call__(self):
         self._call_init()
 
@@ -465,16 +507,13 @@ class Spreader(Spawned):
                 try:
                     while True:
                         try:
-                            episode = self.q_spreader.get(timeout=5)
-                            logger.debug('%r' % episode)
-                            logger.info('Unprocessed q_spreader size %i' %
-                                        self.q_spreader.qsize())
+                            fi, la = self.q_spreader.get(timeout=5)
+                            self._insert_spread(curr, fi, la, logger)
                         except Empty:
                             if not self.stop_flag.is_set():
                                 continue
                             else:
                                 break
-                        episode.insert_spread(curr)
                 except Exception as e:
                     logger.exception('%s', e)
                     self.stop_flag.set()
@@ -822,7 +861,9 @@ def capture(pair, stop_flag, log_queue):
     q_snapshots = Queue()
     q_unordered = Queue()
     q_ordered = Queue()
-    q_spreader = Queue()
+
+    num_of_spreaders = 3
+    q_spreader = Queue(num_of_spreaders)
 
     ts = [Process(target=TradeConverter(ob_R0.trades(pair), stop_flag,
                                         q_snapshots, q_unordered,
@@ -834,8 +875,9 @@ def capture(pair, stop_flag, log_queue):
                                  log_queue, delay=2)),
           Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag, pair,
                                      log_queue, log_level=logging.INFO)),
-          ] + [Process(target=Spreader(n, q_spreader, stop_flag, log_queue))
-               for n in range(3)] + [
+          ] + [Process(target=Spreader(n, q_spreader, stop_flag, log_queue,
+                                       log_level=logging.DEBUG))
+               for n in range(num_of_spreaders)] + [
                    Process(target=ConsEventConverter(ob.books(pair),
                                                      stop_flag, pair,
                                                      prec, ob_len, log_queue,
