@@ -1428,10 +1428,17 @@ ALTER TABLE ONLY bitfinex.bf_trades
 
 
 --
--- Name: bf_cons_book_events_idx_update_next_episode_no; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+-- Name: bf_cons_book_events_idx_update_next_episode_no_by_episode_no; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE INDEX bf_cons_book_events_idx_update_next_episode_no ON bitfinex.bf_cons_book_events USING btree (snapshot_id, price, episode_no);
+CREATE INDEX bf_cons_book_events_idx_update_next_episode_no_by_episode_no ON bitfinex.bf_cons_book_events USING btree (snapshot_id, price, episode_no);
+
+
+--
+-- Name: bf_cons_book_events_idx_update_next_episode_no_by_next_episode_; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_cons_book_events_idx_update_next_episode_no_by_next_episode_ ON bitfinex.bf_cons_book_events USING btree (snapshot_id, price, price_next_episode_no);
 
 
 --
