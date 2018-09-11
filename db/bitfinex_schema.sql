@@ -106,7 +106,7 @@ BEGIN
 				sum(u.order_qty) AS volume,
 				u.bps_level,
 				u.bps_price,
-				round(sum(u.order_qty*u.order_price)/sum(u.order_qty), "precision") AS bps_vwap,
+				round(sum(u.order_qty*u.order_price)/sum(u.order_qty), "R0") AS bps_vwap,
 				u.direction,
 				u.pair,
 				u.exchange_timestamp,
@@ -115,13 +115,13 @@ BEGIN
 			SELECT 	r2.order_price,
 					r2.order_qty, 
 					(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-					round(r2.best_bid*(1 - r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."precision") AS bps_price,
+					round(r2.best_bid*(1 - r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
 					'bid'::character varying AS direction,
 					r2.pair,
 					r2.exchange_timestamp,
 					r2.episode_no,
 					r2.snapshot_id,
-					"precision"
+					"R0"
 			FROM (		
 				SELECT 	r1.order_price, 
 						r1.order_qty, 
@@ -151,13 +151,13 @@ BEGIN
 		SELECT 	r2.order_price,
 				r2.order_qty, 
 				(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-				round(r2.best_ask*(1 + r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."precision") AS bps_price,
+				round(r2.best_ask*(1 + r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
 				'ask'::character varying AS direction,
 				r2.pair,
 				r2.exchange_timestamp,
 				r2.episode_no,
 				r2.snapshot_id,
-				"precision"
+				"R0"
 		FROM (		
 			SELECT 	r1.order_price, 
 					r1.order_qty, 
@@ -184,7 +184,7 @@ BEGIN
 			) r1
 		) r2 JOIN bitfinex.bf_pairs USING (pair)
 		) u 
-		GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "precision"
+		GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "R0"
 		ORDER BY u.episode_no, u.direction, CASE WHEN u.direction = 'ask' THEN 1 ELSE -1 END*u.bps_level DESC;
 	ELSE
 		RETURN QUERY
@@ -192,7 +192,7 @@ BEGIN
 				sum(u.qty) AS volume,
 				u.bps_level,
 				u.bps_price,
-				round(sum(u.qty*u.price)/sum(u.qty), "precision") AS bps_vwap,
+				round(sum(u.qty*u.price)/sum(u.qty), "R0") AS bps_vwap,
 				u.direction,
 				u.pair,
 				u.exchange_timestamp,
@@ -201,13 +201,13 @@ BEGIN
 			SELECT 	r2.price,
 					r2.qty, 
 					(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-					round(r2.best_bid*(1 - r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."precision") AS bps_price,
+					round(r2.best_bid*(1 - r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
 					'bid'::character varying AS direction,
 					r2.pair,
 					r2.exchange_timestamp,
 					r2.episode_no,
 					r2.snapshot_id,
-					"precision"
+					"R0"
 			FROM (		
 				SELECT 	r1.price, 
 						r1.qty, 
@@ -237,13 +237,13 @@ BEGIN
 		SELECT 	r2.price,
 				r2.qty, 
 				(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-				round(r2.best_ask*(1 + r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."precision") AS bps_price,
+				round(r2.best_ask*(1 + r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
 				'ask'::character varying AS direction,
 				r2.pair,
 				r2.exchange_timestamp,
 				r2.episode_no,
 				r2.snapshot_id,
-				"precision"
+				"R0"
 		FROM (		
 			SELECT 	r1.price, 
 					r1.qty, 
@@ -270,7 +270,7 @@ BEGIN
 			) r1
 		) r2 JOIN bitfinex.bf_pairs USING (pair)
 		) u 
-		GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "precision"
+		GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "R0"
 		ORDER BY u.episode_no, u.direction, CASE WHEN u.direction = 'ask' THEN 1 ELSE -1 END*u.bps_level DESC;
 	END IF;
 END
@@ -480,18 +480,18 @@ CREATE FUNCTION bitfinex.bf_order_book_events_dress_new_row() RETURNS trigger
     AS $$
 
 DECLARE
-	precision bitfinex.bf_pairs.precision%TYPE;
+	R0 bitfinex.bf_pairs."R0"%TYPE;
 	e bitfinex.bf_order_book_events%ROWTYPE;
 	
 BEGIN
 
 	IF NEW.event_price != 0 THEN 
 
-		SELECT bf_pairs.precision INTO precision 
+		SELECT bf_pairs."R0" INTO R0 
 		FROM bitfinex.bf_pairs JOIN bitfinex.bf_snapshots USING (pair)
 		WHERE snapshot_id = NEW.snapshot_id;
 
-		NEW.event_price = round(NEW.event_price, precision);
+		NEW.event_price = round(NEW.event_price, R0);
 		NEW.order_price = NEW.event_price;
 		
 		IF NEW.order_qty < 0 THEN 
@@ -813,17 +813,17 @@ CREATE FUNCTION bitfinex.bf_trades_dress_new_row() RETURNS trigger
     AS $$
 
 DECLARE
-	precision bitfinex.bf_pairs.precision%TYPE;
+	R0 bitfinex.bf_pairs."R0"%TYPE;
 	last_episode bitfinex.bf_trades.episode_no%TYPE;
 	trade_episode_no bitfinex.bf_order_book_events.episode_no%TYPE;
 	trade_event_no bitfinex.bf_order_book_events.event_no%TYPE;
 
 BEGIN
-	SELECT bf_pairs.precision INTO precision 
+	SELECT bf_pairs."R0" INTO R0 
 	FROM bitfinex.bf_pairs JOIN bitfinex.bf_snapshots USING (pair)
 	WHERE snapshot_id = NEW.snapshot_id;
 
-	NEW.price = round(NEW.price, precision);
+	NEW.price = round(NEW.price, R0);
 	IF NEW.qty < 0 THEN
 		NEW.direction = 'S';
 		NEW.qty = -NEW.qty;
@@ -886,7 +886,7 @@ ALTER TABLE bitfinex.bf_order_book_events OWNER TO "ob-analytics";
 
 CREATE TABLE bitfinex.bf_pairs (
     pair character varying(12) NOT NULL,
-    "precision" integer NOT NULL,
+    "R0" integer NOT NULL,
     "P0" smallint,
     "P1" smallint,
     "P2" smallint,
@@ -1336,7 +1336,7 @@ ALTER TABLE bitfinex.bf_trades_matched_episode_delay_v OWNER TO "ob-analytics";
 CREATE VIEW bitfinex.bf_trades_v AS
  SELECT t.id,
     t.qty,
-    round(t.price, bf_pairs."precision") AS price,
+    round(t.price, bf_pairs."R0") AS price,
     count(*) OVER (PARTITION BY t.snapshot_id, t.episode_no, t.event_no) AS matched_count,
     bf_pairs.pair,
     t.snapshot_id,
@@ -1428,6 +1428,7 @@ ALTER TABLE ONLY bitfinex.bf_trades
 
 
 --
+--
 -- Name: bf_cons_book_events_idx_update_next_episode_no_by_episode_no; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1441,6 +1442,7 @@ CREATE INDEX bf_cons_book_events_idx_update_next_episode_no_by_episode_no ON bit
 CREATE INDEX bf_cons_book_events_idx_update_next_episode_no_by_next_episode_ ON bitfinex.bf_cons_book_events USING btree (snapshot_id, price, price_next_episode_no);
 
 
+--
 --
 -- Name: bf_order_book_events_idx_active_next; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
