@@ -53,11 +53,11 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
 bfDepth <- function(conn, start.time, end.time, pair="BTCUSD",price.aggregation = "P0", debug.query = FALSE) {
 
 
-  query <- paste0(" SELECT * FROM bitfinex.oba_depth(",
+  query <- paste0(" SELECT \"timestamp\", price, avg(volume) AS volume, side FROM bitfinex.oba_depth(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
                   shQuote(pair), ",",
-                  shQuote(price.aggregation), ") ORDER BY 1, 2 DESC")
+                  shQuote(price.aggregation), ") GROUP BY 1, 2, 4 ORDER BY 1, 2 DESC")
   if(debug.query) cat(query)
   depth <- dbGetQuery(conn, query)
   depth
