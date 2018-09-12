@@ -840,6 +840,132 @@ $$;
 ALTER FUNCTION bitfinex.bf_trades_dress_new_row() OWNER TO "ob-analytics";
 
 --
+-- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying, character); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character DEFAULT 'R0'::bpchar, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character) RETURNS SETOF record
+    LANGUAGE plpgsql
+    AS $_$
+
+DECLARE 
+	p numeric;
+	
+	order_book_episodes CURSOR FOR
+			   SELECT 	snapshot_id, 
+			   			MIN(episode_no) AS min_episode_no, 
+			   			MAX(episode_no) AS max_episode_no
+			   FROM bitfinex.bf_order_book_episodes
+			   WHERE exchange_timestamp BETWEEN "start.time" AND "end.time"
+			   GROUP BY snapshot_id;
+			   
+	cons_book_episodes CURSOR FOR
+				SELECT 	snapshot_id, 
+						MIN(episode_no) AS min_episode_no, 
+						MAX(episode_no) AS max_episode_no
+				FROM bitfinex.bf_cons_book_episodes JOIN bitfinex.bf_snapshots USING (snapshot_id)
+				WHERE bf_snapshots.prec = oba_depth.prec
+			     AND exchange_timestamp BETWEEN "start.time" AND "end.time" 
+				GROUP BY snapshot_id;	
+BEGIN
+	EXECUTE format('SELECT 10^(-%I) FROM bitfinex.bf_pairs WHERE pair = $1', prec) INTO p USING  pair;
+
+
+	FOR rng IN 	order_book_episodes LOOP
+		RETURN QUERY 	WITH ob AS (
+							SELECT	snapshot_id,
+									episode_no,
+									exchange_timestamp AS "timestamp",
+									CASE	WHEN bf_active_orders_after_episode_v.side = 'A' THEN ceiling(order_price/p)*p
+											ELSE floor(order_price/p)*p END AS price,
+									bf_active_orders_after_episode_v.side,
+									sum(order_qty) AS volume
+							FROM bitfinex.bf_active_orders_after_episode_v 
+							WHERE snapshot_id = rng.snapshot_id 
+							  AND episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
+							GROUP BY 1, 2, 3, 4, 5 ORDER BY 3, 4 DESC
+						),
+						ob_squared AS (
+							SELECT 	a.timestamp,
+									a.snapshot_id,
+									a.episode_no,
+									a.price,
+									COALESCE(ob.side, 
+											 CASE 	WHEN a.price >= ROUND((MIN(ob.price) FILTER (WHERE ob.side = 'A') OVER w + MAX(ob.price) FILTER (WHERE ob.side = 'B') OVER w)/2,2)
+														THEN 'A'::character(1)
+													ELSE
+														'B'::character(1)
+											 END
+											) AS side,
+									COALESCE(ob.volume, 0.0) AS volume
+							FROM (SELECT *
+								  FROM (SELECT DISTINCT ob.timestamp, snapshot_id, episode_no
+										FROM ob) t CROSS JOIN 
+										(SELECT DISTINCT ob.price
+										 FROM ob) p 
+								 ) a LEFT JOIN ob USING (timestamp, snapshot_id, episode_no,price) 
+							WINDOW w AS (PARTITION BY a.timestamp )
+						),
+						ob_squared_edge_detection AS (
+							SELECT *, SUM(ob_squared.volume) OVER (PARTITION BY ob_squared.timestamp, ob_squared.side ORDER BY ob_squared.price*CASE WHEN ob_squared.side = 'A' THEN -1 ELSE 1 END) AS cumsum_from_edge
+							FROM ob_squared
+						)
+						SELECT f.timestamp, f.price, f.volume, f.side
+						FROM ob_squared_edge_detection f
+						WHERE cumsum_from_edge > 0 OR prec = 'R0'; 
+	END LOOP;
+		
+	IF prec <> 'R0' THEN
+	
+		FOR rng IN cons_book_episodes LOOP
+		RETURN QUERY 	WITH ob AS (
+							SELECT	snapshot_id,
+									episode_no,
+									exchange_timestamp AS "timestamp",
+									CASE	WHEN bf_price_levels_after_episode_v.side = 'A' THEN ceiling(bf_price_levels_after_episode_v.price/p)*p
+											ELSE floor(bf_price_levels_after_episode_v.price/p)*p END AS price,
+									bf_price_levels_after_episode_v.side,
+									sum(bf_price_levels_after_episode_v.qty) AS volume
+							FROM bitfinex.bf_price_levels_after_episode_v 
+							WHERE bf_price_levels_after_episode_v.snapshot_id = rng.snapshot_id 
+							  AND bf_price_levels_after_episode_v.episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
+							GROUP BY 1, 2, 3, 4, 5 ORDER BY 3, 4 DESC
+						),
+						ob_squared AS (
+							SELECT 	a.timestamp,
+									a.snapshot_id,
+									a.episode_no,
+									a.price,
+									COALESCE(ob.side, 
+											 CASE 	WHEN a.price >= ROUND((MIN(ob.price) FILTER (WHERE ob.side = 'A') OVER w + MAX(ob.price) FILTER (WHERE ob.side = 'B') OVER w)/2,2)
+														THEN 'A'::character(1)
+													ELSE
+														'B'::character(1)
+											 END
+											) AS side,
+									COALESCE(ob.volume, 0.0) AS volume
+							FROM (SELECT *
+								  FROM (SELECT DISTINCT ob.timestamp, snapshot_id, episode_no
+										FROM ob) t CROSS JOIN 
+										(SELECT DISTINCT ob.price
+										 FROM ob) p 
+								 ) a LEFT JOIN ob USING (timestamp, snapshot_id, episode_no,price) 
+							WINDOW w AS (PARTITION BY a.timestamp )
+						)
+						SELECT f.timestamp, f.price, f.volume, f.side
+						FROM ob_squared f;
+		END LOOP;	
+	
+	END IF;
+	
+	RETURN;
+END;
+
+$_$;
+
+
+ALTER FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character) OWNER TO "ob-analytics";
+
+--
 -- Name: bf_order_book_episodes; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1428,6 +1554,12 @@ ALTER TABLE ONLY bitfinex.bf_trades
 
 
 --
+-- Name: bf_cons_book_episodes_idx_by_time; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_cons_book_episodes_idx_by_time ON bitfinex.bf_cons_book_episodes USING btree (exchange_timestamp);
+
+
 --
 -- Name: bf_cons_book_events_idx_update_next_episode_no_by_episode_no; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
@@ -1443,6 +1575,12 @@ CREATE INDEX bf_cons_book_events_idx_update_next_episode_no_by_next_episode_ ON 
 
 
 --
+-- Name: bf_order_book_episodes_idx_by_time; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE INDEX bf_order_book_episodes_idx_by_time ON bitfinex.bf_order_book_episodes USING btree (exchange_timestamp);
+
+
 --
 -- Name: bf_order_book_events_idx_active_next; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --

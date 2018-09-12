@@ -50,24 +50,16 @@ bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 214
 
 
 #' @export
-bfDepth <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647, price.aggregation = "P0", debug.query = FALSE) {
+bfDepth <- function(conn, start.time, end.time, pair="BTCUSD",price.aggregation = "P0", debug.query = FALSE) {
 
-  precision <- switch(price.aggregation, P0=0.01, P1=0.1, P2=1.0, P3=10.0, 0.01)
 
-  query <- paste0(" SELECT exchange_timestamp AS \"timestamp\",
-                            CASE WHEN side = 'A' THEN ceiling(order_price/", precision,")*",precision,
-								          "     ELSE floor(order_price/", precision," )* ", precision,
-              						" END AS price,
-                            sum(order_qty) AS volume
-                    FROM bitfinex.bf_active_orders_after_episode_v
-                    WHERE snapshot_id = ",snapshot_id ,
-                  "   AND episode_no BETWEEN ",min.episode_no, " AND ", max.episode_no,
-                  " GROUP BY 1, 2 ORDER BY 1, 2 DESC" )
+  query <- paste0(" SELECT * FROM bitfinex.oba_depth(",
+                  shQuote(start.time), ",",
+                  shQuote(end.time), ",",
+                  shQuote(pair), ",",
+                  shQuote(price.aggregation), ") ORDER BY 1, 2 DESC")
   if(debug.query) cat(query)
-  df <- dbGetQuery(conn, query)
-  depth <- melt(dcast(df,timestamp ~ price, value.var = "volume", fill=0), id.vars="timestamp", variable.name="price", value.name = "volume")
-  depth$price <- as.numeric(levels(depth$price)[depth$price])
-  depth <- depth[ with(depth, order(timestamp, -price)), ]
+  depth <- dbGetQuery(conn, query)
   depth
 }
 
