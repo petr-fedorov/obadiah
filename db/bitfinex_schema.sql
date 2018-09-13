@@ -89,6 +89,7 @@ ALTER FUNCTION bitfinex.bf_cons_book_events_update_next_episode_no() OWNER TO "o
 
 CREATE FUNCTION bitfinex.bf_depth_summary_after_episode_v(INOUT snapshot_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647, bps_step numeric DEFAULT 25, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT pair character varying, OUT exchange_timestamp timestamp with time zone, OUT episode_no integer) RETURNS SETOF record
     LANGUAGE plpgsql
+    SET work_mem TO '4GB'
     AS $$
 
 DECLARE 
@@ -845,6 +846,7 @@ ALTER FUNCTION bitfinex.bf_trades_dress_new_row() OWNER TO "ob-analytics";
 
 CREATE FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character DEFAULT 'R0'::bpchar, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character) RETURNS SETOF record
     LANGUAGE plpgsql
+    SET work_mem TO '4GB'
     AS $_$
 
 DECLARE 
@@ -868,7 +870,6 @@ DECLARE
 				GROUP BY snapshot_id;	
 BEGIN
 	EXECUTE format('SELECT 10^(-%I) FROM bitfinex.bf_pairs WHERE pair = $1', prec) INTO p USING  pair;
-
 
 	FOR rng IN 	order_book_episodes LOOP
 		RETURN QUERY 	WITH ob AS (
@@ -1321,12 +1322,13 @@ CREATE VIEW bitfinex.bf_p_snapshots_v AS
     date_trunc('seconds'::text, e.max_e_et) AS ends,
     s.pair
    FROM (bitfinex.bf_snapshots s
-     LEFT JOIN ( SELECT bf_cons_book_events.snapshot_id,
+     LEFT JOIN LATERAL ( SELECT bf_cons_book_events.snapshot_id,
             count(*) AS events,
             min(bf_cons_book_events.exchange_timestamp) AS min_e_et,
             max(bf_cons_book_events.exchange_timestamp) AS max_e_et,
             max(bf_cons_book_events.episode_no) AS last_episode
            FROM bitfinex.bf_cons_book_events
+          WHERE (bf_cons_book_events.snapshot_id = s.snapshot_id)
           GROUP BY bf_cons_book_events.snapshot_id) e USING (snapshot_id))
   WHERE (s.prec ~~ 'P%'::text)
   ORDER BY s.snapshot_id DESC;
