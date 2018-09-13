@@ -2,7 +2,6 @@
 
 export(bfDepth)
 export(bfDepthSummary)
-export(bfEpisodes)
 export(bfEvents)
 export(bfOrderBook)
 export(bfSpread)

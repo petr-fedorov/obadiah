@@ -844,7 +844,7 @@ ALTER FUNCTION bitfinex.bf_trades_dress_new_row() OWNER TO "ob-analytics";
 -- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying, character); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character DEFAULT 'R0'::bpchar, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character) RETURNS SETOF record
+CREATE FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character DEFAULT 'R0'::bpchar, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
     LANGUAGE plpgsql
     SET work_mem TO '4GB'
     AS $_$
@@ -853,36 +853,38 @@ DECLARE
 	p numeric;
 	
 	order_book_episodes CURSOR FOR
-			   SELECT 	snapshot_id, 
-			   			MIN(episode_no) AS min_episode_no, 
-			   			MAX(episode_no) AS max_episode_no
-			   FROM bitfinex.bf_order_book_episodes
-			   WHERE exchange_timestamp BETWEEN "start.time" AND "end.time"
-			   GROUP BY snapshot_id;
+			   SELECT 	bf_order_book_episodes.snapshot_id, 
+			   			MIN(bf_order_book_episodes.episode_no) AS min_episode_no, 
+			   			MAX(bf_order_book_episodes.episode_no) AS max_episode_no
+			   FROM bitfinex.bf_order_book_episodes JOIN bitfinex.bf_snapshots USING (snapshot_id)
+			   WHERE exchange_timestamp BETWEEN "start.time" AND "end.time" 
+			     AND bf_snapshots.pair = oba_depth.pair
+			   GROUP BY bf_order_book_episodes.snapshot_id;
 			   
 	cons_book_episodes CURSOR FOR
-				SELECT 	snapshot_id, 
-						MIN(episode_no) AS min_episode_no, 
-						MAX(episode_no) AS max_episode_no
+				SELECT 	bf_cons_book_episodes.snapshot_id, 
+						MIN(bf_cons_book_episodes.episode_no) AS min_episode_no, 
+						MAX(bf_cons_book_episodes.episode_no) AS max_episode_no
 				FROM bitfinex.bf_cons_book_episodes JOIN bitfinex.bf_snapshots USING (snapshot_id)
 				WHERE bf_snapshots.prec = oba_depth.prec
 			     AND exchange_timestamp BETWEEN "start.time" AND "end.time" 
-				GROUP BY snapshot_id;	
+				 AND bf_snapshots.pair = oba_depth.pair
+				GROUP BY bf_cons_book_episodes.snapshot_id;	
 BEGIN
 	EXECUTE format('SELECT 10^(-%I) FROM bitfinex.bf_pairs WHERE pair = $1', prec) INTO p USING  pair;
 
 	FOR rng IN 	order_book_episodes LOOP
 		RETURN QUERY 	WITH ob AS (
-							SELECT	snapshot_id,
-									episode_no,
+							SELECT	bf_active_orders_after_episode_v.snapshot_id,
+									bf_active_orders_after_episode_v.episode_no,
 									exchange_timestamp AS "timestamp",
 									CASE	WHEN bf_active_orders_after_episode_v.side = 'A' THEN ceiling(order_price/p)*p
 											ELSE floor(order_price/p)*p END AS price,
 									bf_active_orders_after_episode_v.side,
 									sum(order_qty) AS volume
 							FROM bitfinex.bf_active_orders_after_episode_v 
-							WHERE snapshot_id = rng.snapshot_id 
-							  AND episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
+							WHERE bf_active_orders_after_episode_v.snapshot_id = rng.snapshot_id 
+							  AND bf_active_orders_after_episode_v.episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
 							GROUP BY 1, 2, 3, 4, 5 ORDER BY 3, 4 DESC
 						),
 						ob_squared AS (
@@ -899,7 +901,7 @@ BEGIN
 											) AS side,
 									COALESCE(ob.volume, 0.0) AS volume
 							FROM (SELECT *
-								  FROM (SELECT DISTINCT ob.timestamp, snapshot_id, episode_no
+								  FROM (SELECT DISTINCT ob.timestamp, ob.snapshot_id, ob.episode_no
 										FROM ob) t CROSS JOIN 
 										(SELECT DISTINCT ob.price
 										 FROM ob) p 
@@ -910,7 +912,7 @@ BEGIN
 							SELECT *, SUM(ob_squared.volume) OVER (PARTITION BY ob_squared.timestamp, ob_squared.side ORDER BY ob_squared.price*CASE WHEN ob_squared.side = 'A' THEN -1 ELSE 1 END) AS cumsum_from_edge
 							FROM ob_squared
 						)
-						SELECT f.timestamp, f.price, f.volume, f.side
+						SELECT f.timestamp, f.price, f.volume, f.side, f.snapshot_id, f.episode_no
 						FROM ob_squared_edge_detection f
 						WHERE cumsum_from_edge > 0 OR prec = 'R0'; 
 	END LOOP;
@@ -919,8 +921,8 @@ BEGIN
 	
 		FOR rng IN cons_book_episodes LOOP
 		RETURN QUERY 	WITH ob AS (
-							SELECT	snapshot_id,
-									episode_no,
+							SELECT	bf_price_levels_after_episode_v.snapshot_id,
+									bf_price_levels_after_episode_v.episode_no,
 									exchange_timestamp AS "timestamp",
 									CASE	WHEN bf_price_levels_after_episode_v.side = 'A' THEN ceiling(bf_price_levels_after_episode_v.price/p)*p
 											ELSE floor(bf_price_levels_after_episode_v.price/p)*p END AS price,
@@ -945,14 +947,14 @@ BEGIN
 											) AS side,
 									COALESCE(ob.volume, 0.0) AS volume
 							FROM (SELECT *
-								  FROM (SELECT DISTINCT ob.timestamp, snapshot_id, episode_no
+								  FROM (SELECT DISTINCT ob.timestamp, ob.snapshot_id, ob.episode_no
 										FROM ob) t CROSS JOIN 
 										(SELECT DISTINCT ob.price
 										 FROM ob) p 
 								 ) a LEFT JOIN ob USING (timestamp, snapshot_id, episode_no,price) 
 							WINDOW w AS (PARTITION BY a.timestamp )
 						)
-						SELECT f.timestamp, f.price, f.volume, f.side
+						SELECT f.timestamp, f.price, f.volume, f.side, f.snapshot_id, f.episode_no
 						FROM ob_squared f;
 		END LOOP;	
 	
@@ -964,7 +966,86 @@ END;
 $_$;
 
 
-ALTER FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character, OUT snapshot_id integer, OUT episode_no integer) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_spread(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT "best.bid.price" numeric, OUT "best.bid.volume" numeric, OUT "best.ask.price" numeric, OUT "best.ask.volume" numeric, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
+    LANGUAGE plpgsql
+    SET work_mem TO '1GB'
+    AS $$
+
+DECLARE 
+	p numeric;
+	
+	order_book_episodes CURSOR FOR
+			   SELECT 	bf_order_book_episodes.snapshot_id, 
+			   			MIN(bf_order_book_episodes.episode_no) AS min_episode_no, 
+			   			MAX(bf_order_book_episodes.episode_no) AS max_episode_no
+			   FROM bitfinex.bf_order_book_episodes JOIN bitfinex.bf_snapshots USING (snapshot_id)
+			   WHERE exchange_timestamp BETWEEN "start.time" AND "end.time" 
+			     AND bf_snapshots.pair = oba_spread.pair
+			   GROUP BY bf_order_book_episodes.snapshot_id;
+			   
+BEGIN
+
+	FOR rng IN 	order_book_episodes LOOP
+		RETURN QUERY 
+			SELECT 	exchange_timestamp AS "timestamp",
+		    		best_bid_price AS "best.bid.price",
+		      		best_bid_qty AS "best.bid.vol",
+		      		best_ask_price AS "best.ask.price",
+		      		best_ask_qty AS "best.ask.vol",
+		      		a.snapshot_id,
+		      		a.episode_no
+  			FROM (
+    			SELECT 	*, 
+						COALESCE(lag(best_bid_price) OVER p, -1) AS lag_bbp,
+              			COALESCE(lag(best_bid_qty) OVER p, -1) AS lag_bbq,
+		          		COALESCE(lag(best_ask_price) OVER p, -1) AS lag_bap,
+              			COALESCE(lag(best_ask_qty) OVER p, -1) AS lag_baq
+    			FROM ( 
+					SELECT 	bf_spreads.episode_no,
+							best_bid_price,
+							best_bid_qty,
+							best_ask_price,
+	  		        		best_ask_qty,
+							bf_spreads.snapshot_id,
+							exchange_timestamp - 0.001*'1 sec'::interval AS exchange_timestamp
+           			FROM bitfinex.bf_spreads JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no)
+			       	WHERE bf_spreads.timing = 'B' 
+					  AND bf_spreads.snapshot_id = rng.snapshot_id
+					  AND bf_spreads.episode_no BETWEEN rng.min_episode_no  AND rng.max_episode_no
+           			UNION ALL
+           			SELECT 	bf_spreads.episode_no,
+							best_bid_price,
+							best_bid_qty,
+							best_ask_price,
+	  		        		best_ask_qty,
+							bf_spreads.snapshot_id,
+							exchange_timestamp 
+           			FROM bitfinex.bf_spreads JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no)
+           			WHERE bf_spreads.timing = 'A' 
+					  AND bf_spreads.snapshot_id = rng.snapshot_id
+					  AND bf_spreads.episode_no BETWEEN rng.min_episode_no  AND rng.max_episode_no
+         		) v
+    			WINDOW p AS (PARTITION BY v.snapshot_id  ORDER BY v.episode_no)
+  			) a
+  			WHERE best_bid_price != lag_bbp
+     		   OR best_bid_qty != lag_bbq
+     		   OR best_ask_price != lag_bap
+      		   OR best_ask_qty != lag_baq;
+	END LOOP;
+	
+	RETURN;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT "best.bid.price" numeric, OUT "best.bid.volume" numeric, OUT "best.ask.price" numeric, OUT "best.ask.volume" numeric, OUT snapshot_id integer, OUT episode_no integer) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics

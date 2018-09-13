@@ -5,47 +5,16 @@
 #' @importFrom reshape2 dcast melt
 
 
-#' @export
-bfEpisodes <- function(conn, snapshot_id) {
-  stop("Not yet implemented.")
-}
-
 
 #' @export
-bfSpread <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647, debug.query = FALSE) {
-  query <- paste0(
-" SELECT 	exchange_timestamp AS \"timestamp\",
-		      best_bid_price AS \"best.bid.price\",
-		      best_bid_qty AS \"best.bid.vol\",
-		      best_ask_price AS \"best.ask.price\",
-		      best_ask_qty AS \"best.ask.vol\",
-		      episode_no,
-		      snapshot_id
-  FROM (
-    SELECT *, COALESCE(lag(best_bid_price) OVER p, -1) AS lag_bbp,
-              COALESCE(lag(best_bid_qty) OVER p, -1) AS lag_bbq,
-		          COALESCE(lag(best_ask_price) OVER p, -1) AS lag_bap,
-              COALESCE(lag(best_ask_qty) OVER p, -1) AS lag_baq
-    FROM ( SELECT episode_no, best_bid_price, best_bid_qty, best_ask_price,
-	  		        best_ask_qty, snapshot_id, exchange_timestamp
-           FROM bitfinex.bf_spreads JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no)
-           WHERE timing = 'B' AND snapshot_id = ", snapshot_id, " AND episode_no BETWEEN ",min.episode_no, " AND ", max.episode_no, "
-           UNION ALL
-           SELECT episode_no, best_bid_price, best_bid_qty, best_ask_price,
-	  		        best_ask_qty, snapshot_id, exchange_timestamp + 0.001*'1 sec'::interval
-           FROM bitfinex.bf_spreads JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no)
-           WHERE timing = 'A' AND snapshot_id = ", snapshot_id, " AND episode_no BETWEEN ",min.episode_no, " AND ", max.episode_no, "
-         ) v
-    WINDOW p AS (PARTITION BY snapshot_id  ORDER BY episode_no)
-  ) a
-  WHERE best_bid_price != lag_bbp
-     OR best_bid_qty != lag_bbq
-     OR best_ask_price != lag_bap
-     OR best_ask_qty != lag_baq
-  ")
+bfSpread <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
+  query <- paste0(" SELECT 	\"timestamp\", \"best.bid.price\", \"best.bid.volume\", \"best.ask.price\", \"best.ask.volume\" FROM bitfinex.oba_spread(",
+                  shQuote(start.time), ",",
+                  shQuote(end.time), ",",
+                  shQuote(pair), ") ORDER BY timestamp")
   if(debug.query) cat(query)
-  dbGetQuery(conn,query)
-
+  spread <- dbGetQuery(conn, query)
+  spread
 }
 
 
