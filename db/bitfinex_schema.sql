@@ -966,6 +966,32 @@ $_$;
 ALTER FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character) OWNER TO "ob-analytics";
 
 --
+-- Name: oba_trades(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
+    LANGUAGE sql
+    SET work_mem TO '1GB'
+    AS $$
+
+	SELECT	bf_order_book_episodes.exchange_timestamp AS "timestamp",
+		   	price, 
+		   	qty AS volume, 
+		   	CASE 	WHEN direction = 'S' THEN 'sell'::character varying
+					ELSE 'buy'::character varying
+			END AS direction,
+			snapshot_id,
+			episode_no
+   	FROM bitfinex.bf_trades JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no) JOIN bitfinex.bf_snapshots USING (snapshot_id)
+   	WHERE  bf_order_book_episodes.exchange_timestamp  BETWEEN oba_trades."start.time" AND oba_trades."end.time"
+	  AND  pair = oba_trades.pair
+
+$$;
+
+
+ALTER FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer) OWNER TO "ob-analytics";
+
+--
 -- Name: bf_order_book_episodes; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
 

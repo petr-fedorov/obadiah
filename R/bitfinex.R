@@ -132,18 +132,14 @@ bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range
 }
 
 #' @export
-bfTrades <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647) {
-  dbGetQuery(conn, paste0(" SELECT 	episode_exchange_timestamp AS \"timestamp\", ",
-                                  " price, ",
-                                  " qty AS volume, ",
-                                  " CASE WHEN direction = 'S' THEN 'sell'::text ",
-                                       " ELSE 'buy'::text ",
-                                  " END AS direction ",
-                          " FROM bitfinex.bf_trades_v ",
-                          " WHERE  episode_exchange_timestamp IS NOT NULL ",
-                            " AND snapshot_id = ", snapshot_id,
-                            " AND episode_no BETWEEN ", min.episode_no, " AND ", max.episode_no,
-                          " ORDER BY id "))
+bfTrades <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
+  query <- paste0(" SELECT 	timestamp, price, volume, direction FROM bitfinex.oba_trades(",
+                  shQuote(start.time), ",",
+                  shQuote(end.time), ",",
+                  shQuote(pair), ") ORDER BY timestamp")
+  if(debug.query) cat(query)
+  trades <- dbGetQuery(conn, query)
+  trades
 }
 
 
