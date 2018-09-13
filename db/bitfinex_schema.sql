@@ -84,204 +84,6 @@ $$;
 ALTER FUNCTION bitfinex.bf_cons_book_events_update_next_episode_no() OWNER TO "ob-analytics";
 
 --
--- Name: bf_depth_summary_after_episode_v(integer, integer, integer, numeric); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE FUNCTION bitfinex.bf_depth_summary_after_episode_v(INOUT snapshot_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647, bps_step numeric DEFAULT 25, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT pair character varying, OUT exchange_timestamp timestamp with time zone, OUT episode_no integer) RETURNS SETOF record
-    LANGUAGE plpgsql
-    SET work_mem TO '4GB'
-    AS $$
-
-DECLARE 
-	p bitfinex.bf_snapshots.prec%TYPE;
-BEGIN
-	
-	SELECT prec INTO p
-	FROM bitfinex.bf_snapshots 
-	WHERE bf_snapshots.snapshot_id = bf_depth_summary_after_episode_v.snapshot_id;
-	
-	IF p = 'R0' THEN
-
-		RETURN QUERY
-		SELECT  u.snapshot_id,
-				sum(u.order_qty) AS volume,
-				u.bps_level,
-				u.bps_price,
-				round(sum(u.order_qty*u.order_price)/sum(u.order_qty), "R0") AS bps_vwap,
-				u.direction,
-				u.pair,
-				u.exchange_timestamp,
-				u.episode_no
-		FROM (
-			SELECT 	r2.order_price,
-					r2.order_qty, 
-					(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-					round(r2.best_bid*(1 - r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
-					'bid'::character varying AS direction,
-					r2.pair,
-					r2.exchange_timestamp,
-					r2.episode_no,
-					r2.snapshot_id,
-					"R0"
-			FROM (		
-				SELECT 	r1.order_price, 
-						r1.order_qty, 
-						ceiling((r1.best_bid - r1.order_price)/r1.best_bid/bf_depth_summary_after_episode_v.bps_step*10000)::integer AS bps_level,
-						r1.best_bid,
-						r1.pair,
-						r1.exchange_timestamp,
-						r1.episode_no,
-						r1.snapshot_id
-				FROM (
-						SELECT 	bf_active_orders_after_episode_v.order_price, 
-								bf_active_orders_after_episode_v.order_qty,
-								first_value(bf_active_orders_after_episode_v.order_price) OVER w AS best_bid, 
-								bf_active_orders_after_episode_v.pair,
-								bf_active_orders_after_episode_v.exchange_timestamp,
-								bf_active_orders_after_episode_v.episode_no,
-								bf_active_orders_after_episode_v.snapshot_id
-						FROM bitfinex.bf_active_orders_after_episode_v
-						WHERE bf_active_orders_after_episode_v.snapshot_id = bf_depth_summary_after_episode_v.snapshot_id
-						  AND bf_active_orders_after_episode_v.episode_no BETWEEN bf_depth_summary_after_episode_v.first_episode_no 
-														AND bf_depth_summary_after_episode_v.last_episode_no
-						  AND bitfinex.bf_active_orders_after_episode_v.side = 'B'
-						WINDOW w AS (PARTITION BY bf_active_orders_after_episode_v.episode_no ORDER BY order_price DESC)
-			) r1
-		) r2 JOIN bitfinex.bf_pairs USING (pair)
-		UNION ALL
-		SELECT 	r2.order_price,
-				r2.order_qty, 
-				(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-				round(r2.best_ask*(1 + r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
-				'ask'::character varying AS direction,
-				r2.pair,
-				r2.exchange_timestamp,
-				r2.episode_no,
-				r2.snapshot_id,
-				"R0"
-		FROM (		
-			SELECT 	r1.order_price, 
-					r1.order_qty, 
-					ceiling((r1.order_price-best_ask)/r1.best_ask/bf_depth_summary_after_episode_v.bps_step*10000)::integer AS bps_level,
-					best_ask,
-					r1.pair,
-					r1.exchange_timestamp,
-					r1.episode_no,
-					r1.snapshot_id
-			FROM (
-					SELECT 	bf_active_orders_after_episode_v.order_price, 
-							bf_active_orders_after_episode_v.order_qty,
-							first_value(bf_active_orders_after_episode_v.order_price) OVER w AS best_ask, 
-							bf_active_orders_after_episode_v.pair,
-							bf_active_orders_after_episode_v.exchange_timestamp,
-							bf_active_orders_after_episode_v.episode_no,
-							bf_active_orders_after_episode_v.snapshot_id
-					FROM bitfinex.bf_active_orders_after_episode_v
-					WHERE bf_active_orders_after_episode_v.snapshot_id = bf_depth_summary_after_episode_v.snapshot_id
-					  AND bf_active_orders_after_episode_v.episode_no BETWEEN bf_depth_summary_after_episode_v.first_episode_no 
-											AND bf_depth_summary_after_episode_v.last_episode_no
-					  AND bitfinex.bf_active_orders_after_episode_v.side = 'A'
-					WINDOW w AS (PARTITION BY bf_active_orders_after_episode_v.episode_no ORDER BY order_price)
-			) r1
-		) r2 JOIN bitfinex.bf_pairs USING (pair)
-		) u 
-		GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "R0"
-		ORDER BY u.episode_no, u.direction, CASE WHEN u.direction = 'ask' THEN 1 ELSE -1 END*u.bps_level DESC;
-	ELSE
-		RETURN QUERY
-		SELECT  u.snapshot_id,
-				sum(u.qty) AS volume,
-				u.bps_level,
-				u.bps_price,
-				round(sum(u.qty*u.price)/sum(u.qty), "R0") AS bps_vwap,
-				u.direction,
-				u.pair,
-				u.exchange_timestamp,
-				u.episode_no
-		FROM (
-			SELECT 	r2.price,
-					r2.qty, 
-					(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-					round(r2.best_bid*(1 - r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
-					'bid'::character varying AS direction,
-					r2.pair,
-					r2.exchange_timestamp,
-					r2.episode_no,
-					r2.snapshot_id,
-					"R0"
-			FROM (		
-				SELECT 	r1.price, 
-						r1.qty, 
-						ceiling((r1.best_bid - r1.price)/r1.best_bid/bf_depth_summary_after_episode_v.bps_step*10000)::integer AS bps_level,
-						r1.best_bid,
-						r1.pair,
-						r1.exchange_timestamp,
-						r1.episode_no,
-						r1.snapshot_id
-				FROM (
-						SELECT 	bf_price_levels_after_episode_v.price, 
-								bf_price_levels_after_episode_v.qty,
-								first_value(bf_price_levels_after_episode_v.price) OVER w AS best_bid, 
-								bf_price_levels_after_episode_v.pair,
-								bf_price_levels_after_episode_v.exchange_timestamp,
-								bf_price_levels_after_episode_v.episode_no,
-								bf_price_levels_after_episode_v.snapshot_id
-						FROM bitfinex.bf_price_levels_after_episode_v 
-						WHERE bf_price_levels_after_episode_v.snapshot_id = bf_depth_summary_after_episode_v.snapshot_id
-						  AND bf_price_levels_after_episode_v.episode_no BETWEEN bf_depth_summary_after_episode_v.first_episode_no 
-														AND bf_depth_summary_after_episode_v.last_episode_no
-						  AND bf_price_levels_after_episode_v.side = 'B'
-						WINDOW w AS (PARTITION BY bf_price_levels_after_episode_v.episode_no ORDER BY price DESC)
-			) r1
-		) r2 JOIN bitfinex.bf_pairs USING (pair)
-		UNION ALL
-		SELECT 	r2.price,
-				r2.qty, 
-				(bf_depth_summary_after_episode_v.bps_step*r2.bps_level)::integer AS bps_level,
-				round(r2.best_ask*(1 + r2.bps_level*bf_depth_summary_after_episode_v.bps_step/10000), bf_pairs."R0") AS bps_price,
-				'ask'::character varying AS direction,
-				r2.pair,
-				r2.exchange_timestamp,
-				r2.episode_no,
-				r2.snapshot_id,
-				"R0"
-		FROM (		
-			SELECT 	r1.price, 
-					r1.qty, 
-					ceiling((r1.price-best_ask)/r1.best_ask/bf_depth_summary_after_episode_v.bps_step*10000)::integer AS bps_level,
-					best_ask,
-					r1.pair,
-					r1.exchange_timestamp,
-					r1.episode_no,
-					r1.snapshot_id
-			FROM (
-					SELECT 	bf_price_levels_after_episode_v.price, 
-							bf_price_levels_after_episode_v.qty,
-							first_value(bf_price_levels_after_episode_v.price) OVER w AS best_ask, 
-							bf_price_levels_after_episode_v.pair,
-							bf_price_levels_after_episode_v.exchange_timestamp,
-							bf_price_levels_after_episode_v.episode_no,
-							bf_price_levels_after_episode_v.snapshot_id
-					FROM bitfinex.bf_price_levels_after_episode_v 
-					WHERE bf_price_levels_after_episode_v.snapshot_id = bf_depth_summary_after_episode_v.snapshot_id
-					  AND bf_price_levels_after_episode_v.episode_no BETWEEN bf_depth_summary_after_episode_v.first_episode_no 
-											AND bf_depth_summary_after_episode_v.last_episode_no
-					  AND bf_price_levels_after_episode_v.side = 'A'
-					WINDOW w AS (PARTITION BY bf_price_levels_after_episode_v.episode_no ORDER BY price)
-			) r1
-		) r2 JOIN bitfinex.bf_pairs USING (pair)
-		) u 
-		GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "R0"
-		ORDER BY u.episode_no, u.direction, CASE WHEN u.direction = 'ask' THEN 1 ELSE -1 END*u.bps_level DESC;
-	END IF;
-END
-
-$$;
-
-
-ALTER FUNCTION bitfinex.bf_depth_summary_after_episode_v(INOUT snapshot_id integer, first_episode_no integer, last_episode_no integer, bps_step numeric, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT pair character varying, OUT exchange_timestamp timestamp with time zone, OUT episode_no integer) OWNER TO "ob-analytics";
-
---
 -- Name: bf_order_book_episodes_match_trades_to_episodes(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -967,6 +769,224 @@ $_$;
 
 
 ALTER FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character, OUT snapshot_id integer, OUT episode_no integer) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, character varying, character, numeric); Type: FUNCTION; Schema: bitfinex; Owner: postgres
+--
+
+CREATE FUNCTION bitfinex.oba_depth_summary("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, prec character DEFAULT 'P1'::character varying, bps_step numeric DEFAULT 25, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT "timestamp" timestamp with time zone, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
+    LANGUAGE plpgsql
+    SET work_mem TO '4GB'
+    AS $$
+
+DECLARE 
+
+	order_book_episodes CURSOR FOR
+			   SELECT 	bf_order_book_episodes.snapshot_id, 
+			   			MIN(bf_order_book_episodes.episode_no) AS min_episode_no, 
+			   			MAX(bf_order_book_episodes.episode_no) AS max_episode_no
+			   FROM bitfinex.bf_order_book_episodes JOIN bitfinex.bf_snapshots USING (snapshot_id)
+			   WHERE bf_order_book_episodes.exchange_timestamp BETWEEN "start.time" AND "end.time" 
+			     AND bf_snapshots.pair = oba_depth_summary.pair
+			   GROUP BY bf_order_book_episodes.snapshot_id;
+			   
+	cons_book_episodes CURSOR FOR
+				SELECT 	bf_cons_book_episodes.snapshot_id, 
+						MIN(bf_cons_book_episodes.episode_no) AS min_episode_no, 
+						MAX(bf_cons_book_episodes.episode_no) AS max_episode_no
+				FROM bitfinex.bf_cons_book_episodes JOIN bitfinex.bf_snapshots USING (snapshot_id)
+				WHERE bf_snapshots.prec = oba_depth_summary.prec
+			     AND bf_cons_book_episodes.exchange_timestamp BETWEEN "start.time" AND "end.time" 
+				 AND bf_snapshots.pair = oba_depth_summary.pair
+				GROUP BY bf_cons_book_episodes.snapshot_id;	
+	
+BEGIN
+	
+	IF prec = 'R0' THEN
+
+		FOR rng IN 	order_book_episodes LOOP
+
+			RETURN QUERY
+				SELECT  sum(u.order_qty) AS volume,
+						u.bps_level,
+						u.bps_price,
+						round(sum(u.order_qty*u.order_price)/sum(u.order_qty), "R0") AS bps_vwap,
+						u.direction,
+						u.exchange_timestamp,
+						u.snapshot_id,				
+						u.episode_no
+				FROM (
+					SELECT 	r2.order_price,
+							r2.order_qty, 
+							(oba_depth_summary.bps_step*r2.bps_level)::integer AS bps_level,
+							round(r2.best_bid*(1 - r2.bps_level*oba_depth_summary.bps_step/10000), bf_pairs."R0") AS bps_price,
+							'bid'::character varying AS direction,
+							r2.pair,
+							r2.exchange_timestamp,
+							r2.episode_no,
+							r2.snapshot_id,
+							"R0"
+					FROM (		
+						SELECT 	r1.order_price, 
+								r1.order_qty, 
+								ceiling((r1.best_bid - r1.order_price)/r1.best_bid/oba_depth_summary.bps_step*10000)::integer AS bps_level,
+								r1.best_bid,
+								r1.pair,
+								r1.exchange_timestamp,
+								r1.episode_no,
+								r1.snapshot_id
+						FROM (
+								SELECT 	bf_active_orders_after_episode_v.order_price, 
+										bf_active_orders_after_episode_v.order_qty,
+										first_value(bf_active_orders_after_episode_v.order_price) OVER w AS best_bid, 
+										bf_active_orders_after_episode_v.pair,
+										bf_active_orders_after_episode_v.exchange_timestamp,
+										bf_active_orders_after_episode_v.episode_no,
+										bf_active_orders_after_episode_v.snapshot_id
+								FROM bitfinex.bf_active_orders_after_episode_v
+								WHERE bf_active_orders_after_episode_v.snapshot_id = rng.snapshot_id
+								  AND bf_active_orders_after_episode_v.episode_no BETWEEN rng.min_episode_no 
+																AND rng.max_episode_no
+								  AND bitfinex.bf_active_orders_after_episode_v.side = 'B'
+								WINDOW w AS (PARTITION BY bf_active_orders_after_episode_v.episode_no ORDER BY order_price DESC)
+					) r1
+				) r2 JOIN bitfinex.bf_pairs USING (pair)
+				UNION ALL
+				SELECT 	r2.order_price,
+						r2.order_qty, 
+						(oba_depth_summary.bps_step*r2.bps_level)::integer AS bps_level,
+						round(r2.best_ask*(1 + r2.bps_level*oba_depth_summary.bps_step/10000), bf_pairs."R0") AS bps_price,
+						'ask'::character varying AS direction,
+						r2.pair,
+						r2.exchange_timestamp,
+						r2.episode_no,
+						r2.snapshot_id,
+						"R0"
+				FROM (		
+					SELECT 	r1.order_price, 
+							r1.order_qty, 
+							ceiling((r1.order_price-best_ask)/r1.best_ask/oba_depth_summary.bps_step*10000)::integer AS bps_level,
+							best_ask,
+							r1.pair,
+							r1.exchange_timestamp,
+							r1.episode_no,
+							r1.snapshot_id
+					FROM (
+							SELECT 	bf_active_orders_after_episode_v.order_price, 
+									bf_active_orders_after_episode_v.order_qty,
+									first_value(bf_active_orders_after_episode_v.order_price) OVER w AS best_ask, 
+									bf_active_orders_after_episode_v.pair,
+									bf_active_orders_after_episode_v.exchange_timestamp,
+									bf_active_orders_after_episode_v.episode_no,
+									bf_active_orders_after_episode_v.snapshot_id
+							FROM bitfinex.bf_active_orders_after_episode_v
+							WHERE bf_active_orders_after_episode_v.snapshot_id = rng.snapshot_id
+							  AND bf_active_orders_after_episode_v.episode_no BETWEEN rng.min_episode_no 
+													AND rng.max_episode_no
+							  AND bitfinex.bf_active_orders_after_episode_v.side = 'A'
+							WINDOW w AS (PARTITION BY bf_active_orders_after_episode_v.episode_no ORDER BY order_price)
+					) r1
+				) r2 JOIN bitfinex.bf_pairs USING (pair)
+				) u 
+				GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "R0"
+				ORDER BY u.episode_no, u.direction, CASE WHEN u.direction = 'ask' THEN 1 ELSE -1 END*u.bps_level DESC;
+		END LOOP;
+	ELSE
+		FOR rng IN cons_book_episodes LOOP
+
+			RETURN QUERY
+			SELECT  sum(u.qty) AS volume,
+					u.bps_level,
+					u.bps_price,
+					round(sum(u.qty*u.price)/sum(u.qty), "R0") AS bps_vwap,
+					u.direction,
+					u.exchange_timestamp,
+					u.snapshot_id,
+					u.episode_no
+			FROM (
+				SELECT 	r2.price,
+						r2.qty, 
+						(oba_depth_summary.bps_step*r2.bps_level)::integer AS bps_level,
+						round(r2.best_bid*(1 - r2.bps_level*oba_depth_summary.bps_step/10000), bf_pairs."R0") AS bps_price,
+						'bid'::character varying AS direction,
+						r2.pair,
+						r2.exchange_timestamp,
+						r2.episode_no,
+						r2.snapshot_id,
+						"R0"
+				FROM (		
+					SELECT 	r1.price, 
+							r1.qty, 
+							ceiling((r1.best_bid - r1.price)/r1.best_bid/oba_depth_summary.bps_step*10000)::integer AS bps_level,
+							r1.best_bid,
+							r1.pair,
+							r1.exchange_timestamp,
+							r1.episode_no,
+							r1.snapshot_id
+					FROM (
+							SELECT 	bf_price_levels_after_episode_v.price, 
+									bf_price_levels_after_episode_v.qty,
+									first_value(bf_price_levels_after_episode_v.price) OVER w AS best_bid, 
+									bf_price_levels_after_episode_v.pair,
+									bf_price_levels_after_episode_v.exchange_timestamp,
+									bf_price_levels_after_episode_v.episode_no,
+									bf_price_levels_after_episode_v.snapshot_id
+							FROM bitfinex.bf_price_levels_after_episode_v 
+							WHERE bf_price_levels_after_episode_v.snapshot_id = rng.snapshot_id
+							  AND bf_price_levels_after_episode_v.episode_no BETWEEN rng.min_episode_no 
+															AND rng.max_episode_no
+							  AND bf_price_levels_after_episode_v.side = 'B'
+							WINDOW w AS (PARTITION BY bf_price_levels_after_episode_v.episode_no ORDER BY price DESC)
+				) r1
+			) r2 JOIN bitfinex.bf_pairs USING (pair)
+			UNION ALL
+			SELECT 	r2.price,
+					r2.qty, 
+					(oba_depth_summary.bps_step*r2.bps_level)::integer AS bps_level,
+					round(r2.best_ask*(1 + r2.bps_level*oba_depth_summary.bps_step/10000), bf_pairs."R0") AS bps_price,
+					'ask'::character varying AS direction,
+					r2.pair,
+					r2.exchange_timestamp,
+					r2.episode_no,
+					r2.snapshot_id,
+					"R0"
+			FROM (		
+				SELECT 	r1.price, 
+						r1.qty, 
+						ceiling((r1.price-best_ask)/r1.best_ask/oba_depth_summary.bps_step*10000)::integer AS bps_level,
+						best_ask,
+						r1.pair,
+						r1.exchange_timestamp,
+						r1.episode_no,
+						r1.snapshot_id
+				FROM (
+						SELECT 	bf_price_levels_after_episode_v.price, 
+								bf_price_levels_after_episode_v.qty,
+								first_value(bf_price_levels_after_episode_v.price) OVER w AS best_ask, 
+								bf_price_levels_after_episode_v.pair,
+								bf_price_levels_after_episode_v.exchange_timestamp,
+								bf_price_levels_after_episode_v.episode_no,
+								bf_price_levels_after_episode_v.snapshot_id
+						FROM bitfinex.bf_price_levels_after_episode_v 
+						WHERE bf_price_levels_after_episode_v.snapshot_id = rng.snapshot_id
+						  AND bf_price_levels_after_episode_v.episode_no BETWEEN rng.min_episode_no 
+												AND rng.max_episode_no
+						  AND bf_price_levels_after_episode_v.side = 'A'
+						WINDOW w AS (PARTITION BY bf_price_levels_after_episode_v.episode_no ORDER BY price)
+				) r1
+			) r2 JOIN bitfinex.bf_pairs USING (pair)
+			) u 
+			GROUP BY u.pair, u.bps_level, u.bps_price, u.direction, u.exchange_timestamp, u.episode_no, u.snapshot_id, "R0"
+			ORDER BY u.episode_no, u.direction, CASE WHEN u.direction = 'ask' THEN 1 ELSE -1 END*u.bps_level DESC;
+		END LOOP;
+	END IF;
+	RETURN;
+END
+
+$$;
+
+
+ALTER FUNCTION bitfinex.oba_depth_summary("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, bps_step numeric, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT "timestamp" timestamp with time zone, OUT snapshot_id integer, OUT episode_no integer) OWNER TO postgres;
 
 --
 -- Name: oba_spread(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics

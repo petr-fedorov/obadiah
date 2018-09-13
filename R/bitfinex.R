@@ -34,9 +34,12 @@ bfDepth <- function(conn, start.time, end.time, pair="BTCUSD",price.aggregation 
 
 
 #' @export
-bfDepthSummary <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647,  debug.query = FALSE) {
-  query <- paste0("SELECT exchange_timestamp AS timestamp, direction, bps_level, bps_vwap, volume
-                   FROM bitfinex.bf_depth_summary_after_episode_v(",snapshot_id,", ", min.episode_no,", ", max.episode_no,")")
+bfDepthSummary <- function(conn, start.time, end.time, pair="BTCUSD",price.aggregation = "P1", debug.query = FALSE) {
+  query <- paste0("SELECT timestamp, direction, bps_level, bps_vwap, volume FROM bitfinex.oba_depth_summary(",
+                  shQuote(start.time), ",",
+                  shQuote(end.time), ",",
+                  shQuote(pair), ",",
+                  shQuote(price.aggregation),")")
   if(debug.query) cat(query)
   df <- dbGetQuery(conn, query)
   df <- df %>%
