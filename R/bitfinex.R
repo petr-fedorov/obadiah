@@ -116,27 +116,11 @@ bfTrades <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 
 
 #' @export
-bfEvents <- function(conn, snapshot_id, min.episode_no = 0, max.episode_no = 2147483647,  debug.query = FALSE) {
-  query <- paste0("SELECT snapshot_id*10000 + episode_no*100 + event_no AS \"event.id\",
-                          order_id AS id,
-		                      bf_order_book_events.exchange_timestamp AS \"timestamp\",
-                          order_price AS price, abs(event_qty) AS volume, 'deleted'::text AS action,
-                          CASE WHEN side = 'A' THEN 'ask'::text ELSE 'bid'::text END AS direction, 'flashed-limit'::text AS \"type\"
-                    FROM bitfinex.bf_order_book_events LEFT JOIN bitfinex.bf_trades USING (snapshot_id, episode_no, event_no)
-                    WHERE snapshot_id = ",snapshot_id,
-                          " AND episode_no BETWEEN ",  min.episode_no ," AND ",max.episode_no,
-                    " AND id IS NULL AND order_qty = 0
-                    UNION ALL
-                    SELECT snapshot_id*10000 + episode_no*100 + event_no AS \"event.id\",
-                          order_id AS id,
-		                      bf_order_book_events.exchange_timestamp AS \"timestamp\",
-                          order_price AS price, abs(event_qty) AS volume, 'created'::text AS action,
-                          CASE WHEN side = 'A' THEN 'ask'::text ELSE 'bid'::text END AS direction, 'flashed-limit'::text AS \"type\"
-                    FROM bitfinex.bf_order_book_events LEFT JOIN bitfinex.bf_trades USING (snapshot_id, episode_no, event_no)
-                    WHERE snapshot_id = ",snapshot_id,
-                  " AND episode_no BETWEEN ",  min.episode_no ," AND ",max.episode_no,
-                  " AND order_qty = event_qty AND event_price = order_price
-                    ORDER BY 1")
+bfEvents <- function(conn,start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
+  query <- paste0("SELECT \"event.id\", id, \"timestamp\", price, volume, action, direction, type FROM bitfinex.oba_events(",
+                  shQuote(start.time), ",",
+                  shQuote(end.time), ",",
+                  shQuote(pair),") ORDER BY 1")
   if(debug.query) cat(query)
   df <- dbGetQuery(conn, query)
   df

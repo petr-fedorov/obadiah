@@ -771,7 +771,7 @@ $_$;
 ALTER FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character, OUT snapshot_id integer, OUT episode_no integer) OWNER TO "ob-analytics";
 
 --
--- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, character varying, character, numeric); Type: FUNCTION; Schema: bitfinex; Owner: postgres
+-- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, character varying, character, numeric); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
 CREATE FUNCTION bitfinex.oba_depth_summary("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, prec character DEFAULT 'P1'::character varying, bps_step numeric DEFAULT 25, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT "timestamp" timestamp with time zone, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
@@ -986,7 +986,75 @@ END
 $$;
 
 
-ALTER FUNCTION bitfinex.oba_depth_summary("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, bps_step numeric, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT "timestamp" timestamp with time zone, OUT snapshot_id integer, OUT episode_no integer) OWNER TO postgres;
+ALTER FUNCTION bitfinex.oba_depth_summary("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character, bps_step numeric, OUT volume numeric, OUT bps_level integer, OUT bps_price numeric, OUT bps_vwap numeric, OUT direction character varying, OUT "timestamp" timestamp with time zone, OUT snapshot_id integer, OUT episode_no integer) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_events(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.oba_events("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, OUT "event.id" bigint, OUT id bigint, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT action character varying, OUT direction character varying, OUT type character varying, OUT snapshot_id integer, OUT episode_no integer, OUT event_no smallint) RETURNS SETOF record
+    LANGUAGE plpgsql
+    SET work_mem TO '4GB'
+    AS $$
+
+DECLARE 
+
+	order_book_episodes CURSOR FOR
+			   SELECT 	bf_order_book_episodes.snapshot_id, 
+			   			MIN(bf_order_book_episodes.episode_no) AS min_episode_no, 
+			   			MAX(bf_order_book_episodes.episode_no) AS max_episode_no
+			   FROM bitfinex.bf_order_book_episodes JOIN bitfinex.bf_snapshots USING (snapshot_id)
+			   WHERE bf_order_book_episodes.exchange_timestamp BETWEEN "start.time" AND "end.time" 
+			     AND bf_snapshots.pair = oba_events.pair
+			   GROUP BY bf_order_book_episodes.snapshot_id;
+			   
+	
+BEGIN
+	
+	FOR rng IN 	order_book_episodes LOOP
+		RETURN QUERY
+			SELECT 	bf_order_book_events.snapshot_id::bigint *10000 + bf_order_book_events.episode_no*100 + bf_order_book_events.event_no AS "event.id",
+					order_id AS id,
+					bf_order_book_events.exchange_timestamp AS "timestamp",
+					order_price AS price,
+					abs(event_qty) AS volume,
+					'deleted'::character varying AS action,
+					CASE WHEN side = 'A' THEN 'ask'::character varying 
+						ELSE 'bid'::character varying END AS direction,
+					'flashed-limit'::character varying AS "type",
+					bf_order_book_events.snapshot_id, 
+					bf_order_book_events.episode_no, 
+					bf_order_book_events.event_no
+			FROM bitfinex.bf_order_book_events LEFT JOIN bitfinex.bf_trades USING (snapshot_id, episode_no, event_no)
+			WHERE bf_order_book_events.snapshot_id = rng.snapshot_id
+			  AND bf_order_book_events.episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
+			  AND bf_trades.id IS NULL 
+			  AND order_qty = 0
+			UNION ALL
+			SELECT 	bf_order_book_events.snapshot_id*10000 + bf_order_book_events.episode_no*100 + bf_order_book_events.event_no AS "event.id",
+					order_id AS id,
+					bf_order_book_events.exchange_timestamp AS "timestamp",
+					order_price AS price,
+					abs(event_qty) AS volume, 'created'::character varying AS action,
+					CASE WHEN side = 'A' THEN 'ask'::character varying 
+						 ELSE 'bid'::character varying END AS direction, 
+					'flashed-limit'::character varying AS "type",
+					bf_order_book_events.snapshot_id, 
+					bf_order_book_events.episode_no, 
+					bf_order_book_events.event_no
+			FROM bitfinex.bf_order_book_events LEFT JOIN bitfinex.bf_trades USING (snapshot_id, episode_no, event_no)
+			WHERE bf_order_book_events.snapshot_id = rng.snapshot_id
+			  AND bf_order_book_events.episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
+			  AND order_qty = event_qty 
+			  AND event_price = order_price;
+	END LOOP;
+	RETURN;
+END
+
+$$;
+
+
+ALTER FUNCTION bitfinex.oba_events("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "event.id" bigint, OUT id bigint, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT action character varying, OUT direction character varying, OUT type character varying, OUT snapshot_id integer, OUT episode_no integer, OUT event_no smallint) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_spread(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
