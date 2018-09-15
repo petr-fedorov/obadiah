@@ -646,7 +646,7 @@ ALTER FUNCTION bitfinex.bf_trades_dress_new_row() OWNER TO "ob-analytics";
 -- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying, character); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, prec character DEFAULT 'R0'::bpchar, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
+CREATE FUNCTION bitfinex.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, prec character DEFAULT 'R0'::bpchar, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side character, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
     LANGUAGE plpgsql
     SET work_mem TO '4GB'
     AS $_$
@@ -1060,7 +1060,7 @@ ALTER FUNCTION bitfinex.oba_events("start.time" timestamp with time zone, "end.t
 -- Name: oba_spread(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT "best.bid.price" numeric, OUT "best.bid.volume" numeric, OUT "best.ask.price" numeric, OUT "best.ask.volume" numeric, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
+CREATE FUNCTION bitfinex.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, OUT "timestamp" timestamp with time zone, OUT "best.bid.price" numeric, OUT "best.bid.volume" numeric, OUT "best.ask.price" numeric, OUT "best.ask.volume" numeric, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
     LANGUAGE plpgsql
     SET work_mem TO '1GB'
     AS $$
@@ -1139,7 +1139,7 @@ ALTER FUNCTION bitfinex.oba_spread("start.time" timestamp with time zone, "end.t
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
+CREATE FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
     LANGUAGE sql
     SET work_mem TO '1GB'
     AS $$
