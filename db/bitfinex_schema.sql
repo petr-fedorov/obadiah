@@ -490,7 +490,7 @@ ALTER TABLE bitfinex.bf_spreads OWNER TO "ob-analytics";
 --
 
 CREATE FUNCTION bitfinex.bf_spread_after_episode_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
-    LANGUAGE sql
+    LANGUAGE sql STABLE
     AS $$
 
 WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
@@ -529,7 +529,7 @@ ALTER FUNCTION bitfinex.bf_spread_after_episode_v(s_id integer, first_episode_no
 --
 
 CREATE FUNCTION bitfinex.bf_spread_between_episodes_v(s_id integer, first_episode_no integer DEFAULT 0, last_episode_no integer DEFAULT 2147483647) RETURNS SETOF bitfinex.bf_spreads
-    LANGUAGE sql
+    LANGUAGE sql STABLE
     AS $$
 
 WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
@@ -548,14 +548,28 @@ WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
 				WHERE price = min_ask OR price = min_bid
 				ORDER BY episode_no, side
 			)
-SELECT 	bids.price AS best_bid_price,
-		asks.price AS best_ask_price, 
-		bids.qty AS best_bid_qty,
-		asks.qty AS best_ask_qty,
+SELECT 	COALESCE(bids.price, (	SELECT 	MIN(order_price)
+							 	FROM 	bitfinex.bf_order_book_events i
+							 	WHERE 	i.snapshot_id = asks.snapshot_id 
+							  	  AND 	i.episode_no = asks.episode_no
+							  	  AND   i.side = 'B'
+							      AND 	i.event_price = 0
+							 ) 
+				)  AS best_bid_price,
+		COALESCE(asks.price, (	SELECT 	MAX(order_price)
+							 	FROM 	bitfinex.bf_order_book_events i
+							 	WHERE 	i.snapshot_id = bids.snapshot_id 
+							  	  AND 	i.episode_no = bids.episode_no
+							  	  AND   i.side = 'A'
+							      AND 	i.event_price = 0
+							 ) 
+				) AS best_ask_price, 
+		COALESCE(bids.qty,0) AS best_bid_qty,
+		COALESCE(asks.qty,0) AS best_ask_qty,
 		snapshot_id,
 		episode_no,
 		'B'::char(1)
-FROM 	(SELECT * FROM base WHERE side = 'A' ) asks JOIN 
+FROM 	(SELECT * FROM base WHERE side = 'A' ) asks FULL JOIN 
 		(SELECT * FROM base WHERE side = 'B' ) bids USING (snapshot_id, episode_no);
 
 $$;
@@ -1139,7 +1153,7 @@ ALTER FUNCTION bitfinex.oba_spread("start.time" timestamp with time zone, "end.t
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer) RETURNS SETOF record
+CREATE FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer, OUT event_no smallint, OUT id bigint) RETURNS SETOF record
     LANGUAGE sql
     SET work_mem TO '1GB'
     AS $$
@@ -1151,7 +1165,9 @@ CREATE FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.
 					ELSE 'buy'::character varying
 			END AS direction,
 			snapshot_id,
-			episode_no
+			episode_no,
+			event_no,
+			id
    	FROM bitfinex.bf_trades JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no) JOIN bitfinex.bf_snapshots USING (snapshot_id)
    	WHERE  bf_order_book_episodes.exchange_timestamp  BETWEEN oba_trades."start.time" AND oba_trades."end.time"
 	  AND  pair = oba_trades.pair
@@ -1159,7 +1175,7 @@ CREATE FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.
 $$;
 
 
-ALTER FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer, OUT event_no smallint, OUT id bigint) OWNER TO "ob-analytics";
 
 --
 -- Name: bf_order_book_episodes; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
