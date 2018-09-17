@@ -154,7 +154,7 @@ BEGIN
 							p_id,
 						    5 AS match_rule
 					FROM nearest_episodes
-					ORDER BY id
+					ORDER BY tet, id
 					LIMIT 1
 				) a
 			UNION ALL
@@ -554,7 +554,9 @@ WITH base AS (	SELECT a.snapshot_id, a.episode_no, side, price, qty
 				WHERE price = min_ask OR price = min_bid
 				ORDER BY episode_no, side
 			)
-SELECT 	COALESCE(bids.price, (	SELECT 	MIN(order_price)
+SELECT 	COALESCE(bids.price, (	SELECT 	MIN(order_price)*0.5	-- the real price is to be calculated manually later on 
+							  									-- this price is set to ensure that the spread is wide 
+							  									-- enough for matching
 							 	FROM 	bitfinex.bf_order_book_events i
 							 	WHERE 	i.snapshot_id = asks.snapshot_id 
 							  	  AND 	i.episode_no = asks.episode_no
@@ -562,7 +564,7 @@ SELECT 	COALESCE(bids.price, (	SELECT 	MIN(order_price)
 							      AND 	i.event_price = 0
 							 ) 
 				)  AS best_bid_price,
-		COALESCE(asks.price, (	SELECT 	MAX(order_price)
+		COALESCE(asks.price, (	SELECT 	MAX(order_price)*1.5	-- the real price is to be calculated manually later on 
 							 	FROM 	bitfinex.bf_order_book_events i
 							 	WHERE 	i.snapshot_id = bids.snapshot_id 
 							  	  AND 	i.episode_no = bids.episode_no
