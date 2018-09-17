@@ -108,7 +108,7 @@ BEGIN
 			WHERE t.snapshot_id = NEW.snapshot_id AND t.exchange_timestamp > NEW.exchange_timestamp - '1 min'::interval
 		), 
 		between_same_episodes AS (	
-			SELECT id, b_e AS episode_no
+			SELECT id, b_e AS episode_no, 4 AS match_rule
 			FROM admissible_episode_range a
 			WHERE not_matched AND a.b_e = a.a_e
 		),
@@ -144,14 +144,15 @@ BEGIN
 					) a
 				)a
 		),
-		nearest_episode (id, episode_no, p_id) AS (
-			SELECT * 
+		nearest_episode (id, episode_no, p_id, match_rule) AS (
+			SELECT *
 			FROM (
 					SELECT 	id, 
 							(	SELECT min(episode_no) 
 								FROM unnest(candidate_episodes) episode_no
 							), 
-							p_id
+							p_id,
+						    5 AS match_rule
 					FROM nearest_episodes
 					ORDER BY id
 					LIMIT 1
@@ -162,16 +163,18 @@ BEGIN
 						FROM unnest(candidate_episodes) episode_no
 						WHERE episode_no >= p.episode_no
 					), 
-					ps.p_id
+					ps.p_id,
+				    5 AS match_rule
 			FROM nearest_episodes ps JOIN nearest_episode p ON  ps.p_id = p.id
 		)
 	UPDATE bitfinex.bf_trades t
-	SET episode_no = a.episode_no
+	SET episode_no = a.episode_no,
+		match_rule = a.match_rule
 	FROM (
-		SELECT * 
+		SELECT id, episode_no, match_rule 
 		FROM between_same_episodes
 	  	UNION ALL
-	  	SELECT id, episode_no 
+	  	SELECT id, episode_no, match_rule 
 		FROM nearest_episode
 	 )
 	 a
@@ -253,7 +256,8 @@ BEGIN
 			
 				UPDATE bitfinex.bf_trades
 				SET episode_no = episodes[behind],
-					event_no = e.event_no
+					event_no = e.event_no,
+					match_rule = 3
 				WHERE CURRENT OF trades;
 				
 				UPDATE bitfinex.bf_order_book_events
@@ -400,7 +404,8 @@ BEGIN
 
 		UPDATE bitfinex.bf_trades 
 		SET episode_no = NEW.episode_no, 
-			event_no = NEW.event_no
+			event_no = NEW.event_no,
+			match_rule = 1
 		WHERE id = tr_id.id AND bf_trades.snapshot_id = NEW.snapshot_id;		
 		NEW.matched = True;
 
@@ -419,7 +424,8 @@ BEGIN
 		IF FOUND THEN
 			UPDATE bitfinex.bf_trades t
 			SET episode_no = NEW.episode_no, 
-				event_no = NEW.event_no	
+				event_no = NEW.event_no,
+				match_rule = 2
 			WHERE t.price		= NEW.order_price
 			AND t.snapshot_id = NEW.snapshot_id
 			AND t.event_no IS NULL
@@ -1423,7 +1429,8 @@ CREATE TABLE bitfinex.bf_trades (
     exchange_timestamp timestamp(3) with time zone NOT NULL,
     episode_no integer,
     event_no smallint,
-    direction character(1) NOT NULL
+    direction character(1) NOT NULL,
+    match_rule smallint
 )
 WITH (autovacuum_enabled='true', autovacuum_analyze_threshold='5000', autovacuum_vacuum_threshold='5000', autovacuum_analyze_scale_factor='0.0', autovacuum_vacuum_scale_factor='0.0');
 
@@ -1456,6 +1463,13 @@ COMMENT ON COLUMN bitfinex.bf_trades.local_timestamp IS 'When we''ve got this re
 --
 
 COMMENT ON COLUMN bitfinex.bf_trades.exchange_timestamp IS 'Bitfinex''s timestamp';
+
+
+--
+-- Name: COLUMN bf_trades.match_rule; Type: COMMENT; Schema: bitfinex; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN bitfinex.bf_trades.match_rule IS 'An identifier of SQL statement which matched the trade with an episode.';
 
 
 --
