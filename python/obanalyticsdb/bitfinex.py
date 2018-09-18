@@ -224,13 +224,11 @@ class Trade(OrderedDatabaseInsertion):
                  local_timestamp,
                  exchange_timestamp,
                  id,
-                 trade_timestamp,
                  qty,
                  price,
                  snapshot_id):
         super().__init__(local_timestamp, exchange_timestamp)
         self.id = id
-        self.trade_timestamp = trade_timestamp
         self.qty = qty
         self.price = price
         self.snapshot_id = snapshot_id
@@ -250,14 +248,11 @@ class Trade(OrderedDatabaseInsertion):
     def save(self, curr):
 
         curr.execute("INSERT INTO bitfinex.bf_trades"
-                     "(id, trade_timestamp, qty,"
-                     "price,local_timestamp, snapshot_id,"
+                     "(id,  qty, price,local_timestamp, snapshot_id,"
                      "exchange_timestamp)"
-                     "VALUES (%s, %s, %s, %s, %s,"
-                     "%s, %s)",
-                     (self.id, self.trade_timestamp, self.qty,
-                      self.price, self.local_timestamp, self.snapshot_id,
-                      self.exchange_timestamp))
+                     "VALUES (%s, %s, %s, %s, %s, %s)",
+                     (self.id, self.qty, self.price, self.local_timestamp,
+                      self.snapshot_id, self.exchange_timestamp))
 
 
 class Spawned:
@@ -545,9 +540,8 @@ class TradeConverter(Spawned):
                     else:
                         break
                 logger.debug("%i %s" % (snapshot_id, data))
-                *data, rts = data
+                *data, _ = data
                 lts = datetime.fromtimestamp(lts)
-                rts = datetime.fromtimestamp(rts/1000)
 
                 if data[0] == 'tu':
                     data = [data[1]]
@@ -568,9 +562,9 @@ class TradeConverter(Spawned):
                     continue
                     # data = data[0]
                 for d in data:
-                    self.q_unordered.put(Trade(lts, rts,  d[0],
+                    self.q_unordered.put(Trade(lts,
                                                datetime.fromtimestamp(
-                                                   d[1]/1000),
+                                                   d[1]/1000), d[0],
                                                d[2], d[3], snapshot_id))
 
         except Exception as e:
