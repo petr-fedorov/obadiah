@@ -14,7 +14,6 @@ LazyData: true
 Imports:
     obAnalytics,
     DBI,
-    RPostgreSQL,
     magrittr,
     dplyr,
     plyr,
