@@ -65,43 +65,32 @@ bfDepthSummary <- function(conn, start.time, end.time, pair="BTCUSD",price.aggre
 
 
 #' @export
-bfOrderBook <- function(conn, snapshot_id, episode_no, max.levels = 0, bps.range = 0, min.bid = 0, max.ask = "'Infinity'::float") {
+bfOrderBook <- function(conn, tp, pair="BTCUSD", max.levels = NA, bps.range = NA, min.bid = NA, max.ask = NA, debug.query = FALSE) {
 
-  ts <- DBI::dbGetQuery(conn, paste0(" SELECT exchange_timestamp",
-                                " FROM bitfinex.bf_order_book_episodes ",
-                                " WHERE snapshot_id = ", snapshot_id,
-                                " AND episode_no = ", episode_no ))$exchange_timestamp
-
-  where_cond <- paste0(" WHERE snapshot_id = ", snapshot_id,
-                       " AND episode_no = ", episode_no )
-
-  if (bps.range > 0 ) {
-    where_cond <- paste0(where_cond, " AND bps <= ", bps.range)
-  }
-
-  if ( max.levels > 0 ) {
-    where_cond <- paste0(where_cond, " AND lvl <= ", max.levels )
-  }
+  if (is.na(max.levels)) max.levels <- "NULL"
+  if (is.na(bps.range)) bps.range <- "NULL"
+  if (is.na(min.bid)) min.bid <- "NULL"
+  if (is.na(max.ask)) max.ask <- "NULL"
 
 
-  bids  <-    DBI::dbGetQuery(conn, paste0(" SELECT order_id AS id
-                                              , order_price AS price
-                                              , order_qty AS volume
-                                              , cumm_qty AS liquidity
-                                              , bps
-                                        FROM bitfinex.bf_active_orders_after_episode_v ",
-                                     where_cond, " AND side = 'B' AND order_price >= ", min.bid))
-
-  asks  <-    DBI::dbGetQuery(conn, paste0(" SELECT order_id AS id
-                                              , order_price AS price
-                                              , order_qty AS volume
-                                              , cumm_qty AS liquidity
-                                              , bps
-                                        FROM bitfinex.bf_active_orders_after_episode_v ",
-                                      where_cond, " AND side = 'A' AND order_price <= ", max.ask))
-
-  list(timestamp=ts, asks=asks, bids=bids)
+  query <- paste0("SELECT order_id AS id, order_price AS price, order_qty AS volume,
+                            cumm_qty AS liquidity, bps, side, exchange_timestamp
+                    FROM bitfinex.oba_order_book(",
+                    shQuote(tp), ",",
+                    shQuote(pair), ",",
+                    max.levels,  ",",
+                    bps.range,  ",",
+                    min.bid,  ",",
+                    max.ask, ")")
+    if(debug.query) cat(query)
+    full_book <- DBI::dbGetQuery(conn, query)
+    cols <- c("id", "price", "volume", "liquidity")
+    bids <- full_book[which(full_book$side == 'B'), cols ]
+    asks <- full_book[which(full_book$side == 'A'), cols ]
+    ts <- full_book$exchange_timestamp[1]
+    list(timestamp=ts, asks=asks, bids=bids)
 }
+
 
 #' @export
 bfTrades <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
