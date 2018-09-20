@@ -24,6 +24,92 @@ CREATE SCHEMA bitfinex;
 
 ALTER SCHEMA bitfinex OWNER TO "ob-analytics";
 
+SET default_tablespace = '';
+
+SET default_with_oids = false;
+
+--
+-- Name: bf_spreads; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.bf_spreads (
+    best_bid_price numeric NOT NULL,
+    best_ask_price numeric NOT NULL,
+    best_bid_qty numeric NOT NULL,
+    best_ask_qty numeric NOT NULL,
+    snapshot_id integer NOT NULL,
+    episode_no integer NOT NULL,
+    timing character(1) NOT NULL,
+    local_timestamp timestamp with time zone DEFAULT clock_timestamp() NOT NULL
+);
+
+
+ALTER TABLE bitfinex.bf_spreads OWNER TO "ob-analytics";
+
+--
+-- Name: bf_adjust_spread(integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_adjust_spread(snapshot_id integer) RETURNS SETOF bitfinex.bf_spreads
+    LANGUAGE plpgsql
+    AS $$
+
+BEGIN 
+	RETURN QUERY
+		UPDATE bitfinex.bf_spreads s
+		SET best_bid_price = COALESCE( 
+			( 	SELECT min(price)
+			 	FROM bitfinex.bf_trades t
+			 	WHERE t.snapshot_id = s.snapshot_id
+			 	  AND t.episode_no = s.episode_no
+			 	  AND t.direction = 'S'
+			),
+			(	SELECT min(order_price)
+			 	FROM bitfinex.bf_order_book_events e
+			 	WHERE e.snapshot_id = s.snapshot_id
+			   	  AND e.episode_no = s.episode_no
+			 	  AND e.event_price = 0
+			)
+		)
+		WHERE s.snapshot_id = bf_adjust_spread.snapshot_id 
+		  AND best_bid_qty = 0
+		RETURNING *;
+		
+	RETURN QUERY
+		UPDATE bitfinex.bf_spreads s
+		SET best_ask_price = COALESCE( 
+			( 	SELECT max(price)
+			 	FROM bitfinex.bf_trades t
+			 	WHERE t.snapshot_id = s.snapshot_id
+			 	  AND t.episode_no = s.episode_no
+			 	  AND t.direction = 'B'
+			),
+			(	SELECT max(order_price)
+			 	FROM bitfinex.bf_order_book_events e
+			 	WHERE e.snapshot_id = s.snapshot_id
+			   	  AND e.episode_no = s.episode_no
+			 	  AND e.event_price = 0
+			)
+		)
+		WHERE s.snapshot_id = bf_adjust_spread.snapshot_id 
+		  AND best_ask_qty = 0
+		RETURNING *;
+		
+
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_adjust_spread(snapshot_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION bf_adjust_spread(snapshot_id integer); Type: COMMENT; Schema: bitfinex; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitfinex.bf_adjust_spread(snapshot_id integer) IS 'Calculates ''best_bid_price'' and ''best_ask_price'' for those spreads with ''B'' timing where order book is one-sided i.e. bids or asks are competely missing from the order book and the corresponding side of the spread must be estimated from trades or order_book_events themselves';
+
+
 --
 -- Name: bf_cons_book_events_dress_new_row(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
@@ -102,8 +188,16 @@ BEGIN
 					t.snapshot_id,
 	 				t.exchange_timestamp AS tet,
 					t.episode_no IS NULL AS not_matched,
-					max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp) AS b_e,
-					min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp DESC) AS a_e
+					COALESCE( max(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp),
+						COALESCE( (	SELECT max(episode_no)
+									FROM bitfinex.bf_trades i
+									WHERE i.snapshot_id = t.snapshot_id 
+									AND i.exchange_timestamp < t.exchange_timestamp
+								   ), 0
+								 )
+					)	AS b_e,
+					COALESCE(min(t.episode_no) OVER (PARTITION BY t.snapshot_id ORDER BY t.exchange_timestamp DESC),
+							 2147483647 ) AS a_e
 			FROM bitfinex.bf_trades t
 			WHERE t.snapshot_id = NEW.snapshot_id AND t.exchange_timestamp > NEW.exchange_timestamp - '1 min'::interval
 		), 
@@ -377,28 +471,6 @@ $$;
 
 
 ALTER FUNCTION bitfinex.bf_order_book_events_update_next_episode_no() OWNER TO "ob-analytics";
-
-SET default_tablespace = '';
-
-SET default_with_oids = false;
-
---
--- Name: bf_spreads; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE TABLE bitfinex.bf_spreads (
-    best_bid_price numeric NOT NULL,
-    best_ask_price numeric NOT NULL,
-    best_bid_qty numeric NOT NULL,
-    best_ask_qty numeric NOT NULL,
-    snapshot_id integer NOT NULL,
-    episode_no integer NOT NULL,
-    timing character(1) NOT NULL,
-    local_timestamp timestamp with time zone DEFAULT clock_timestamp() NOT NULL
-);
-
-
-ALTER TABLE bitfinex.bf_spreads OWNER TO "ob-analytics";
 
 --
 -- Name: bf_spread_after_episode_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
