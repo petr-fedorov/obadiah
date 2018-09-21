@@ -11,10 +11,20 @@ def main():
     parser = argparse.ArgumentParser(description="Gather high-frequency trade "
                                      "data for a pair from a cryptocurrency "
                                      "exchange and store it.")
-    parser.add_argument("--stream", help="where STREAM  must be in the format "
+    parser.add_argument("-s", "--stream",
+                        help="where STREAM  must be in the format "
                         "PAIR:EXCHANGE (default: BTCUSD:BITFINEX)",
                         default="BTCUSD:BITFINEX")
 
+    parser.add_argument("-d", "--dbname", help="where DBNAME is the name of "
+                        "PostgreSQL database where the data is to be saved "
+                        "(default: ob-analytics),",
+                        default="ob-analytics")
+
+    parser.add_argument("-U", "--user", help="where USER is the name of "
+                        "PostgreSQL database role to be used to save the data"
+                        "(default: ob-analytics),",
+                        default="ob-analytics")
     args = parser.parse_args()
     stream = args.stream.split(':')
     # We have to use the default context since BtfxWss uses it to create Queues
@@ -26,7 +36,8 @@ def main():
 
     log_queue = Queue(-1)
     listener = Process(target=listener_process,
-                       args=(log_queue, "oba%s_%s.log" % tuple(stream)))
+                       args=(log_queue, "oba%s_%s_%s.log" %
+                             (tuple(stream) + (args.dbname.upper(),))))
     listener.start()
 
     logging_configurer(log_queue)
@@ -38,7 +49,7 @@ def main():
     try:
         capture = exchanges[stream[1]]
         print("Press Ctrl-C to stop ...")
-        capture(stream[0], stop_flag, log_queue)
+        capture(stream[0], args.dbname, args.user, stop_flag, log_queue)
     except KeyError as e:
         logging.getLogger("bitfinex.main").exception(e)
         print('Exchange %s is not supported (yet)' % stream[1])

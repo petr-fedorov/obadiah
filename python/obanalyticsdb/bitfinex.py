@@ -378,19 +378,22 @@ class Orderer(Spawned):
         logger.info('Exit %r ' % (self,))
 
 
-def connect_db():
-    return psycopg2.connect("dbname=ob-analytics user=ob-analytics")
+def connect_db(dbname, user):
+    return psycopg2.connect("dbname=%s user=%s password=%s" %
+                            (dbname, user, user))
 
 
 class Stockkeeper(Spawned):
 
-    def __init__(self, q_ordered, q_spreader, stop_flag, pair, log_queue,
-                 log_level=logging.INFO):
+    def __init__(self, q_ordered, q_spreader, stop_flag, pair, dbname, user,
+                 log_queue, log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q_ordered = q_ordered
         self.q_spreader = q_spreader
         self.prec = "R0"
         self.pair = pair
+        self.dbname = dbname
+        self.user = user
 
     def __call__(self):
         self._call_init()
@@ -398,7 +401,7 @@ class Stockkeeper(Spawned):
         logger = logging.getLogger("bitfinex.Stockkeeper_%s_%s" % (self.pair,
                                                                    self.prec))
         logger.info('Started')
-        with connect_db() as con:
+        with connect_db(self.dbname, self.user) as con:
             con.set_session(autocommit=False)
             with con.cursor() as curr:
                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
@@ -443,11 +446,13 @@ class Stockkeeper(Spawned):
 
 class Spreader(Spawned):
 
-    def __init__(self, n, q_spreader, stop_flag, log_queue,
+    def __init__(self, n, q_spreader, dbname, user, stop_flag, log_queue,
                  log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q_spreader = q_spreader
         self.n = n
+        self.dbname = dbname
+        self.user = user
 
     def _insert_spread(self, curr, fi, la, logger):
         if fi.snapshot_id == la.snapshot_id:
@@ -496,7 +501,7 @@ class Spreader(Spawned):
 
         logger = logging.getLogger("bitfinex.Spreader_%i" % self.n)
         logger.info('Started')
-        with connect_db() as con:
+        with connect_db(self.dbname, self.user) as con:
             con.set_session(autocommit=True)
             with con.cursor() as curr:
                 try:
@@ -575,14 +580,16 @@ class TradeConverter(Spawned):
 
 class EventConverter(Spawned):
 
-    def __init__(self, q, stop_flag, pair, q_snapshots, ob_len, q_unordered,
-                 log_queue, log_level=logging.INFO):
+    def __init__(self, q, stop_flag, pair, dbname, user,  q_snapshots, ob_len,
+                 q_unordered, log_queue, log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q = q
         self.pair = pair
         self.ob_len = ob_len
         self.q_unordered = q_unordered
         self.q_snapshots = q_snapshots
+        self.dbname = dbname
+        self.user = user
 
     def __call__(self):
         self._call_init()
@@ -617,7 +624,8 @@ class EventConverter(Spawned):
                                                      snapshot_id,
                                                      episode_no,
                                                      False))
-                    snapshot_id = start_new_snapshot(self.ob_len, self.pair)
+                    snapshot_id = start_new_snapshot(self.ob_len, self.pair,
+                                                     self.dbname, self.user)
                     logger.debug("Started new snapshot: %i" % snapshot_id)
                     self.q_snapshots.put(snapshot_id)
                     episode_no = 0
@@ -665,13 +673,15 @@ class EventConverter(Spawned):
 
 class ConsEventConverter(Spawned):
 
-    def __init__(self, q, stop_flag, pair, prec, ob_len, log_queue,
-                 log_level=logging.INFO):
+    def __init__(self, q, stop_flag, pair, dbname, user, prec, ob_len,
+                 log_queue, log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q = q
         self.ob_len = ob_len
         self.pair = pair
         self.prec = prec
+        self.dbname = dbname
+        self.user = user
 
     def __call__(self):
         self._call_init()
@@ -687,7 +697,7 @@ class ConsEventConverter(Spawned):
             increase_episode_no = True  # The first 'addition' event
             snapshot_id = 0
 
-            with connect_db() as con:
+            with connect_db(self.dbname, self.user) as con:
                 con.set_session(autocommit=False)
                 with con.cursor() as curr:
                     curr.execute("SET CONSTRAINTS ALL DEFERRED")
@@ -723,6 +733,8 @@ class ConsEventConverter(Spawned):
                                 curr.execute("SET CONSTRAINTS ALL DEFERRED")
                             snapshot_id = start_new_snapshot(self.ob_len,
                                                              self.pair,
+                                                             self.dbname,
+                                                             self.user,
                                                              self.prec)
                             episode_no = 0
                             event_no = 1
@@ -787,8 +799,8 @@ class ConsEventConverter(Spawned):
         logger.info('Exit')
 
 
-def check_pair(pair):
-    with connect_db() as con:
+def check_pair(pair, dbname, user):
+    with connect_db(dbname, user) as con:
         with con.cursor() as curr:
             curr.execute(" SELECT * "
                          " FROM bitfinex.bf_pairs "
@@ -798,9 +810,9 @@ def check_pair(pair):
                 raise KeyError(pair)
 
 
-def start_new_snapshot(ob_len, pair, prec="R0"):
+def start_new_snapshot(ob_len, pair, dbname, user, prec="R0"):
     logger = logging.getLogger("bitfinex.new.snapshot")
-    with connect_db() as con:
+    with connect_db(dbname, user) as con:
         with con.cursor() as curr:
             try:
                 curr.execute("insert into bitfinex.bf_snapshots "
@@ -819,13 +831,13 @@ def start_new_snapshot(ob_len, pair, prec="R0"):
     return snapshot_id
 
 
-def capture(pair, stop_flag, log_queue):
+def capture(pair, dbname, user,  stop_flag, log_queue):
 
     logger = logging.getLogger("bitfinex.capture")
     ob_len = 100
 
     try:
-        check_pair(pair)
+        check_pair(pair, dbname, user)
     except Exception as e:
         logger.exception('%s', e)
         return
@@ -863,18 +875,20 @@ def capture(pair, stop_flag, log_queue):
                                         q_snapshots, q_unordered,
                                         log_queue)),
           Process(target=EventConverter(ob_R0.raw_books(pair), stop_flag, pair,
-                                        q_snapshots, ob_len, q_unordered,
-                                        log_queue)),
+                                        dbname, user, q_snapshots, ob_len,
+                                        q_unordered, log_queue)),
           Process(target=Orderer(q_unordered, q_ordered, stop_flag,
                                  log_queue, delay=2)),
           Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag, pair,
-                                     log_queue, log_level=logging.INFO)),
-          ] + [Process(target=Spreader(n, q_spreader, stop_flag, log_queue,
-                                       log_level=logging.DEBUG))
+                                     dbname, user, log_queue,
+                                     log_level=logging.INFO)),
+          ] + [Process(target=Spreader(n, q_spreader, dbname, user, stop_flag,
+                                       log_queue, log_level=logging.DEBUG))
                for n in range(num_of_spreaders)] + [
                    Process(target=ConsEventConverter(ob.books(pair),
-                                                     stop_flag, pair,
-                                                     prec, ob_len, log_queue,
+                                                     stop_flag, pair, dbname,
+                                                     user, prec, ob_len,
+                                                     log_queue,
                                                      log_level=logging.DEBUG))
                    for (prec, ob) in zip(precs, obs)]
 
