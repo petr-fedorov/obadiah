@@ -34,3 +34,25 @@ def logging_configurer(logging_queue, logging_level=logging.DEBUG):
     root = logging.getLogger()
     root.addHandler(h)
     root.setLevel(logging_level)
+
+
+def log_notices(logger, notices):
+    while notices:
+        logger.info(notices.pop(0))
+
+
+class QueueSizeLogger:
+    def __init__(self, queue, queue_name, threshold=100):
+        self.n = 0
+        self.queue = queue
+        self.queue_name = queue_name
+        self.THRE = threshold
+
+    def __call__(self, logger):
+
+        s = self.queue.qsize()
+        if (s > self.THRE*2**(self.n)):
+            self.n += 1
+            logger.warning("Unprocessed %s size: %i" % (self.queue_name, s))
+        elif self.n and (s < self.THRE*2**(self.n - 1)):
+            self.n -= 1

@@ -40,7 +40,7 @@ def main():
                              (tuple(stream) + (args.dbname.upper(),))))
     listener.start()
 
-    logging_configurer(log_queue)
+    logging_configurer(log_queue, logging.INFO)
     logger = logging.getLogger("obanalyticsdb.main")
     logger.info('Started')
 

@@ -8,7 +8,8 @@ from btfxwss import BtfxWss
 import psycopg2
 from datetime import datetime, timedelta
 from functools import total_ordering
-from obanalyticsdb.utils import logging_configurer
+from obanalyticsdb.utils import logging_configurer, log_notices,\
+    QueueSizeLogger
 
 
 @total_ordering
@@ -281,6 +282,7 @@ class Orderer(Spawned):
         self.latest_departed = datetime.now()
         self.seq_no = 0
         self.latest_departed_seq_no = -1
+        self.log_ordered = QueueSizeLogger(q_ordered, "q_ordered")
 
     def __repr__(self):
         return "Orderer a:%s d: %s b:%s" % (self.latest_arrived.strftime(
@@ -321,8 +323,8 @@ class Orderer(Spawned):
         self.alogger.debug('Suspend arrive - current_delay %f, l_a %s ' %
                            (self._current_delay().total_seconds(),
                             self.latest_arrived.strftime("%H-%M-%S.%f")[:-3]))
-        self.alogger.info('Unprocessed q_unordered size: %i' %
-                          self.q_unordered.qsize())
+        self.alogger.debug('Unprocessed q_unordered size: %i' %
+                           self.q_unordered.qsize())
 
     def _depart_to_database(self):
         self.dlogger.debug('Start depart - current delay %f, l_d %s' %
@@ -358,8 +360,7 @@ class Orderer(Spawned):
         self.dlogger.debug('Suspend depart - current_delay %f, l_d %s ' %
                            (self._current_delay().total_seconds(),
                             self.latest_departed.strftime("%H-%M-%S.%f")[:-3]))
-        self.dlogger.info('Unprocessed q_ordered size: %i' %
-                          self.q_ordered.qsize())
+        self.log_ordered(self.dlogger)
 
     def __call__(self):
         self._call_init()
@@ -374,12 +375,13 @@ class Orderer(Spawned):
                    and self.q_ordered.qsize() == 0):
             self._arrive_from_exchange()
             self._depart_to_database()
-            logger.info("Unprocessed heap size: %i" % len(self.buffer))
+            logger.debug("Unprocessed heap size: %i" % len(self.buffer))
         logger.info('Exit %r ' % (self,))
 
 
 def connect_db(dbname, user):
-    return psycopg2.connect("dbname=%s user=%s password=%s" %
+    return psycopg2.connect("dbname=%s user=%s password=%s "
+                            "application_name=obanalyticsdb" %
                             (dbname, user, user))
 
 
@@ -421,6 +423,14 @@ class Stockkeeper(Spawned):
                                     la = obj
                                     try:
                                         self.q_spreader.put_nowait((fi, la))
+                                        if fi != la:
+                                            logger.warning("Long spread: from "
+                                                           "(%i,%i) to"
+                                                           "(%i, %i)" %
+                                                           (fi.snapshot_id,
+                                                            fi.episode_no,
+                                                            la.snapshot_id,
+                                                            la.episode_no))
                                         fi = None
                                     except Full:
                                         pass
@@ -441,6 +451,8 @@ class Stockkeeper(Spawned):
                         logger.exception('An exception occured while '
                                          'processing %s' % obj)
                         self.stop_flag.set()
+                    finally:
+                        log_notices(logger, con.notices)
         logger.info("Exit")
 
 
@@ -517,6 +529,8 @@ class Spreader(Spawned):
                 except Exception as e:
                     logger.exception('%s', e)
                     self.stop_flag.set()
+                finally:
+                    log_notices(logger, con.notices)
         logger.info("Exit")
 
 
@@ -558,7 +572,7 @@ class TradeConverter(Spawned):
                     while not self.stop_flag.is_set():
                         try:
                             snapshot_id = self.q_snapshots.get(timeout=1)
-                            logger.debug("New snapshot_id: %i" % snapshot_id)
+                            logger.info("New snapshot_id: %i" % snapshot_id)
                             break
                         except Empty:
                             continue
@@ -626,7 +640,7 @@ class EventConverter(Spawned):
                                                      False))
                     snapshot_id = start_new_snapshot(self.ob_len, self.pair,
                                                      self.dbname, self.user)
-                    logger.debug("Started new snapshot: %i" % snapshot_id)
+                    logger.info("Started new snapshot: %i" % snapshot_id)
                     self.q_snapshots.put(snapshot_id)
                     episode_no = 0
                     event_no = 1
@@ -648,8 +662,8 @@ class EventConverter(Spawned):
                                 break
                             event_no = 1
                             episode_rts = rts
-                            logger.info("Unprocessed queue size: %i" %
-                                        (self.q.qsize(),))
+                            logger.debug("Unprocessed queue size: %i" %
+                                         (self.q.qsize(),))
                     elif not increase_episode_no:
                         # it is the first 'addition' event of an episode
                         increase_episode_no = True
@@ -682,6 +696,7 @@ class ConsEventConverter(Spawned):
         self.prec = prec
         self.dbname = dbname
         self.user = user
+        self.log_input_queue = QueueSizeLogger(q, "websocket Book queue")
 
     def __call__(self):
         self._call_init()
@@ -773,8 +788,8 @@ class ConsEventConverter(Spawned):
                                         break
                                     event_no = 1
                                     episode_rts = rts
-                                    logger.info("Unprocessed queue size: %i" %
-                                                (self.q.qsize(),))
+                                    logger.debug("Unprocessed queue size: %i" %
+                                                 (self.q.qsize(),))
                             elif not increase_episode_no:
                                 # it is the first addition event of an episode
                                 increase_episode_no = True
@@ -783,7 +798,9 @@ class ConsEventConverter(Spawned):
                                                 snapshot_id, episode_no,
                                                 event_no)
                             obj.save(curr)
+                            log_notices(logger, con.notices)
                             logger.debug('Saved %r' % obj)
+                            self.log_input_queue(logger)
                             event_no += 1
                             last_rts = rts
 
@@ -827,6 +844,8 @@ def start_new_snapshot(ob_len, pair, dbname, user, prec="R0"):
             except Exception as e:
                 logger.exception('%s', e)
                 raise e
+            finally:
+                log_notices(logger, con.notices)
 
     return snapshot_id
 
@@ -883,13 +902,13 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
                                      dbname, user, log_queue,
                                      log_level=logging.INFO)),
           ] + [Process(target=Spreader(n, q_spreader, dbname, user, stop_flag,
-                                       log_queue, log_level=logging.DEBUG))
+                                       log_queue, log_level=logging.INFO))
                for n in range(num_of_spreaders)] + [
                    Process(target=ConsEventConverter(ob.books(pair),
                                                      stop_flag, pair, dbname,
                                                      user, prec, ob_len,
                                                      log_queue,
-                                                     log_level=logging.DEBUG))
+                                                     log_level=logging.INFO))
                    for (prec, ob) in zip(precs, obs)]
 
     for t in ts:
@@ -915,6 +934,11 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
     for t in ts:
         pid = t.pid
         t.join()
-        logger.debug('Process %i terminated, exitcode %i' % (pid, t.exitcode))
+        if t.exitcode:
+            logger.error('Process %i terminated, exitcode %i' %
+                         (pid, t.exitcode))
+        else:
+            logger.debug('Process %i terminated, exitcode %i' %
+                         (pid, t.exitcode))
 
     logger.info("Exit")
