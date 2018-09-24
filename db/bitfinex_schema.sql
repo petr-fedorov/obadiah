@@ -473,6 +473,56 @@ $$;
 ALTER FUNCTION bitfinex.bf_order_book_events_update_next_episode_no() OWNER TO "ob-analytics";
 
 --
+-- Name: bf_snapshots_create_partitions(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_snapshots_create_partitions() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+	schema_name CONSTANT TEXT := 'bitfinex';
+	table_name TEXT;
+	s_from	INTEGER;
+	s_to   	INTEGER;
+	cons_size CONSTANT INTEGER := 100;
+BEGIN 
+	IF NEW.prec <> 'R0' THEN 
+		IF NOT EXISTS (	SELECT *
+						FROM (
+							SELECT regexp_match(relname, '([0-9]+)_([0-9]+)') AS rng
+							FROM pg_class 
+							WHERE oid::regclass::text LIKE 'bitfinex.bf_cons_book_%'::text
+						) r
+						WHERE NEW.snapshot_id BETWEEN rng[1]::integer AND rng[2]::integer - 1
+					  ) THEN
+			s_from := NEW.snapshot_id;
+			s_to := s_from + cons_size;
+			table_name := 'bf_cons_book_events_' || LPAD(s_from::text,9,'0') || '_' || s_to;
+			EXECUTE	'CREATE TABLE ' || schema_name ||'.' ||table_name||' PARTITION OF bitfinex.bf_cons_book_events 
+					 FOR VALUES FROM (' ||s_from|| ') TO (' || s_to || ') 
+					 WITH (autovacuum_enabled=''true'', autovacuum_vacuum_threshold=''5000'', autovacuum_analyze_threshold=''5000'', autovacuum_analyze_scale_factor=''0.0'', autovacuum_vacuum_scale_factor=''0.0'', autovacuum_vacuum_cost_delay=''0'')';
+					
+			EXECUTE 'ALTER TABLE ONLY ' || schema_name ||'.' || table_name ||' ADD CONSTRAINT ' ||table_name||'_pkey PRIMARY KEY (snapshot_id, episode_no, event_no);';				
+			EXECUTE 'CREATE INDEX ' ||table_name || '_idx_update_next_episode_no ON ' ||schema_name || '.' || table_name || ' USING btree (snapshot_id, price, price_next_episode_no);';
+			EXECUTE 'CREATE TRIGGER a_dress_new_row BEFORE INSERT ON ' ||schema_name || '.' || table_name || ' FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_cons_book_events_dress_new_row();';
+			EXECUTE 'CREATE TRIGGER b_update_next_episode_no BEFORE INSERT ON ' || schema_name || '.' || table_name || ' FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_cons_book_events_update_next_episode_no();';
+			EXECUTE 'ALTER TABLE ONLY '|| schema_name ||'.' || table_name || ' ADD CONSTRAINT ' ||
+						table_name ||'_fkey_bf_cons_book_episodes FOREIGN KEY (snapshot_id, episode_no) REFERENCES ' || schema_name ||'.bf_cons_book_episodes(snapshot_id, episode_no) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;';
+			EXECUTE 'ALTER TABLE ONLY '|| schema_name ||'.' || table_name || ' ADD CONSTRAINT ' ||
+						table_name ||'_fkey_bf_snapshots FOREIGN KEY (snapshot_id) REFERENCES ' || schema_name ||'.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;';
+			RAISE NOTICE 'Created partition: %.%', schema_name, table_name;
+		END IF;
+	END IF;
+	RETURN NEW;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_snapshots_create_partitions() OWNER TO "ob-analytics";
+
+--
 -- Name: bf_spread_after_episode_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1436,7 +1486,7 @@ CREATE TABLE bitfinex.bf_cons_book_events (
     price_next_episode_no integer NOT NULL,
     side character(1) NOT NULL
 )
-WITH (autovacuum_enabled='true', autovacuum_vacuum_threshold='5000', autovacuum_analyze_threshold='5000', autovacuum_analyze_scale_factor='0.0', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_cost_delay='0');
+PARTITION BY RANGE (snapshot_id);
 ALTER TABLE ONLY bitfinex.bf_cons_book_events ALTER COLUMN active_episode_no SET STATISTICS 1000;
 ALTER TABLE ONLY bitfinex.bf_cons_book_events ALTER COLUMN price_next_episode_no SET STATISTICS 1000;
 
@@ -1744,14 +1794,6 @@ ALTER TABLE ONLY bitfinex.bf_cons_book_episodes
 
 
 --
--- Name: bf_cons_book_events bf_cons_book_events_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitfinex.bf_cons_book_events
-    ADD CONSTRAINT bf_cons_book_events_pkey PRIMARY KEY (snapshot_id, episode_no, event_no);
-
-
---
 -- Name: bf_order_book_episodes bf_order_book_episodes_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1807,13 +1849,6 @@ CREATE INDEX bf_cons_book_episodes_idx_by_time ON bitfinex.bf_cons_book_episodes
 
 
 --
--- Name: bf_cons_book_events_idx_update_next_episode_no_by_next_episode_; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE INDEX bf_cons_book_events_idx_update_next_episode_no_by_next_episode_ ON bitfinex.bf_cons_book_events USING btree (snapshot_id, price, price_next_episode_no);
-
-
---
 -- Name: bf_order_book_episodes_idx_by_time; Type: INDEX; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1856,6 +1891,13 @@ CREATE CONSTRAINT TRIGGER a_check_episode_no_order AFTER INSERT OR UPDATE OF epi
 
 
 --
+-- Name: bf_snapshots a_create_partitions; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TRIGGER a_create_partitions AFTER INSERT ON bitfinex.bf_snapshots FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_snapshots_create_partitions();
+
+
+--
 -- Name: bf_trades a_dress_new_row; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1867,13 +1909,6 @@ CREATE TRIGGER a_dress_new_row BEFORE INSERT ON bitfinex.bf_trades FOR EACH ROW 
 --
 
 CREATE TRIGGER a_dress_new_row BEFORE INSERT ON bitfinex.bf_order_book_events FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_order_book_events_dress_new_row();
-
-
---
--- Name: bf_cons_book_events a_dress_new_row; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE TRIGGER a_dress_new_row BEFORE INSERT ON bitfinex.bf_cons_book_events FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_cons_book_events_dress_new_row();
 
 
 --
@@ -1891,13 +1926,6 @@ CREATE TRIGGER b_update_next_episode_no BEFORE INSERT ON bitfinex.bf_order_book_
 
 
 --
--- Name: bf_cons_book_events b_update_next_episode_no; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE TRIGGER b_update_next_episode_no BEFORE INSERT ON bitfinex.bf_cons_book_events FOR EACH ROW EXECUTE PROCEDURE bitfinex.bf_cons_book_events_update_next_episode_no();
-
-
---
 -- Name: bf_order_book_events c_match_trades_to_events; Type: TRIGGER; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1910,22 +1938,6 @@ CREATE TRIGGER c_match_trades_to_events BEFORE INSERT ON bitfinex.bf_order_book_
 
 ALTER TABLE ONLY bitfinex.bf_cons_book_episodes
     ADD CONSTRAINT bf_cons_book_episodes_fkey_bf_snapshots FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
-
-
---
--- Name: bf_cons_book_events bf_cons_book_events_fkey_bf_cons_book_episodes; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitfinex.bf_cons_book_events
-    ADD CONSTRAINT bf_cons_book_events_fkey_bf_cons_book_episodes FOREIGN KEY (snapshot_id, episode_no) REFERENCES bitfinex.bf_cons_book_episodes(snapshot_id, episode_no) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
-
-
---
--- Name: bf_cons_book_events bf_cons_book_events_fkey_bf_snapshots; Type: FK CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitfinex.bf_cons_book_events
-    ADD CONSTRAINT bf_cons_book_events_fkey_bf_snapshots FOREIGN KEY (snapshot_id) REFERENCES bitfinex.bf_snapshots(snapshot_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --

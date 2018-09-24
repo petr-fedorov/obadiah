@@ -832,6 +832,12 @@ def start_new_snapshot(ob_len, pair, dbname, user, prec="R0"):
     with connect_db(dbname, user) as con:
         with con.cursor() as curr:
             try:
+                if prec != "R0":
+                    # A trigger on bf_snapshots might decide to add a partition
+                    # to bf_cons_book_events
+                    curr.execute("LOCK TABLE bitfinex.bf_cons_book_events")
+                else:
+                    pass
                 curr.execute("insert into bitfinex.bf_snapshots "
                              "(len, pair, prec)"
                              "values (%s, %s, %s) returning snapshot_id",
@@ -877,9 +883,12 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
 
     ob_R0.subscribe_to_raw_order_book(pair, len=ob_len)
     ob_R0.subscribe_to_trades(pair)
+    logger.info('%s %s' % ('R0', ob_R0.conn.socket.sock.sock.getpeername()[0]))
 
     for prec, ob in zip(precs, obs):
         ob.subscribe_to_order_book(pair, prec=prec, len=ob_len)
+        logger.info('%s %s' % (prec,
+                               ob.conn.socket.sock.sock.getpeername()[0]))
 
     time.sleep(5)
 
