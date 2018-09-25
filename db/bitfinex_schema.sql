@@ -1125,14 +1125,20 @@ BEGIN
 					abs(event_qty) AS volume, 'created'::character varying AS action,
 					CASE WHEN side = 'A' THEN 'ask'::character varying 
 						 ELSE 'bid'::character varying END AS direction, 
-					'flashed-limit'::character varying AS "type",
+					bf_order_book_events."type", 
 					bf_order_book_events.snapshot_id, 
 					bf_order_book_events.episode_no, 
 					bf_order_book_events.event_no
-			FROM bitfinex.bf_order_book_events LEFT JOIN bitfinex.bf_trades USING (snapshot_id, episode_no, event_no)
-			WHERE bf_order_book_events.snapshot_id = rng.snapshot_id
-			  AND bf_order_book_events.episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
-			  AND order_qty = event_qty 
+			FROM (	SELECT 	*,
+				  			CASE WHEN (first_value(order_qty) OVER o <> 0  OR first_value(matched) OVER o ) THEN 'resting-limit'::character varying 
+						 		ELSE 'flashed-limit'::character varying 
+							END AS "type"
+				  	FROM bitfinex.bf_order_book_events 
+				  	WHERE  	bf_order_book_events.snapshot_id = rng.snapshot_id
+			  		  AND 	bf_order_book_events.episode_no BETWEEN rng.min_episode_no AND rng.max_episode_no
+					WINDOW o AS (PARTITION BY bf_order_book_events.snapshot_id, order_id ORDER BY bf_order_book_events.episode_no DESC)
+				 ) bf_order_book_events  LEFT JOIN bitfinex.bf_trades USING (snapshot_id, episode_no, event_no)
+			WHERE order_qty = event_qty 
 			  AND event_price = order_price;
 	END LOOP;
 	RETURN;
