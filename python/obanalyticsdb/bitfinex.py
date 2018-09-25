@@ -832,12 +832,10 @@ def start_new_snapshot(ob_len, pair, dbname, user, prec="R0"):
     with connect_db(dbname, user) as con:
         with con.cursor() as curr:
             try:
-                if prec != "R0":
-                    # A trigger on bf_snapshots might decide to add a partition
-                    # to bf_cons_book_events
-                    curr.execute("LOCK TABLE bitfinex.bf_cons_book_events")
-                else:
-                    pass
+                # A trigger on bf_snapshots might decide to add a partition
+                # to bf_cons_book_events or bf_order_book_events
+                curr.execute("LOCK TABLE bitfinex.bf_cons_book_events")
+                curr.execute("LOCK TABLE bitfinex.bf_order_book_events")
                 curr.execute("insert into bitfinex.bf_snapshots "
                              "(len, pair, prec)"
                              "values (%s, %s, %s) returning snapshot_id",
