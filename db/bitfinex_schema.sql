@@ -341,7 +341,8 @@ BEGIN
 			NEW.event_qty = -e.order_qty;
 			NEW.order_qty = 0;
 		ELSE
-			RAISE WARNING 'Requested removal of order: %  which is not in the order book!', NEW.order_id;
+			RAISE WARNING 'Bypassed the removal of order: %  which is not in the order book', NEW.order_id;
+			RETURN NULL;
 		END IF;
 		
 		NEW.order_next_episode_no := -1;
