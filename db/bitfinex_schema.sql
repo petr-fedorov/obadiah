@@ -170,6 +170,80 @@ $$;
 ALTER FUNCTION bitfinex.bf_cons_book_events_update_next_episode_no() OWNER TO "ob-analytics";
 
 --
+-- Name: bf_infer_agressors(integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_infer_agressors(snapshot_id integer) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+
+BEGIN 
+
+	WITH trades_with_market_orders AS (
+		SELECT sum(g::integer) OVER (PARTITION BY a.snapshot_id, episode_no ORDER BY exchange_timestamp) AS mo_id,
+			 direction , episode_no, event_no, exchange_timestamp, a.snapshot_id, id, price, qty
+		FROM (
+			SELECT COALESCE(
+				direction !=lag(direction) OVER w 
+				OR (exchange_timestamp - lag(exchange_timestamp) OVER w ) > '0.1 sec'::interval 
+				OR (direction = 'B' AND price < lag(price) OVER w)
+				OR (direction = 'S' AND price > lag(price) OVER w)
+				, false) AS g, direction , 
+			episode_no, exchange_timestamp, bf_trades.snapshot_id, id, price, qty, event_no
+			FROM bitfinex.bf_trades
+			WHERE bf_trades.snapshot_id = bf_derive_market_orders.snapshot_id 
+			WINDOW w AS (PARTITION BY bf_trades.snapshot_id, episode_no ORDER BY exchange_timestamp) 
+		) a 
+	),
+	market_orders_last_exec_price AS (
+		SELECT DISTINCT ON (trades_with_market_orders.snapshot_id, episode_no, mo_id) trades_with_market_orders.snapshot_id, episode_no, mo_id, direction, price, qty, id, exchange_timestamp
+		FROM trades_with_market_orders
+		ORDER BY snapshot_id, episode_no, mo_id, exchange_timestamp DESC
+	), 
+	market_orders_with_distinct_price AS (
+		SELECT DISTINCT ON (market_orders_last_exec_price.snapshot_id, episode_no, direction, price ) * 
+		FROM market_orders_last_exec_price
+		ORDER BY snapshot_id, episode_no, direction, price, exchange_timestamp DESC
+	),
+	new_orders_in_the_book AS (
+		SELECT DISTINCT ON (o.snapshot_id, episode_no, side, price) *
+		FROM (
+			SELECT bf_order_book_events.snapshot_id, episode_no, order_id, order_price AS price, side,
+				row_number() OVER (PARTITION BY bf_order_book_events.snapshot_id, order_id ORDER BY episode_no) AS r
+			FROM bitfinex.bf_order_book_events
+			WHERE bf_order_book_events.snapshot_id = bf_derive_market_orders.snapshot_id
+		) o
+		WHERE r = 1
+		ORDER BY o.snapshot_id, episode_no, side, price, order_id DESC
+	),
+	market_limit_orders AS (
+		SELECT m.snapshot_id, m.episode_no, mo_id, o.order_id AS ml_order_id
+		FROM market_orders_with_distinct_price m JOIN new_orders_in_the_book o ON 
+			m.snapshot_id = o.snapshot_id AND m.episode_no = o.episode_no AND m.price = o.price
+			AND ( 	(m.direction = 'B' AND o.side = 'A' ) OR (m.direction = 'S' AND o.side = 'B')		)
+	)
+	UPDATE bitfinex.bf_trades
+	SET market_order_type = CASE WHEN ml_order_id IS NULL THEN 'M' ELSE 'L' END,
+		market_order_id = COALESCE(ml_order_id, ('x'||md5(trades_with_market_orders.snapshot_id::text||trades_with_market_orders.episode_no::text||mo_id::text))::bit(33)::bigint )
+	FROM trades_with_market_orders LEFT JOIN market_limit_orders USING (snapshot_id, episode_no, mo_id)
+	WHERE trades_with_market_orders.id = bf_trades.id;
+												 
+
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_infer_agressors(snapshot_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION bf_infer_agressors(snapshot_id integer); Type: COMMENT; Schema: bitfinex; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitfinex.bf_infer_agressors(snapshot_id integer) IS 'Infers market and market-limit orders from trades ';
+
+
+--
 -- Name: bf_order_book_episodes_match_trades_to_episodes(); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1545,7 +1619,9 @@ CREATE TABLE bitfinex.bf_trades (
     episode_no integer,
     event_no smallint,
     direction character(1) NOT NULL,
-    match_rule smallint
+    match_rule smallint,
+    market_order_type character(1),
+    market_order_id bigint
 )
 WITH (autovacuum_enabled='true', autovacuum_analyze_threshold='5000', autovacuum_vacuum_threshold='5000', autovacuum_analyze_scale_factor='0.0', autovacuum_vacuum_scale_factor='0.0');
 
