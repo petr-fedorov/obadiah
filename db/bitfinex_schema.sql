@@ -630,6 +630,68 @@ $$;
 ALTER FUNCTION bitfinex.bf_snapshots_create_partitions() OWNER TO "ob-analytics";
 
 --
+-- Name: bf_snapshots_v(integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.bf_snapshots_v(INOUT snapshot_id integer DEFAULT NULL::integer, "limit" integer DEFAULT 5, OUT prec character, OUT events bigint, OUT trades bigint, OUT matched_to_episode bigint, OUT matched_to_event bigint, OUT starts timestamp with time zone, OUT ends timestamp with time zone, OUT last_episode integer, OUT pair character varying, OUT len smallint) RETURNS SETOF record
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+	s RECORD;
+
+BEGIN 
+
+	IF bf_snapshots_v.snapshot_id IS NULL THEN
+		SELECT max(bf_snapshots.snapshot_id) INTO snapshot_id
+		FROM bitfinex.bf_snapshots;
+	END IF;
+
+	FOR s IN 	SELECT * 
+				FROM bitfinex.bf_snapshots 
+				WHERE bf_snapshots.snapshot_id <= bf_snapshots_v.snapshot_id
+				ORDER BY bf_snapshots.snapshot_id DESC
+				LIMIT bf_snapshots_v."limit" LOOP
+		IF s.prec = 'R0' THEN
+			RETURN QUERY	SELECT 	bf_r_snapshots_v.snapshot_id,
+									s.prec AS prec,
+									bf_r_snapshots_v.events,
+									bf_r_snapshots_v.trades,
+									bf_r_snapshots_v.matched_to_episode,
+									bf_r_snapshots_v.matched_to_event,
+									bf_r_snapshots_v.starts,
+									bf_r_snapshots_v.ends,
+									bf_r_snapshots_v.last_episode,
+									bf_r_snapshots_v.pair,
+									bf_r_snapshots_v.len
+							FROM bitfinex.bf_r_snapshots_v
+							WHERE bf_r_snapshots_v.snapshot_id = s.snapshot_id;
+		ELSE
+			RETURN QUERY	SELECT 	bf_p_snapshots_v.snapshot_id,
+									bf_p_snapshots_v.prec,
+									bf_p_snapshots_v.events,
+									NULL::bigint AS trades,
+									NULL::bigint AS matched_to_episode,
+									NULL::bigint AS matched_to_event,
+									bf_p_snapshots_v.starts,
+									bf_p_snapshots_v.ends,
+									bf_p_snapshots_v.last_episode,
+									bf_p_snapshots_v.pair,
+									bf_p_snapshots_v.len
+							FROM bitfinex.bf_p_snapshots_v
+							WHERE bf_p_snapshots_v.snapshot_id = s.snapshot_id;
+		
+		END IF;
+	END LOOP;				
+	RETURN;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.bf_snapshots_v(INOUT snapshot_id integer, "limit" integer, OUT prec character, OUT events bigint, OUT trades bigint, OUT matched_to_episode bigint, OUT matched_to_event bigint, OUT starts timestamp with time zone, OUT ends timestamp with time zone, OUT last_episode integer, OUT pair character varying, OUT len smallint) OWNER TO "ob-analytics";
+
+--
 -- Name: bf_spread_after_episode_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
