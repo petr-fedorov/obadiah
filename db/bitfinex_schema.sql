@@ -24,6 +24,64 @@ CREATE SCHEMA bitfinex;
 
 ALTER SCHEMA bitfinex OWNER TO "ob-analytics";
 
+--
+-- Name: order_type; Type: TYPE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TYPE bitfinex.order_type AS ENUM (
+    'hidden',
+    'flashed-limit',
+    'resting-limit',
+    'market',
+    'market-limit'
+);
+
+
+ALTER TYPE bitfinex.order_type OWNER TO "ob-analytics";
+
+--
+-- Name: raw_event_action; Type: TYPE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TYPE bitfinex.raw_event_action AS ENUM (
+    'created',
+    'changed',
+    'deleted'
+);
+
+
+ALTER TYPE bitfinex.raw_event_action OWNER TO "ob-analytics";
+
+--
+-- Name: _hidden_order_id(bigint); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex._hidden_order_id(id bigint) RETURNS bigint
+    LANGUAGE sql STRICT LEAKPROOF
+    AS $$
+
+SELECT ('x'||md5(id::text||'hidden'))::bit(33)::bigint;
+
+$$;
+
+
+ALTER FUNCTION bitfinex._hidden_order_id(id bigint) OWNER TO "ob-analytics";
+
+--
+-- Name: _market_order_id(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex._market_order_id(snapshot_id integer, episode_no integer, mo_id integer) RETURNS bigint
+    LANGUAGE sql STRICT LEAKPROOF
+    AS $$
+
+SELECT ('x'||md5(snapshot_id::text||episode_no::text||mo_id::text))::bit(33)::bigint;
+
+$$;
+
+
+ALTER FUNCTION bitfinex._market_order_id(snapshot_id integer, episode_no integer, mo_id integer) OWNER TO "ob-analytics";
+
 SET default_tablespace = '';
 
 SET default_with_oids = false;
@@ -180,7 +238,7 @@ CREATE FUNCTION bitfinex.bf_infer_agressors(snapshot_id integer) RETURNS void
 BEGIN 
 
 	WITH trades_with_market_orders AS (
-		SELECT sum(g::integer) OVER (PARTITION BY a.snapshot_id, episode_no ORDER BY exchange_timestamp) AS mo_id,
+		SELECT (sum(g::integer) OVER (PARTITION BY a.snapshot_id, episode_no ORDER BY exchange_timestamp))::integer AS mo_id,
 			 direction , episode_no, event_no, exchange_timestamp, a.snapshot_id, id, price, qty
 		FROM (
 			SELECT COALESCE(
@@ -191,7 +249,7 @@ BEGIN
 				, false) AS g, direction , 
 			episode_no, exchange_timestamp, bf_trades.snapshot_id, id, price, qty, event_no
 			FROM bitfinex.bf_trades
-			WHERE bf_trades.snapshot_id = bf_derive_market_orders.snapshot_id 
+			WHERE bf_trades.snapshot_id = bf_infer_agressors.snapshot_id 
 			WINDOW w AS (PARTITION BY bf_trades.snapshot_id, episode_no ORDER BY exchange_timestamp) 
 		) a 
 	),
@@ -209,22 +267,22 @@ BEGIN
 		SELECT DISTINCT ON (o.snapshot_id, episode_no, side, price) *
 		FROM (
 			SELECT bf_order_book_events.snapshot_id, episode_no, order_id, order_price AS price, side,
-				row_number() OVER (PARTITION BY bf_order_book_events.snapshot_id, order_id ORDER BY episode_no) AS r
+				row_number() OVER (PARTITION BY bf_order_book_events.snapshot_id, order_id ORDER BY episode_no) AS r, order_qty
 			FROM bitfinex.bf_order_book_events
-			WHERE bf_order_book_events.snapshot_id = bf_derive_market_orders.snapshot_id
+			WHERE bf_order_book_events.snapshot_id = bf_infer_agressors.snapshot_id
 		) o
 		WHERE r = 1
 		ORDER BY o.snapshot_id, episode_no, side, price, order_id DESC
 	),
 	market_limit_orders AS (
-		SELECT m.snapshot_id, m.episode_no, mo_id, o.order_id AS ml_order_id
+		SELECT m.snapshot_id, m.episode_no, mo_id, o.order_id AS ml_order_id, order_qty
 		FROM market_orders_with_distinct_price m JOIN new_orders_in_the_book o ON 
 			m.snapshot_id = o.snapshot_id AND m.episode_no = o.episode_no AND m.price = o.price
 			AND ( 	(m.direction = 'B' AND o.side = 'A' ) OR (m.direction = 'S' AND o.side = 'B')		)
 	)
 	UPDATE bitfinex.bf_trades
-	SET market_order_type = CASE WHEN ml_order_id IS NULL THEN 'M' ELSE 'L' END,
-		market_order_id = COALESCE(ml_order_id, ('x'||md5(trades_with_market_orders.snapshot_id::text||trades_with_market_orders.episode_no::text||mo_id::text))::bit(33)::bigint )
+	SET market_limit_unfilled_qty = order_qty,
+		market_order_id = COALESCE(ml_order_id, bitfinex._market_order_id(trades_with_market_orders.snapshot_id, trades_with_market_orders.episode_no, mo_id))
 	FROM trades_with_market_orders LEFT JOIN market_limit_orders USING (snapshot_id, episode_no, mo_id)
 	WHERE trades_with_market_orders.id = bf_trades.id;
 												 
@@ -633,7 +691,7 @@ ALTER FUNCTION bitfinex.bf_snapshots_create_partitions() OWNER TO "ob-analytics"
 -- Name: bf_snapshots_v(integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.bf_snapshots_v(INOUT snapshot_id integer DEFAULT NULL::integer, "limit" integer DEFAULT 5, OUT prec character, OUT events bigint, OUT trades bigint, OUT matched_to_episode bigint, OUT matched_to_event bigint, OUT starts timestamp with time zone, OUT ends timestamp with time zone, OUT last_episode integer, OUT pair character varying, OUT len smallint) RETURNS SETOF record
+CREATE FUNCTION bitfinex.bf_snapshots_v("limit" integer DEFAULT 5, INOUT snapshot_id integer DEFAULT NULL::integer, OUT prec character, OUT events bigint, OUT trades bigint, OUT matched_to_episode bigint, OUT matched_to_event bigint, OUT starts timestamp with time zone, OUT ends timestamp with time zone, OUT last_episode integer, OUT pair character varying, OUT len smallint) RETURNS SETOF record
     LANGUAGE plpgsql
     AS $$
 
@@ -689,7 +747,7 @@ END;
 $$;
 
 
-ALTER FUNCTION bitfinex.bf_snapshots_v(INOUT snapshot_id integer, "limit" integer, OUT prec character, OUT events bigint, OUT trades bigint, OUT matched_to_episode bigint, OUT matched_to_event bigint, OUT starts timestamp with time zone, OUT ends timestamp with time zone, OUT last_episode integer, OUT pair character varying, OUT len smallint) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.bf_snapshots_v("limit" integer, INOUT snapshot_id integer, OUT prec character, OUT events bigint, OUT trades bigint, OUT matched_to_episode bigint, OUT matched_to_event bigint, OUT starts timestamp with time zone, OUT ends timestamp with time zone, OUT last_episode integer, OUT pair character varying, OUT len smallint) OWNER TO "ob-analytics";
 
 --
 -- Name: bf_spread_after_episode_v(integer, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
@@ -1455,6 +1513,132 @@ $$;
 ALTER FUNCTION bitfinex.oba_order_book(tp timestamp with time zone, pair character varying, "max.levels" integer, "bps.range" numeric, "min.bid" numeric, "max.ask" numeric) OWNER TO "ob-analytics";
 
 --
+-- Name: oba_raw_events(integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.oba_raw_events(s_id integer, OUT id bigint, OUT "timestamp" bigint, OUT "exchange.timestamp" bigint, OUT price numeric, OUT volume numeric, OUT action bitfinex.raw_event_action, OUT direction text, OUT orig_id bigint, OUT order_type bitfinex.order_type, OUT trade_id bigint, OUT trade_qty numeric, OUT trade_timestamp timestamp with time zone, OUT market_order_id bigint) RETURNS SETOF record
+    LANGUAGE sql
+    AS $$
+
+WITH trades_against_hidden AS (
+	SELECT id,
+			price,
+			qty,
+			direction,
+			bf_order_book_episodes.exchange_timestamp,
+			bitfinex.bf_trades.exchange_timestamp AS trade_timestamp,
+			market_order_id,
+			market_limit_unfilled_qty, 
+			id AS trade_id
+	FROM bitfinex.bf_trades JOIN bitfinex.bf_order_book_episodes USING (snapshot_id, episode_no)
+	WHERE snapshot_id = s_id
+  	  AND event_no IS NULL
+),
+hidden_events AS (
+	SELECT bitfinex._hidden_order_id(id) AS id,
+			exchange_timestamp AS "timestamp",
+			exchange_timestamp,
+			price,
+			qty AS volume,
+			'created'::bitfinex.raw_event_action AS "action",
+			CASE WHEN direction = 'B' THEN 'ask'::text
+					 ELSE 'bid'::text END AS "direction", 
+			'hidden'::bitfinex.order_type AS order_type,
+			trade_id,
+			qty AS trade_qty,
+			trade_timestamp,
+			market_order_id,
+			1::integer AS priority
+	FROM trades_against_hidden
+	UNION ALL				 
+	SELECT bitfinex._hidden_order_id(id)  AS id,
+			exchange_timestamp AS "timestamp",
+			exchange_timestamp,
+			price,
+			0 AS volume,
+			'deleted'::bitfinex.raw_event_action AS "action",
+			CASE WHEN direction = 'B' THEN 'ask'::text
+					 ELSE 'bid'::text END AS "direction",
+			'hidden'::bitfinex.order_type AS order_type	,
+			trade_id,
+			qty AS trade_qty,
+			trade_timestamp,
+			market_order_id,
+			3::integer AS priority
+	FROM trades_against_hidden
+) ,
+raw_market_order_events AS (
+	SELECT market_order_id  AS id,
+			last_value(exchange_timestamp) OVER mo_asc AS "timestamp",
+			first_value(exchange_timestamp) OVER mo_asc AS exchange_timestamp,
+			CASE WHEN direction = 'B' THEN max(price) OVER mo_dsc 
+				ELSE min(price) OVER mo_dsc END AS price,
+			sum(qty) OVER mo_dsc + COALESCE(market_limit_unfilled_qty,0) AS volume,
+			qty, 
+			CASE WHEN direction = 'B' THEN 'bid'::text
+					 ELSE 'ask'::text END AS "direction",
+			CASE WHEN market_limit_unfilled_qty IS NOT NULL THEN 'market-limit'::bitfinex.order_type
+				ELSE 'market'::bitfinex.order_type END AS order_type,
+			trade_id,
+			qty AS trade_qty,
+			market_limit_unfilled_qty,
+			trade_timestamp,
+			market_order_id,
+			row_number() OVER mo_asc  AS first_last_no,
+			row_number() OVER mo_dsc  AS last_first_no
+	FROM trades_against_hidden
+	WINDOW mo_asc AS (PARTITION BY market_order_id ORDER BY trade_timestamp),
+			mo_dsc AS (PARTITION BY market_order_id ORDER BY trade_timestamp DESC)
+),
+market_order_events AS (
+	SELECT id, "timestamp", exchange_timestamp, price, volume, 'created'::bitfinex.raw_event_action AS "action", "direction", 
+				order_type, trade_id, trade_qty,trade_timestamp, market_order_id, 2::integer AS priority
+	FROM raw_market_order_events
+	WHERE first_last_no = 1
+	UNION ALL
+	SELECT id, "timestamp", exchange_timestamp, price, volume -qty, 'changed'::bitfinex.raw_event_action, "direction",
+			order_type, trade_id, trade_qty,trade_timestamp, market_order_id, 3::integer AS priority
+	FROM raw_market_order_events
+	WHERE last_first_no != 1 OR market_limit_unfilled_qty IS NOT NULL
+	UNION ALL
+	SELECT id, "timestamp", exchange_timestamp, price, volume - qty, 'deleted'::bitfinex.raw_event_action, "direction",
+			order_type, trade_id, trade_qty,trade_timestamp, market_order_id, 3::integer AS priority
+	FROM raw_market_order_events
+	WHERE last_first_no = 1 AND  market_limit_unfilled_qty IS NULL
+),
+combined_ordered_events AS (
+	SELECT row_number() OVER () AS rn, a.*
+	FROM (
+		SELECT *
+		FROM (
+			SELECT * FROM hidden_events
+			UNION ALL
+			SELECT * FROM market_order_events
+		) a
+		ORDER BY market_order_id, priority, trade_timestamp, action , order_type DESC
+	) a
+)
+SELECT new_id AS id, 
+		(EXTRACT( EPOCH FROM "timestamp")*1000)::bigint,
+		(EXTRACT( EPOCH FROM exchange_timestamp)*1000)::bigint,
+		price,
+		volume,
+		"action",
+		"direction", 
+		id AS orig_id, 		
+		order_type,
+		trade_id,
+		trade_qty,
+		trade_timestamp,
+		market_order_id
+FROM combined_ordered_events JOIN (SELECT id, min(rn) AS new_id FROM combined_ordered_events GROUP BY id) b USING (id);
+
+$$;
+
+
+ALTER FUNCTION bitfinex.oba_raw_events(s_id integer, OUT id bigint, OUT "timestamp" bigint, OUT "exchange.timestamp" bigint, OUT price numeric, OUT volume numeric, OUT action bitfinex.raw_event_action, OUT direction text, OUT orig_id bigint, OUT order_type bitfinex.order_type, OUT trade_id bigint, OUT trade_qty numeric, OUT trade_timestamp timestamp with time zone, OUT market_order_id bigint) OWNER TO "ob-analytics";
+
+--
 -- Name: oba_spread(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -1682,8 +1866,8 @@ CREATE TABLE bitfinex.bf_trades (
     event_no smallint,
     direction character(1) NOT NULL,
     match_rule smallint,
-    market_order_type character(1),
-    market_order_id bigint
+    market_order_id bigint,
+    market_limit_unfilled_qty numeric
 )
 WITH (autovacuum_enabled='true', autovacuum_analyze_threshold='5000', autovacuum_vacuum_threshold='5000', autovacuum_analyze_scale_factor='0.0', autovacuum_vacuum_scale_factor='0.0');
 
@@ -1716,6 +1900,13 @@ COMMENT ON COLUMN bitfinex.bf_trades.exchange_timestamp IS 'Bitfinex''s timestam
 --
 
 COMMENT ON COLUMN bitfinex.bf_trades.match_rule IS 'An identifier of SQL statement which matched the trade with an episode.';
+
+
+--
+-- Name: COLUMN bf_trades.market_limit_unfilled_qty; Type: COMMENT; Schema: bitfinex; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN bitfinex.bf_trades.market_limit_unfilled_qty IS 'If the trade is originated by a market-limit agressor, then this field contains  unfilled quantity which when to the order book (after all trades). Otherwise it is NULL';
 
 
 --
