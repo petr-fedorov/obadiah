@@ -1520,6 +1520,8 @@ WITH all_trades AS (
 			bf_order_book_episodes.exchange_timestamp,
 			bitfinex.bf_trades.exchange_timestamp AS trade_timestamp,
 			market_order_id,
+			min(bitfinex.bf_trades.exchange_timestamp) OVER (PARTITION BY snapshot_id, market_order_id ORDER BY bitfinex.bf_trades.exchange_timestamp )
+				AS market_order_timestamp,	-- the column is needed to order the output correctly
 			id AS trade_id,
 			snapshot_id,
 			episode_no,
@@ -1571,6 +1573,7 @@ matched_events AS (
 			trades_against_revealed.qty AS trade_qty,
 			trades_against_revealed.trade_timestamp,
 			trades_against_revealed.market_order_id AS market_order_id,
+			trades_against_revealed.market_order_timestamp AS market_order_timestamp,
 			3::integer AS priority,
 			snapshot_id,
 			episode_no,
@@ -1600,6 +1603,7 @@ not_matched_events AS (
 			NULL::numeric AS trade_qty,
 			NULL::timestamptz AS trade_timestamp,
 			NULL::bigint AS market_order_id,
+			NULL::timestamptz AS market_order_timestamp,
 			CASE WHEN first_last_no = 1 THEN 1::integer
 				ELSE 3::integer 
 			END AS priority,
@@ -1609,6 +1613,44 @@ not_matched_events AS (
 	FROM all_events
 	WHERE NOT matched
 ),
+order_book_events AS (
+	SELECT id, 
+		"timestamp",
+		exchange_timestamp,
+		price,
+		-- obAnalytics::processData() matches events to produce trades by volume change only. In order to avoid generation of spurious trades
+		-- we slightly modify the volume of 'flashed-limit'-type events which could originate suche trades. Also we check that the change will not 
+		-- negatively impact the matched events.
+		CASE WHEN direction = 'ask' AND NOT matched AND NOT next_matched THEN volume*(1 + 0.001*(dense_rank() OVER by_fill - 1))
+			ELSE volume
+		END AS volume,		
+		"action",
+		"direction",
+		order_type,
+		trade_id, 
+		trade_qty, 
+		trade_timestamp,
+		market_order_id,
+		market_order_timestamp,																								 
+		priority,
+		snapshot_id,
+		episode_no,
+		event_no
+	FROM (
+		SELECT a.*, 
+				COALESCE(lead(volume) OVER by_id - volume, 0) AS next_fill,
+				COALESCE(lead(matched) OVER by_id, FALSE) AS next_matched	
+		FROM (
+			SELECT *, FALSE AS matched
+			FROM not_matched_events
+			UNION ALL
+			SELECT *, TRUE AS matched
+			FROM matched_events
+		) a
+		WINDOW by_id AS (PARTITION BY id ORDER BY "timestamp" )
+	) b
+	WINDOW by_fill AS (PARTITION BY abs(next_fill) ORDER BY exchange_timestamp)
+), 
 hidden_events AS (
 	SELECT bitfinex._hidden_order_id(id) AS id,
 			exchange_timestamp AS "timestamp",
@@ -1618,11 +1660,12 @@ hidden_events AS (
 			'created'::bitfinex.raw_event_action AS "action",
 			CASE WHEN direction = 'B' THEN 'ask'::text
 					 ELSE 'bid'::text END AS "direction", 
-			'hidden'::bitfinex.order_type AS order_type,
+			'resting-limit'::bitfinex.order_type AS order_type,
 			trade_id,
 			qty AS trade_qty,
 			trade_timestamp,
 			market_order_id,
+	 		market_order_timestamp, 
 			1::integer AS priority,
 			snapshot_id,
 			episode_no,
@@ -1637,11 +1680,12 @@ hidden_events AS (
 			'deleted'::bitfinex.raw_event_action AS "action",
 			CASE WHEN direction = 'B' THEN 'ask'::text
 					 ELSE 'bid'::text END AS "direction",
-			'hidden'::bitfinex.order_type AS order_type	,
+			'resting-limit'::bitfinex.order_type AS order_type	,
 			trade_id,
 			qty AS trade_qty,
 			trade_timestamp,
 			market_order_id,
+	 		market_order_timestamp, 
 			3::integer AS priority,
 			snapshot_id,
 			episode_no,
@@ -1663,6 +1707,7 @@ raw_market_order_events AS (
 			qty AS trade_qty,
 			trade_timestamp,
 			market_order_id,
+			market_order_timestamp,
 			row_number() OVER mo_asc  AS first_last_no,
 			row_number() OVER mo_dsc  AS last_first_no,
 			snapshot_id,
@@ -1674,18 +1719,18 @@ raw_market_order_events AS (
 ),
 market_order_events AS (
 	SELECT id, "timestamp", exchange_timestamp, price, volume, 'created'::bitfinex.raw_event_action AS "action", "direction", 
-				order_type, trade_id, trade_qty,trade_timestamp, market_order_id, 2::integer AS priority, snapshot_id, episode_no, event_no
+				order_type, trade_id, trade_qty,trade_timestamp, market_order_id, market_order_timestamp, 2::integer AS priority, snapshot_id, episode_no, event_no
 
 	FROM raw_market_order_events
 	WHERE first_last_no = 1
 	UNION ALL
 	SELECT id, "timestamp", exchange_timestamp, price, volume - qty, 'changed'::bitfinex.raw_event_action, "direction",
-			order_type, trade_id, trade_qty,trade_timestamp, market_order_id, 3::integer AS priority, snapshot_id, episode_no, event_no
+			order_type, trade_id, trade_qty,trade_timestamp, market_order_id, market_order_timestamp,  3::integer AS priority, snapshot_id, episode_no, event_no
 	FROM raw_market_order_events
 	WHERE last_first_no != 1 
 	UNION ALL
 	SELECT id, "timestamp", exchange_timestamp, price, volume - qty, 'deleted'::bitfinex.raw_event_action, "direction",
-			order_type, trade_id, trade_qty,trade_timestamp, market_order_id, 3::integer AS priority, snapshot_id, episode_no, event_no
+			order_type, trade_id, trade_qty,trade_timestamp, market_order_id,  market_order_timestamp, 3::integer AS priority, snapshot_id, episode_no, event_no
 	FROM raw_market_order_events
 	WHERE last_first_no = 1 
 ),
@@ -1696,13 +1741,11 @@ combined_ordered_events AS (
 		FROM (
 			SELECT * FROM hidden_events
 			UNION ALL
-			SELECT * FROM not_matched_events
-			UNION ALL
-			SELECT * FROM matched_events
+			SELECT * FROM order_book_events
 			UNION ALL
 			SELECT * FROM market_order_events
 		) a
-		ORDER BY exchange_timestamp, market_order_id, priority, trade_timestamp, action , order_type DESC
+		ORDER BY exchange_timestamp, market_order_timestamp, priority, trade_timestamp, action , order_type DESC
 	) a
 )
 SELECT new_id AS id, 
