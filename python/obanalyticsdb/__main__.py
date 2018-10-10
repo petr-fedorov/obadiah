@@ -4,6 +4,7 @@ from multiprocessing import set_start_method, Event, Process, Queue
 import signal
 import argparse
 import obanalyticsdb.bitfinex as bf
+import obanalyticsdb.bitstamp as bs
 from obanalyticsdb.utils import listener_process, logging_configurer
 
 
@@ -44,14 +45,14 @@ def main():
     logger = logging.getLogger("obanalyticsdb.main")
     logger.info('Started')
 
-    exchanges = {'BITFINEX': bf.capture}
+    exchanges = {'BITFINEX': bf.capture, 'BITSTAMP': bs.capture}
 
     try:
         capture = exchanges[stream[1]]
         print("Press Ctrl-C to stop ...")
         capture(stream[0], args.dbname, args.user, stop_flag, log_queue)
     except KeyError as e:
-        logging.getLogger("bitfinex.main").exception(e)
+        logger.exception(e)
         print('Exchange %s is not supported (yet)' % stream[1])
 
     logger.info('Exit')

@@ -2,14 +2,12 @@ from queue import Empty, Full
 from multiprocessing import Process, Queue
 import logging
 import time
-import signal
 from heapq import heappush, heappop
 from btfxwss import BtfxWss
-import psycopg2
 from datetime import datetime, timedelta
 from functools import total_ordering
-from obanalyticsdb.utils import logging_configurer, log_notices,\
-    QueueSizeLogger
+from obanalyticsdb.utils import log_notices, QueueSizeLogger,\
+    connect_db, Spawned
 
 
 @total_ordering
@@ -256,19 +254,6 @@ class Trade(OrderedDatabaseInsertion):
                       self.snapshot_id, self.exchange_timestamp))
 
 
-class Spawned:
-
-    def __init__(self, log_queue, stop_flag, log_level=logging.INFO):
-        self.log_queue = log_queue
-        self.stop_flag = stop_flag
-        self.log_level = log_level
-
-    def _call_init(self):
-        logging_configurer(self.log_queue, self.log_level)
-
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-
 class Orderer(Spawned):
 
     def __init__(self, q_unordered, q_ordered, stop_flag, log_queue,
@@ -377,12 +362,6 @@ class Orderer(Spawned):
             self._depart_to_database()
             logger.debug("Unprocessed heap size: %i" % len(self.buffer))
         logger.info('Exit %r ' % (self,))
-
-
-def connect_db(dbname, user):
-    return psycopg2.connect("dbname=%s user=%s password=%s "
-                            "application_name=obanalyticsdb" %
-                            (dbname, user, user))
 
 
 class Stockkeeper(Spawned):

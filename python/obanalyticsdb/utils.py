@@ -3,6 +3,13 @@ import logging.handlers
 import sys
 import traceback
 import signal
+import psycopg2
+
+
+def connect_db(dbname, user):
+    return psycopg2.connect("dbname=%s user=%s password=%s "
+                            "application_name=obanalyticsdb" %
+                            (dbname, user, user))
 
 
 def listener_process(logging_queue, log_file_name):
@@ -56,3 +63,16 @@ class QueueSizeLogger:
             logger.warning("Unprocessed %s size: %i" % (self.queue_name, s))
         elif self.n and (s < self.THRE*2**(self.n - 1)):
             self.n -= 1
+
+
+class Spawned:
+
+    def __init__(self, log_queue, stop_flag, log_level=logging.INFO):
+        self.log_queue = log_queue
+        self.stop_flag = stop_flag
+        self.log_level = log_level
+
+    def _call_init(self):
+        logging_configurer(self.log_queue, self.log_level)
+
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
