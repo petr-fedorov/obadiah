@@ -63,7 +63,7 @@ class LiveOrders(LiveStream):
         channel_name = 'live_orders'
         if self.pair != 'BTCUSD':
             channel_name += '_' + self.pair.lower()
-        self.logger.debug(channel_name)
+        self.logger.info(channel_name)
         channel = self.pusher.subscribe(channel_name)
         channel.bind('order_created', self.order_created)
         channel.bind('order_changed', self.order_changed)
@@ -132,7 +132,7 @@ class LiveTicker(LiveStream):
         channel_name = 'live_trades'
         if self.pair != 'BTCUSD':
             channel_name += '_' + self.pair.lower()
-        self.logger.debug(channel_name)
+        self.logger.info(channel_name)
         channel = self.pusher.subscribe(channel_name)
         channel.bind('trade', self.trade)
 
@@ -167,6 +167,84 @@ class LiveTicker(LiveStream):
                 self.stop_flag.set()
 
 
+class LiveDiffOrderBook(LiveStream):
+
+    def __init__(self, pair_id, pair, dbname, user, stop_flag, log_queue,
+                 log_level):
+
+        super().__init__(log_queue, stop_flag, log_level)
+
+        self.pair_id = pair_id
+        self.pair = pair
+        self.stop_flag = stop_flag
+        self.dbname = dbname
+        self.user = user
+        self.pusher_key = 'de504dc5763aeef9ff52'
+
+    def connect_handler(self, data):
+        channel_name = 'diff_order_book'
+        if self.pair != 'BTCUSD':
+            channel_name += '_' + self.pair.lower()
+        self.logger.info(channel_name)
+        channel = self.pusher.subscribe(channel_name)
+        channel.bind('data', self.data)
+
+    def _insert_differences(self, curr, side, data):
+        for d in data[side]:
+            curr.execute("""
+                        INSERT INTO bitstamp.diff_order_book
+                        (local_timestamp, pair_id, timestamp,
+                         price, amount, side)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """, (data["local_timestamp"], data["pair_id"],
+                              data["timestamp"], d[0], d[1], side[:-1]))
+
+    def data(self, data):
+        self.logger.debug("data %s" % (data, ))
+        if not self.stop_flag.is_set():
+            try:
+                data = eval(data)
+                data["timestamp"] = datetime.fromtimestamp(
+                    int(data["timestamp"]))
+                data["local_timestamp"] = datetime.now()
+                data["pair_id"] = self.pair_id
+                # psycopg2's connections are not thread safe
+                # so we have to create one here
+                with self.con.cursor() as curr:
+                    self._insert_differences(curr, "bids", data)
+                    self._insert_differences(curr, "asks", data)
+
+            except Exception as e:
+                self.logger.exception('%s', e)
+                self.stop_flag.set()
+
+
+class LiveOrderBook(LiveStream):
+
+    def __init__(self, pair_id, pair, dbname, user, stop_flag, log_queue,
+                 log_level):
+
+        super().__init__(log_queue, stop_flag, log_level)
+
+        self.pair_id = pair_id
+        self.pair = pair
+        self.stop_flag = stop_flag
+        self.dbname = dbname
+        self.user = user
+        self.pusher_key = 'de504dc5763aeef9ff52'
+
+    def connect_handler(self, data):
+        channel_name = 'order_book'
+        if self.pair != 'BTCUSD':
+            channel_name += '_' + self.pair.lower()
+        self.logger.info(channel_name)
+        channel = self.pusher.subscribe(channel_name)
+        channel.bind('data', self.data)
+
+    def data(self, data):
+        self.logger.debug("data %s" % (data, ))
+
+
 def capture(pair, dbname, user,  stop_flag, log_queue):
 
     logger = logging.getLogger("bitstamp.capture")
@@ -175,10 +253,16 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
         pair_id = get_pair(pair, dbname, user)
         ts = [Process(target=LiveOrders(pair_id, pair, dbname, user,
                                         stop_flag, log_queue,
-                                        log_level=logging.DEBUG)),
+                                        log_level=logging.INFO)),
               Process(target=LiveTicker(pair_id, pair, dbname, user,
                                         stop_flag, log_queue,
-                                        log_level=logging.DEBUG)), ]
+                                        log_level=logging.INFO)),
+              # Process(target=LiveOrderBook(pair_id, pair, dbname, user,
+              #                              stop_flag, log_queue,
+              #                              log_level=logging.DEBUG)),
+              Process(target=LiveDiffOrderBook(pair_id, pair, dbname, user,
+                                               stop_flag, log_queue,
+                                               log_level=logging.INFO)), ]
         for t in ts:
             t.start()
 

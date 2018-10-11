@@ -49,9 +49,37 @@ CREATE TYPE bitstamp.live_orders_event AS ENUM (
 
 ALTER TYPE bitstamp.live_orders_event OWNER TO "ob-analytics";
 
+--
+-- Name: side; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.side AS ENUM (
+    'ask',
+    'bid'
+);
+
+
+ALTER TYPE bitstamp.side OWNER TO "ob-analytics";
+
 SET default_tablespace = '';
 
 SET default_with_oids = false;
+
+--
+-- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.diff_order_book (
+    "timestamp" timestamp with time zone NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    side bitstamp.side NOT NULL,
+    pair_id smallint NOT NULL,
+    local_timestamp timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE bitstamp.diff_order_book OWNER TO "ob-analytics";
 
 --
 -- Name: live_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -102,6 +130,14 @@ CREATE TABLE bitstamp.pairs (
 
 
 ALTER TABLE bitstamp.pairs OWNER TO "ob-analytics";
+
+--
+-- Name: diff_order_book diff_order_book_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.diff_order_book
+    ADD CONSTRAINT diff_order_book_pkey PRIMARY KEY ("timestamp", price);
+
 
 --
 -- Name: live_orders live_orders_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
