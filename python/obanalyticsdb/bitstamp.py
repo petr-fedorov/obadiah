@@ -19,7 +19,33 @@ def get_pair(pair, dbname, user):
             return pair_id
 
 
-class LiveOrders(Spawned):
+class LiveStream(Spawned):
+
+    def connect_handler(self):
+        raise NotImplementedError
+
+    def __call__(self):
+        self._call_init()
+
+        self.logger = logging.getLogger(self.__module__ + "."
+                                        + self.__class__.__qualname__)
+        # psycopg2's connections are thread safe, so will share it ...
+        self.con = connect_db(self.dbname, self.user)
+        self.con.set_session(autocommit=True)
+        self.pusher = pusherclient.Pusher(self.pusher_key,
+                                          log_level=logging.WARNING)
+        self.pusher.connection.bind('pusher:connection_established',
+                                    self.connect_handler)
+        self.pusher.connect()
+        self.logger.info('Started')
+
+        while not self.stop_flag.is_set():
+            time.sleep(1)
+        self.con.close()
+        self.logger.info('Exit')
+
+
+class LiveOrders(LiveStream):
 
     def __init__(self, pair_id, pair, dbname, user, stop_flag, log_queue,
                  log_level):
@@ -31,9 +57,14 @@ class LiveOrders(Spawned):
         self.stop_flag = stop_flag
         self.dbname = dbname
         self.user = user
+        self.pusher_key = 'de504dc5763aeef9ff52'
 
     def connect_handler(self, data):
-        channel = self.pusher.subscribe('live_orders')
+        channel_name = 'live_orders'
+        if self.pair != 'BTCUSD':
+            channel_name += '_' + self.pair.lower()
+        self.logger.debug(channel_name)
+        channel = self.pusher.subscribe(channel_name)
         channel.bind('order_created', self.order_created)
         channel.bind('order_changed', self.order_changed)
         channel.bind('order_deleted', self.order_deleted)
@@ -53,16 +84,19 @@ class LiveOrders(Spawned):
                     data["order_type"] = "sell"
                 else:
                     data["order_type"] = "buy"
-                self.curr.execute("""
-                                  INSERT INTO bitstamp.live_orders
-                                  (order_id, amount, event, order_type,
-                                  datetime, microtimestamp, local_timestamp,
-                                  price, pair_id )
-                                  VALUES (%(id)s, %(amount)s, %(event)s,
-                                  %(order_type)s, %(datetime)s,
-                                  %(microtimestamp)s, %(local_timestamp)s,
-                                  %(price)s, %(pair_id)s )
-                                  """, data)
+                # psycopg2's connections are not thread safe
+                # so we have to create one here
+                with self.con.cursor() as curr:
+                    curr.execute("""
+                                 INSERT INTO bitstamp.live_orders
+                                 (order_id, amount, event, order_type,
+                                 datetime, microtimestamp, local_timestamp,
+                                 price, pair_id )
+                                 VALUES (%(id)s, %(amount)s, %(event)s,
+                                 %(order_type)s, %(datetime)s,
+                                 %(microtimestamp)s, %(local_timestamp)s,
+                                 %(price)s, %(pair_id)s )
+                                 """, data)
             except Exception as e:
                 self.logger.exception('%s', e)
                 self.stop_flag.set()
@@ -79,26 +113,58 @@ class LiveOrders(Spawned):
         self.logger.debug("order_deleted %s" % (data, ))
         self._save_event("order_deleted", data)
 
-    def __call__(self):
-        self._call_init()
 
-        self.logger = logging.getLogger("bitstamp.LiveOrders")
-        self.con = connect_db(self.dbname, self.user)
-        self.con.set_session(autocommit=True)
-        self.curr = self.con.cursor()
-        self.pusher = pusherclient.Pusher('de504dc5763aeef9ff52',
-                                          log_level=logging.WARNING)
-        self.pusher.connection.bind('pusher:connection_established',
-                                    self.connect_handler)
-        self.pusher.connect()
-        self.logger.info('Started')
+class LiveTicker(LiveStream):
 
-        while not self.stop_flag.is_set():
-            time.sleep(1)
-        self.logger.info('Exit')
+    def __init__(self, pair_id, pair, dbname, user, stop_flag, log_queue,
+                 log_level):
 
-    def stop(self):
-        pass
+        super().__init__(log_queue, stop_flag, log_level)
+
+        self.pair_id = pair_id
+        self.pair = pair
+        self.stop_flag = stop_flag
+        self.dbname = dbname
+        self.user = user
+        self.pusher_key = 'de504dc5763aeef9ff52'
+
+    def connect_handler(self, data):
+        channel_name = 'live_trades'
+        if self.pair != 'BTCUSD':
+            channel_name += '_' + self.pair.lower()
+        self.logger.debug(channel_name)
+        channel = self.pusher.subscribe(channel_name)
+        channel.bind('trade', self.trade)
+
+    def trade(self, data):
+        self.logger.debug("trade %s" % (data, ))
+        if not self.stop_flag.is_set():
+            try:
+                data = eval(data)
+                data["timestamp"] = datetime.fromtimestamp(
+                    int(data["timestamp"]))
+                data["local_timestamp"] = datetime.now()
+                data["pair_id"] = self.pair_id
+                if data["type"]:
+                    data["type"] = "sell"
+                else:
+                    data["type"] = "buy"
+                # psycopg2's connections are not thread safe
+                # so we have to create one here
+                with self.con.cursor() as curr:
+                    curr.execute("""
+                                 INSERT INTO bitstamp.live_trades
+                                 (trade_id, amount, price, trade_timestamp,
+                                  trade_type, buy_order_id, sell_order_id,
+                                  pair_id, local_timestamp )
+                                 VALUES (%(id)s, %(amount)s, %(price)s,
+                                 %(timestamp)s, %(type)s, %(buy_order_id)s,
+                                 %(sell_order_id)s, %(pair_id)s,
+                                 %(local_timestamp)s )
+                                 """, data)
+            except Exception as e:
+                self.logger.exception('%s', e)
+                self.stop_flag.set()
 
 
 def capture(pair, dbname, user,  stop_flag, log_queue):
@@ -108,6 +174,9 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
     try:
         pair_id = get_pair(pair, dbname, user)
         ts = [Process(target=LiveOrders(pair_id, pair, dbname, user,
+                                        stop_flag, log_queue,
+                                        log_level=logging.DEBUG)),
+              Process(target=LiveTicker(pair_id, pair, dbname, user,
                                         stop_flag, log_queue,
                                         log_level=logging.DEBUG)), ]
         for t in ts:

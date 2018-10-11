@@ -48,7 +48,7 @@ def log_notices(logger, notices):
         logger.info(notices.pop(0))
 
 
-class QueueSizeLogger:
+class QueueSizeLogger(object):
     def __init__(self, queue, queue_name, threshold=100):
         self.n = 0
         self.queue = queue
@@ -65,7 +65,7 @@ class QueueSizeLogger:
             self.n -= 1
 
 
-class Spawned:
+class Spawned(object):
 
     def __init__(self, log_queue, stop_flag, log_level=logging.INFO):
         self.log_queue = log_queue

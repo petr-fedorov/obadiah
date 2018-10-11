@@ -12,6 +12,10 @@ setup(
     install_requires=[
         'psycopg2-binary',
         'websocket-client',
-        'btfxwss'
-    ]
+        'btfxwss',
+        'pusherclient'
+    ],
+
+
+
 )

@@ -21,6 +21,7 @@ SET row_security = off;
 
 COPY bitstamp.pairs (pair_id, pair) FROM stdin;
 1	BTCUSD
+2	LTCUSD
 \.
 
 
