@@ -61,6 +61,106 @@ CREATE TYPE bitstamp.side AS ENUM (
 
 ALTER TYPE bitstamp.side OWNER TO "ob-analytics";
 
+--
+-- Name: _get_live_orders_eon(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._get_live_orders_eon(ts timestamp with time zone) RETURNS timestamp with time zone
+    LANGUAGE sql IMMUTABLE
+    AS $$
+SELECT '-infinity'::timestamptz;
+$$;
+
+
+ALTER FUNCTION bitstamp._get_live_orders_eon(ts timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: live_orders_incorporate_new_event(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.live_orders_incorporate_new_event() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+	previous_event CURSOR FOR  SELECT * 
+								FROM bitstamp.live_orders 
+								WHERE microtimestamp >= NEW.era
+							  	  AND order_id = NEW.order_id 
+								  AND next_microtimestamp > NEW.microtimestamp FOR UPDATE;
+	eon timestamptz;
+BEGIN 
+
+	eon := bitstamp._get_live_orders_eon(NEW.microtimestamp);
+	
+	-- 'eon' is a period of time covered by a single live_orders partition
+	-- 'era' is a period that started when a Websocket connection to Bitstamp had been successfully established 
+	
+	-- Events in the era can't cross an eon boundary. An event will be assigned to the new era starting when the most recent eon eon starts
+	-- if the eon bondary has been crossed.
+	
+	IF eon > NEW.era THEN 
+		NEW.era := eon;	
+	END IF;
+
+	-- set 'next_microtimestamp'
+	CASE NEW.event 
+		WHEN 'order_created', 'order_changed'  THEN 
+			NEW.next_microtimestamp := 'infinity'::timestamptz;		-- later than all other timestamps
+		WHEN 'order_deleted' THEN 
+			NEW.next_microtimestamp := '-infinity'::timestamptz;	-- earlier than all other timestamps
+	END CASE;
+	
+	CASE NEW.event
+		WHEN 'order_created' THEN
+			NEW.fill = -NEW.amount;
+			
+		WHEN 'order_changed', 'order_deleted' THEN
+			FOR e IN previous_event LOOP
+			
+				UPDATE bitstamp.live_orders
+				SET next_microtimestamp = NEW.microtimestamp
+				WHERE CURRENT OF previous_event;
+
+				NEW.fill = e.amount - NEW.amount;
+
+			END LOOP;
+	END CASE;
+	RETURN NEW;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.live_orders_incorporate_new_event() OWNER TO "ob-analytics";
+
+--
+-- Name: order_book_v(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.order_book_v(INOUT ts timestamp with time zone, OUT price numeric, OUT amount numeric, OUT order_type bitstamp.direction, OUT order_id bigint, OUT microtimestamp timestamp with time zone, OUT event_type bitstamp.live_orders_event, OUT pair_id smallint) RETURNS SETOF record
+    LANGUAGE sql
+    AS $$
+
+	SELECT order_book_v.ts,
+			price,
+			amount,
+			order_type,
+			order_id,
+			microtimestamp,
+			event,
+			pair_id
+	FROM bitstamp.live_orders
+	WHERE microtimestamp BETWEEN (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= order_book_v.ts ) AND order_book_v.ts 
+	  AND next_microtimestamp > order_book_v.ts 
+	  AND event <> 'order_deleted'
+	ORDER BY order_type DESC, price DESC;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.order_book_v(INOUT ts timestamp with time zone, OUT price numeric, OUT amount numeric, OUT order_type bitstamp.direction, OUT order_id bigint, OUT microtimestamp timestamp with time zone, OUT event_type bitstamp.live_orders_event, OUT pair_id smallint) OWNER TO "ob-analytics";
+
 SET default_tablespace = '';
 
 SET default_with_oids = false;
@@ -94,11 +194,25 @@ CREATE TABLE bitstamp.live_orders (
     microtimestamp timestamp with time zone NOT NULL,
     local_timestamp timestamp with time zone,
     pair_id smallint NOT NULL,
-    price numeric NOT NULL
+    price numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone,
+    era timestamp with time zone NOT NULL
 );
 
 
 ALTER TABLE bitstamp.live_orders OWNER TO "ob-analytics";
+
+--
+-- Name: live_orders_eras; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.live_orders_eras (
+    era timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE bitstamp.live_orders_eras OWNER TO "ob-analytics";
 
 --
 -- Name: live_trades; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -136,7 +250,15 @@ ALTER TABLE bitstamp.pairs OWNER TO "ob-analytics";
 --
 
 ALTER TABLE ONLY bitstamp.diff_order_book
-    ADD CONSTRAINT diff_order_book_pkey PRIMARY KEY ("timestamp", price);
+    ADD CONSTRAINT diff_order_book_pkey PRIMARY KEY ("timestamp", price, side);
+
+
+--
+-- Name: live_orders_eras eras_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_orders_eras
+    ADD CONSTRAINT eras_pkey PRIMARY KEY (era);
 
 
 --
@@ -169,6 +291,28 @@ ALTER TABLE ONLY bitstamp.pairs
 
 ALTER TABLE ONLY bitstamp.pairs
     ADD CONSTRAINT pairs_unq UNIQUE (pair) DEFERRABLE;
+
+
+--
+-- Name: fki_live_orders_fkey_eras; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX fki_live_orders_fkey_eras ON bitstamp.live_orders USING btree (era);
+
+
+--
+-- Name: live_orders a_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER a_incorporate_new_event BEFORE INSERT ON bitstamp.live_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
+
+
+--
+-- Name: live_orders live_orders_fkey_eras; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_orders
+    ADD CONSTRAINT live_orders_fkey_eras FOREIGN KEY (era) REFERENCES bitstamp.live_orders_eras(era) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
 
 
 --
