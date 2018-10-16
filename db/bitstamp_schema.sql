@@ -50,6 +50,24 @@ CREATE TYPE bitstamp.live_orders_event AS ENUM (
 ALTER TYPE bitstamp.live_orders_event OWNER TO "ob-analytics";
 
 --
+-- Name: order_book; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.order_book AS (
+	ts timestamp with time zone,
+	price numeric,
+	amount numeric,
+	direction bitstamp.direction,
+	order_id bigint,
+	microtimestamp timestamp with time zone,
+	event_type bitstamp.live_orders_event,
+	pair_id smallint
+);
+
+
+ALTER TYPE bitstamp.order_book OWNER TO "ob-analytics";
+
+--
 -- Name: side; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -60,6 +78,21 @@ CREATE TYPE bitstamp.side AS ENUM (
 
 
 ALTER TYPE bitstamp.side OWNER TO "ob-analytics";
+
+--
+-- Name: spread; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.spread AS (
+	best_bid_price numeric,
+	best_bid_qty numeric,
+	best_ask_price numeric,
+	best_ask_qty numeric,
+	microtimestamp timestamp with time zone
+);
+
+
+ALTER TYPE bitstamp.spread OWNER TO "ob-analytics";
 
 --
 -- Name: _get_live_orders_eon(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -346,6 +379,32 @@ $$;
 ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side text, OUT order_id bigint) OWNER TO "ob-analytics";
 
 --
+-- Name: oba_spread(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: postgres
+--
+
+CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.spread
+    LANGUAGE sql
+    AS $$
+
+SELECT best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+FROM (
+	SELECT a.*, lag(best_bid_price) OVER p AS pbp, lag(best_bid_qty) OVER p AS pbq, lag(best_ask_price) OVER p AS pap, lag(best_ask_qty) OVER p AS paq
+	FROM (
+		SELECT (bitstamp.spread(live_orders.*) OVER (ORDER BY microtimestamp)).*  
+		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
+		WHERE microtimestamp BETWEEN oba_spread."start.time" AND oba_spread."end.time" AND pairs.pair = oba_spread.pair
+	) a
+	WINDOW p AS (ORDER BY microtimestamp)
+) b
+WHERE best_bid_price <> pbp	OR best_bid_qty <> pbq OR best_ask_price <> pap OR best_ask_qty <> paq
+ORDER BY microtimestamp DESC
+
+$$;
+
+
+ALTER FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text) OWNER TO postgres;
+
+--
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -380,7 +439,7 @@ ALTER FUNCTION bitstamp.oba_trades("start.time" timestamp with time zone, "end.t
 -- Name: order_book_v(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.order_book_v(INOUT ts timestamp with time zone, OUT price numeric, OUT amount numeric, OUT order_type bitstamp.direction, OUT order_id bigint, OUT microtimestamp timestamp with time zone, OUT event_type bitstamp.live_orders_event, OUT pair_id smallint) RETURNS SETOF record
+CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone) RETURNS SETOF bitstamp.order_book
     LANGUAGE sql
     AS $$
 
@@ -401,27 +460,32 @@ CREATE FUNCTION bitstamp.order_book_v(INOUT ts timestamp with time zone, OUT pri
 $$;
 
 
-ALTER FUNCTION bitstamp.order_book_v(INOUT ts timestamp with time zone, OUT price numeric, OUT amount numeric, OUT order_type bitstamp.direction, OUT order_id bigint, OUT microtimestamp timestamp with time zone, OUT event_type bitstamp.live_orders_event, OUT pair_id smallint) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: spread_ffunc(bitstamp.order_book[]); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.spread_ffunc(s bitstamp.order_book[]) RETURNS bitstamp.spread
+    LANGUAGE sql
+    AS $$
+
+WITH price_levels AS (
+	SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r
+	FROM unnest(s)
+	GROUP BY ts, direction, price
+)
+SELECT b.price, b.qty, s.price, s.qty, b.ts
+FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b CROSS JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s
+
+$$;
+
+
+ALTER FUNCTION bitstamp.spread_ffunc(s bitstamp.order_book[]) OWNER TO "ob-analytics";
 
 SET default_tablespace = '';
 
 SET default_with_oids = false;
-
---
--- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TABLE bitstamp.diff_order_book (
-    "timestamp" timestamp with time zone NOT NULL,
-    price numeric NOT NULL,
-    amount numeric NOT NULL,
-    side bitstamp.side NOT NULL,
-    pair_id smallint NOT NULL,
-    local_timestamp timestamp with time zone NOT NULL
-);
-
-
-ALTER TABLE bitstamp.diff_order_book OWNER TO "ob-analytics";
 
 --
 -- Name: live_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -446,6 +510,96 @@ CREATE TABLE bitstamp.live_orders (
 
 
 ALTER TABLE bitstamp.live_orders OWNER TO "ob-analytics";
+
+--
+-- Name: spread_sfunc(bitstamp.order_book[], bitstamp.live_orders); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.spread_sfunc(s bitstamp.order_book[], v bitstamp.live_orders) RETURNS bitstamp.order_book[]
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+
+	i bigint;
+
+BEGIN 
+	
+	IF s IS NULL THEN
+		s := ARRAY(SELECT bitstamp.order_book_v(spread_sfunc.v.microtimestamp));
+ 	ELSE
+		IF spread_sfunc.v.event <> 'order_created' THEN 
+			s := ARRAY(SELECT  ROW(spread_sfunc.v.microtimestamp,
+								s_prev.price,
+								s_prev.amount,
+								s_prev.direction,
+								s_prev.order_id,
+								s_prev.microtimestamp,
+								s_prev.event_type,
+								s_prev.pair_id)
+						FROM unnest(s) AS s_prev
+						WHERE s_prev.order_id <> spread_sfunc.v.order_id);
+		ELSE
+			s := ARRAY(SELECT  ROW(spread_sfunc.v.microtimestamp,
+								s_prev.price,
+								s_prev.amount,
+								s_prev.direction,
+								s_prev.order_id,
+								s_prev.microtimestamp,
+								s_prev.event_type,
+								s_prev.pair_id)
+						FROM unnest(s) AS s_prev
+					  );
+		END IF;
+												
+		IF spread_sfunc.v.event <> 'order_deleted' THEN 
+			s := array_append(s, ROW(spread_sfunc.v.microtimestamp, 
+									 spread_sfunc.v.price,
+									 spread_sfunc.v.amount,
+									 spread_sfunc.v.order_type,
+									 spread_sfunc.v.order_id,
+									 spread_sfunc.v.microtimestamp,
+									 spread_sfunc.v.event,
+									 spread_sfunc.v.pair_id
+									)::bitstamp.order_book);
+		END IF;												
+	END IF;
+	RETURN s;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.spread_sfunc(s bitstamp.order_book[], v bitstamp.live_orders) OWNER TO "ob-analytics";
+
+--
+-- Name: spread(bitstamp.live_orders); Type: AGGREGATE; Schema: bitstamp; Owner: postgres
+--
+
+CREATE AGGREGATE bitstamp.spread(bitstamp.live_orders) (
+    SFUNC = bitstamp.spread_sfunc,
+    STYPE = bitstamp.order_book[],
+    FINALFUNC = bitstamp.spread_ffunc
+);
+
+
+ALTER AGGREGATE bitstamp.spread(bitstamp.live_orders) OWNER TO postgres;
+
+--
+-- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.diff_order_book (
+    "timestamp" timestamp with time zone NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    side bitstamp.side NOT NULL,
+    pair_id smallint NOT NULL,
+    local_timestamp timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE bitstamp.diff_order_book OWNER TO "ob-analytics";
 
 --
 -- Name: live_orders_eras; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
