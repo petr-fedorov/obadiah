@@ -241,8 +241,9 @@ BEGIN
 				buy_match_rule = 1
 			WHERE CURRENT OF buy_match;
 			
-			NEW.trade_id = t.trade_id;
-			NEW.trade_timestamp = t.trade_timestamp;
+			NEW.trade_id := t.trade_id;
+			NEW.trade_timestamp := t.trade_timestamp;
+			NEW.is_maker := NEW.order_type <> t.trade_type;
 			
 			EXIT;
 		END LOOP;
@@ -254,12 +255,14 @@ BEGIN
 				 sell_match_rule = 1
 			WHERE CURRENT OF sell_match;
 			
-			NEW.trade_id = t.trade_id;
-			NEW.trade_timestamp = t.trade_timestamp;
+			NEW.trade_id := t.trade_id;
+			NEW.trade_timestamp := t.trade_timestamp;
+			NEW.is_maker := NEW.order_type <> t.trade_type;
 			
 			EXIT;
 		END LOOP;
 	END IF;
+	
 	RETURN NEW;
 
 END;
@@ -270,13 +273,39 @@ $$;
 ALTER FUNCTION bitstamp.live_orders_match() OWNER TO "ob-analytics";
 
 --
+-- Name: live_orders_process_agressor(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.live_orders_process_agressor() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+	AGRESSOR_WINDOW CONSTANT interval  := '1 sec'::interval;
+BEGIN 
+
+	UPDATE bitstamp.live_orders
+	   SET is_maker = FALSE
+	WHERE microtimestamp BETWEEN NEW.microtimestamp - AGRESSOR_WINDOW AND NEW.microtimestamp
+	  AND order_id = NEW.order_id
+	  AND event = 'order_created';
+	  
+	RETURN NEW;
+
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.live_orders_process_agressor() OWNER TO "ob-analytics";
+
+--
 -- Name: live_trades_match(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE FUNCTION bitstamp.live_trades_match() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-
 
 DECLARE
 	LOOK_AROUND CONSTANT interval := '2 sec'::interval; 
@@ -308,7 +337,8 @@ BEGIN
 		
 		UPDATE bitstamp.live_orders
 		SET trade_id = NEW.trade_id,
-			trade_timestamp = NEW.trade_timestamp
+			trade_timestamp = NEW.trade_timestamp,
+			is_maker = e.order_type <> NEW.trade_type
 		WHERE CURRENT OF buy_match;
 		
 		EXIT;
@@ -321,7 +351,8 @@ BEGIN
 		
 		UPDATE bitstamp.live_orders
 		SET trade_id = NEW.trade_id,
-			trade_timestamp = NEW.trade_timestamp
+			trade_timestamp = NEW.trade_timestamp,
+			is_maker = e.order_type <> NEW.trade_type
 		WHERE CURRENT OF sell_match;
 		
 		EXIT;
@@ -355,9 +386,8 @@ BEGIN
 	
 	RETURN QUERY SELECT microtimestamp AS "timestamp",
 						  o.price,
-						  o.amount AS volume,
-						  CASE WHEN order_type = 'buy' THEN 'bid'
-						  	ELSE 'ask' END as side,
+						  CASE WHEN o.event <> 'order_deleted' THEN o.amount ELSE 0.0 END AS volume,
+						  CASE WHEN order_type = 'buy' THEN 'bid' ELSE 'ask' END as side,
 						  o.order_id
 				  FROM  ( SELECT *, min(live_orders.price) OVER o <> max(live_orders.price) OVER o AS pacman
 				  		   FROM bitstamp.live_orders
@@ -370,7 +400,8 @@ BEGIN
 				  WHERE NOT pacman 
 				  	AND (    ( microtimestamp <= oba_depth."start.time" AND next_microtimestamp > oba_depth."start.time") 
 						  OR ( microtimestamp BETWEEN oba_depth."start.time" AND oba_depth."end.time")
-					     );
+					     )
+				    AND is_maker;
 END;
 
 $$;
@@ -379,10 +410,10 @@ $$;
 ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side text, OUT order_id bigint) OWNER TO "ob-analytics";
 
 --
--- Name: oba_spread(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: postgres
+-- Name: oba_spread(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.spread
+CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.spread
     LANGUAGE sql
     AS $$
 
@@ -396,13 +427,13 @@ FROM (
 	) a
 	WINDOW p AS (ORDER BY microtimestamp)
 ) b
-WHERE best_bid_price <> pbp	OR best_bid_qty <> pbq OR best_ask_price <> pap OR best_ask_qty <> paq
+WHERE best_bid_price <> pbp	OR best_bid_qty <> pbq OR best_ask_price <> pap OR best_ask_qty <> paq OR NOT "only.different"
 ORDER BY microtimestamp DESC
 
 $$;
 
 
-ALTER FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text) OWNER TO postgres;
+ALTER FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -455,6 +486,7 @@ CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone) RETURNS SETOF
 	WHERE microtimestamp BETWEEN (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= order_book_v.ts ) AND order_book_v.ts 
 	  AND next_microtimestamp > order_book_v.ts 
 	  AND event <> 'order_deleted'
+	  AND is_maker
 	ORDER BY order_type DESC, price DESC;
 
 $$;
@@ -467,16 +499,25 @@ ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone) OWNER TO "ob-a
 --
 
 CREATE FUNCTION bitstamp.spread_ffunc(s bitstamp.order_book[]) RETURNS bitstamp.spread
-    LANGUAGE sql
+    LANGUAGE plpgsql
     AS $$
 
-WITH price_levels AS (
-	SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r
-	FROM unnest(s)
-	GROUP BY ts, direction, price
-)
-SELECT b.price, b.qty, s.price, s.qty, b.ts
-FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b CROSS JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s
+	
+DECLARE 
+	
+	spread bitstamp.spread;
+	
+BEGIN
+	WITH price_levels AS (
+		SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r
+		FROM unnest(s)
+		GROUP BY ts, direction, price
+	)
+	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts) INTO spread
+	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s ON TRUE;
+	
+	RETURN spread;
+END;
 
 $$;
 
@@ -505,7 +546,8 @@ CREATE TABLE bitstamp.live_orders (
     next_microtimestamp timestamp with time zone,
     era timestamp with time zone NOT NULL,
     trade_timestamp timestamp with time zone,
-    trade_id bigint
+    trade_id bigint,
+    is_maker boolean DEFAULT true NOT NULL
 );
 
 
@@ -552,7 +594,7 @@ BEGIN
 					  );
 		END IF;
 												
-		IF spread_sfunc.v.event <> 'order_deleted' THEN 
+		IF spread_sfunc.v.event <> 'order_deleted' AND spread_sfunc.v.is_maker THEN 
 			s := array_append(s, ROW(spread_sfunc.v.microtimestamp, 
 									 spread_sfunc.v.price,
 									 spread_sfunc.v.amount,
@@ -573,7 +615,7 @@ $$;
 ALTER FUNCTION bitstamp.spread_sfunc(s bitstamp.order_book[], v bitstamp.live_orders) OWNER TO "ob-analytics";
 
 --
--- Name: spread(bitstamp.live_orders); Type: AGGREGATE; Schema: bitstamp; Owner: postgres
+-- Name: spread(bitstamp.live_orders); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE AGGREGATE bitstamp.spread(bitstamp.live_orders) (
@@ -583,7 +625,7 @@ CREATE AGGREGATE bitstamp.spread(bitstamp.live_orders) (
 );
 
 
-ALTER AGGREGATE bitstamp.spread(bitstamp.live_orders) OWNER TO postgres;
+ALTER AGGREGATE bitstamp.spread(bitstamp.live_orders) OWNER TO "ob-analytics";
 
 --
 -- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -721,6 +763,13 @@ CREATE TRIGGER a_match_event BEFORE INSERT ON bitstamp.live_trades FOR EACH ROW 
 --
 
 CREATE TRIGGER b_match_trade BEFORE INSERT ON bitstamp.live_orders FOR EACH ROW WHEN ((new.event <> 'order_created'::bitstamp.live_orders_event)) EXECUTE PROCEDURE bitstamp.live_orders_match();
+
+
+--
+-- Name: live_orders c_process_agressor; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER c_process_agressor BEFORE INSERT OR UPDATE ON bitstamp.live_orders FOR EACH ROW WHEN (((NOT new.is_maker) AND (new.event <> 'order_created'::bitstamp.live_orders_event))) EXECUTE PROCEDURE bitstamp.live_orders_process_agressor();
 
 
 --
