@@ -25,19 +25,27 @@ SET default_with_oids = false;
 
 CREATE TABLE bitstamp.pairs (
     pair_id smallint NOT NULL,
-    pair character varying NOT NULL
+    pair character varying NOT NULL,
+    "R0" smallint NOT NULL
 );
 
 
 ALTER TABLE bitstamp.pairs OWNER TO "ob-analytics";
 
 --
+-- Name: COLUMN pairs."R0"; Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN bitstamp.pairs."R0" IS 'A negative order of magnitude of the fractional monetary unit used to represent price in the pair. For example for BTCUSD pair the fractional monetary unit is 1 cent or 0.01 of USD and the value of R0 is 2';
+
+
+--
 -- Data for Name: pairs; Type: TABLE DATA; Schema: bitstamp; Owner: ob-analytics
 --
 
-COPY bitstamp.pairs (pair_id, pair) FROM stdin;
-1	BTCUSD
-2	LTCUSD
+COPY bitstamp.pairs (pair_id, pair, "R0") FROM stdin;
+1	BTCUSD	2
+2	LTCUSD	2
 \.
 
 

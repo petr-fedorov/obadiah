@@ -94,6 +94,59 @@ CREATE TYPE bitstamp.spread AS (
 
 ALTER TYPE bitstamp.spread OWNER TO "ob-analytics";
 
+SET default_tablespace = '';
+
+SET default_with_oids = false;
+
+--
+-- Name: live_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.live_orders (
+    order_id bigint NOT NULL,
+    amount numeric NOT NULL,
+    event bitstamp.live_orders_event NOT NULL,
+    order_type bitstamp.direction NOT NULL,
+    datetime timestamp with time zone NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    local_timestamp timestamp with time zone,
+    pair_id smallint NOT NULL,
+    price numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone,
+    era timestamp with time zone NOT NULL,
+    trade_timestamp timestamp with time zone,
+    trade_id bigint,
+    is_maker boolean DEFAULT true NOT NULL
+);
+
+
+ALTER TABLE bitstamp.live_orders OWNER TO "ob-analytics";
+
+--
+-- Name: _events_match_trade(timestamp with time zone, bigint, numeric, numeric, bitstamp.direction, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._events_match_trade(trade_timestamp timestamp with time zone, order_id bigint, amount numeric, price numeric, order_type bitstamp.direction, look_around interval DEFAULT '00:00:02'::interval) RETURNS SETOF bitstamp.live_orders
+    LANGUAGE sql STABLE
+    AS $$
+
+SELECT live_orders.* 
+FROM bitstamp.live_orders 
+WHERE microtimestamp BETWEEN _events_match_trade.trade_timestamp - _events_match_trade.look_around  AND _events_match_trade.trade_timestamp + _events_match_trade.look_around
+  AND order_id = _events_match_trade.order_id
+  AND round(fill*_events_match_trade.price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_orders.pair_id )) = round(_events_match_trade.amount*_events_match_trade.price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_orders.pair_id ))
+  AND trade_id IS NULL
+  AND order_type = _events_match_trade.order_type
+ORDER BY microtimestamp	-- we want the earliest one available
+FOR UPDATE;		
+  
+
+$$;
+
+
+ALTER FUNCTION bitstamp._events_match_trade(trade_timestamp timestamp with time zone, order_id bigint, amount numeric, price numeric, order_type bitstamp.direction, look_around interval) OWNER TO "ob-analytics";
+
 --
 -- Name: _get_live_orders_eon(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
@@ -106,6 +159,77 @@ $$;
 
 
 ALTER FUNCTION bitstamp._get_live_orders_eon(ts timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: live_trades; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.live_trades (
+    trade_id bigint NOT NULL,
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    trade_type bitstamp.direction NOT NULL,
+    trade_timestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint NOT NULL,
+    sell_order_id bigint NOT NULL,
+    local_timestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    sell_microtimestamp timestamp with time zone,
+    buy_microtimestamp timestamp with time zone,
+    buy_match_rule smallint,
+    sell_match_rule smallint
+);
+
+
+ALTER TABLE bitstamp.live_trades OWNER TO "ob-analytics";
+
+--
+-- Name: _trades_match_buy_event(timestamp with time zone, bigint, numeric, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval DEFAULT '00:00:02'::interval) RETURNS SETOF bitstamp.live_trades
+    LANGUAGE sql STABLE
+    AS $$
+
+SELECT live_trades.*
+FROM bitstamp.live_trades  
+WHERE trade_timestamp BETWEEN _trades_match_buy_event.microtimestamp - _trades_match_buy_event.look_around  
+									AND _trades_match_buy_event.microtimestamp + _trades_match_buy_event.look_around  
+  AND buy_order_id = _trades_match_buy_event.order_id
+  AND round(amount*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) = round(_trades_match_buy_event.new_fill*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) -- match by value instead of quantity (amount) to avoid failures due to rounding
+  AND buy_microtimestamp IS NULL
+ORDER BY trade_id -- we want the earliest one available 
+FOR UPDATE;
+  
+
+$$;
+
+
+ALTER FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval) OWNER TO "ob-analytics";
+
+--
+-- Name: _trades_match_sell_event(timestamp with time zone, bigint, numeric, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval DEFAULT '00:00:02'::interval) RETURNS SETOF bitstamp.live_trades
+    LANGUAGE sql STABLE
+    AS $$
+
+SELECT live_trades.*
+FROM bitstamp.live_trades
+WHERE trade_timestamp BETWEEN _trades_match_sell_event.microtimestamp - _trades_match_sell_event.look_around  
+									AND _trades_match_sell_event.microtimestamp + _trades_match_sell_event.look_around  
+  AND sell_order_id = _trades_match_sell_event.order_id
+  AND round(amount*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) = round(_trades_match_sell_event.new_fill*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) -- match by value instead of quantity (amount) to avoid failures due to rounding
+  AND sell_microtimestamp IS NULL
+ORDER BY trade_id -- we want the earliest one available 
+FOR UPDATE;
+  
+
+$$;
+
+
+ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval) OWNER TO "ob-analytics";
 
 --
 -- Name: live_orders_eras_v(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -210,25 +334,11 @@ CREATE FUNCTION bitstamp.live_orders_match() RETURNS trigger
     AS $$
 
 DECLARE
-	LOOK_AROUND CONSTANT interval := '2 sec'::interval; 
-	
-	buy_match CURSOR FOR SELECT * 
-						  FROM bitstamp.live_trades 
-						  WHERE trade_timestamp BETWEEN NEW.microtimestamp - LOOK_AROUND  AND NEW.microtimestamp + LOOK_AROUND
-						    AND buy_order_id = NEW.order_id
-							AND amount = NEW.fill
-							AND buy_microtimestamp IS NULL
-						  ORDER BY trade_id	-- we want the earliest one available 
-						  FOR UPDATE;
 						  
-	sell_match CURSOR FOR SELECT * 
-				 		   FROM bitstamp.live_trades 
- 						   WHERE trade_timestamp BETWEEN NEW.microtimestamp - LOOK_AROUND AND NEW.microtimestamp + LOOK_AROUND
-						     AND sell_order_id = NEW.order_id
-							 AND amount = NEW.fill
-							 AND sell_microtimestamp IS NULL
-						   ORDER BY trade_id	-- we want the earliest one available 1							 
-						   FOR UPDATE;
+	buy_match CURSOR FOR SELECT * FROM bitstamp._trades_match_buy_event(NEW.microtimestamp, NEW.order_id, NEW.fill);
+
+	sell_match CURSOR FOR SELECT * FROM bitstamp._trades_match_sell_event(NEW.microtimestamp, NEW.order_id, NEW.fill);	
+
 	t RECORD;						   
 
 BEGIN 
@@ -310,23 +420,10 @@ CREATE FUNCTION bitstamp.live_trades_match() RETURNS trigger
 DECLARE
 	LOOK_AROUND CONSTANT interval := '2 sec'::interval; 
 	
-	buy_match CURSOR FOR SELECT * 
-						  FROM bitstamp.live_orders
-						  WHERE microtimestamp BETWEEN NEW.trade_timestamp - LOOK_AROUND  AND NEW.trade_timestamp + LOOK_AROUND
-						    AND order_id = NEW.buy_order_id
-							AND fill = NEW.amount
-							AND trade_id IS NULL
-						  ORDER BY microtimestamp	-- we want the earliest one available 
-						  FOR UPDATE;
-						  
-	sell_match CURSOR FOR SELECT * 
-						  FROM bitstamp.live_orders
-						  WHERE microtimestamp BETWEEN NEW.trade_timestamp - LOOK_AROUND  AND NEW.trade_timestamp + LOOK_AROUND
-						    AND order_id = NEW.sell_order_id
-							AND fill = NEW.amount
-							AND trade_id IS NULL
-						  ORDER BY microtimestamp	-- we want the earliest one available 
-						  FOR UPDATE;						  
+	buy_match CURSOR FOR SELECT * FROM bitstamp._events_match_trade(NEW.trade_timestamp, NEW.buy_order_id, NEW.amount,  NEW.price, 'buy'::bitstamp.direction);
+
+	sell_match CURSOR FOR SELECT * FROM bitstamp._events_match_trade(NEW.trade_timestamp, NEW.sell_order_id, NEW.amount, NEW.price, 'sell'::bitstamp.direction);
+
 	e RECORD;
 	
 BEGIN 
@@ -524,35 +621,6 @@ $$;
 
 ALTER FUNCTION bitstamp.spread_ffunc(s bitstamp.order_book[]) OWNER TO "ob-analytics";
 
-SET default_tablespace = '';
-
-SET default_with_oids = false;
-
---
--- Name: live_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TABLE bitstamp.live_orders (
-    order_id bigint NOT NULL,
-    amount numeric NOT NULL,
-    event bitstamp.live_orders_event NOT NULL,
-    order_type bitstamp.direction NOT NULL,
-    datetime timestamp with time zone NOT NULL,
-    microtimestamp timestamp with time zone NOT NULL,
-    local_timestamp timestamp with time zone,
-    pair_id smallint NOT NULL,
-    price numeric NOT NULL,
-    fill numeric,
-    next_microtimestamp timestamp with time zone,
-    era timestamp with time zone NOT NULL,
-    trade_timestamp timestamp with time zone,
-    trade_id bigint,
-    is_maker boolean DEFAULT true NOT NULL
-);
-
-
-ALTER TABLE bitstamp.live_orders OWNER TO "ob-analytics";
-
 --
 -- Name: spread_sfunc(bitstamp.order_book[], bitstamp.live_orders); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
@@ -655,39 +723,24 @@ CREATE TABLE bitstamp.live_orders_eras (
 ALTER TABLE bitstamp.live_orders_eras OWNER TO "ob-analytics";
 
 --
--- Name: live_trades; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TABLE bitstamp.live_trades (
-    trade_id bigint NOT NULL,
-    amount numeric NOT NULL,
-    price numeric NOT NULL,
-    trade_type bitstamp.direction NOT NULL,
-    trade_timestamp timestamp with time zone NOT NULL,
-    buy_order_id bigint NOT NULL,
-    sell_order_id bigint NOT NULL,
-    local_timestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    sell_microtimestamp timestamp with time zone,
-    buy_microtimestamp timestamp with time zone,
-    buy_match_rule smallint,
-    sell_match_rule smallint
-);
-
-
-ALTER TABLE bitstamp.live_trades OWNER TO "ob-analytics";
-
---
 -- Name: pairs; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE TABLE bitstamp.pairs (
     pair_id smallint NOT NULL,
-    pair character varying NOT NULL
+    pair character varying NOT NULL,
+    "R0" smallint NOT NULL
 );
 
 
 ALTER TABLE bitstamp.pairs OWNER TO "ob-analytics";
+
+--
+-- Name: COLUMN pairs."R0"; Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN bitstamp.pairs."R0" IS 'A negative order of magnitude of the fractional monetary unit used to represent price in the pair. For example for BTCUSD pair the fractional monetary unit is 1 cent or 0.01 of USD and the value of R0 is 2';
+
 
 --
 -- Name: diff_order_book diff_order_book_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
