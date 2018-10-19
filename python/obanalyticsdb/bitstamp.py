@@ -1,11 +1,11 @@
 import logging
 import time
 from datetime import datetime
-from multiprocessing import Process
+from multiprocessing import Process, Queue
 from threading import Thread
-from queue import Queue, Empty
+from queue import Empty
 import pusherclient
-from obanalyticsdb.utils import connect_db, Spawned
+from obanalyticsdb.utils import connect_db, Spawned, log_notices
 
 
 def get_pair(pair, dbname, user):
@@ -21,6 +21,47 @@ def get_pair(pair, dbname, user):
             return pair_id
 
 
+class Stockkeeper(Spawned):
+
+    def __init__(self, q_ordered, dbname, user, stop_flag, log_queue,
+                 log_level=logging.INFO):
+        super().__init__(log_queue, stop_flag, log_level)
+        self.q_ordered = q_ordered
+        self.dbname = dbname
+        self.user = user
+
+    def __call__(self):
+        self._call_init()
+
+        logger = logging.getLogger(self.__module__ + "."
+                                   + self.__class__.__qualname__)
+        logger.info('Started')
+        with connect_db(self.dbname, self.user) as con:
+            con.set_session(autocommit=True)
+            with con.cursor() as curr:
+                while True:
+                    try:
+                        s, d = self.q_ordered.get(timeout=5)
+                        if not self.stop_flag.is_set():
+                            curr.execute(s, d)
+                            logger.debug('Saved %r' % d)
+                        else:
+                            logger.debug('Discarded %r' % d)
+                    except Empty:
+                        if not self.stop_flag.is_set():
+                            continue
+                        else:
+                            con.rollback()
+                            break
+                    except Exception:
+                        logger.exception('An exception occured while '
+                                         'processing %s' % d)
+                        self.stop_flag.set()
+                    finally:
+                        log_notices(logger, con.notices)
+        logger.info("Exit")
+
+
 class LiveStream(Spawned):
 
     def _connect_handler(self):
@@ -34,9 +75,6 @@ class LiveStream(Spawned):
 
         self.logger = logging.getLogger(self.__module__ + "."
                                         + self.__class__.__qualname__)
-        # psycopg2's connections are thread safe, so will share it ...
-        self.con = connect_db(self.dbname, self.user)
-        self.con.set_session(autocommit=True)
         self.pusher = pusherclient.Pusher(self.pusher_key,
                                           log_level=logging.WARNING)
         self.pusher.connection.bind('pusher:connection_established',
@@ -50,13 +88,12 @@ class LiveStream(Spawned):
         while not self.stop_flag.is_set():
             time.sleep(1)
         self.saver.join()
-        self.con.close()
         self.logger.info('Exit')
 
 
 class LiveOrders(LiveStream):
 
-    def __init__(self, pair_id, pair, dbname, user, stop_flag, log_queue,
+    def __init__(self, pair_id, pair, q_save, stop_flag, log_queue,
                  log_level):
 
         super().__init__(log_queue, stop_flag, log_level)
@@ -64,10 +101,9 @@ class LiveOrders(LiveStream):
         self.pair_id = pair_id
         self.pair = pair
         self.stop_flag = stop_flag
-        self.dbname = dbname
-        self.user = user
         self.pusher_key = 'de504dc5763aeef9ff52'
         self.era = None
+        self.q_save = q_save
 
     def _connect_handler(self, data):
         channel_name = 'live_orders'
@@ -80,50 +116,47 @@ class LiveOrders(LiveStream):
         channel.bind('order_deleted', self.order_deleted)
 
     def _saving_thread(self):
-        # psycopg2's cursors are not thread safe
-        # so we have to create one here
-        with self.con.cursor() as curr:
-            while not self.stop_flag.is_set():
-                try:
-                    event, data = self.q.get(timeout=5)
-                    data = eval(data)
-                    data["event"] = event
-                    data["microtimestamp"] = datetime.fromtimestamp(
-                        int(data["microtimestamp"])/1000000)
-                    if not self.era:
-                        self.era = data["microtimestamp"]
-                        curr.execute("""
-                                     INSERT INTO bitstamp.live_orders_eras
-                                     VALUES (%s)
-                                     """, (self.era,))
-                    data["era"] = self.era
-                    data["datetime"] = datetime.fromtimestamp(
-                        int(data["datetime"]))
-                    data["local_timestamp"] = datetime.now()
-                    data["pair_id"] = self.pair_id
-                    if data["order_type"]:
-                        data["order_type"] = "sell"
-                    else:
-                        data["order_type"] = "buy"
-                    curr.execute("""
-                                INSERT INTO bitstamp.live_orders
-                                (order_id, amount, event, order_type,
-                                datetime, microtimestamp, local_timestamp,
-                                price, pair_id, era )
-                                VALUES (%(id)s, %(amount)s, %(event)s,
-                                %(order_type)s, %(datetime)s,
-                                %(microtimestamp)s, %(local_timestamp)s,
-                                %(price)s, %(pair_id)s, %(era)s )
-                                """, data)
-                    self.logger.debug("queue size: %i" % self.q.qsize())
-                except Empty:
-                    if not self.stop_flag.is_set():
-                        continue
-                    else:
-                        break
-                except Exception as e:
-                    self.logger.exception('%s', e)
-                    self.stop_flag.set()
+        while not self.stop_flag.is_set():
+            try:
+                event, data = self.q.get(timeout=5)
+                data = eval(data)
+                data["event"] = event
+                data["microtimestamp"] = datetime.fromtimestamp(
+                    int(data["microtimestamp"])/1000000)
+                if not self.era:
+                    self.era = data["microtimestamp"]
+                    self.q_save.put(("""
+                                    INSERT INTO bitstamp.live_orders_eras
+                                    VALUES (%(era)s)
+                                     """, {"era": self.era}))
+                data["era"] = self.era
+                data["datetime"] = datetime.fromtimestamp(
+                    int(data["datetime"]))
+                data["local_timestamp"] = datetime.now()
+                data["pair_id"] = self.pair_id
+                if data["order_type"]:
+                    data["order_type"] = "sell"
+                else:
+                    data["order_type"] = "buy"
+                self.q_save.put(("""
+                            INSERT INTO bitstamp.live_orders
+                            (order_id, amount, event, order_type,
+                            datetime, microtimestamp, local_timestamp,
+                            price, pair_id, era )
+                            VALUES (%(id)s, %(amount)s, %(event)s,
+                            %(order_type)s, %(datetime)s,
+                            %(microtimestamp)s, %(local_timestamp)s,
+                            %(price)s, %(pair_id)s, %(era)s )
+                            """, data))
+                self.logger.debug("queue size: %i" % self.q.qsize())
+            except Empty:
+                if not self.stop_flag.is_set():
+                    continue
+                else:
+                    break
+            except Exception as e:
+                self.logger.exception('%s', e)
+                self.stop_flag.set()
 
     def order_created(self, data):
         self.logger.debug("order_created %s" % (data, ))
@@ -140,7 +173,7 @@ class LiveOrders(LiveStream):
 
 class LiveTrades(LiveStream):
 
-    def __init__(self, pair_id, pair, dbname, user, stop_flag, log_queue,
+    def __init__(self, pair_id, pair, q_save, stop_flag, log_queue,
                  log_level):
 
         super().__init__(log_queue, stop_flag, log_level)
@@ -148,9 +181,8 @@ class LiveTrades(LiveStream):
         self.pair_id = pair_id
         self.pair = pair
         self.stop_flag = stop_flag
-        self.dbname = dbname
-        self.user = user
         self.pusher_key = 'de504dc5763aeef9ff52'
+        self.q_save = q_save
 
     def _connect_handler(self, data):
         channel_name = 'live_trades'
@@ -161,42 +193,37 @@ class LiveTrades(LiveStream):
         channel.bind('trade', self.trade)
 
     def _saving_thread(self):
-        # psycopg2's cursors are not thread safe
-        # so we have to create one here
-        with self.con.cursor() as curr:
-            while not self.stop_flag.is_set():
-                try:
-                    data = self.q.get(timeout=5)
-                    data = eval(data)
-                    data["timestamp"] = datetime.fromtimestamp(
-                        int(data["timestamp"]))
-                    data["local_timestamp"] = datetime.now()
-                    data["pair_id"] = self.pair_id
-                    if data["type"]:
-                        data["type"] = "sell"
-                    else:
-                        data["type"] = "buy"
-                    # psycopg2's connections are not thread safe
-                    # so we have to create one here
-                    curr.execute("""
-                                INSERT INTO bitstamp.live_trades
-                                (trade_id, amount, price, trade_timestamp,
-                                trade_type, buy_order_id, sell_order_id,
-                                pair_id, local_timestamp )
-                                VALUES (%(id)s, %(amount)s, %(price)s,
-                                %(timestamp)s, %(type)s, %(buy_order_id)s,
-                                %(sell_order_id)s, %(pair_id)s,
-                                %(local_timestamp)s )
-                                """, data)
-                    self.logger.debug("queue size: %i" % self.q.qsize())
-                except Empty:
-                    if not self.stop_flag.is_set():
-                        continue
-                    else:
-                        break
-                except Exception as e:
-                    self.logger.exception('%s', e)
-                    self.stop_flag.set()
+        while not self.stop_flag.is_set():
+            try:
+                data = self.q.get(timeout=5)
+                data = eval(data)
+                data["timestamp"] = datetime.fromtimestamp(
+                    int(data["timestamp"]))
+                data["local_timestamp"] = datetime.now()
+                data["pair_id"] = self.pair_id
+                if data["type"]:
+                    data["type"] = "sell"
+                else:
+                    data["type"] = "buy"
+                self.q_save.put(("""
+                            INSERT INTO bitstamp.live_trades
+                            (trade_id, amount, price, trade_timestamp,
+                            trade_type, buy_order_id, sell_order_id,
+                            pair_id, local_timestamp )
+                            VALUES (%(id)s, %(amount)s, %(price)s,
+                            %(timestamp)s, %(type)s, %(buy_order_id)s,
+                            %(sell_order_id)s, %(pair_id)s,
+                            %(local_timestamp)s )
+                            """, data))
+                self.logger.debug("queue size: %i" % self.q.qsize())
+            except Empty:
+                if not self.stop_flag.is_set():
+                    continue
+                else:
+                    break
+            except Exception as e:
+                self.logger.exception('%s', e)
+                self.stop_flag.set()
 
     def trade(self, data):
         self.logger.debug("trade %s" % (data, ))
@@ -226,40 +253,37 @@ class LiveDiffOrderBook(LiveStream):
         channel.bind('data', self.data)
 
     def _saving_thread(self):
-        # psycopg2's cursors are not thread safe
-        # so we have to create one here
-        with self.con.cursor() as curr:
-            while not self.stop_flag.is_set():
-                try:
-                    data = self.q.get(timeout=5)
-                    data = eval(data)
-                    data["timestamp"] = datetime.fromtimestamp(
-                        int(data["timestamp"]))
-                    data["local_timestamp"] = datetime.now()
-                    data["pair_id"] = self.pair_id
-                    for side in ('bids', 'asks'):
-                        for d in data[side]:
-                            curr.execute("""
-                                        INSERT INTO bitstamp.diff_order_book
-                                        (local_timestamp, pair_id, timestamp,
-                                        price, amount, side)
-                                        VALUES (%s, %s, %s, %s, %s, %s)
-                                        """,
-                                         (data["local_timestamp"],
-                                          data["pair_id"],
-                                          data["timestamp"],
-                                          d[0],
-                                          d[1],
-                                          side[:-1]))
-                    self.logger.debug("queue size: %i" % self.q.qsize())
-                except Empty:
-                    if not self.stop_flag.is_set():
-                        continue
-                    else:
-                        break
-                except Exception as e:
-                    self.logger.exception('%s', e)
-                    self.stop_flag.set()
+        with connect_db(self.dbname, self.user) as con:
+            with con.cursor() as curr:
+                while not self.stop_flag.is_set():
+                    try:
+                        data = self.q.get(timeout=5)
+                        data = eval(data)
+                        data["timestamp"] = datetime.fromtimestamp(
+                            int(data["timestamp"]))
+                        data["local_timestamp"] = datetime.now()
+                        data["pair_id"] = self.pair_id
+                        for side in ('bids', 'asks'):
+                            for d in data[side]:
+                                curr.execute("""
+                                          INSERT INTO bitstamp.diff_order_book
+                                          (local_timestamp, pair_id, timestamp,
+                                          price, amount, side)
+                                          VALUES (%s, %s, %s, %s, %s, %s)
+                                          """,
+                                             (data["local_timestamp"],
+                                              data["pair_id"],
+                                              data["timestamp"], d[0], d[1],
+                                              side[:-1]))
+                        self.logger.debug("queue size: %i" % self.q.qsize())
+                    except Empty:
+                        if not self.stop_flag.is_set():
+                            continue
+                        else:
+                            break
+                    except Exception as e:
+                        self.logger.exception('%s', e)
+                        self.stop_flag.set()
 
     def data(self, data):
         self.logger.debug("data %s" % (data, ))
@@ -295,15 +319,16 @@ class LiveOrderBook(LiveStream):
 def capture(pair, dbname, user,  stop_flag, log_queue):
 
     logger = logging.getLogger("bitstamp.capture")
+    q_save = Queue()
 
     try:
         pair_id = get_pair(pair, dbname, user)
-        ts = [Process(target=LiveOrders(pair_id, pair, dbname, user,
-                                        stop_flag, log_queue,
-                                        log_level=logging.INFO)),
-              Process(target=LiveTrades(pair_id, pair, dbname, user,
-                                        stop_flag, log_queue,
-                                        log_level=logging.INFO)),
+        ts = [Process(target=LiveOrders(pair_id, pair, q_save, stop_flag,
+                                        log_queue, log_level=logging.INFO)),
+              Process(target=LiveTrades(pair_id, pair, q_save, stop_flag,
+                                        log_queue, log_level=logging.INFO)),
+              Process(target=Stockkeeper(q_save, dbname, user, stop_flag,
+                                         log_queue, log_level=logging.DEBUG)),
               # Process(target=LiveOrderBook(pair_id, pair, dbname, user,
               #                               stop_flag, log_queue,
               #                               log_level=logging.INFO)),
