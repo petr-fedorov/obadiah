@@ -10,8 +10,10 @@ class TestPutInOrder(unittest.TestCase):
     def setUp(self):
         self.q_in = Queue()
         self.q_out = Queue()
+        self.log_queue = Queue()
         self.stop_flag = Event()
-        self.p = Process(target=Orderer(self.q_in, self.q_out, self.stop_flag))
+        self.p = Process(target=Orderer(self.q_in, self.q_out, self.stop_flag,
+                                        self.log_queue))
         self.p.start()
 
     def tearDown(self):
@@ -28,8 +30,9 @@ class TestPutInOrder(unittest.TestCase):
         local_timestamp = datetime.now()
         delay = timedelta(seconds=0.5)
 
-        tr = Trade(local_timestamp, exchange_timestamp+delay)
-        obe = OrderBookEvent(local_timestamp+delay, exchange_timestamp)
+        tr = Trade(local_timestamp, exchange_timestamp+delay, 1, 0.1, 1, 1)
+        obe = OrderBookEvent(local_timestamp+delay, exchange_timestamp,
+                             1, 1, 1, 1, 1, 1)
 
         self.q_in.put(tr)
         sleep(delay.total_seconds())
@@ -44,8 +47,9 @@ class TestPutInOrder(unittest.TestCase):
     def test_trade_overtakes_event(self):
         exchange_timestamp = datetime.now()
         local_timestamp = datetime.now()
-        obe = OrderBookEvent(local_timestamp, exchange_timestamp)
-        tr = Trade(local_timestamp, exchange_timestamp)
+        obe = OrderBookEvent(local_timestamp, exchange_timestamp,
+                             1, 1, 1, 1, 1, 1)
+        tr = Trade(local_timestamp, exchange_timestamp, 1, 0.1, 1, 1)
 
         self.q_in.put(obe)
         sleep(0.5)
@@ -65,8 +69,9 @@ class TestPutInOrder(unittest.TestCase):
         local_timestamp = datetime.now()
         delay = timedelta(seconds=0.5)
 
-        tr = Trade(local_timestamp, exchange_timestamp+delay)
-        obe = OrderBookEvent(local_timestamp+delay, exchange_timestamp)
+        tr = Trade(local_timestamp, exchange_timestamp+delay, 1, 0.1, 1, 1)
+        obe = OrderBookEvent(local_timestamp+delay, exchange_timestamp,
+                             1, 1, 1, 1, 1, 1)
 
         self.q_in.put(tr)
         sleep(3*delay.total_seconds())

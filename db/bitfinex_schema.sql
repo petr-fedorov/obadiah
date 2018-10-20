@@ -57,7 +57,7 @@ ALTER TYPE bitfinex.raw_event_action OWNER TO "ob-analytics";
 --
 
 CREATE FUNCTION bitfinex._hidden_order_id(id bigint) RETURNS bigint
-    LANGUAGE sql STRICT LEAKPROOF
+    LANGUAGE sql STRICT 
     AS $$
 
 SELECT ('x'||md5(id::text||'hidden'))::bit(33)::bigint;
@@ -72,7 +72,7 @@ ALTER FUNCTION bitfinex._hidden_order_id(id bigint) OWNER TO "ob-analytics";
 --
 
 CREATE FUNCTION bitfinex._market_order_id(snapshot_id integer, episode_no integer, mo_id integer) RETURNS bigint
-    LANGUAGE sql STRICT LEAKPROOF
+    LANGUAGE sql STRICT 
     AS $$
 
 SELECT ('x'||md5(snapshot_id::text||episode_no::text||mo_id::text))::bit(33)::bigint;
@@ -87,7 +87,7 @@ ALTER FUNCTION bitfinex._market_order_id(snapshot_id integer, episode_no integer
 --
 
 CREATE FUNCTION bitfinex._revealed_order_id(order_id bigint, reincarnation bigint) RETURNS bigint
-    LANGUAGE sql STRICT LEAKPROOF
+    LANGUAGE sql STRICT 
     AS $$
 
 SELECT CASE WHEN reincarnation = 0 THEN order_id ELSE ('x'||md5(order_id::text||reincarnation::text||'revealed'))::bit(33)::bigint END;

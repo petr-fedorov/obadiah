@@ -16,12 +16,11 @@ class OrderedDatabaseInsertion:
         self.local_timestamp = local_timestamp
         self.exchange_timestamp = exchange_timestamp
         self.priority = 0
-        self.seq_no = 0
 
     def __eq__(self, other):
         return ((self.exchange_timestamp == other.exchange_timestamp) and
                 (self.priority == other.priority) and
-                (self.seq_no == other.seq_no))
+                (self.local_timestamp == other.local_timestamp))
 
     def __lt__(self, other):
         if self.exchange_timestamp < other.exchange_timestamp:
@@ -30,7 +29,8 @@ class OrderedDatabaseInsertion:
               self.priority < other.priority):
             return True
         elif (self.exchange_timestamp == other.exchange_timestamp and
-              self.priority == other.priority and self.seq_no < other.seq_no):
+              self.priority == other.priority and
+              self.local_timestamp < other.local_timestamp):
             return True
         else:
             return False
@@ -51,11 +51,10 @@ class Episode(OrderedDatabaseInsertion):
         self.is_complete = is_complete
 
     def __repr__(self):
-        return "Ep-de no: %i e:%s p:%i s:%i l:%s sn:%s" % (
+        return "Ep-de no: %i e:%s p:%i l:%s sn:%s" % (
             self.episode_no,
             self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.priority,
-            self.seq_no,
             self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.snapshot_id
         )
@@ -138,7 +137,7 @@ class OrderBookEvent(OrderedDatabaseInsertion):
         self.event_no = event_no
 
     def __repr__(self):
-        return ("Event id: %s ep: %i ev: %i pr: %s qty:%s e:%s p:%i s:%i l:%s "
+        return ("Event id: %s ep: %i ev: %i pr: %s qty:%s e:%s p:%i l:%s "
                 "sn:%s"
                 % (self.order_id,
                    self.episode_no,
@@ -147,7 +146,6 @@ class OrderBookEvent(OrderedDatabaseInsertion):
                    self.order_qty,
                    self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
                    self.priority,
-                   self.seq_no,
                    self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
                    self.snapshot_id
                    )
@@ -233,13 +231,12 @@ class Trade(OrderedDatabaseInsertion):
         self.snapshot_id = snapshot_id
 
     def __repr__(self):
-        return "Trade id: %s p: %s qty: %s e:%s p:%i s:%i l:%s sn: %s" % (
+        return "Trade id: %s p: %s qty: %s e:%s p:%i l:%s sn: %s" % (
             self.id,
             self.price,
             self.qty,
             self.exchange_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.priority,
-            self.seq_no,
             self.local_timestamp.strftime("%H-%M-%S.%f")[:-3],
             self.snapshot_id
         )
@@ -265,9 +262,7 @@ class Orderer(Spawned):
         self.buffer = []
         self.latest_arrived = datetime.now()
         self.latest_departed = datetime.now()
-        self.seq_no = 0
-        self.latest_departed_seq_no = -1
-        self.log_ordered = QueueSizeLogger(q_ordered, "q_ordered")
+        self.log_output_queue_size = QueueSizeLogger(q_ordered, "q_ordered")
 
     def __repr__(self):
         return "Orderer a:%s d: %s b:%s" % (self.latest_arrived.strftime(
@@ -277,91 +272,52 @@ class Orderer(Spawned):
     def _current_delay(self):
         return (self.latest_arrived - self.latest_departed)
 
-    def _arrive_from_exchange(self):
-        self.alogger.debug('Start arrive - current delay %f, l_a %s' %
-                           (self._current_delay().total_seconds(),
-                            self.latest_arrived.strftime("%H-%M-%S.%f")[:-3])
-                           )
+    def receive_unordered(self):
 
         while self._current_delay() < self.delay:
-            self.alogger.debug('current_delay %f ' %
-                               self._current_delay().total_seconds())
             try:
                 obj = self.q_unordered.get(True,
                                            (self.delay -
                                             self._current_delay()
                                             ).total_seconds())
-                obj.seq_no = self.seq_no
-                self.alogger.debug('%r' % obj)
-                self.seq_no += 1
                 if obj.local_timestamp > self.latest_arrived:
                     self.latest_arrived = obj.local_timestamp
-                    self.alogger.debug('l_a %s' % self.latest_arrived.strftime(
-                        "%H-%M-%S.%f")[:-3])
                 heappush(self.buffer, obj)
 
             except Empty:
                 self.latest_arrived = datetime.now()
-                self.alogger.debug('l_a(time-out) %s' %
-                                   self.latest_arrived.strftime(
-                                       "%H-%M-%S.%f")[:-3])
-        self.alogger.debug('Suspend arrive - current_delay %f, l_a %s ' %
-                           (self._current_delay().total_seconds(),
-                            self.latest_arrived.strftime("%H-%M-%S.%f")[:-3]))
-        self.alogger.debug('Unprocessed q_unordered size: %i' %
-                           self.q_unordered.qsize())
 
-    def _depart_to_database(self):
-        self.dlogger.debug('Start depart - current delay %f, l_d %s' %
-                           (self._current_delay().total_seconds(),
-                            self.latest_departed.strftime("%H-%M-%S.%f")[:-3])
-                           )
+    def send_reordered(self):
         while True:
-            self.dlogger.debug('current_delay %f ' %
-                               self._current_delay().total_seconds())
             try:
                 if self.buffer[0].local_timestamp > self.latest_departed:
                     self.latest_departed = self.buffer[0].local_timestamp
-                    self.dlogger.debug(
-                        'l_d %s' % self.latest_departed.strftime(
-                            "%H-%M-%S.%f")[:-3])
 
                 if self._current_delay() >= self.delay:
                     obj = heappop(self.buffer)
-                    if obj.seq_no > self.latest_departed_seq_no:
-                        self.dlogger.debug('%r' % obj)
-                        self.latest_departed_seq_no = obj.seq_no
-                    else:
-                        self.dlogger.debug('DELAYED %r' % obj)
                     self.q_ordered.put(obj)
                 else:
                     break
             except IndexError:
                 self.latest_departed = datetime.now()
-                self.dlogger.debug('l_d(empty) %s' %
-                                   self.latest_departed.strftime(
-                                       "%H-%M-%S.%f")[:-3])
                 break
-        self.dlogger.debug('Suspend depart - current_delay %f, l_d %s ' %
-                           (self._current_delay().total_seconds(),
-                            self.latest_departed.strftime("%H-%M-%S.%f")[:-3]))
-        self.log_ordered(self.dlogger)
 
-    def __call__(self):
-        self._call_init()
-
-        logger = logging.getLogger("bitfinex.Orderer.__call")
-        self.alogger = logging.getLogger("bitfinex.Orderer.arrive")
-        self.dlogger = logging.getLogger("bitfinex.Orderer.depart")
-        logger.info('Started %r ' % (self,))
+    def run(self):
         while not (self.stop_flag.is_set()
                    and self.q_unordered.qsize() == 0
                    and len(self.buffer) == 0
                    and self.q_ordered.qsize() == 0):
-            self._arrive_from_exchange()
-            self._depart_to_database()
-            logger.debug("Unprocessed heap size: %i" % len(self.buffer))
-        logger.info('Exit %r ' % (self,))
+            self.receive_unordered()
+            self.send_reordered()
+            self.log_output_queue_size(self.logger)
+
+    def __call__(self):
+        self._call_init()
+
+        self.logger = logging.getLogger("bitfinex.Orderer")
+        self.logger.info('Started %r ' % (self,))
+        self.run()
+        self.logger.info('Exit %r ' % (self,))
 
 
 class Stockkeeper(Spawned):
