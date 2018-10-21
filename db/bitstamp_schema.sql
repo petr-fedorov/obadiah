@@ -135,10 +135,15 @@ SELECT live_orders.*
 FROM bitstamp.live_orders 
 WHERE microtimestamp BETWEEN _events_match_trade.trade_timestamp - _events_match_trade.look_around  AND _events_match_trade.trade_timestamp + _events_match_trade.look_around
   AND order_id = _events_match_trade.order_id
-  AND round(fill*_events_match_trade.price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_orders.pair_id )) = round(_events_match_trade.amount*_events_match_trade.price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_orders.pair_id ))
+  AND ( abs(fill*_events_match_trade.price - _events_match_trade.amount*_events_match_trade.price) < 10^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_orders.pair_id ) 
+	     OR fill IS NULL 	-- fill IS NULL when the previous event was not sent to us by 'live_trades'
+	   )
   AND trade_id IS NULL
   AND order_type = _events_match_trade.order_type
-ORDER BY microtimestamp	-- we want the earliest one available
+  AND event <> 'order_created'
+ORDER BY   COALESCE(fill, 0) DESC, -- if there is matching not-NULL fill, then we match to it
+			microtimestamp			  -- we want the earliest one if there are more than one 
+LIMIT 1			
 FOR UPDATE;		
   
 
@@ -196,7 +201,10 @@ FROM bitstamp.live_trades
 WHERE trade_timestamp BETWEEN _trades_match_buy_event.microtimestamp - _trades_match_buy_event.look_around  
 									AND _trades_match_buy_event.microtimestamp + _trades_match_buy_event.look_around  
   AND buy_order_id = _trades_match_buy_event.order_id
-  AND round(amount*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) = round(_trades_match_buy_event.new_fill*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) -- match by value instead of quantity (amount) to avoid failures due to rounding
+  AND ( abs(amount*price - _trades_match_buy_event.new_fill*price) < 10^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id ) 
+	     OR _trades_match_buy_event.new_fill IS NULL
+	   )
+  
   AND buy_microtimestamp IS NULL
 ORDER BY trade_id -- we want the earliest one available 
 FOR UPDATE;
@@ -220,7 +228,9 @@ FROM bitstamp.live_trades
 WHERE trade_timestamp BETWEEN _trades_match_sell_event.microtimestamp - _trades_match_sell_event.look_around  
 									AND _trades_match_sell_event.microtimestamp + _trades_match_sell_event.look_around  
   AND sell_order_id = _trades_match_sell_event.order_id
-  AND round(amount*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) = round(_trades_match_sell_event.new_fill*price, (SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )) -- match by value instead of quantity (amount) to avoid failures due to rounding
+  AND ( abs(amount*price - _trades_match_sell_event.new_fill*price) < 10^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id ) 
+	     OR _trades_match_sell_event.new_fill IS NULL
+	   )
   AND sell_microtimestamp IS NULL
 ORDER BY trade_id -- we want the earliest one available 
 FOR UPDATE;
@@ -352,7 +362,9 @@ BEGIN
 		
 			UPDATE bitstamp.live_trades
 			SET buy_microtimestamp = NEW.microtimestamp,
-				buy_match_rule = 1
+				buy_match_rule = CASE WHEN t.amount = NEW.fill THEN 10 
+									   WHEN NEW.fill IS NULL THEN 12
+									   ELSE 11 END
 			WHERE CURRENT OF buy_match;
 			
 			NEW.trade_id := t.trade_id;
@@ -366,7 +378,9 @@ BEGIN
 		
 			UPDATE bitstamp.live_trades
 			SET sell_microtimestamp = NEW.microtimestamp,
-				 sell_match_rule = 1
+				 sell_match_rule = CASE WHEN t.amount = NEW.fill THEN 10 
+									     WHEN NEW.fill IS NULL THEN 12
+									     ELSE 11 END
 			WHERE CURRENT OF sell_match;
 			
 			NEW.trade_id := t.trade_id;
@@ -434,7 +448,9 @@ BEGIN
 
 	FOR e in buy_match LOOP
 		NEW.buy_microtimestamp := e.microtimestamp;
-		NEW.buy_match_rule := 2;
+		NEW.buy_match_rule := CASE WHEN e.fill = NEW.amount THEN 20 
+									WHEN e.fill IS NULL THEN 22 
+									ELSE 21 END;
 		
 		UPDATE bitstamp.live_orders
 		SET trade_id = NEW.trade_id,
@@ -448,7 +464,9 @@ BEGIN
 
 	FOR e in sell_match LOOP
 		NEW.sell_microtimestamp := e.microtimestamp;
-		NEW.sell_match_rule := 2;
+		NEW.sell_match_rule := CASE WHEN e.fill = NEW.amount THEN 20 
+									 WHEN e.fill IS NULL THEN 22 
+									 ELSE 21 END;
 		
 		UPDATE bitstamp.live_orders
 		SET trade_id = NEW.trade_id,

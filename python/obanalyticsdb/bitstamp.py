@@ -6,6 +6,7 @@ from threading import Thread
 from queue import Empty
 import pusherclient
 from obanalyticsdb.utils import connect_db, Spawned, log_notices
+from obanalyticsdb.reorder import OrderedDatabaseInsertion, Reorderer
 
 
 def get_pair(pair, dbname, user):
@@ -23,10 +24,10 @@ def get_pair(pair, dbname, user):
 
 class Stockkeeper(Spawned):
 
-    def __init__(self, q_ordered, dbname, user, stop_flag, log_queue,
+    def __init__(self, q_unordered, dbname, user, stop_flag, log_queue,
                  log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
-        self.q_ordered = q_ordered
+        self.q_unordered = q_unordered
         self.dbname = dbname
         self.user = user
 
@@ -35,13 +36,19 @@ class Stockkeeper(Spawned):
 
         logger = logging.getLogger(self.__module__ + "."
                                    + self.__class__.__qualname__)
+        q_ordered = Queue()
+        reorderer = Reorderer(self.q_unordered, q_ordered, self.stop_flag)
+        reorder = Thread(target=reorderer.run)
+        reorder.start()
+
         logger.info('Started')
         with connect_db(self.dbname, self.user) as con:
             con.set_session(autocommit=True)
             with con.cursor() as curr:
                 while True:
                     try:
-                        s, d = self.q_ordered.get(timeout=5)
+                        obj = q_ordered.get(timeout=5)
+                        s, d = obj.data
                         if not self.stop_flag.is_set():
                             curr.execute(s, d)
                             logger.debug('Saved %r' % d)
@@ -59,6 +66,7 @@ class Stockkeeper(Spawned):
                         self.stop_flag.set()
                     finally:
                         log_notices(logger, con.notices)
+        reorder.join()
         logger.info("Exit")
 
 
@@ -123,22 +131,29 @@ class LiveOrders(LiveStream):
                 data["event"] = event
                 data["microtimestamp"] = datetime.fromtimestamp(
                     int(data["microtimestamp"])/1000000)
+                data["local_timestamp"] = datetime.now()
                 if not self.era:
                     self.era = data["microtimestamp"]
-                    self.q_save.put(("""
+                    era = OrderedDatabaseInsertion(data["local_timestamp"],
+                                                   data["microtimestamp"],
+                                                   0)
+                    era.data = ("""
                                     INSERT INTO bitstamp.live_orders_eras
                                     VALUES (%(era)s)
-                                     """, {"era": self.era}))
+                                     """, {"era": self.era})
+                    self.q_save.put(era)
                 data["era"] = self.era
                 data["datetime"] = datetime.fromtimestamp(
                     int(data["datetime"]))
-                data["local_timestamp"] = datetime.now()
                 data["pair_id"] = self.pair_id
                 if data["order_type"]:
                     data["order_type"] = "sell"
                 else:
                     data["order_type"] = "buy"
-                self.q_save.put(("""
+                event = OrderedDatabaseInsertion(data["local_timestamp"],
+                                                 data["microtimestamp"],
+                                                 1)
+                event.data = ("""
                             INSERT INTO bitstamp.live_orders
                             (order_id, amount, event, order_type,
                             datetime, microtimestamp, local_timestamp,
@@ -147,7 +162,8 @@ class LiveOrders(LiveStream):
                             %(order_type)s, %(datetime)s,
                             %(microtimestamp)s, %(local_timestamp)s,
                             %(price)s, %(pair_id)s, %(era)s )
-                            """, data))
+                            """, data)
+                self.q_save.put(event)
                 self.logger.debug("queue size: %i" % self.q.qsize())
             except Empty:
                 if not self.stop_flag.is_set():
@@ -205,7 +221,10 @@ class LiveTrades(LiveStream):
                     data["type"] = "sell"
                 else:
                     data["type"] = "buy"
-                self.q_save.put(("""
+                trade = OrderedDatabaseInsertion(data["local_timestamp"],
+                                                 data["timestamp"],
+                                                 2)
+                trade.data = ("""
                             INSERT INTO bitstamp.live_trades
                             (trade_id, amount, price, trade_timestamp,
                             trade_type, buy_order_id, sell_order_id,
@@ -214,7 +233,8 @@ class LiveTrades(LiveStream):
                             %(timestamp)s, %(type)s, %(buy_order_id)s,
                             %(sell_order_id)s, %(pair_id)s,
                             %(local_timestamp)s )
-                            """, data))
+                            """, data)
+                self.q_save.put(trade)
                 self.logger.debug("queue size: %i" % self.q.qsize())
             except Empty:
                 if not self.stop_flag.is_set():
