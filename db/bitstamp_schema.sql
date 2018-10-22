@@ -135,9 +135,13 @@ SELECT live_orders.*
 FROM bitstamp.live_orders 
 WHERE microtimestamp BETWEEN _events_match_trade.trade_timestamp - _events_match_trade.look_around  AND _events_match_trade.trade_timestamp + _events_match_trade.look_around
   AND order_id = _events_match_trade.order_id
-  AND ( abs(fill*_events_match_trade.price - _events_match_trade.amount*_events_match_trade.price) < 10^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_orders.pair_id ) 
-	     OR fill IS NULL 	-- fill IS NULL when the previous event was not sent to us by 'live_trades'
-	   )
+  AND bitstamp._get_match_rule(	trade_amount := _events_match_trade.amount,
+							   	trade_price := _events_match_trade.price,
+							   	event_amount := amount,
+							   	event_fill := fill,
+							   	event := event,
+							   	tolerance := 10::numeric^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_orders.pair_id )
+							  ) IS NOT NULL
   AND trade_id IS NULL
   AND order_type = _events_match_trade.order_type
   AND event <> 'order_created'
@@ -166,6 +170,41 @@ $$;
 ALTER FUNCTION bitstamp._get_live_orders_eon(ts timestamp with time zone) OWNER TO "ob-analytics";
 
 --
+-- Name: _get_match_rule(numeric, numeric, numeric, numeric, bitstamp.live_orders_event, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._get_match_rule(trade_amount numeric, trade_price numeric, event_amount numeric, event_fill numeric, event bitstamp.live_orders_event, tolerance numeric) RETURNS smallint
+    LANGUAGE sql IMMUTABLE
+    AS $$
+
+    SELECT CASE 
+				WHEN _get_match_rule.trade_amount = _get_match_rule.event_fill
+					THEN 0::smallint	-- the event matches the trade with certainty. Usually 98% of all matches have this code.
+				WHEN abs(_get_match_rule.trade_amount*_get_match_rule.trade_price - _get_match_rule.event_fill*_get_match_rule.trade_price) < tolerance 
+					THEN 1::smallint	-- it is highly likely that the event matches the trade. 'fill' and 'amount' are different due to rounding errors but within tolerance
+	      		WHEN _get_match_rule.event_fill IS NULL 
+					THEN 2::smallint	-- it is likely that the event matches the trade. 'fill' is not available since the previous event is missing
+	      		WHEN _get_match_rule.event = 'order_deleted' 
+				 AND _get_match_rule.event_fill = 0.0 
+				 AND abs(_get_match_rule.trade_amount*_get_match_rule.trade_price - _get_match_rule.event_amount*_get_match_rule.trade_price) < tolerance 
+				  	THEN 3::smallint	-- it is highly likely that the event matches the trade. 'fill' is wrong due to Bitstamp's bug while 'amount's are within tolerance
+		  ELSE NULL::smallint
+    END;
+	           
+
+$$;
+
+
+ALTER FUNCTION bitstamp._get_match_rule(trade_amount numeric, trade_price numeric, event_amount numeric, event_fill numeric, event bitstamp.live_orders_event, tolerance numeric) OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION _get_match_rule(trade_amount numeric, trade_price numeric, event_amount numeric, event_fill numeric, event bitstamp.live_orders_event, tolerance numeric); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitstamp._get_match_rule(trade_amount numeric, trade_price numeric, event_amount numeric, event_fill numeric, event bitstamp.live_orders_event, tolerance numeric) IS 'The function determines the ''ones'' part of the two-digit matching rule code used to match a trade and an event. See the function body for details';
+
+
+--
 -- Name: live_trades; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -189,10 +228,24 @@ CREATE TABLE bitstamp.live_trades (
 ALTER TABLE bitstamp.live_trades OWNER TO "ob-analytics";
 
 --
--- Name: _trades_match_buy_event(timestamp with time zone, bigint, numeric, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: COLUMN live_trades.buy_match_rule; Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval DEFAULT '00:00:02'::interval) RETURNS SETOF bitstamp.live_trades
+COMMENT ON COLUMN bitstamp.live_trades.buy_match_rule IS 'A two-digit code of the match rule used to match this trade with a buy order event. ''tens'' digit determines whether the event was matched to the previously saved trade (''1'') or vice versa (''2''). ''ones'' part is given by _get_match_rule() function';
+
+
+--
+-- Name: COLUMN live_trades.sell_match_rule; Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN bitstamp.live_trades.sell_match_rule IS 'A two-digit code of the match rule used to match this trade with a sell order event. ''tens'' digit determines whether the event was matched to the previously saved trade (''1'') or vice versa (''2''). ''ones'' part is given by _get_match_rule() function.';
+
+
+--
+-- Name: _trades_match_buy_event(timestamp with time zone, bigint, numeric, numeric, bitstamp.live_orders_event, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval DEFAULT '00:00:02'::interval) RETURNS SETOF bitstamp.live_trades
     LANGUAGE sql STABLE
     AS $$
 
@@ -201,11 +254,14 @@ FROM bitstamp.live_trades
 WHERE trade_timestamp BETWEEN _trades_match_buy_event.microtimestamp - _trades_match_buy_event.look_around  
 									AND _trades_match_buy_event.microtimestamp + _trades_match_buy_event.look_around  
   AND buy_order_id = _trades_match_buy_event.order_id
-  AND ( abs(amount*price - _trades_match_buy_event.new_fill*price) < 10^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id ) 
-	     OR _trades_match_buy_event.new_fill IS NULL
-	   )
-  
-  AND buy_microtimestamp IS NULL
+  AND bitstamp._get_match_rule(trade_amount := amount,
+							   trade_price := price,
+							   event_amount := _trades_match_buy_event.amount,
+							   event_fill := _trades_match_buy_event.fill,
+							   event := _trades_match_buy_event.event,
+							   tolerance := 10::numeric^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )
+							  ) IS NOT NULL
+   AND buy_microtimestamp IS NULL
 ORDER BY trade_id -- we want the earliest one available 
 FOR UPDATE;
   
@@ -213,13 +269,13 @@ FOR UPDATE;
 $$;
 
 
-ALTER FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval) OWNER TO "ob-analytics";
 
 --
--- Name: _trades_match_sell_event(timestamp with time zone, bigint, numeric, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: _trades_match_sell_event(timestamp with time zone, bigint, numeric, numeric, bitstamp.live_orders_event, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval DEFAULT '00:00:02'::interval) RETURNS SETOF bitstamp.live_trades
+CREATE FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval DEFAULT '00:00:02'::interval) RETURNS SETOF bitstamp.live_trades
     LANGUAGE sql STABLE
     AS $$
 
@@ -228,9 +284,13 @@ FROM bitstamp.live_trades
 WHERE trade_timestamp BETWEEN _trades_match_sell_event.microtimestamp - _trades_match_sell_event.look_around  
 									AND _trades_match_sell_event.microtimestamp + _trades_match_sell_event.look_around  
   AND sell_order_id = _trades_match_sell_event.order_id
-  AND ( abs(amount*price - _trades_match_sell_event.new_fill*price) < 10^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id ) 
-	     OR _trades_match_sell_event.new_fill IS NULL
-	   )
+  AND bitstamp._get_match_rule(trade_amount := amount,
+							   trade_price := price,
+							   event_amount := _trades_match_sell_event.amount,
+							   event_fill := _trades_match_sell_event.fill,
+							   event := _trades_match_sell_event.event,
+							   tolerance := 10::numeric^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )
+							  ) IS NOT NULL
   AND sell_microtimestamp IS NULL
 ORDER BY trade_id -- we want the earliest one available 
 FOR UPDATE;
@@ -239,7 +299,7 @@ FOR UPDATE;
 $$;
 
 
-ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, new_fill numeric, look_around interval) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval) OWNER TO "ob-analytics";
 
 --
 -- Name: live_orders_eras_v(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -349,22 +409,31 @@ CREATE FUNCTION bitstamp.live_orders_match() RETURNS trigger
 
 DECLARE
 						  
-	buy_match CURSOR FOR SELECT * FROM bitstamp._trades_match_buy_event(NEW.microtimestamp, NEW.order_id, NEW.fill);
+	buy_match CURSOR FOR SELECT * FROM bitstamp._trades_match_buy_event(NEW.microtimestamp, NEW.order_id, NEW.fill, NEW.amount, NEW.event);
 
-	sell_match CURSOR FOR SELECT * FROM bitstamp._trades_match_sell_event(NEW.microtimestamp, NEW.order_id, NEW.fill);	
+	sell_match CURSOR FOR SELECT * FROM bitstamp._trades_match_sell_event(NEW.microtimestamp, NEW.order_id, NEW.fill, NEW.amount, NEW.event);	
 
 	t RECORD;						   
+	tolerance numeric;
 
 BEGIN 
 
+	SELECT 10::numeric^"R0" INTO tolerance
+	FROM bitstamp.pairs 
+	WHERE pairs.pair_id = NEW.pair_id;
+	
 	IF NEW.order_type = 'buy' THEN
 		FOR t IN buy_match LOOP
 		
 			UPDATE bitstamp.live_trades
 			SET buy_microtimestamp = NEW.microtimestamp,
-				buy_match_rule = CASE WHEN t.amount = NEW.fill THEN 10 
-									   WHEN NEW.fill IS NULL THEN 12
-									   ELSE 11 END
+				buy_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
+							   							  trade_price := t.price,
+							   							  event_amount := NEW.amount,
+							   							  event_fill := NEW.fill,
+							   							  event := NEW.event,
+							   							  tolerance := tolerance
+							  							 ) + 10
 			WHERE CURRENT OF buy_match;
 			
 			NEW.trade_id := t.trade_id;
@@ -378,9 +447,13 @@ BEGIN
 		
 			UPDATE bitstamp.live_trades
 			SET sell_microtimestamp = NEW.microtimestamp,
-				 sell_match_rule = CASE WHEN t.amount = NEW.fill THEN 10 
-									     WHEN NEW.fill IS NULL THEN 12
-									     ELSE 11 END
+				sell_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
+							   							   trade_price := t.price,
+							   							   event_amount := NEW.amount,
+							   							   event_fill := NEW.fill,
+							   							   event := NEW.event,
+							   							   tolerance := tolerance
+							  							  ) + 10
 			WHERE CURRENT OF sell_match;
 			
 			NEW.trade_id := t.trade_id;
@@ -444,13 +517,23 @@ DECLARE
 
 	e RECORD;
 	
+	tolerance numeric;
+	
 BEGIN 
 
+	SELECT 10::numeric^"R0" INTO tolerance 
+ 	FROM bitstamp.pairs 
+	WHERE pairs.pair_id = NEW.pair_id;
+	
 	FOR e in buy_match LOOP
 		NEW.buy_microtimestamp := e.microtimestamp;
-		NEW.buy_match_rule := CASE WHEN e.fill = NEW.amount THEN 20 
-									WHEN e.fill IS NULL THEN 22 
-									ELSE 21 END;
+		NEW.buy_match_rule := 20 + bitstamp._get_match_rule( trade_amount := NEW.amount,
+														   	  trade_price := NEW.price,
+															  event_amount := e.amount,
+															  event_fill := e.fill,
+															  event := e.event,
+															  tolerance := tolerance
+														     );
 		
 		UPDATE bitstamp.live_orders
 		SET trade_id = NEW.trade_id,
@@ -464,9 +547,14 @@ BEGIN
 
 	FOR e in sell_match LOOP
 		NEW.sell_microtimestamp := e.microtimestamp;
-		NEW.sell_match_rule := CASE WHEN e.fill = NEW.amount THEN 20 
-									 WHEN e.fill IS NULL THEN 22 
-									 ELSE 21 END;
+		
+		NEW.sell_match_rule := 20 + bitstamp._get_match_rule( trade_amount := NEW.amount,
+														   	  trade_price := NEW.price,
+															  event_amount := e.amount,
+															  event_fill := e.fill,
+															  event := e.event,
+															  tolerance := tolerance
+														     );
 		
 		UPDATE bitstamp.live_orders
 		SET trade_id = NEW.trade_id,
