@@ -88,7 +88,9 @@ CREATE TYPE bitstamp.spread AS (
 	best_bid_qty numeric,
 	best_ask_price numeric,
 	best_ask_qty numeric,
-	microtimestamp timestamp with time zone
+	microtimestamp timestamp with time zone,
+	best_bid_order_ids bigint[],
+	best_ask_order_ids bigint[]
 );
 
 
@@ -170,6 +172,13 @@ $$;
 ALTER FUNCTION bitstamp._get_live_orders_eon(ts timestamp with time zone) OWNER TO "ob-analytics";
 
 --
+-- Name: FUNCTION _get_live_orders_eon(ts timestamp with time zone); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitstamp._get_live_orders_eon(ts timestamp with time zone) IS 'When bitstamp.live_orders will be partitioned, this function will return the ''eon'' for the provided timestamp. Currently returns -inf';
+
+
+--
 -- Name: _get_match_rule(numeric, numeric, numeric, numeric, bitstamp.live_orders_event, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -203,6 +212,87 @@ ALTER FUNCTION bitstamp._get_match_rule(trade_amount numeric, trade_price numeri
 
 COMMENT ON FUNCTION bitstamp._get_match_rule(trade_amount numeric, trade_price numeric, event_amount numeric, event_fill numeric, event bitstamp.live_orders_event, tolerance numeric) IS 'The function determines the ''ones'' part of the two-digit matching rule code used to match a trade and an event. See the function body for details';
 
+
+--
+-- Name: _order_book_after_event(bitstamp.order_book[], bitstamp.live_orders); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._order_book_after_event(s bitstamp.order_book[], v bitstamp.live_orders) RETURNS bitstamp.order_book[]
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+
+	i bigint;
+
+BEGIN 
+	
+	IF s IS NULL THEN
+		s := ARRAY(SELECT bitstamp.order_book_v(_order_book_after_event.v.microtimestamp));
+ 	ELSE
+		IF _order_book_after_event.v.event <> 'order_created' THEN 
+			s := ARRAY(SELECT  ROW(_order_book_after_event.v.microtimestamp,
+								s_prev.price,
+								s_prev.amount,
+								s_prev.direction,
+								s_prev.order_id,
+								s_prev.microtimestamp,
+								s_prev.event_type,
+								s_prev.pair_id)
+						FROM unnest(s) AS s_prev
+						WHERE s_prev.order_id <> _order_book_after_event.v.order_id);
+		END IF;
+		IF _order_book_after_event.v.event <> 'order_deleted' AND _order_book_after_event.v.is_maker THEN 
+			s := array_append(s, ROW(_order_book_after_event.v.microtimestamp, 
+									 _order_book_after_event.v.price,
+									 _order_book_after_event.v.amount,
+									 _order_book_after_event.v.order_type,
+									 _order_book_after_event.v.order_id,
+									 _order_book_after_event.v.microtimestamp,
+									 _order_book_after_event.v.event,
+									 _order_book_after_event.v.pair_id
+									)::bitstamp.order_book);
+		END IF;												
+	END IF;
+	RETURN s;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp._order_book_after_event(s bitstamp.order_book[], v bitstamp.live_orders) OWNER TO "ob-analytics";
+
+--
+-- Name: _spread_from_order_book(bitstamp.order_book[]); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book[]) RETURNS bitstamp.spread
+    LANGUAGE plpgsql
+    AS $$
+
+	
+DECLARE 
+	
+	spread bitstamp.spread;
+	
+BEGIN
+	WITH price_levels AS (
+		SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r,
+				array_agg(order_id) AS ids
+			    		
+		FROM unnest(s)
+		GROUP BY ts, direction, price
+	)
+	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), b.ids, s.ids INTO spread
+	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s ON TRUE;
+	
+	RETURN spread;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book[]) OWNER TO "ob-analytics";
 
 --
 -- Name: live_trades; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -624,7 +714,7 @@ CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.
     LANGUAGE sql
     AS $$
 
-SELECT best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+SELECT best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, best_bid_order_ids, best_ask_order_ids
 FROM (
 	SELECT a.*, lag(best_bid_price) OVER p AS pbp, lag(best_bid_qty) OVER p AS pbq, lag(best_ask_price) OVER p AS pap, lag(best_ask_qty) OVER p AS paq
 	FROM (
@@ -702,104 +792,13 @@ $$;
 ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: spread_ffunc(bitstamp.order_book[]); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.spread_ffunc(s bitstamp.order_book[]) RETURNS bitstamp.spread
-    LANGUAGE plpgsql
-    AS $$
-
-	
-DECLARE 
-	
-	spread bitstamp.spread;
-	
-BEGIN
-	WITH price_levels AS (
-		SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r
-		FROM unnest(s)
-		GROUP BY ts, direction, price
-	)
-	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts) INTO spread
-	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s ON TRUE;
-	
-	RETURN spread;
-END;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.spread_ffunc(s bitstamp.order_book[]) OWNER TO "ob-analytics";
-
---
--- Name: spread_sfunc(bitstamp.order_book[], bitstamp.live_orders); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.spread_sfunc(s bitstamp.order_book[], v bitstamp.live_orders) RETURNS bitstamp.order_book[]
-    LANGUAGE plpgsql
-    AS $$
-
-DECLARE
-
-	i bigint;
-
-BEGIN 
-	
-	IF s IS NULL THEN
-		s := ARRAY(SELECT bitstamp.order_book_v(spread_sfunc.v.microtimestamp));
- 	ELSE
-		IF spread_sfunc.v.event <> 'order_created' THEN 
-			s := ARRAY(SELECT  ROW(spread_sfunc.v.microtimestamp,
-								s_prev.price,
-								s_prev.amount,
-								s_prev.direction,
-								s_prev.order_id,
-								s_prev.microtimestamp,
-								s_prev.event_type,
-								s_prev.pair_id)
-						FROM unnest(s) AS s_prev
-						WHERE s_prev.order_id <> spread_sfunc.v.order_id);
-		ELSE
-			s := ARRAY(SELECT  ROW(spread_sfunc.v.microtimestamp,
-								s_prev.price,
-								s_prev.amount,
-								s_prev.direction,
-								s_prev.order_id,
-								s_prev.microtimestamp,
-								s_prev.event_type,
-								s_prev.pair_id)
-						FROM unnest(s) AS s_prev
-					  );
-		END IF;
-												
-		IF spread_sfunc.v.event <> 'order_deleted' AND spread_sfunc.v.is_maker THEN 
-			s := array_append(s, ROW(spread_sfunc.v.microtimestamp, 
-									 spread_sfunc.v.price,
-									 spread_sfunc.v.amount,
-									 spread_sfunc.v.order_type,
-									 spread_sfunc.v.order_id,
-									 spread_sfunc.v.microtimestamp,
-									 spread_sfunc.v.event,
-									 spread_sfunc.v.pair_id
-									)::bitstamp.order_book);
-		END IF;												
-	END IF;
-	RETURN s;
-END;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.spread_sfunc(s bitstamp.order_book[], v bitstamp.live_orders) OWNER TO "ob-analytics";
-
---
 -- Name: spread(bitstamp.live_orders); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE AGGREGATE bitstamp.spread(bitstamp.live_orders) (
-    SFUNC = bitstamp.spread_sfunc,
+    SFUNC = bitstamp._order_book_after_event,
     STYPE = bitstamp.order_book[],
-    FINALFUNC = bitstamp.spread_ffunc
+    FINALFUNC = bitstamp._spread_from_order_book
 );
 
 
@@ -901,13 +900,6 @@ ALTER TABLE ONLY bitstamp.pairs
 
 
 --
--- Name: fki_live_orders_fkey_eras; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE INDEX fki_live_orders_fkey_eras ON bitstamp.live_orders USING btree (era);
-
-
---
 -- Name: live_orders a_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -932,7 +924,7 @@ CREATE TRIGGER b_match_trade BEFORE INSERT ON bitstamp.live_orders FOR EACH ROW 
 -- Name: live_orders c_process_agressor; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER c_process_agressor BEFORE INSERT OR UPDATE ON bitstamp.live_orders FOR EACH ROW WHEN (((NOT new.is_maker) AND (new.event <> 'order_created'::bitstamp.live_orders_event))) EXECUTE PROCEDURE bitstamp.live_orders_process_agressor();
+CREATE TRIGGER c_process_agressor BEFORE INSERT OR UPDATE OF is_maker ON bitstamp.live_orders FOR EACH ROW WHEN (((NOT new.is_maker) AND (new.event <> 'order_created'::bitstamp.live_orders_event))) EXECUTE PROCEDURE bitstamp.live_orders_process_agressor();
 
 
 --
