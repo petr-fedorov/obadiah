@@ -218,7 +218,7 @@ COMMENT ON FUNCTION bitstamp._get_match_rule(trade_amount numeric, trade_price n
 --
 
 CREATE FUNCTION bitstamp._order_book_after_event(s bitstamp.order_book[], v bitstamp.live_orders) RETURNS bitstamp.order_book[]
-    LANGUAGE plpgsql
+    LANGUAGE plpgsql STABLE
     AS $$
 
 DECLARE
@@ -241,6 +241,17 @@ BEGIN
 								s_prev.pair_id)
 						FROM unnest(s) AS s_prev
 						WHERE s_prev.order_id <> _order_book_after_event.v.order_id);
+		ELSE
+			-- we still have to update 'ts' !
+			s := ARRAY(SELECT  ROW(_order_book_after_event.v.microtimestamp,	
+								s_prev.price,
+								s_prev.amount,
+								s_prev.direction,
+								s_prev.order_id,
+								s_prev.microtimestamp,
+								s_prev.event_type,
+								s_prev.pair_id)
+						FROM unnest(s) AS s_prev);
 		END IF;
 		IF _order_book_after_event.v.event <> 'order_deleted' AND _order_book_after_event.v.is_maker THEN 
 			s := array_append(s, ROW(_order_book_after_event.v.microtimestamp, 
@@ -267,15 +278,9 @@ ALTER FUNCTION bitstamp._order_book_after_event(s bitstamp.order_book[], v bitst
 --
 
 CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book[]) RETURNS bitstamp.spread
-    LANGUAGE plpgsql
+    LANGUAGE sql IMMUTABLE
     AS $$
 
-	
-DECLARE 
-	
-	spread bitstamp.spread;
-	
-BEGIN
 	WITH price_levels AS (
 		SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r,
 				array_agg(order_id) AS ids
@@ -283,11 +288,8 @@ BEGIN
 		FROM unnest(s)
 		GROUP BY ts, direction, price
 	)
-	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), b.ids, s.ids INTO spread
+	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), b.ids, s.ids
 	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s ON TRUE;
-	
-	RETURN spread;
-END;
 
 $$;
 
@@ -711,21 +713,37 @@ ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.ti
 --
 
 CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.spread
-    LANGUAGE sql
+    LANGUAGE plpgsql STABLE
     AS $$
 
-SELECT best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, best_bid_order_ids, best_ask_order_ids
-FROM (
-	SELECT a.*, lag(best_bid_price) OVER p AS pbp, lag(best_bid_qty) OVER p AS pbq, lag(best_ask_price) OVER p AS pap, lag(best_ask_qty) OVER p AS paq
-	FROM (
-		SELECT (bitstamp.spread(live_orders.*) OVER (ORDER BY microtimestamp)).*  
-		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
-		WHERE microtimestamp BETWEEN oba_spread."start.time" AND oba_spread."end.time" AND pairs.pair = oba_spread.pair
-	) a
-	WINDOW p AS (ORDER BY microtimestamp)
-) b
-WHERE best_bid_price <> pbp	OR best_bid_qty <> pbq OR best_ask_price <> pap OR best_ask_qty <> paq OR NOT "only.different"
-ORDER BY microtimestamp DESC
+DECLARE
+	cur bitstamp.spread;
+	prev bitstamp.spread;
+	ob bitstamp.order_book[];
+	e bitstamp.live_orders;
+	
+BEGIN
+	ob := NULL;
+	prev := ROW(0.0, 0.0, 0.0, 0.0, '1970-01-01'::timestamptz,' {}', '{}') ;
+											 
+	FOR e IN SELECT * 
+			  FROM bitstamp.live_orders 
+			  WHERE microtimestamp BETWEEN oba_spread."start.time" AND oba_spread."end.time" 
+			  ORDER BY microtimestamp
+				LOOP
+		ob := bitstamp._order_book_after_event(ob, e);
+		cur := bitstamp._spread_from_order_book(ob);
+		IF  (cur.best_bid_price <> prev.best_bid_price OR 
+		    cur.best_bid_qty <> prev.best_bid_qty OR
+		    cur.best_ask_price <> prev.best_ask_price OR
+		    cur.best_ask_qty <> prev.best_ask_qty ) 
+			OR NOT oba_spread."only.different" THEN
+			prev := cur;
+			RETURN NEXT cur;
+		END IF;
+	END LOOP;
+	RETURN;
+END;
 
 $$;
 
@@ -790,19 +808,6 @@ $$;
 
 
 ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone) OWNER TO "ob-analytics";
-
---
--- Name: spread(bitstamp.live_orders); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE AGGREGATE bitstamp.spread(bitstamp.live_orders) (
-    SFUNC = bitstamp._order_book_after_event,
-    STYPE = bitstamp.order_book[],
-    FINALFUNC = bitstamp._spread_from_order_book
-);
-
-
-ALTER AGGREGATE bitstamp.spread(bitstamp.live_orders) OWNER TO "ob-analytics";
 
 --
 -- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
