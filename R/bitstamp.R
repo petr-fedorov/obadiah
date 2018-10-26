@@ -2,11 +2,11 @@
 bsDepth <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
 
 
-  query <- paste0(" SELECT \"timestamp\", price, avg(volume) AS volume, side FROM bitstamp.oba_depth(",
+  query <- paste0(" SELECT \"timestamp\", price, volume, side FROM bitstamp.oba_depth(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
                   shQuote(pair),
-                  ") GROUP BY 1, 2, 4 ORDER BY 1, 2 DESC")
+                  ")")
   if(debug.query) cat(query)
   depth <- DBI::dbGetQuery(conn, query)
   depth
@@ -27,15 +27,15 @@ bsTrades <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 
 #' @export
 bsSpread <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
-  query <- paste0(" SELECT 	microtimestamp AS \"timestamp\",
-                            best_bid_price AS \"best.bid.price\",
-                            best_bid_qty AS \"best.bid.volume\",
-                            best_ask_price AS \"best.ask.price\",
-                            best_ask_qty AS \"best.ask.volume\"
+  query <- paste0(" SELECT 	\"timestamp\",
+                            \"best.bid.price\",
+                            \"best.bid.volume\",
+                            \"best.ask.price\",
+                            \"best.ask.volume\"
                     FROM bitstamp.oba_spread(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
-                  shQuote(pair), ") ORDER BY microtimestamp")
+                  shQuote(pair), ") ORDER BY 1")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
   spread

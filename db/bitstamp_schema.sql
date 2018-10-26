@@ -50,6 +50,75 @@ CREATE TYPE bitstamp.live_orders_event AS ENUM (
 ALTER TYPE bitstamp.live_orders_event OWNER TO "ob-analytics";
 
 --
+-- Name: oba_depth; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.oba_depth AS (
+	"timestamp" timestamp with time zone,
+	price numeric,
+	volume numeric,
+	side text
+);
+
+
+ALTER TYPE bitstamp.oba_depth OWNER TO "ob-analytics";
+
+--
+-- Name: oba_event; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.oba_event AS (
+	"event.id" bigint,
+	id bigint,
+	"timestamp" timestamp with time zone,
+	"exchange.timestamp" timestamp with time zone,
+	price numeric,
+	volume numeric,
+	action text,
+	direction text,
+	fill numeric,
+	"matching.event" bigint,
+	type text,
+	"aggressiveness.bps" numeric
+);
+
+
+ALTER TYPE bitstamp.oba_event OWNER TO "ob-analytics";
+
+--
+-- Name: oba_spread; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.oba_spread AS (
+	"best.bid.price" numeric,
+	"best.bid.volume" numeric,
+	"best.ask.price" numeric,
+	"best.ask.volume" numeric,
+	"timestamp" timestamp with time zone
+);
+
+
+ALTER TYPE bitstamp.oba_spread OWNER TO "ob-analytics";
+
+--
+-- Name: oba_trade; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.oba_trade AS (
+	"timestamp" timestamp with time zone,
+	price numeric,
+	volume numeric,
+	direction text,
+	"maker.event.id" bigint,
+	"taker.event.id" bigint,
+	maker bigint,
+	taker bigint
+);
+
+
+ALTER TYPE bitstamp.oba_trade OWNER TO "ob-analytics";
+
+--
 -- Name: order_book; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -89,9 +158,7 @@ CREATE TYPE bitstamp.spread AS (
 	best_bid_qty numeric,
 	best_ask_price numeric,
 	best_ask_qty numeric,
-	microtimestamp timestamp with time zone,
-	best_bid_order_ids bigint[],
-	best_ask_order_ids bigint[]
+	microtimestamp timestamp with time zone
 );
 
 
@@ -255,7 +322,7 @@ BEGIN
 								s_prev.is_maker)
 						FROM unnest(s) AS s_prev);
 		END IF;
-		IF _order_book_after_event.v.event <> 'order_deleted' AND _order_book_after_event.v.is_maker THEN 
+		IF _order_book_after_event.v.event <> 'order_deleted'  THEN 
 			s := array_append(s, ROW(_order_book_after_event.v.microtimestamp, 
 									 _order_book_after_event.v.price,
 									 _order_book_after_event.v.amount,
@@ -264,7 +331,7 @@ BEGIN
 									 _order_book_after_event.v.microtimestamp,
 									 _order_book_after_event.v.event,
 									 _order_book_after_event.v.pair_id,
-									 _order_book_after_event.v.is_maker
+									 TRUE
 									)::bitstamp.order_book);
 		END IF;												
 	END IF;
@@ -285,13 +352,11 @@ CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book[]) RETURN
     AS $$
 
 	WITH price_levels AS (
-		SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r,
-				array_agg(order_id) AS ids
-			    		
+		SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r
 		FROM unnest(s)
 		GROUP BY ts, direction, price
 	)
-	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), b.ids, s.ids
+	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts)
 	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s ON TRUE;
 
 $$;
@@ -432,7 +497,6 @@ BEGIN
 			  WHERE microtimestamp BETWEEN inferred_trades."start.time" AND inferred_trades."end.time" 
 			  ORDER BY microtimestamp
 				LOOP
-		-- RAISE NOTICE '% % % % %', e.order_id, e.order_type, e.event, e.fill, e.trade_id;									   
 									  
 		IF ( e.fill > 0.0 ) OR (e.event <> 'order_created' AND e.fill IS NULL) THEN -- it's part of the trade to be inferred
 			SELECT * INTO trade_part
@@ -444,7 +508,6 @@ BEGIN
 			LIMIT 1;
 									  
 			IF FOUND THEN 
-				-- RAISE NOTICE 'Matched with % % % %', trade_part.order_id, trade_part.event, trade_part.fill, trade_part.trade_id; 									   
 				SELECT ARRAY[a.*] INTO trade_parts 
 				FROM unnest(trade_parts) AS a 
 				WHERE NOT (a.microtimestamp = trade_part.microtimestamp AND a.order_id = trade_part.order_id);
@@ -468,7 +531,6 @@ BEGIN
 								   0::smallint);
 				END IF;												  
 			ELSE
-				-- RAISE NOTICE 'Saved'; 									   											  	
 				trade_parts := array_append(trade_parts, e);
 			END IF;
 		END IF;
@@ -480,7 +542,7 @@ BEGIN
 				sp := bitstamp._spread_from_order_book(ob);
 		END IF;				
 	END LOOP;
-	RAISE NOTICE 'Trade parts %', trade_parts;
+	RAISE NOTICE 'Trade parts without a pair %', trade_parts;
 	RETURN;
 END;
 
@@ -736,79 +798,135 @@ ALTER FUNCTION bitstamp.live_trades_match() OWNER TO "ob-analytics";
 -- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side text, OUT order_id bigint) RETURNS SETOF record
-    LANGUAGE plpgsql
+CREATE FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying) RETURNS SETOF bitstamp.oba_depth
+    LANGUAGE sql
     AS $$
 
-DECLARE 
-	pair_id smallint;
-BEGIN
-
-	SELECT pairs.pair_id INTO pair_id
-	FROM bitstamp.pairs 
-	WHERE pairs.pair = oba_depth.pair;
-	
-	RETURN QUERY SELECT microtimestamp AS "timestamp",
-						  o.price,
-						  CASE WHEN o.event <> 'order_deleted' THEN o.amount ELSE 0.0 END AS volume,
-						  CASE WHEN order_type = 'buy' THEN 'bid' ELSE 'ask' END as side,
-						  o.order_id
-				  FROM  ( SELECT *, min(live_orders.price) OVER o <> max(live_orders.price) OVER o AS pacman
-				  		   FROM bitstamp.live_orders
-				  		   WHERE microtimestamp BETWEEN ( SELECT MAX(era) 
-														 	FROM bitstamp.live_orders_eras 
-														    WHERE era <= oba_depth."end.time" ) 
-						 								AND oba_depth."end.time"
-						   WINDOW o AS (PARTITION BY live_orders.order_id)
-						 ) o
-				  WHERE NOT pacman 
-				  	AND (    ( microtimestamp <= oba_depth."start.time" AND next_microtimestamp > oba_depth."start.time") 
-						  OR ( microtimestamp BETWEEN oba_depth."start.time" AND oba_depth."end.time")
-					     )
-				    AND is_maker;
-END;
-
+ WITH spread AS (
+		  SELECT *
+		  FROM bitstamp.spread_after_event(oba_depth."start.time",oba_depth."end.time", "only.different" := FALSE)
+	  ),
+	  events AS (
+		SELECT microtimestamp, 
+		  		price,
+		  		CASE event WHEN 'order_deleted' THEN 0.0 ELSE amount END AS amount, 
+		  		order_type
+		FROM bitstamp.live_orders
+		WHERE microtimestamp BETWEEN oba_depth."start.time" AND oba_depth."end.time" 
+	  )
+  SELECT microtimestamp AS "timestamp",
+		  price, 
+		  SUM(amount) AS volume,
+		  CASE order_type 
+		  	WHEN 'buy' THEN 'bid'::text
+			WHEN 'sell' THEN 'ask'::text 
+		  END AS direction
+  FROM events JOIN spread USING (microtimestamp)	-- INNER JOIN here is enough to remove all 'taker' events
+  GROUP BY 1,2,4, order_type
+  ORDER BY 1;
 $$;
 
 
-ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT side text, OUT order_id bigint) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_event(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.oba_event
+    LANGUAGE sql STABLE
+    AS $$
+
+ WITH trades AS (
+		SELECT * 
+		FROM bitstamp.inferred_trades(oba_event."start.time",oba_event."end.time", "only.missing" := FALSE)
+	   ),
+	  takers AS (
+		  SELECT DISTINCT buy_order_id AS order_id
+		  FROM trades
+		  WHERE trade_type = 'buy'
+		  UNION	-- not ALL, unique
+		  SELECT DISTINCT sell_order_id AS order_id
+		  FROM trades
+		  WHERE trade_type = 'sell'				
+		),
+	  spread AS (
+		  SELECT *
+		  FROM bitstamp.spread_after_event(oba_event."start.time",oba_event."end.time", "only.different" := FALSE)
+	  ),
+	  makers AS (
+		  SELECT DISTINCT buy_order_id AS order_id
+		  FROM trades
+		  WHERE trade_type = 'sell'
+		  UNION -- not ALL, unique
+		  SELECT DISTINCT sell_order_id AS order_id
+		  FROM trades
+		  WHERE trade_type = 'buy'				
+		),
+	  events AS (
+		SELECT row_number() OVER (ORDER BY microtimestamp, order_id) AS event_id,
+		  		live_orders.*,
+		  		MAX(price) OVER o_all <> MIN(price) OVER o_all AS order_price_ever_changed,
+		  		makers.order_id IS NOT NULL AS is_maker,
+		  	    takers.order_id IS NOT NULL AS is_taker,
+		  		first_value(event) OVER o_after = 'order_deleted' AS is_deleted
+		FROM bitstamp.live_orders LEFT JOIN makers USING (order_id) LEFT JOIN takers USING (order_id) 
+		WHERE microtimestamp BETWEEN oba_event."start.time" AND oba_event."end.time" 
+		WINDOW o_all AS (PARTITION BY order_id), 
+		  		o_after AS (PARTITION BY order_id ORDER BY microtimestamp DESC)
+	  ),
+	  event_connection AS (
+		  SELECT buy_microtimestamp AS microtimestamp, 
+		  		  buy_order_id AS order_id, 
+		  		  events.event_id
+		  FROM trades JOIN events ON sell_microtimestamp = microtimestamp AND sell_order_id = order_id
+		  UNION ALL
+		  SELECT sell_microtimestamp AS microtimestamp, 
+		  		  sell_order_id AS order_id, 
+		  		  events.event_id
+		  FROM trades JOIN events ON buy_microtimestamp = microtimestamp AND buy_order_id = order_id
+	  )
+  SELECT events.event_id AS "event.id",
+  		  order_id AS id,
+		  microtimestamp AS "timestamp",
+		  datetime AS "exchange.timestamp",
+		  price, 
+		  amount AS volume,
+		  event::text AS action,
+		  order_type::text AS direction,
+		  CASE WHEN fill > 0.0 THEN fill
+		  		ELSE 0.0
+		  END AS fill,
+		  event_connection.event_id AS "matching.event",
+		  CASE WHEN order_price_ever_changed THEN 'pacman'::text
+		  	    WHEN NOT is_maker AND NOT is_taker AND is_deleted THEN 'flashing-limit'::text
+				WHEN NOT is_maker AND NOT is_taker AND NOT is_deleted THEN 'resting-limit'::text
+				WHEN is_maker AND NOT is_taker THEN 'resting-limit'::text
+				WHEN NOT is_maker AND is_taker AND is_deleted THEN 'market'::text
+				WHEN NOT is_maker AND is_taker AND NOT is_deleted THEN 'market-limit'::text
+				WHEN is_maker AND is_taker THEN 'market-limit'::text
+		  		ELSE NULL::text 
+		  END AS "type",
+			CASE order_type 
+		  		WHEN 'sell' THEN round((best_ask_price - price)/best_ask_price*10000)
+		  		WHEN 'buy' THEN round((price - best_bid_price)/best_ask_price*10000)
+		  	END AS "aggressiveness.bps"
+  FROM events LEFT JOIN event_connection USING (microtimestamp, order_id) LEFT JOIN spread USING (microtimestamp)
+  ORDER BY microtimestamp, order_id;
+$$;
+
+
+ALTER FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_spread(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.spread
-    LANGUAGE plpgsql STABLE
+CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.oba_spread
+    LANGUAGE sql STABLE
     AS $$
-
-DECLARE
-	cur bitstamp.spread;
-	prev bitstamp.spread;
-	ob bitstamp.order_book[];
-	e bitstamp.live_orders;
-	
-BEGIN
-	ob := NULL;
-	prev := ROW(0.0, 0.0, 0.0, 0.0, '1970-01-01'::timestamptz,' {}', '{}') ;
-											 
-	FOR e IN SELECT * 
-			  FROM bitstamp.live_orders 
-			  WHERE microtimestamp BETWEEN oba_spread."start.time" AND oba_spread."end.time" 
-			  ORDER BY microtimestamp LOOP
-		ob := bitstamp._order_book_after_event(ob, e);
-		cur := bitstamp._spread_from_order_book(ob);
-		IF  (cur.best_bid_price <> prev.best_bid_price OR 
-			cur.best_bid_qty <> prev.best_bid_qty OR
-			cur.best_ask_price <> prev.best_ask_price OR
-			cur.best_ask_qty <> prev.best_ask_qty ) 
-			OR NOT oba_spread."only.different" THEN
-			prev := cur;
-			RETURN NEXT cur;
-		END IF;
-	END LOOP;
-	RETURN;
-END;
-
+	SELECT best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+	FROM bitstamp.spread_after_event(oba_spread."start.time" ,oba_spread."end.time", oba_spread.pair, oba_spread."only.different")
 $$;
 
 
@@ -818,32 +936,62 @@ ALTER FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.t
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction text, OUT id bigint) RETURNS SETOF record
+CREATE FUNCTION bitstamp.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.oba_trade
     LANGUAGE sql
     SET work_mem TO '1GB'
     AS $$
 
-	WITH trades AS (
-		SELECT CASE WHEN trade_type = 'sell' THEN COALESCE(buy_microtimestamp, sell_microtimestamp)	  -- trade can be matched partially so will use the available
-					  ELSE COALESCE(sell_microtimestamp, buy_microtimestamp) END AS "timestamp",	   --  non-NULL value if the appropriate value is not defined
-				live_trades.price,
-				live_trades.amount AS volume,
-				live_trades.trade_type::text,
-				live_trades.trade_id AS id
-		FROM bitstamp.live_trades JOIN bitstamp.pairs USING (pair_id)
-		WHERE pairs.pair = oba_trades.pair
-		  AND ( buy_microtimestamp  BETWEEN oba_trades."start.time" AND oba_trades."end.time"
-		        OR sell_microtimestamp BETWEEN oba_trades."start.time" AND oba_trades."end.time"
-			   )
-	)
-	SELECT *
-	FROM trades
-	WHERE "timestamp" BETWEEN oba_trades."start.time" AND oba_trades."end.time"
+ WITH trades AS (
+		SELECT * 
+		FROM bitstamp.inferred_trades(oba_trades."start.time",oba_trades."end.time", "only.missing" := FALSE)
+	   ),
+	  events AS (
+		SELECT row_number() OVER (ORDER BY microtimestamp, order_id) AS event_id,
+		  		live_orders.*
+		FROM bitstamp.live_orders
+		WHERE microtimestamp BETWEEN oba_trades."start.time" AND oba_trades."end.time" 
+	  ),
+	  event_connection AS (
+		  SELECT buy_microtimestamp AS microtimestamp, 
+		  		  buy_order_id AS order_id, 
+		  		  events.event_id,
+		  		  sell_order_id AS connected_order_id
+		  FROM trades JOIN events ON sell_microtimestamp = microtimestamp AND sell_order_id = order_id
+		  UNION ALL
+		  SELECT sell_microtimestamp AS microtimestamp, 
+		  		  sell_order_id AS order_id, 
+		  		  events.event_id,
+		  		  buy_order_id AS connected_order_id
+		  FROM trades JOIN events ON buy_microtimestamp = microtimestamp AND buy_order_id = order_id
+	  )
+  SELECT trade_timestamp AS "timestamp",
+  		  price,
+		  amount AS volume,
+		  trade_type::text AS direction,
+		  CASE trade_type
+		  	WHEN 'buy' THEN s.event_id
+			WHEN 'sell' THEN b.event_id
+		  END AS "maker.event.id",
+		  CASE trade_type
+		  	WHEN 'buy' THEN b.event_id
+			WHEN 'sell' THEN s.event_id
+		  END AS "maker.event.id",
+		  CASE trade_type
+		  	WHEN 'buy' THEN s.connected_order_id
+			WHEN 'sell' THEN b.connected_order_id
+		  END AS maker,
+		  CASE trade_type
+		  	WHEN 'buy' THEN b.connected_order_id
+			WHEN 'sell' THEN s.connected_order_id
+		  END AS taker			
+  FROM trades JOIN event_connection b ON buy_microtimestamp = b.microtimestamp AND buy_order_id = b.order_id 
+  		JOIN event_connection s ON sell_microtimestamp = s.microtimestamp AND sell_order_id = s.order_id 
+  ORDER BY trade_timestamp;
 
 $$;
 
 
-ALTER FUNCTION bitstamp.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction text, OUT id bigint) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_v(timestamp with time zone, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -881,6 +1029,50 @@ $$;
 
 
 ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: spread_after_event(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.spread
+    LANGUAGE plpgsql STABLE
+    AS $$
+
+DECLARE
+	cur bitstamp.spread;
+	prev bitstamp.spread;
+	ob bitstamp.order_book[];
+	e bitstamp.live_orders;
+	
+BEGIN
+	ob := NULL;
+	prev := ROW(NULL, 0.0, NULL, 0.0, '1970-01-01'::timestamptz);	-- the widest spread - see IF below
+											 
+	FOR e IN SELECT * FROM bitstamp.live_orders 
+			  WHERE microtimestamp BETWEEN spread_after_event."start.time" AND spread_after_event."end.time" 
+			  ORDER BY microtimestamp LOOP
+		IF ( e.order_type = 'buy' AND e.price < COALESCE(prev.best_ask_price, e.price+1)  ) 
+			 OR ( e.order_type = 'sell' AND e.price > COALESCE(prev.best_bid_price, e.price - 1) ) THEN 
+			-- it's a liquidity maker event, so we'll process it 
+			ob := bitstamp._order_book_after_event(ob, e);
+			cur := bitstamp._spread_from_order_book(ob);
+			IF  (cur.best_bid_price <> prev.best_bid_price OR 
+				cur.best_bid_qty <> prev.best_bid_qty OR
+				cur.best_ask_price <> prev.best_ask_price OR
+				cur.best_ask_qty <> prev.best_ask_qty ) 
+				OR NOT spread_after_event."only.different" THEN
+				prev := cur;
+				RETURN NEXT cur;
+			END IF;
+		END IF;
+	END LOOP;
+	RETURN;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
