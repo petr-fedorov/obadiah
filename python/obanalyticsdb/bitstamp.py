@@ -37,7 +37,13 @@ class Stockkeeper(Spawned):
         logger = logging.getLogger(self.__module__ + "."
                                    + self.__class__.__qualname__)
         q_ordered = Queue()
-        reorderer = Reorderer(self.q_unordered, q_ordered, self.stop_flag)
+
+        # Bitstamp once sent 'order_created' 1.01 seconds after 'order_deleted'
+        # for the same order, so delay set to 3 seconds to be on the safe side
+
+        reorderer = Reorderer(self.q_unordered, q_ordered, self.stop_flag,
+                              delay=3)
+
         reorder = Thread(target=reorderer.run)
         reorder.start()
 
