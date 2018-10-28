@@ -834,10 +834,10 @@ $$;
 ALTER FUNCTION bitstamp.live_trades_match() OWNER TO "ob-analytics";
 
 --
--- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying, boolean); Type: FUNCTION; Schema: bitstamp; Owner: postgres
 --
 
-CREATE FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying) RETURNS SETOF bitstamp.oba_depth
+CREATE FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, strict boolean DEFAULT false) RETURNS SETOF bitstamp.oba_depth
     LANGUAGE sql
     AS $$
 
@@ -845,13 +845,42 @@ CREATE FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.t
 		  SELECT *
 		  FROM bitstamp.spread_after_event(oba_depth."start.time",oba_depth."end.time", "only.different" := FALSE)
 	  ),
-	  events AS (
+	  base_events AS (
 		SELECT microtimestamp, 
 		  		price,
 		  		CASE event WHEN 'order_deleted' THEN 0.0 ELSE amount END AS amount, 
-		  		order_type
+		  		order_type,
+		  		order_id
 		FROM bitstamp.live_orders
 		WHERE microtimestamp BETWEEN oba_depth."start.time" AND oba_depth."end.time" 
+		UNION ALL
+		SELECT (SELECT MIN(microtimestamp) FROM spread), -- all these events will 'happens' at the start of the interval
+		  		price,
+		  		CASE event WHEN 'order_deleted' THEN 0.0 ELSE amount END AS amount, 
+		  		order_type,
+		  		order_id
+		FROM bitstamp.live_orders
+		WHERE NOT oba_depth.strict 
+		  AND microtimestamp BETWEEN (SELECT max(era) 
+									   FROM bitstamp.live_orders_eras 
+									   WHERE era < oba_depth."start.time" ) AND oba_depth."start.time" 
+		  AND next_microtimestamp > oba_depth."start.time" 
+	  ),
+	  events AS (
+		  SELECT microtimestamp,
+		  		  price,
+		  		  amount,
+		  		  order_type
+		  FROM base_events
+		  UNION ALL
+		  SELECT microtimestamp,
+		  		  prev_price,		-- add an artifical price-level removal event in case order pirce has changed
+		  		  0,
+		  		  order_type
+		  FROM ( SELECT *, lag(price) OVER (PARTITION BY order_id ORDER BY microtimestamp) AS prev_price
+		  		  FROM base_events
+		        ) a
+		  WHERE price <> prev_price
 	  )
   SELECT microtimestamp AS "timestamp",
 		  price, 
@@ -861,14 +890,15 @@ CREATE FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.t
 			WHEN 'sell' THEN 'ask'::text 
 		  END AS direction
   FROM events JOIN spread USING (microtimestamp)
-  WHERE (order_type = 'buy' AND price < best_ask_price) OR (order_type = 'sell' AND price > best_bid_price) 	-- only makers
+  WHERE amount = 0.0	-- it is normal for an order removal event to occur beyound spread
+     OR (order_type = 'buy' AND price < best_ask_price) OR (order_type = 'sell' AND price > best_bid_price) 	-- only makers
   GROUP BY 1,2,4, order_type
   ORDER BY 1;
 
 $$;
 
 
-ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, strict boolean) OWNER TO postgres;
 
 --
 -- Name: oba_event(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -960,18 +990,30 @@ $$;
 ALTER FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean) OWNER TO "ob-analytics";
 
 --
--- Name: oba_spread(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: oba_spread(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.oba_spread
+CREATE FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true, strict boolean DEFAULT false) RETURNS SETOF bitstamp.oba_spread
     LANGUAGE sql STABLE
     AS $$
+
+-- ARGUMENTS
+--	See bitstamp.spread_after_event()
+
 	SELECT best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
-	FROM bitstamp.spread_after_event(oba_spread."start.time" ,oba_spread."end.time", oba_spread.pair, oba_spread."only.different")
+	FROM bitstamp.spread_after_event(oba_spread."start.time" ,oba_spread."end.time", oba_spread.pair, oba_spread."only.different", oba_spread."strict")
+
 $$;
 
 
-ALTER FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitstamp.oba_spread("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each event in the ''live_orders'' table that hits the interval between "start.time" and "end.time" for the given "pair" and in the format expected by  obAnalytics package. The spread is calculated using all available data before "start.time" unless "strict" is set to TRUE. In the latter case the spread is caclulated using only events within the interval between "start.time" and "end.time". ';
+
 
 --
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1076,12 +1118,19 @@ $$;
 ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean) OWNER TO "ob-analytics";
 
 --
--- Name: spread_after_event(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: spread_after_event(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true) RETURNS SETOF bitstamp.spread
+CREATE FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true, strict boolean DEFAULT false) RETURNS SETOF bitstamp.spread
     LANGUAGE plpgsql STABLE
     AS $$
+
+-- ARGUMENTS
+--		"start.time" - the start of the interval for the calculation of spreads
+--		"end.time"	 - the end of the interval
+--		"pair"		 - the pair for which spreads will be calculated
+--		"only.different"	- whether to output the spread only when it is different from the previous one (true) or after each event (false). true is the default.
+--		"strict"		- whether to calculate the spread using events before "start.time" (false) or not (false). 
 
 DECLARE
 	cur bitstamp.spread;
@@ -1090,7 +1139,12 @@ DECLARE
 	e bitstamp.live_orders;
 	
 BEGIN
-	ob := NULL;
+	IF spread_after_event."strict" THEN 
+		ob := '{}';	-- only the events within the ["start.time", "end.time"] interval will be used
+	ELSE
+		ob := NULL;	-- this will force bitstamp._order_book_after_event() to load events before the "start.time" and thus to calculate an entry spread for the interval
+	END IF;
+	
 	prev := ROW(NULL, 0.0, NULL, 0.0, '1970-01-01'::timestamptz);	-- the widest spread - see IF below
 											 
 	FOR e IN SELECT * FROM bitstamp.live_orders 
@@ -1113,7 +1167,14 @@ END;
 $$;
 
 
-ALTER FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each event in the ''live_orders'' table that hits the interval between "start.time" and "end.time" for the given "pair". The spread is calculated using all available data before "start.time" unless "strict" is set to TRUE. In the latter case the spread is caclulated using only events within the interval between "start.time" and "end.time"';
+
 
 --
 -- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
