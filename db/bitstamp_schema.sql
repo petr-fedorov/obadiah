@@ -499,6 +499,70 @@ $$;
 ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval) OWNER TO "ob-analytics";
 
 --
+-- Name: find_and_repair_eternal_orders(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.find_and_repair_eternal_orders(ts_within_era timestamp with time zone) RETURNS SETOF bitstamp.live_orders
+    LANGUAGE sql
+    AS $$
+WITH time_range AS (
+	SELECT *
+	FROM (
+		SELECT era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
+		FROM bitstamp.live_orders_eras
+	) r
+	WHERE find_and_repair_eternal_orders.ts_within_era BETWEEN r."start.time" AND r."end.time"
+),
+eternal_orders AS (
+	SELECT *
+	FROM bitstamp.live_orders 
+	WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
+	  AND event <> 'order_deleted'
+	  AND next_microtimestamp = 'Infinity'::timestamptz
+),
+filled_orders AS (
+	SELECT *
+	FROM bitstamp.live_orders 
+	WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
+	  AND fill > 0
+)
+INSERT INTO bitstamp.live_orders
+SELECT o.order_id,
+		o.amount,
+		'order_deleted'::bitstamp.live_orders_event,
+		o.order_type,
+		o.datetime,
+		n.microtimestamp - '00:00:00.000001'::interval,	-- the cancellation will be just before the crossing event 
+		NULL::timestamptz, -- we didn't receive this event from Bitstamp!
+		o.pair_id,
+		o.price,
+		0.0::numeric,	-- the order had been cancelled 
+		'Infinity'::timestamptz,
+		o.era,
+		NULL::timestamptz,
+		NULL::bigint
+FROM eternal_orders o
+	 JOIN LATERAL (	 -- the first 'filled' order that crossed the 'eternal' order. The latter had to be cancelled before but for some reason wasn't
+		 			  SELECT microtimestamp	
+				  	  FROM filled_orders i
+				   	  WHERE i.microtimestamp > o.microtimestamp
+				   		AND i.order_type = o.order_type
+				   		AND i.order_id <> o.order_id -- this is a redundant condition because eternal_orders.next_microtimestamp would not be infinity. But just in case ...
+				   	    AND CASE o.order_type
+				   				WHEN 'buy' THEN i.price <= o.price
+				   				WHEN 'sell' THEN i.price >= o.price
+				   			END
+				   	  ORDER BY microtimestamp
+				   	  LIMIT 1
+				  ) n ON TRUE
+RETURNING *	
+
+$$;
+
+
+ALTER FUNCTION bitstamp.find_and_repair_eternal_orders(ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
 -- Name: inferred_trades(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
