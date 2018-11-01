@@ -1,14 +1,18 @@
 #' @export
-bsDepth <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
+bsDepth <- function(conn, start.time, end.time, pair="BTCUSD", strict = FALSE, debug.query = FALSE) {
 
 
-  query <- paste0(" SELECT \"timestamp\", price, volume, side FROM bitstamp.oba_depth(",
+  query <- paste0(" SELECT date_trunc('milliseconds', \"timestamp\") AS \"timestamp\",
+                           price, volume, side FROM bitstamp.oba_depth(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
-                  shQuote(pair),
+                  shQuote(pair), ",",
+                  strict,
                   ")")
   if(debug.query) cat(query)
   depth <- DBI::dbGetQuery(conn, query)
+  depth$side <- factor(depth$side, c("bid", "ask"))
+  attr(depth$timestamp, 'tzone') <- ""
   depth
 }
 
@@ -33,7 +37,7 @@ bsTrades <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 
 
 #' @export
-bsSpread <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
+bsSpread <- function(conn, start.time, end.time, pair="BTCUSD", strict = FALSE, debug.query = FALSE) {
   query <- paste0(" SELECT 	\"timestamp\",
                             \"best.bid.price\",
                             \"best.bid.volume\",
@@ -42,7 +46,10 @@ bsSpread <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
                     FROM bitstamp.oba_spread(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
-                  shQuote(pair), ") ORDER BY 1")
+                  shQuote(pair),", ",
+                  "TRUE , ",
+                  strict,
+                  " ) ORDER BY 1")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
   spread
@@ -53,7 +60,7 @@ bsSpread <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FALSE) {
   query <- paste0(" SELECT 	\"event.id\"::integer,
                   \"id\"::numeric,
-                  \"timestamp\",
+                  date_trunc('milliseconds', \"timestamp\") AS \"timestamp\",
                   \"exchange.timestamp\",
                   price,
                   volume,
@@ -62,7 +69,8 @@ bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
                   fill,
                   \"matching.event\"::integer,
                   \"type\",
-                  \"aggressiveness.bps\"
+                  \"aggressiveness.bps\",
+                  \"real.trade.id\"
                   FROM bitstamp.oba_event(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
@@ -71,6 +79,8 @@ bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
   events <- DBI::dbGetQuery(conn, query)
   events$action <- factor(events$action, c("created", "changed", "deleted"))
   events$direction <- factor(events$direction, c("bid", "ask"))
+  events$type <- factor(events$type, c("unknown", "flashed-limit",
+                                       "resting-limit", "market-limit", "pacman", "market"))
   events
 }
 
@@ -78,10 +88,10 @@ bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 #' @export
 bsExportEvents <- function(conn, start.time, end.time, pair="BTCUSD", file = "events.csv", debug.query = FALSE) {
   query <- paste0(" SELECT 	order_id AS id,
-                            EXTRACT(EPOCH FROM microtimestamp)*1000 AS timestamp,
-                            EXTRACT(EPOCH FROM datetime)*1000 AS \"exchange.timestamp\",
+                            EXTRACT(EPOCH FROM date_trunc('milliseconds', microtimestamp))*1000 AS timestamp,
+                            EXTRACT(EPOCH FROM date_trunc('milliseconds', datetime))*1000 AS \"exchange.timestamp\",
                             price,
-                            amount AS volume,
+                            round(amount,8) AS volume,
                             CASE event
                               WHEN 'order_created' THEN 'created'::text
                               WHEN 'order_changed' THEN 'changed'::text
