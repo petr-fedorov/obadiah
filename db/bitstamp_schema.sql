@@ -81,6 +81,21 @@ CREATE TYPE bitstamp.oba_depth AS (
 ALTER TYPE bitstamp.oba_depth OWNER TO "ob-analytics";
 
 --
+-- Name: oba_depth_summary; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.oba_depth_summary AS (
+	"timestamp" timestamp with time zone,
+	price numeric,
+	volume numeric,
+	side text,
+	bps_level integer
+);
+
+
+ALTER TYPE bitstamp.oba_depth_summary OWNER TO "ob-analytics";
+
+--
 -- Name: oba_event; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1000,6 +1015,63 @@ $$;
 ALTER FUNCTION bitstamp.oba_depth("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, strict boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, character varying, boolean, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.oba_depth_summary("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying DEFAULT 'BTCUSD'::character varying, strict boolean DEFAULT false, bps_step numeric DEFAULT 25) RETURNS SETOF bitstamp.oba_depth_summary
+    LANGUAGE sql STABLE
+    AS $$
+
+
+WITH events AS (
+	SELECT MIN(price) FILTER (WHERE direction = 'sell') OVER (PARTITION BY ts) AS best_ask_price, 
+			MAX(price) FILTER (WHERE direction = 'buy') OVER (PARTITION BY ts) AS best_bid_price, * 
+	FROM bitstamp.order_book_after_event('2018-10-28 23:26:30+03','2018-10-28 23:28:55+03','BTCUSD', FALSE)
+	WHERE is_maker 
+),
+events_with_bps_levels AS (
+	SELECT ts, 
+			amount, 
+			price,
+			direction,
+			CASE direction
+				WHEN 'sell' THEN ceiling((price-best_ask_price)/best_ask_price/oba_depth_summary.bps_step*10000)::integer
+				WHEN 'buy' THEN ceiling((best_bid_price - price)/best_bid_price/oba_depth_summary.bps_step*10000)::integer 
+			END AS bps_level,
+			best_ask_price,
+			best_bid_price,
+			pair_id
+	FROM events 
+),
+events_with_price_adjusted AS (
+	SELECT ts,
+			amount,
+			CASE direction
+				WHEN 'sell' THEN round(best_ask_price*(1 + bps_level*oba_depth_summary.bps_step/10000), pairs."R0")
+				WHEN 'buy' THEN round(best_bid_price*(1 - bps_level*oba_depth_summary.bps_step/10000), pairs."R0") 
+			END AS price,
+			CASE direction
+				WHEN 'sell' THEN 'ask'::text
+				WHEN 'buy'	THEN 'bid'::text
+			END AS side,
+			bps_level
+	FROM events_with_bps_levels JOIN bitstamp.pairs USING (pair_id)
+)
+SELECT ts, 
+		price, 
+		SUM(amount) AS volume, 
+		side, 
+		bps_level*oba_depth_summary.bps_step::integer
+FROM events_with_price_adjusted
+GROUP BY 1, 2, 4, 5
+
+
+$$;
+
+
+ALTER FUNCTION bitstamp.oba_depth_summary("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, strict boolean, bps_step numeric) OWNER TO "ob-analytics";
+
+--
 -- Name: oba_event(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1185,6 +1257,52 @@ $$;
 
 
 ALTER FUNCTION bitstamp.oba_trade("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text) OWNER TO "ob-analytics";
+
+--
+-- Name: order_book_after_event(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.order_book_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, strict boolean DEFAULT false) RETURNS SETOF bitstamp.order_book
+    LANGUAGE plpgsql STABLE
+    AS $$
+
+-- ARGUMENTS
+--		"start.time" - the start of the interval for the calculation of order books
+--		"end.time"	 - the end of the interval
+--		"pair"		 - the pair for which order books will be calculated
+--		"strict"		- whether to calculate order books using events before "start.time" (false) or not (false). 
+
+DECLARE
+	ob bitstamp.order_book[];
+	e bitstamp.live_orders;
+	
+	depth_before_event bitstamp.depth[];
+	order_book_after_event bitstamp.depth[];
+	
+BEGIN
+	IF order_book_after_event."strict" THEN 
+		ob := '{}';	-- only the events within the ["start.time", "end.time"] interval will be used
+	ELSE
+		ob := NULL;	-- this will force bitstamp._order_book_after_event() to load events before the "start.time" and thus to calculate an entry depth for the interval
+	END IF;
+	
+	FOR e IN SELECT live_orders.* FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
+			  WHERE microtimestamp BETWEEN order_book_after_event."start.time" AND order_book_after_event."end.time" 
+			    AND pairs.pair = order_book_after_event.pair 
+			  ORDER BY microtimestamp LOOP
+			  
+		ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);	-- we need to keep takers in case they will become makers later on?
+
+		RETURN QUERY SELECT * FROM  unnest(ob);
+										   
+	END LOOP;
+	RETURN;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.order_book_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, strict boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_v(timestamp with time zone, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
