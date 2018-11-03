@@ -1026,7 +1026,10 @@ CREATE FUNCTION bitstamp.oba_depth_summary("start.time" timestamp with time zone
 WITH events AS (
 	SELECT MIN(price) FILTER (WHERE direction = 'sell') OVER (PARTITION BY ts) AS best_ask_price, 
 			MAX(price) FILTER (WHERE direction = 'buy') OVER (PARTITION BY ts) AS best_bid_price, * 
-	FROM bitstamp.order_book_after_event('2018-10-28 23:26:30+03','2018-10-28 23:28:55+03','BTCUSD', FALSE)
+	FROM bitstamp.order_book_after_event(oba_depth_summary."start.time",
+										 oba_depth_summary."end.time",
+										 oba_depth_summary.pair,
+										 oba_depth_summary.strict)
 	WHERE is_maker 
 ),
 events_with_bps_levels AS (
@@ -1274,10 +1277,12 @@ CREATE FUNCTION bitstamp.order_book_after_event("start.time" timestamp with time
 
 DECLARE
 	ob bitstamp.order_book[];
+	empty_order_book bitstamp.order_book[];
+	
 	e bitstamp.live_orders;
 	
-	depth_before_event bitstamp.depth[];
-	order_book_after_event bitstamp.depth[];
+	volume_before numeric[];
+	volume_after numeric[];
 	
 BEGIN
 	IF order_book_after_event."strict" THEN 
@@ -1291,9 +1296,33 @@ BEGIN
 			    AND pairs.pair = order_book_after_event.pair 
 			  ORDER BY microtimestamp LOOP
 			  
+		volume_before := ARRAY( 
+			SELECT amount
+			FROM unnest(ob) o
+			WHERE is_maker 
+			ORDER BY price, microtimestamp
+			);
+			
 		ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);	-- we need to keep takers in case they will become makers later on?
-
-		RETURN QUERY SELECT * FROM  unnest(ob);
+		
+		volume_after := ARRAY( 
+			SELECT amount
+			FROM unnest(ob) o
+			WHERE is_maker 
+			ORDER BY price, microtimestamp
+			);
+			
+		IF volume_after = '{}' AND volume_before <> '{}' THEN -- the order book is empty
+			empty_order_book := ARRAY[ ROW(e.microtimestamp, NULL, 0.0, 'sell'::bitstamp.direction, e.order_id, NULL, NULL, e.pair_id, TRUE, NULL),
+  					      				ROW(e.microtimestamp, NULL, 0.0, 'buy'::bitstamp.direction, e.order_id, NULL, NULL, e.pair_id, TRUE, NULL)
+									  ];
+			RETURN QUERY SELECT * FROM  unnest(empty_order_book);
+											 
+		ELSIF  volume_before <> volume_after THEN 
+											 
+			RETURN QUERY SELECT * FROM  unnest(ob);
+											 
+		END IF;
 										   
 	END LOOP;
 	RETURN;
