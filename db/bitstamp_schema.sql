@@ -316,6 +316,28 @@ COMMENT ON FUNCTION bitstamp._get_match_rule(trade_amount numeric, trade_price n
 
 
 --
+-- Name: _in_milliseconds(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) RETURNS text
+    LANGUAGE sql IMMUTABLE
+    AS $$
+
+SELECT ( ( EXTRACT( EPOCH FROM (_in_milliseconds.ts - '1514754000 seconds'::interval) )::numeric(20,5) + 1514754000 )*1000 )::text;
+
+$$;
+
+
+ALTER FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION _in_milliseconds(ts timestamp with time zone); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) IS 'Since R''s POSIXct is not able to handle time with the precision higher than 0.1 of millisecond, this function converts timestamp to text with this precision to ensure that the timestamps are not mangled by an interface between Postgres and R somehow.';
+
+
+--
 -- Name: _order_book_after_event(bitstamp.order_book[], bitstamp.live_orders, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
