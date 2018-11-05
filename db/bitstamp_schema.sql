@@ -684,6 +684,106 @@ $$;
 ALTER FUNCTION bitstamp.find_and_repair_eternal_orders(ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
+-- Name: find_and_repair_ex_nihilo_orders(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.find_and_repair_ex_nihilo_orders(ts_within_era timestamp with time zone) RETURNS SETOF bitstamp.live_orders
+    LANGUAGE sql
+    AS $$
+
+WITH time_range AS (
+	SELECT *
+	FROM (
+		SELECT era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
+		FROM bitstamp.live_orders_eras
+	) r
+	WHERE find_and_repair_ex_nihilo_orders.ts_within_era BETWEEN r."start.time" AND r."end.time"
+),
+events_with_first_event AS (
+	SELECT *, first_value(event) OVER o AS first_event, first_value(microtimestamp) OVER o AS first_microtimestamp
+	FROM bitstamp.live_orders 
+	WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
+	WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
+)
+INSERT INTO bitstamp.live_orders
+SELECT o.order_id,
+		o.amount + COALESCE(o.fill,0),			-- our best guess of the order amount when it was created
+		'order_created'::bitstamp.live_orders_event,
+		o.order_type,
+		o.datetime,
+		CASE WHEN o.datetime < o.era THEN o.era ELSE o.datetime END,	  -- the creation event will be at the start of the current era if the order 
+																			 -- was created earlier or it's creation time known up to a second
+		NULL::timestamptz, -- we didn't receive this event from Bitstamp!
+		o.pair_id,
+		o.price,
+		o.fill,	
+		o.microtimestamp, 	-- we know the next event microtimestamp precisely!
+		o.era,
+		NULL::timestamptz,
+		NULL::bigint
+FROM events_with_first_event o
+WHERE o.first_event <> 'order_created' 
+  AND microtimestamp = first_microtimestamp	-- i.e. only the first known event for each order_id
+  AND ( ( trade_id IS NULL AND fill IS NULL )	-- fill is used to determine 'order_created' amount, so we temporarily ignore inconsisten events.
+	    OR 										 -- They might be included later when they are repaired.
+	    ( trade_id IS NOT NULL AND fill IS NOT NULL )
+	   )
+RETURNING *	
+
+$$;
+
+
+ALTER FUNCTION bitstamp.find_and_repair_ex_nihilo_orders(ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: find_and_repair_missing_fill(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.find_and_repair_missing_fill(ts_within_era timestamp with time zone) RETURNS SETOF bitstamp.live_orders
+    LANGUAGE sql
+    AS $$
+
+WITH time_range AS (
+	SELECT *
+	FROM (
+		SELECT era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
+		FROM bitstamp.live_orders_eras
+	) r
+	WHERE find_and_repair_missing_fill.ts_within_era BETWEEN r."start.time" AND r."end.time"
+),
+events_fill_missing AS (
+	SELECT o.order_id,
+			o.amount,			
+			o.event,
+			o.order_type,
+			o.datetime,
+			o.microtimestamp,
+			o.local_timestamp,
+			o.pair_id,
+			o.price,
+			t.amount AS fill,					-- fill is equal to the matched trade's amount
+			o.next_microtimestamp, 	
+			o.era,
+			o.trade_timestamp,
+			o.trade_id
+	FROM bitstamp.live_orders o JOIN bitstamp.live_trades t USING (trade_timestamp, trade_id)
+	WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
+	  AND fill IS NULL
+	  AND o.trade_id IS NOT NULL
+)	
+UPDATE bitstamp.live_orders
+SET fill = events_fill_missing.fill
+FROM events_fill_missing
+WHERE live_orders.microtimestamp = events_fill_missing.microtimestamp
+  AND live_orders.order_id = events_fill_missing.order_id
+RETURNING live_orders.*	
+
+$$;
+
+
+ALTER FUNCTION bitstamp.find_and_repair_missing_fill(ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
 -- Name: inferred_trades(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1410,10 +1510,14 @@ CREATE FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zon
 --		"pair"		 - the pair for which spreads will be calculated
 --		"only.different"	- whether to output the spread only when it is different from the previous one (true) or after each event (false). true is the default.
 --		"strict"		- whether to calculate the spread using events before "start.time" (false) or not (false). 
+-- DETAILS
+--		If "only.different" is FALSE returns spread after each event or several events that happened simultaneously (i.e. have the same microtimestamp)
+--		If "only.different" is TRUE then will check whether the spread has changed and will not return if not.
 
 DECLARE
 	cur bitstamp.spread;
 	prev bitstamp.spread;
+	cur_event_time timestamp with time zone;
 	ob bitstamp.order_book[];
 	e bitstamp.live_orders;
 	
@@ -1425,26 +1529,34 @@ BEGIN
 	END IF;
 	
 	prev := ROW(NULL, 0.0, NULL, 0.0, '1970-01-01'::timestamptz);	-- the widest spread - see IF below
+	cur_event_time := NULL;
 											 
 	FOR e IN SELECT live_orders.* FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
 			  WHERE microtimestamp BETWEEN spread_after_event."start.time" AND spread_after_event."end.time" 
 			    AND pairs.pair = spread_after_event.pair
-			  ORDER BY microtimestamp LOOP
-		ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);	-- we need to keep takers in case they will become makers later on
-		cur := bitstamp._spread_from_order_book(ob);	-- this will ignore takers 
-		
-		IF cur IS NULL THEN -- ob was empty
-			cur := ROW(NULL, NULL, NULL, NULL, e.microtimestamp);
+			  ORDER BY microtimestamp, order_id LOOP
+		IF COALESCE(cur_event_time, e.microtimestamp) = e.microtimestamp THEN 
+			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+		ELSE
+			cur := bitstamp._spread_from_order_book(ob);	
+
+			IF cur IS NULL THEN -- ob was empty
+				cur := ROW(NULL, NULL, NULL, NULL, e.microtimestamp);
+			END IF;
+
+			IF  (cur.best_bid_price <> prev.best_bid_price OR 
+				cur.best_bid_qty <> prev.best_bid_qty OR
+				cur.best_ask_price <> prev.best_ask_price OR
+				cur.best_ask_qty <> prev.best_ask_qty ) 
+				OR NOT spread_after_event."only.different" THEN
+				prev := cur;
+				RETURN NEXT cur;
+			END IF;
+			
+			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);	
+			
 		END IF;
-		
-		IF  (cur.best_bid_price <> prev.best_bid_price OR 
-			cur.best_bid_qty <> prev.best_bid_qty OR
-			cur.best_ask_price <> prev.best_ask_price OR
-			cur.best_ask_qty <> prev.best_ask_qty ) 
-			OR NOT spread_after_event."only.different" THEN
-			prev := cur;
-			RETURN NEXT cur;
-		END IF;
+		cur_event_time := e.microtimestamp;
 	END LOOP;
 	RETURN;
 END;
