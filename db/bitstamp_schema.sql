@@ -342,92 +342,58 @@ COMMENT ON FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) IS 'S
 --
 
 CREATE FUNCTION bitstamp._order_book_after_event(s bitstamp.order_book[], v bitstamp.live_orders, "only.makers" boolean DEFAULT true) RETURNS bitstamp.order_book[]
-    LANGUAGE plpgsql STABLE
+    LANGUAGE sql IMMUTABLE
     AS $$
 
-DECLARE
-
-	i bigint;
-
-BEGIN 
-	
-	IF s IS NULL THEN
-		s := ARRAY(SELECT bitstamp.order_book_v(_order_book_after_event.v.microtimestamp, _order_book_after_event."only.makers"));
- 	ELSE
-		IF _order_book_after_event.v.event <> 'order_created' THEN 
-			s := ARRAY(SELECT  ROW(_order_book_after_event.v.microtimestamp,
-								s_prev.price,
-								s_prev.amount,
-								s_prev.direction,
-								s_prev.order_id,
-								s_prev.microtimestamp,
-								s_prev.event_type,
-								s_prev.pair_id,
-								s_prev.is_maker,
-								s_prev.datetime  )
-						FROM unnest(s) AS s_prev
-						WHERE s_prev.order_id <> _order_book_after_event.v.order_id);
-		ELSE
-			-- we still have to update 'ts' !
-			s := ARRAY(SELECT  ROW(_order_book_after_event.v.microtimestamp,	
-								s_prev.price,
-								s_prev.amount,
-								s_prev.direction,
-								s_prev.order_id,
-								s_prev.microtimestamp,
-								s_prev.event_type,
-								s_prev.pair_id,
-								s_prev.is_maker,
-								s_prev.datetime)
-						FROM unnest(s) AS s_prev);
-		END IF;
-		IF _order_book_after_event.v.event <> 'order_deleted'  THEN 
-			s := array_append(s, ROW(_order_book_after_event.v.microtimestamp, 
-									 _order_book_after_event.v.price,
-									 _order_book_after_event.v.amount,
-									 _order_book_after_event.v.order_type,
-									 _order_book_after_event.v.order_id,
-									 _order_book_after_event.v.microtimestamp,
-									 _order_book_after_event.v.event,
-									 _order_book_after_event.v.pair_id,
-									 TRUE,
-									 _order_book_after_event.v.datetime
-									)::bitstamp.order_book);
-		END IF;												
-		s := ARRAY( WITH orders AS (
-						SELECT ts,
-								price,
-								amount,
-								direction,
-								order_id,
-								microtimestamp,
-								event_type, 
-								pair_id,
-								COALESCE(
-									CASE direction
-										WHEN 'buy' THEN price < min(price) FILTER (WHERE direction = 'sell') OVER (ORDER BY datetime, microtimestamp)
-										WHEN 'sell' THEN price > max(price) FILTER (WHERE direction = 'buy') OVER (ORDER BY datetime, microtimestamp)
-									END,
-								TRUE) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
-								AS is_maker,
-								datetime
-						FROM unnest(s)
-					)
-					SELECT (ts,
-							price,
-							amount,
-							direction,
-							order_id,
-							microtimestamp,
-							event_type,
-							pair_id,
-							is_maker,
-						    datetime)
-					FROM orders	
-					WHERE is_maker OR NOT _order_book_after_event."only.makers");
-	END IF;
-	RETURN s;
-END;
+WITH orders AS (
+		SELECT _order_book_after_event.v.microtimestamp AS ts,
+				price,
+				amount,
+				direction,
+				order_id,
+				microtimestamp,
+				event_type, 
+				pair_id,
+				COALESCE(
+					CASE direction
+						WHEN 'buy' THEN price < min(price) FILTER (WHERE direction = 'sell') OVER (ORDER BY datetime, microtimestamp)
+						WHEN 'sell' THEN price > max(price) FILTER (WHERE direction = 'buy') OVER (ORDER BY datetime, microtimestamp)
+					END,
+				TRUE) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
+				AS is_maker,
+				datetime
+		FROM ( SELECT * 
+			  	FROM unnest(s) i
+			  	WHERE ( _order_book_after_event.v.event = 'order_created' OR i.order_id <> _order_book_after_event.v.order_id )
+				UNION ALL 
+				SELECT * 
+				FROM unnest(ARRAY[ROW( _order_book_after_event.v.microtimestamp, 
+										_order_book_after_event.v.price,
+										_order_book_after_event.v.amount,
+										_order_book_after_event.v.order_type,
+										_order_book_after_event.v.order_id,
+										_order_book_after_event.v.microtimestamp,
+										_order_book_after_event.v.event,
+										_order_book_after_event.v.pair_id,
+										TRUE,
+										_order_book_after_event.v.datetime
+										 )::bitstamp.order_book]::bitstamp.order_book[]) 
+				WHERE event_type <> 'order_deleted' 
+				) a
+		
+	)
+	SELECT array_agg((ts,
+			price,
+			amount,
+			direction,
+			order_id,
+			microtimestamp,
+			event_type,
+			pair_id,
+			is_maker,
+			datetime)::bitstamp.order_book )
+	FROM orders	
+	WHERE is_maker OR NOT _order_book_after_event."only.makers";
 
 $$;
 
@@ -443,13 +409,20 @@ CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book[]) RETURN
     AS $$
 
 	WITH price_levels AS (
-		SELECT ts, direction, price, sum(amount) AS qty, dense_rank() OVER (PARTITION BY direction ORDER BY price*CASE WHEN direction = 'buy' THEN -1 ELSE 1 END ) AS r
+		SELECT ts, 
+				direction,
+				price,
+				sum(amount) AS qty, 
+				CASE direction
+						WHEN 'buy' THEN price = min(price) FILTER (WHERE direction = 'sell') OVER ()
+						WHEN 'sell' THEN price = max(price) FILTER (WHERE direction = 'buy') OVER ()
+				END AS is_best
 		FROM unnest(s)
 		WHERE is_maker
 		GROUP BY ts, direction, price
 	)
 	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts)
-	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND r = 1) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND r = 1) s ON TRUE;
+	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND is_best) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND is_best) s ON TRUE;
 
 $$;
 
@@ -593,7 +566,12 @@ BEGIN
 			  AND o.price = e.price
 			);
 
-		ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);	-- we need to keep takers in case they will become makers later on?
+		IF ob IS NULL THEN 
+			ob := ARRAY(SELECT bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE));
+		ELSE
+			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+		END IF;
+
 
 		depth_after_event := ARRAY( 
 			SELECT ROW(e.microtimestamp, price, amount, direction, pair_id, order_id, is_maker)
@@ -1425,7 +1403,11 @@ BEGIN
 			ORDER BY price, microtimestamp
 			);
 			
-		ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);	-- we need to keep takers in case they will become makers later on?
+		IF ob IS NULL THEN 
+			ob := ARRAY(SELECT bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE));
+		ELSE
+			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+		END IF;
 		
 		volume_after := ARRAY( 
 			SELECT amount
@@ -1525,7 +1507,7 @@ BEGIN
 	IF spread_after_event."strict" THEN 
 		ob := '{}';	-- only the events within the ["start.time", "end.time"] interval will be used
 	ELSE
-		ob := NULL;	-- this will force bitstamp._order_book_after_event() to load events before the "start.time" and thus to calculate an entry spread for the interval
+		ob := NULL;
 	END IF;
 	
 	prev := ROW(NULL, 0.0, NULL, 0.0, '1970-01-01'::timestamptz);	-- the widest spread - see IF below
@@ -1535,8 +1517,13 @@ BEGIN
 			  WHERE microtimestamp BETWEEN spread_after_event."start.time" AND spread_after_event."end.time" 
 			    AND pairs.pair = spread_after_event.pair
 			  ORDER BY microtimestamp, order_id LOOP
+													 
 		IF COALESCE(cur_event_time, e.microtimestamp) = e.microtimestamp THEN 
-			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+			IF ob IS NULL THEN 
+				ob := ARRAY(SELECT bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE));
+			ELSE
+				ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+			END IF;
 		ELSE
 			cur := bitstamp._spread_from_order_book(ob);	
 
@@ -1552,9 +1539,13 @@ BEGIN
 				prev := cur;
 				RETURN NEXT cur;
 			END IF;
-			
-			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);	
-			
+														 
+			IF ob IS NULL THEN 
+				ob := ARRAY(SELECT bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE));
+			ELSE
+				ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+			END IF;
+														 
 		END IF;
 		cur_event_time := e.microtimestamp;
 	END LOOP;
