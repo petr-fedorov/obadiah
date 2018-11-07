@@ -414,8 +414,8 @@ CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book[]) RETURN
 				price,
 				sum(amount) AS qty, 
 				CASE direction
-						WHEN 'buy' THEN price = min(price) FILTER (WHERE direction = 'sell') OVER ()
-						WHEN 'sell' THEN price = max(price) FILTER (WHERE direction = 'buy') OVER ()
+						WHEN 'sell' THEN price = min(price) FILTER (WHERE direction = 'sell') OVER ()
+						WHEN 'buy' THEN price = max(price) FILTER (WHERE direction = 'buy') OVER ()
 				END AS is_best
 		FROM unnest(s)
 		WHERE is_maker
@@ -922,12 +922,14 @@ BEGIN
 	END IF;
 
 	-- set 'next_microtimestamp'
-	CASE NEW.event 
-		WHEN 'order_created', 'order_changed'  THEN 
-			NEW.next_microtimestamp := 'infinity'::timestamptz;		-- later than all other timestamps
-		WHEN 'order_deleted' THEN 
-			NEW.next_microtimestamp := '-infinity'::timestamptz;	-- earlier than all other timestamps
-	END CASE;
+	IF NEW.next_microtimestamp IS NULL THEN 
+		CASE NEW.event 
+			WHEN 'order_created', 'order_changed'  THEN 
+				NEW.next_microtimestamp := 'infinity'::timestamptz;		-- later than all other timestamps
+			WHEN 'order_deleted' THEN 
+				NEW.next_microtimestamp := '-infinity'::timestamptz;	-- earlier than all other timestamps
+		END CASE;
+	END IF;
 	
 	CASE NEW.event
 		WHEN 'order_created' THEN
@@ -1469,7 +1471,7 @@ CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers"
 			pair_id,
 			is_maker,
 			datetime
-    FROM orders	
+    FROM orders
 	WHERE is_maker OR NOT order_book_v."only.makers"
 	ORDER BY order_type DESC, price DESC;
 
