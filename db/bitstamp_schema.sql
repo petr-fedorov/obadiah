@@ -1481,6 +1481,56 @@ $$;
 ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: pga_process_transient_live_orders(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.pga_process_transient_live_orders() RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE
+
+	e bitstamp.transient_live_orders;
+	p bitstamp.live_orders;
+	s bitstamp.spread;
+	
+	ob bitstamp.order_book[];
+
+BEGIN 
+
+	FOR e IN WITH deleted AS ( DELETE FROM bitstamp.transient_live_orders RETURNING * ) SELECT * FROM deleted ORDER BY microtimestamp LOOP 
+	
+	
+		IF ob IS NULL THEN 
+			ob := ARRAY(SELECT ROW(ob.*) FROM bitstamp.order_book_v(e.microtimestamp) AS ob);
+		END IF;
+		
+		s := bitstamp._spread_from_order_book(ob);	-- to be used later
+		
+		p := ROW(e.order_id, e.amount,e.event,e.order_type,e.datetime,e.microtimestamp,e.local_timestamp,e.pair_id, e.price,NULL,NULL,e.era,NULL,NULL)::bitstamp.live_orders;
+		
+		INSERT INTO bitstamp.live_orders 
+		VALUES (p.*);
+		
+		ob := bitstamp._order_book_after_event(ob, p, "only.makers" := FALSE);	-- to be used later
+		
+	END LOOP;
+
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.pga_process_transient_live_orders() OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION pga_process_transient_live_orders(); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION bitstamp.pga_process_transient_live_orders() IS 'This function is expected to be run by pgAgent as often as necessary to store order book events from  transient_live_orders table';
+
+
+--
 -- Name: spread_after_event(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1612,6 +1662,26 @@ ALTER TABLE bitstamp.pairs OWNER TO "ob-analytics";
 
 COMMENT ON COLUMN bitstamp.pairs."R0" IS 'A negative order of magnitude of the fractional monetary unit used to represent price in the pair. For example for BTCUSD pair the fractional monetary unit is 1 cent or 0.01 of USD and the value of R0 is 2';
 
+
+--
+-- Name: transient_live_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.transient_live_orders (
+    order_id bigint NOT NULL,
+    amount numeric NOT NULL,
+    event bitstamp.live_orders_event NOT NULL,
+    order_type bitstamp.direction NOT NULL,
+    datetime timestamp with time zone NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    local_timestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    price numeric NOT NULL,
+    era timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE bitstamp.transient_live_orders OWNER TO "ob-analytics";
 
 --
 -- Name: diff_order_book diff_order_book_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics

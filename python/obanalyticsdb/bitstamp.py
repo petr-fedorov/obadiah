@@ -160,7 +160,7 @@ class LiveOrders(LiveStream):
                                                  data["microtimestamp"],
                                                  1)
                 event.data = ("""
-                            INSERT INTO bitstamp.live_orders
+                            INSERT INTO bitstamp.transient_live_orders
                             (order_id, amount, event, order_type,
                             datetime, microtimestamp, local_timestamp,
                             price, pair_id, era )
