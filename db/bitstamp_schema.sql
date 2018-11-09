@@ -184,21 +184,6 @@ CREATE TYPE bitstamp.side AS ENUM (
 
 ALTER TYPE bitstamp.side OWNER TO "ob-analytics";
 
---
--- Name: spread; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TYPE bitstamp.spread AS (
-	best_bid_price numeric,
-	best_bid_qty numeric,
-	best_ask_price numeric,
-	best_ask_qty numeric,
-	microtimestamp timestamp with time zone
-);
-
-
-ALTER TYPE bitstamp.spread OWNER TO "ob-analytics";
-
 SET default_tablespace = '';
 
 SET default_with_oids = false;
@@ -366,39 +351,46 @@ WITH orders AS (
 			  	FROM unnest(s) i
 			  	WHERE ( _order_book_after_event.v.event = 'order_created' OR i.order_id <> _order_book_after_event.v.order_id )
 				UNION ALL 
-				SELECT * 
-				FROM unnest(ARRAY[ROW( _order_book_after_event.v.microtimestamp, 
-										_order_book_after_event.v.price,
-										_order_book_after_event.v.amount,
-										_order_book_after_event.v.order_type,
-										_order_book_after_event.v.order_id,
-										_order_book_after_event.v.microtimestamp,
-										_order_book_after_event.v.event,
-										_order_book_after_event.v.pair_id,
-										TRUE,
-										_order_book_after_event.v.datetime
-										 )::bitstamp.order_book]::bitstamp.order_book[]) 
-				WHERE event_type <> 'order_deleted' 
+				SELECT  _order_book_after_event.v.microtimestamp, 
+						 _order_book_after_event.v.price,
+						 _order_book_after_event.v.amount,
+						 _order_book_after_event.v.order_type,
+						 _order_book_after_event.v.order_id,
+						 _order_book_after_event.v.microtimestamp,
+						 _order_book_after_event.v.event,
+						 _order_book_after_event.v.pair_id,
+						 TRUE,
+						 _order_book_after_event.v.datetime
+				WHERE _order_book_after_event.v.event <> 'order_deleted' 
 				) a
 		
 	)
-	SELECT array_agg((ts,
-			price,
-			amount,
-			direction,
-			order_id,
-			microtimestamp,
-			event_type,
-			pair_id,
-			is_maker,
-			datetime)::bitstamp.order_book )
-	FROM orders	
-	WHERE is_maker OR NOT _order_book_after_event."only.makers";
+	SELECT ARRAY(
+		SELECT orders.*::bitstamp.order_book
+		FROM orders	
+		WHERE is_maker OR NOT _order_book_after_event."only.makers"
+   );
 
 $$;
 
 
 ALTER FUNCTION bitstamp._order_book_after_event(s bitstamp.order_book[], v bitstamp.live_orders, "only.makers" boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: spread; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.spread (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL
+);
+
+
+ALTER TABLE bitstamp.spread OWNER TO "ob-analytics";
 
 --
 -- Name: _spread_from_order_book(bitstamp.order_book[]); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -416,13 +408,14 @@ CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book[]) RETURN
 				CASE direction
 						WHEN 'sell' THEN price = min(price) FILTER (WHERE direction = 'sell') OVER ()
 						WHEN 'buy' THEN price = max(price) FILTER (WHERE direction = 'buy') OVER ()
-				END AS is_best
+				END AS is_best,
+				pair_id
 		FROM unnest(s)
 		WHERE is_maker
-		GROUP BY ts, direction, price
+		GROUP BY pair_id, ts, direction, price
 	)
-	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts)
-	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND is_best) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND is_best) s ON TRUE;
+	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), pair_id
+	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND is_best) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND is_best) s USING (pair_id);
 
 $$;
 
@@ -762,16 +755,14 @@ $$;
 ALTER FUNCTION bitstamp.find_and_repair_missing_fill(ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: inferred_trades(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: inferred_trades(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.inferred_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.missing" boolean DEFAULT true) RETURNS SETOF bitstamp.live_trades
+CREATE FUNCTION bitstamp.inferred_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.missing" boolean DEFAULT true, strict boolean DEFAULT false) RETURNS SETOF bitstamp.live_trades
     LANGUAGE plpgsql STABLE
     AS $$
 
 DECLARE
-	sp bitstamp.spread;
-	ob bitstamp.order_book[];
 	
 	e bitstamp.live_orders;
 	is_e_agressor boolean;
@@ -783,8 +774,18 @@ DECLARE
 
 	
 BEGIN
-	SELECT ARRAY[bitstamp.order_book_v(inferred_trades."start.time" - '00:00:00.000001'::interval)] INTO ob;	-- the current Order Book
-	sp := bitstamp._spread_from_order_book(ob);
+	IF NOT strict THEN -- get the trade parts outstanding at "start.time"
+		SELECT ARRAY[live_orders.*] INTO trade_parts
+		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
+		WHERE microtimestamp >= ( SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= inferred_trades."start.time" ) 
+		  AND microtimestamp < inferred_trades."start.time" 
+		  AND next_microtimestamp >= inferred_trades."start.time"
+		  AND pairs.pair = inferred_trades.pair
+		  AND ( ( live_orders.fill > 0.0 ) OR (live_orders.event <> 'order_created' AND live_orders.fill IS NULL ) );
+	ELSE
+		trade_parts := '{}';
+	END IF;
+	
 	trade_part := NULL;
 									   
 	SELECT 0.1::numeric^"R0" INTO tolerance 
@@ -792,22 +793,24 @@ BEGIN
 	WHERE pairs.pair = inferred_trades.pair;
 	
 											 
-	FOR e IN SELECT * 
-			  FROM bitstamp.live_orders 
+	FOR e IN SELECT live_orders.* 
+			  FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
 			  WHERE microtimestamp BETWEEN inferred_trades."start.time" AND inferred_trades."end.time" 
+			    AND pairs.pair = inferred_trades.pair
 			  ORDER BY microtimestamp
 				LOOP
 									  
 		IF ( e.fill > 0.0 ) OR (e.event <> 'order_created' AND e.fill IS NULL) THEN -- it's part of the trade to be inferred
+			-- check whether the first part of the trade has been seen already 
 			SELECT * INTO trade_part
 			FROM unnest(trade_parts) AS a
 			WHERE a.order_type  = CASE WHEN e.order_type = 'buy'::bitstamp.direction THEN 'sell'::bitstamp.direction  ELSE 'buy'::bitstamp.direction  END 
  			  AND ( (a.trade_id IS NULL AND e.trade_id IS NULL AND abs( (a.fill - e.fill)*CASE WHEN e.datetime < a.datetime THEN e.price ELSE a.price END) <= tolerance) 
 				   OR ( a.trade_id = e.trade_id ) )
-			ORDER BY microtimestamp
+			ORDER BY microtimestamp		-- TO DO: add order by 'price' too? 
 			LIMIT 1;
 									  
-			IF FOUND THEN 
+			IF FOUND THEN -- the first par has been seen 
 				SELECT ARRAY[a.*] INTO trade_parts 
 				FROM unnest(trade_parts) AS a 
 				WHERE NOT (a.microtimestamp = trade_part.microtimestamp AND a.order_id = trade_part.order_id);
@@ -833,18 +836,12 @@ BEGIN
 								   0::smallint,
 								   0::smallint);
 				END IF;												  
-			ELSE
+			ELSE -- the first par has NOT been seen, so e is the first part - save it!
 				trade_parts := array_append(trade_parts, e);
 			END IF;
 		END IF;
-									  
-		IF ( e.event = 'order_deleted'  )
-			OR ( e.order_type = 'buy' AND e.price < sp.best_ask_price )
-			OR ( e.order_type = 'sell' AND e.price > sp.best_bid_price ) THEN
-				ob := bitstamp._order_book_after_event(ob, e);
-				sp := bitstamp._spread_from_order_book(ob);
-		END IF;				
 	END LOOP;
+										   
 	RAISE NOTICE 'Trade parts without a pair %', trade_parts;
 	RETURN;
 END;
@@ -852,7 +849,7 @@ END;
 $$;
 
 
-ALTER FUNCTION bitstamp.inferred_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.missing" boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.inferred_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.missing" boolean, strict boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: live_orders_eras_v(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1186,7 +1183,7 @@ CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.t
 
  WITH trades AS (
 		SELECT * 
-		FROM bitstamp.inferred_trades(oba_event."start.time",oba_event."end.time", "only.missing" := FALSE)
+		FROM bitstamp.inferred_trades(oba_event."start.time",oba_event."end.time", "only.missing" := FALSE, "strict" := TRUE)
 	   ),
 	  takers AS (
 		  SELECT DISTINCT buy_order_id AS order_id
@@ -1481,10 +1478,10 @@ $$;
 ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean) OWNER TO "ob-analytics";
 
 --
--- Name: pga_process_transient_live_orders(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: pga_process_transient_live_orders(text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.pga_process_transient_live_orders() RETURNS void
+CREATE FUNCTION bitstamp.pga_process_transient_live_orders(pair text DEFAULT 'BTCUSD'::text) RETURNS void
     LANGUAGE plpgsql
     AS $$
 
@@ -1492,27 +1489,52 @@ DECLARE
 
 	e bitstamp.transient_live_orders;
 	p bitstamp.live_orders;
-	s bitstamp.spread;
+	prev bitstamp.spread;
+	cur bitstamp.spread;
 	
 	ob bitstamp.order_book[];
+	
+	v_pair_id smallint;
 
 BEGIN 
 
-	FOR e IN WITH deleted AS ( DELETE FROM bitstamp.transient_live_orders RETURNING * ) SELECT * FROM deleted ORDER BY microtimestamp LOOP 
+	SELECT pair_id INTO v_pair_id
+	FROM bitstamp.pairs WHERE pairs.pair = pga_process_transient_live_orders.pair;
+
+	
+	
+	FOR e IN WITH deleted AS ( DELETE FROM bitstamp.transient_live_orders 
+							  	WHERE transient_live_orders.pair_id = v_pair_id
+							    RETURNING * ) SELECT * FROM deleted ORDER BY microtimestamp LOOP 
 	
 	
 		IF ob IS NULL THEN 
-			ob := ARRAY(SELECT ROW(ob.*) FROM bitstamp.order_book_v(e.microtimestamp) AS ob);
+			ob := ARRAY(SELECT ROW(ob.*) FROM bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE) AS ob);
+			prev := bitstamp._spread_from_order_book(ob);
 		END IF;
 		
-		s := bitstamp._spread_from_order_book(ob);	-- to be used later
-		
 		p := ROW(e.order_id, e.amount,e.event,e.order_type,e.datetime,e.microtimestamp,e.local_timestamp,e.pair_id, e.price,NULL,NULL,e.era,NULL,NULL)::bitstamp.live_orders;
+		
+		ob := bitstamp._order_book_after_event(ob, p, "only.makers" := FALSE);	
+		cur := bitstamp._spread_from_order_book(ob);
 		
 		INSERT INTO bitstamp.live_orders 
 		VALUES (p.*);
 		
-		ob := bitstamp._order_book_after_event(ob, p, "only.makers" := FALSE);	-- to be used later
+		IF cur IS NULL THEN -- ob was empty
+			cur := ROW(NULL, NULL, NULL, NULL, e.microtimestamp, v_pair_id);
+		END IF;
+
+		IF ( cur.best_bid_price <> prev.best_bid_price OR 
+			 cur.best_bid_qty <> prev.best_bid_qty OR
+			 cur.best_ask_price <> prev.best_ask_price OR
+			 cur.best_ask_qty <> prev.best_ask_qty ) 
+			THEN
+				prev := cur;
+				INSERT INTO bitstamp.spread
+				VALUES (cur.*);
+		END IF;
+
 		
 	END LOOP;
 
@@ -1521,20 +1543,20 @@ END;
 $$;
 
 
-ALTER FUNCTION bitstamp.pga_process_transient_live_orders() OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.pga_process_transient_live_orders(pair text) OWNER TO "ob-analytics";
 
 --
--- Name: FUNCTION pga_process_transient_live_orders(); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+-- Name: FUNCTION pga_process_transient_live_orders(pair text); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
 --
 
-COMMENT ON FUNCTION bitstamp.pga_process_transient_live_orders() IS 'This function is expected to be run by pgAgent as often as necessary to store order book events from  transient_live_orders table';
+COMMENT ON FUNCTION bitstamp.pga_process_transient_live_orders(pair text) IS 'This function is expected to be run by pgAgent as often as necessary to store order book events from  transient_live_orders table';
 
 
 --
 -- Name: spread_after_event(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true, strict boolean DEFAULT false) RETURNS SETOF bitstamp.spread
+CREATE FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, "only.different" boolean DEFAULT true, strict boolean DEFAULT false) RETURNS SETOF bitstamp.spread
     LANGUAGE plpgsql STABLE
     AS $$
 
@@ -1554,7 +1576,7 @@ DECLARE
 	cur_event_time timestamp with time zone;
 	ob bitstamp.order_book[];
 	e bitstamp.live_orders;
-	
+	v_pair_id smallint;
 BEGIN
 	IF spread_after_event."strict" THEN 
 		ob := '{}';	-- only the events within the ["start.time", "end.time"] interval will be used
@@ -1562,12 +1584,16 @@ BEGIN
 		ob := NULL;
 	END IF;
 	
+	SELECT pair_id INTO v_pair_id
+	FROM bitstamp.pairs WHERE pairs.pair = p_pair;
+
+	
 	prev := ROW(NULL, 0.0, NULL, 0.0, '1970-01-01'::timestamptz);	-- the widest spread - see IF below
 	cur_event_time := NULL;
 											 
-	FOR e IN SELECT live_orders.* FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
+	FOR e IN SELECT live_orders.* FROM bitstamp.live_orders 
 			  WHERE microtimestamp BETWEEN spread_after_event."start.time" AND spread_after_event."end.time" 
-			    AND pairs.pair = spread_after_event.pair
+			    AND pair_id = v_pair_id
 			  ORDER BY microtimestamp, order_id LOOP
 													 
 		IF COALESCE(cur_event_time, e.microtimestamp) = e.microtimestamp THEN 
@@ -1580,7 +1606,7 @@ BEGIN
 			cur := bitstamp._spread_from_order_book(ob);	
 
 			IF cur IS NULL THEN -- ob was empty
-				cur := ROW(NULL, NULL, NULL, NULL, e.microtimestamp);
+				cur := ROW(NULL, NULL, NULL, NULL, e.microtimestamp, v_pair_id);
 			END IF;
 
 			IF  (cur.best_bid_price <> prev.best_bid_price OR 
@@ -1607,13 +1633,13 @@ END;
 $$;
 
 
-ALTER FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, p_pair text, "only.different" boolean, strict boolean) OWNER TO "ob-analytics";
 
 --
--- Name: FUNCTION spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+-- Name: FUNCTION spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, p_pair text, "only.different" boolean, strict boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
 --
 
-COMMENT ON FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, "only.different" boolean, strict boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each event in the ''live_orders'' table that hits the interval between "start.time" and "end.time" for the given "pair". The spread is calculated using all available data before "start.time" unless "strict" is set to TRUE. In the latter case the spread is caclulated using only events within the interval between "start.time" and "end.time"';
+COMMENT ON FUNCTION bitstamp.spread_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, p_pair text, "only.different" boolean, strict boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each event in the ''live_orders'' table that hits the interval between "start.time" and "end.time" for the given "pair". The spread is calculated using all available data before "start.time" unless "strict" is set to TRUE. In the latter case the spread is caclulated using only events within the interval between "start.time" and "end.time"';
 
 
 --
@@ -1729,6 +1755,14 @@ ALTER TABLE ONLY bitstamp.pairs
 
 ALTER TABLE ONLY bitstamp.pairs
     ADD CONSTRAINT pairs_unq UNIQUE (pair) DEFERRABLE;
+
+
+--
+-- Name: spread spread_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.spread
+    ADD CONSTRAINT spread_pkey PRIMARY KEY (pair_id, microtimestamp);
 
 
 --
