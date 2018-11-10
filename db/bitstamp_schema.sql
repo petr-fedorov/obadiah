@@ -54,6 +54,18 @@ CREATE TYPE bitstamp.depth AS (
 ALTER TYPE bitstamp.depth OWNER TO "ob-analytics";
 
 --
+-- Name: enum_neighborhood; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.enum_neighborhood AS ENUM (
+    'before',
+    'after'
+);
+
+
+ALTER TYPE bitstamp.enum_neighborhood OWNER TO "ob-analytics";
+
+--
 -- Name: live_orders_event; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1437,10 +1449,10 @@ $$;
 ALTER FUNCTION bitstamp.order_book_after_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text, strict boolean) OWNER TO "ob-analytics";
 
 --
--- Name: order_book_v(timestamp with time zone, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: order_book_v(timestamp with time zone, boolean, bitstamp.enum_neighborhood); Type: FUNCTION; Schema: bitstamp; Owner: postgres
 --
 
-CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean DEFAULT true) RETURNS SETOF bitstamp.order_book
+CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean DEFAULT true, neighborhood bitstamp.enum_neighborhood DEFAULT 'after'::bitstamp.enum_neighborhood) RETURNS SETOF bitstamp.order_book
     LANGUAGE sql STABLE
     AS $$
 
@@ -1454,9 +1466,13 @@ CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers"
 				TRUE )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
 				AS is_maker
 		FROM bitstamp.live_orders
-		WHERE microtimestamp BETWEEN (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= order_book_v.ts ) AND order_book_v.ts 
-		  AND next_microtimestamp > order_book_v.ts 
-		  AND event <> 'order_deleted'
+		WHERE microtimestamp >= (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= order_book_v.ts ) 
+		  AND CASE order_book_v.neighborhood
+				WHEN 'after'  THEN  microtimestamp <= order_book_v.ts 
+				WHEN 'before' THEN  microtimestamp < order_book_v.ts 
+		  	   END
+		   AND next_microtimestamp > order_book_v.ts 
+		   AND event <> 'order_deleted'
 		)
 	SELECT order_book_v.ts,
 			price,
@@ -1475,7 +1491,7 @@ CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers"
 $$;
 
 
-ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers" boolean, neighborhood bitstamp.enum_neighborhood) OWNER TO postgres;
 
 --
 -- Name: pga_process_transient_live_orders(text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1509,8 +1525,13 @@ BEGIN
 	
 	
 		IF ob IS NULL THEN 
-			ob := ARRAY(SELECT ROW(ob.*) FROM bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE) AS ob);
+			ob := ARRAY(SELECT ROW(ob.*) FROM bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE, neighborhood := 'before') AS ob);
 			prev := bitstamp._spread_from_order_book(ob);
+			
+			IF prev IS NULL THEN -- ob was empty
+				prev := ROW(NULL, NULL, NULL, NULL, e.microtimestamp, v_pair_id);	-- the widest spread - see IF below
+			END IF;
+
 		END IF;
 		
 		p := ROW(e.order_id, e.amount,e.event,e.order_type,e.datetime,e.microtimestamp,e.local_timestamp,e.pair_id, e.price,NULL,NULL,e.era,NULL,NULL)::bitstamp.live_orders;
@@ -1525,10 +1546,10 @@ BEGIN
 			cur := ROW(NULL, NULL, NULL, NULL, e.microtimestamp, v_pair_id);
 		END IF;
 
-		IF ( cur.best_bid_price <> prev.best_bid_price OR 
-			 cur.best_bid_qty <> prev.best_bid_qty OR
-			 cur.best_ask_price <> prev.best_ask_price OR
-			 cur.best_ask_qty <> prev.best_ask_qty ) 
+		IF ( cur.best_bid_price IS DISTINCT FROM  prev.best_bid_price OR 
+			 cur.best_bid_qty IS DISTINCT FROM  prev.best_bid_qty OR
+			 cur.best_ask_price IS DISTINCT FROM  prev.best_ask_price OR
+			 cur.best_ask_qty IS DISTINCT FROM  prev.best_ask_qty ) 
 			THEN
 				prev := cur;
 				INSERT INTO bitstamp.spread
@@ -1587,8 +1608,6 @@ BEGIN
 	SELECT pair_id INTO v_pair_id
 	FROM bitstamp.pairs WHERE pairs.pair = p_pair;
 
-	
-	prev := ROW(NULL, 0.0, NULL, 0.0, '1970-01-01'::timestamptz);	-- the widest spread - see IF below
 	cur_event_time := NULL;
 											 
 	FOR e IN SELECT live_orders.* FROM bitstamp.live_orders 
@@ -1597,36 +1616,57 @@ BEGIN
 			  ORDER BY microtimestamp, order_id LOOP
 													 
 		IF COALESCE(cur_event_time, e.microtimestamp) = e.microtimestamp THEN 
+			
 			IF ob IS NULL THEN 
-				ob := ARRAY(SELECT bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE));
-			ELSE
-				ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+				ob := ARRAY(SELECT bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE, neighborhood := 'before'));
+				prev := bitstamp._spread_from_order_book(ob);
+				IF prev IS NULL THEN -- ob was empty
+					prev := ROW(NULL, NULL, NULL, NULL, cur_event_time, v_pair_id);	-- the widest spread - see IF below
+				END IF;
 			END IF;
+														 
+			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
 		ELSE
 			cur := bitstamp._spread_from_order_book(ob);	
 
 			IF cur IS NULL THEN -- ob was empty
-				cur := ROW(NULL, NULL, NULL, NULL, e.microtimestamp, v_pair_id);
+				cur := ROW(NULL, NULL, NULL, NULL, cur_event_time, v_pair_id);
 			END IF;
 
-			IF  (cur.best_bid_price <> prev.best_bid_price OR 
-				cur.best_bid_qty <> prev.best_bid_qty OR
-				cur.best_ask_price <> prev.best_ask_price OR
-				cur.best_ask_qty <> prev.best_ask_qty ) 
+			IF  (cur.best_bid_price IS DISTINCT FROM  prev.best_bid_price OR 
+				cur.best_bid_qty IS DISTINCT FROM  prev.best_bid_qty OR
+				cur.best_ask_price IS DISTINCT FROM  prev.best_ask_price OR
+				cur.best_ask_qty IS DISTINCT FROM  prev.best_ask_qty ) 
 				OR NOT spread_after_event."only.different" THEN
 				prev := cur;
 				RETURN NEXT cur;
 			END IF;
 														 
-			IF ob IS NULL THEN 
-				ob := ARRAY(SELECT bitstamp.order_book_v(e.microtimestamp, "only.makers" := FALSE));
-			ELSE
-				ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
-			END IF;
+			ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
 														 
 		END IF;
 		cur_event_time := e.microtimestamp;
 	END LOOP;
+														 
+	-- we have to process the last event in the loop above ... so exactly the same code as in ELSE	 
+	cur := bitstamp._spread_from_order_book(ob);	
+
+	IF cur IS NULL THEN -- ob was empty
+		cur := ROW(NULL, NULL, NULL, NULL, cur_event_time, v_pair_id);
+	END IF;
+
+	IF  (cur.best_bid_price IS DISTINCT FROM  prev.best_bid_price OR 
+		cur.best_bid_qty IS DISTINCT FROM  prev.best_bid_qty OR
+		cur.best_ask_price IS DISTINCT FROM  prev.best_ask_price OR
+		cur.best_ask_qty IS DISTINCT FROM  prev.best_ask_qty ) 
+		OR NOT spread_after_event."only.different" THEN
+		prev := cur;
+		RETURN NEXT cur;
+	END IF;
+
+	ob := bitstamp._order_book_after_event(ob, e, "only.makers" := FALSE);
+														 
+														 
 	RETURN;
 END;
 
