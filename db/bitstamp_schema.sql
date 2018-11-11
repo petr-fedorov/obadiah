@@ -108,29 +108,6 @@ CREATE TYPE bitstamp.oba_depth_summary AS (
 ALTER TYPE bitstamp.oba_depth_summary OWNER TO "ob-analytics";
 
 --
--- Name: oba_event; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TYPE bitstamp.oba_event AS (
-	"event.id" bigint,
-	id bigint,
-	"timestamp" timestamp with time zone,
-	"exchange.timestamp" timestamp with time zone,
-	price numeric,
-	volume numeric,
-	action text,
-	direction text,
-	fill numeric,
-	"matching.event" bigint,
-	type text,
-	"aggressiveness.bps" numeric,
-	"real.trade.id" bigint
-);
-
-
-ALTER TYPE bitstamp.oba_event OWNER TO "ob-analytics";
-
---
 -- Name: oba_spread; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1189,7 +1166,7 @@ ALTER FUNCTION bitstamp.oba_depth_summary("start.time" timestamp with time zone,
 -- Name: oba_event(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.oba_event
+CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair text DEFAULT 'BTCUSD'::text) RETURNS TABLE("event.id" bigint, id bigint, "timestamp" timestamp with time zone, "exchange.timestamp" timestamp with time zone, price numeric, volume numeric, action text, direction text, fill numeric, "matching.event" bigint, type text, "aggressiveness.bps" numeric, "real.trade.id" bigint, is_aggressor boolean, is_created boolean, is_ever_resting boolean, is_ever_aggressor boolean, is_ever_filled boolean, is_deleted boolean)
     LANGUAGE sql STABLE
     AS $$
 
@@ -1206,10 +1183,6 @@ CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.t
 		  FROM trades
 		  WHERE trade_type = 'sell'				
 		),
-	  spread AS (
-		  SELECT *
-		  FROM bitstamp.spread_after_event(oba_event."start.time",oba_event."end.time", "only.different" := FALSE, "strict" := TRUE)
-	  ),
 	  makers AS (
 		  SELECT DISTINCT buy_order_id AS order_id
 		  FROM trades
@@ -1228,16 +1201,30 @@ CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.t
 		  		  event,
 		  		  datetime,
 		  		  fill,
-		  		  trade_id
-		  FROM bitstamp.live_orders
+		  		  trade_id,
+		  		  -- The columns below require 'first-last-agg' from PGXN to be installed
+		  		  -- https://pgxn.org/dist/first_last_agg/doc/first_last_agg.html
+		  		  last(best_ask_price) OVER (ORDER BY microtimestamp) AS best_ask_price,	
+		  		  last(best_bid_price) OVER (ORDER BY microtimestamp) AS best_bid_price,	
+		  		  -- COALESCE below on the right handles the case of one-sided order book ...
+		  		  CASE 
+		  			WHEN event <> 'order_deleted' THEN
+					  CASE order_type 
+						WHEN 'sell' THEN price <= COALESCE(last(best_bid_price) OVER (ORDER BY microtimestamp), price - 1)
+						WHEN 'buy' THEN price >= COALESCE(last(best_ask_price) OVER (ORDER BY microtimestamp) , price + 1 )
+		 			  END
+		  			ELSE NULL
+		          END AS is_aggressor
+		  FROM bitstamp.live_orders LEFT JOIN bitstamp.spread USING (microtimestamp)
 	  	  WHERE microtimestamp BETWEEN oba_event."start.time" AND oba_event."end.time" 
 	  ),
 	  events AS (
 		SELECT row_number() OVER (ORDER BY order_id, event, microtimestamp) AS event_id,		-- ORDER BY must be the same as in oba_trade(). Change both!
 		  		base_events.*,
 		  		MAX(price) OVER o_all <> MIN(price) OVER o_all AS order_price_ever_changed,
-		  		makers.order_id IS NOT NULL AS is_maker,
-		  	    takers.order_id IS NOT NULL AS is_taker,
+				bool_or(NOT is_aggressor) OVER o_all AS is_ever_resting,
+		  		bool_or(is_aggressor) OVER o_all AS is_ever_aggressor, 	
+		  		bool_or(COALESCE(fill, CASE WHEN event <> 'order_deleted' THEN 1.0 ELSE NULL END ) > 0.0 ) OVER o_all AS is_ever_filled, 	
 		  		first_value(event) OVER o_after = 'order_deleted' AS is_deleted,
 		  		first_value(event) OVER o_before = 'order_created' AS is_created
 		FROM base_events LEFT JOIN makers USING (order_id) LEFT JOIN takers USING (order_id) 
@@ -1276,20 +1263,25 @@ CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.t
 		  END AS fill,
 		  event_connection.event_id AS "matching.event",
 		  CASE WHEN order_price_ever_changed THEN 'pacman'::text
-		  	    WHEN NOT is_maker AND NOT is_taker AND is_created AND is_deleted THEN 'flashed-limit'::text
-				WHEN NOT is_maker AND NOT is_taker AND NOT is_deleted THEN 'resting-limit'::text
-				WHEN is_maker AND NOT is_taker THEN 'resting-limit'::text
-				WHEN NOT is_maker AND is_taker AND is_deleted THEN 'market'::text
-				WHEN NOT is_maker AND is_taker AND NOT is_deleted THEN 'market-limit'::text
-				WHEN is_maker AND is_taker THEN 'market-limit'::text
+		  	    WHEN is_ever_resting AND NOT is_ever_aggressor AND NOT is_ever_filled AND is_deleted THEN 'flashed-limit'::text
+				WHEN is_ever_resting AND NOT is_ever_aggressor AND NOT is_ever_filled AND NOT is_deleted THEN 'resting-limit'::text
+				WHEN is_ever_resting AND NOT is_ever_aggressor AND is_ever_filled THEN 'resting-limit'::text
+				WHEN NOT is_ever_resting AND is_ever_aggressor AND is_deleted THEN 'market'::text
+				WHEN is_ever_resting AND is_ever_aggressor THEN 'market-limit'::text
 		  		ELSE 'unknown'::text 
 		  END AS "type",
 			CASE order_type 
 		  		WHEN 'sell' THEN round((best_ask_price - price)/best_ask_price*10000)
 		  		WHEN 'buy' THEN round((price - best_bid_price)/best_ask_price*10000)
 		  	END AS "aggressiveness.bps",
-		trade_id AS "real.trade.id"
-  FROM events LEFT JOIN event_connection USING (microtimestamp, order_id) LEFT JOIN spread USING (microtimestamp)
+		trade_id AS "real.trade.id",
+		is_aggressor,
+		is_created,
+		is_ever_resting,
+		is_ever_aggressor,
+		is_ever_filled,
+		is_deleted
+  FROM events LEFT JOIN event_connection USING (microtimestamp, order_id) 
   ORDER BY 1;
 
 $$;
