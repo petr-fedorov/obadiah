@@ -1414,15 +1414,19 @@ CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers"
     AS $$
 
 	WITH orders AS (
-		SELECT *, 
-				COALESCE(
-					CASE order_type 
-						WHEN 'buy' THEN price < min(price) FILTER (WHERE order_type = 'sell') OVER (ORDER BY datetime, microtimestamp)
-						WHEN 'sell' THEN price > max(price) FILTER (WHERE order_type = 'buy') OVER (ORDER BY datetime, microtimestamp)
-					END,
-				TRUE )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
-				AS is_maker
-		FROM bitstamp.live_orders
+		SELECT *,
+				NOT EXISTS (   SELECT 1 
+								FROM bitstamp.live_orders i
+					   	 		WHERE i.microtimestamp < o.microtimestamp 
+							      AND i.microtimestamp >= o.era
+						      	  AND i.next_microtimestamp > o.microtimestamp 
+								  AND i.datetime <= o.datetime	-- IMPORTANT: the order 'i' was created before the 'o'
+						      	  AND CASE o.order_type 
+										WHEN 'sell' THEN i.order_type = 'buy' AND i.price >= o.price
+										WHEN 'buy' THEN i.order_type = 'sell' AND i.price <= o.price 
+									   END
+					         ) AS is_maker
+		FROM bitstamp.live_orders o
 		WHERE microtimestamp >= (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= order_book_v.ts ) 
 		  AND CASE order_book_v.neighborhood
 				WHEN 'after'  THEN  microtimestamp <= order_book_v.ts 
