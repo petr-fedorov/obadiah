@@ -1421,6 +1421,7 @@ CREATE FUNCTION bitstamp.order_book_v(ts timestamp with time zone, "only.makers"
 							      AND i.microtimestamp >= o.era
 						      	  AND i.next_microtimestamp > o.microtimestamp 
 								  AND i.datetime <= o.datetime	-- IMPORTANT: the order 'i' was created before the 'o'
+								  AND i.pair_id = o.pair_id
 						      	  AND CASE o.order_type 
 										WHEN 'sell' THEN i.order_type = 'buy' AND i.price >= o.price
 										WHEN 'buy' THEN i.order_type = 'sell' AND i.price <= o.price 
