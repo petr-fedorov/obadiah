@@ -724,19 +724,39 @@ DECLARE
 	trade_part		bitstamp.live_orders;
 	
 	tolerance numeric;
-
 	
+
 BEGIN
 	IF NOT strict THEN -- get the trade parts outstanding at "start.time"
-		SELECT ARRAY[live_orders.*] INTO trade_parts
-		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
-		WHERE microtimestamp >= ( SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= inferred_trades."start.time" ) 
-		  AND microtimestamp < inferred_trades."start.time" 
-		  AND next_microtimestamp >= inferred_trades."start.time"
-		  AND pairs.pair = inferred_trades.pair
-		  AND ( ( live_orders.fill > 0.0 ) OR (live_orders.event <> 'order_created' AND live_orders.fill IS NULL ) );
+		trade_parts := ARRAY(SELECT ROW(live_orders.*) 
+							  FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
+							  WHERE microtimestamp >= ( SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= inferred_trades."start.time" ) 
+		  						AND microtimestamp < inferred_trades."start.time" 
+		  						AND next_microtimestamp >= inferred_trades."start.time"
+		  						AND pairs.pair = inferred_trades.pair
+		  						AND ( ( live_orders.fill > 0.0 ) OR (live_orders.event <> 'order_created' AND live_orders.fill IS NULL ) )
+							);
 	ELSE
 		trade_parts := '{}';
+	END IF;
+	
+	IF NOT inferred_trades."only.missing"  THEN
+		RETURN QUERY SELECT trade_id,
+							  amount,
+							  price, 
+							  trade_type,
+							  GREATEST(buy_microtimestamp, sell_microtimestamp),
+							  buy_order_id,
+							  sell_order_id,
+							  local_timestamp,
+							  pair_id,
+							  sell_microtimestamp,
+							  buy_microtimestamp,
+							  buy_match_rule,
+							  sell_match_rule
+					  FROM bitstamp.live_trades JOIN bitstamp.pairs USING (pair_id)
+					  WHERE pairs.pair = inferred_trades.pair
+					    AND GREATEST(buy_microtimestamp, sell_microtimestamp) BETWEEN inferred_trades."start.time" AND inferred_trades."end.time" ;
 	END IF;
 	
 	trade_part := NULL;
@@ -746,56 +766,60 @@ BEGIN
 	WHERE pairs.pair = inferred_trades.pair;
 	
 											 
-	FOR e IN SELECT live_orders.* 
+	FOR e IN SELECT live_orders.*
 			  FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
 			  WHERE microtimestamp BETWEEN inferred_trades."start.time" AND inferred_trades."end.time" 
 			    AND pairs.pair = inferred_trades.pair
+				AND trade_id IS NULL
 			  ORDER BY microtimestamp
 				LOOP
 									  
 		IF ( e.fill > 0.0 ) OR (e.event <> 'order_created' AND e.fill IS NULL) THEN -- it's part of the trade to be inferred
 			-- check whether the first part of the trade has been seen already 
+			
 			SELECT * INTO trade_part
 			FROM unnest(trade_parts) AS a
 			WHERE a.order_type  = CASE WHEN e.order_type = 'buy'::bitstamp.direction THEN 'sell'::bitstamp.direction  ELSE 'buy'::bitstamp.direction  END 
- 			  AND ( (a.trade_id IS NULL AND e.trade_id IS NULL AND abs( (a.fill - e.fill)*CASE WHEN e.datetime < a.datetime THEN e.price ELSE a.price END) <= tolerance) 
-				   OR ( a.trade_id = e.trade_id ) )
+ 			  AND abs( (a.fill - e.fill)*CASE WHEN e.datetime < a.datetime THEN e.price ELSE a.price END) <= tolerance
 			ORDER BY microtimestamp		-- TO DO: add order by 'price' too? 
 			LIMIT 1;
+
 									  
 			IF FOUND THEN -- the first par has been seen 
-				SELECT ARRAY[a.*] INTO trade_parts 
-				FROM unnest(trade_parts) AS a 
-				WHERE NOT (a.microtimestamp = trade_part.microtimestamp AND a.order_id = trade_part.order_id);
+			
+				trade_parts := ARRAY( SELECT ROW(a.*)
+									   FROM unnest(trade_parts) AS a 
+									   WHERE NOT (a.microtimestamp = trade_part.microtimestamp AND a.order_id = trade_part.order_id)
+									 );
 									   
-				IF (NOT "only.missing" ) OR e.trade_id IS NULL THEN -- here trade_part.trade_id will be either equal to e.trade_id or both will be NULL
-									   
-					is_e_agressor := NOT ( e.datetime < trade_part.datetime OR (e.datetime = trade_part.datetime AND e.order_id < trade_part.order_id ) );
-										  
-					RETURN NEXT ( e.trade_id,
-								   COALESCE(e.fill, trade_part.fill), 
-								 	-- maker's price defines trade price
-								   CASE WHEN NOT is_e_agressor THEN e.price ELSE trade_part.price END, 
-								 	-- trade type below is defined by maker's type, i.e. who was sitting in the order book 
-								   CASE WHEN is_e_agressor THEN e.order_type  ELSE trade_part.order_type END, 
-								    -- trade_timestamp below is defined by a maker departure time from the order book, so its price line 
-								 	-- on plotPriceLevels chart ends by the trade
-								   CASE WHEN NOT is_e_agressor THEN e.microtimestamp ELSE trade_part.microtimestamp END,
-								   CASE e.order_type WHEN 'buy' THEN e.order_id ELSE trade_part.order_id END, 
-								   CASE e.order_type WHEN 'sell' THEN e.order_id ELSE trade_part.order_id END, 
-								   e.local_timestamp, e.pair_id, 
-								   CASE e.order_type WHEN 'sell' THEN e.microtimestamp ELSE trade_part.microtimestamp END, 								 
-								   CASE e.order_type WHEN 'buy' THEN e.microtimestamp ELSE trade_part.microtimestamp END,
-								   0::smallint,
-								   0::smallint);
-				END IF;												  
+				is_e_agressor := NOT ( e.datetime < trade_part.datetime OR (e.datetime = trade_part.datetime AND e.order_id < trade_part.order_id ) );
+
+				RETURN NEXT ( e.trade_id,
+							   COALESCE(e.fill, trade_part.fill), 
+								-- maker's price defines trade price
+							   CASE WHEN NOT is_e_agressor THEN e.price ELSE trade_part.price END, 
+								-- trade type below is defined by maker's type, i.e. who was sitting in the order book 
+							   CASE WHEN is_e_agressor THEN e.order_type  ELSE trade_part.order_type END, 
+								-- trade_timestamp below is defined by a maker departure time from the order book, so its price line 
+								-- on plotPriceLevels chart ends by the trade
+							   CASE WHEN NOT is_e_agressor THEN e.microtimestamp ELSE trade_part.microtimestamp END,
+							   CASE e.order_type WHEN 'buy' THEN e.order_id ELSE trade_part.order_id END, 
+							   CASE e.order_type WHEN 'sell' THEN e.order_id ELSE trade_part.order_id END, 
+							   e.local_timestamp, e.pair_id, 
+							   CASE e.order_type WHEN 'sell' THEN e.microtimestamp ELSE trade_part.microtimestamp END, 								 
+							   CASE e.order_type WHEN 'buy' THEN e.microtimestamp ELSE trade_part.microtimestamp END,
+							   NULL::smallint,
+							   NULL::smallint); 
 			ELSE -- the first par has NOT been seen, so e is the first part - save it!
+
 				trade_parts := array_append(trade_parts, e);
+
 			END IF;
 		END IF;
 	END LOOP;
-										   
-	RAISE NOTICE 'Trade parts without a pair %', trade_parts;
+	
+	RAISE LOG 'Number of not matched trade parts: %  ', array_length(trade_parts,1);
+	RAISE DEBUG 'Not matched trade parts: %', trade_parts;
 	RETURN;
 END;
 
