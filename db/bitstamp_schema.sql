@@ -652,6 +652,7 @@ WHERE o.first_event <> 'order_created'
 	    OR 										 -- They might be included later when they are repaired.
 	    ( trade_id IS NOT NULL AND fill IS NOT NULL )
 	   )
+  AND microtimestamp > (SELECT "start.time" FROM time_range)  
 RETURNING *	
 
 $$;
