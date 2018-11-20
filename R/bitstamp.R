@@ -8,7 +8,7 @@ bsDepth <- function(conn, start.time, end.time, pair="BTCUSD", strict = FALSE, d
                   shQuote(end.time), ",",
                   shQuote(pair), ",",
                   strict,
-                  ")")
+                  ") ORDER BY 1, 2 DESC")
   if(debug.query) cat(query)
   depth <- DBI::dbGetQuery(conn, query)
   depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
@@ -93,7 +93,7 @@ bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 #' @export
 bsExportEvents <- function(conn, start.time, end.time, pair="BTCUSD", file = "events.csv", debug.query = FALSE) {
   query <- paste0(" SELECT 	order_id AS id,
-                            bitstamp._in_milliseconds(microtimestamp) AS timestamp,
+                            bitstamp._in_milliseconds(GREATEST(microtimestamp, matched_microtimestamp)) AS timestamp,
                             bitstamp._in_milliseconds(datetime) AS \"exchange.timestamp\",
                             price,
                             round(amount,8) AS volume,
@@ -109,7 +109,7 @@ bsExportEvents <- function(conn, start.time, end.time, pair="BTCUSD", file = "ev
                   FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
                   WHERE microtimestamp BETWEEN ", shQuote(start.time), "  AND ", shQuote(end.time),
                   " AND pair = ", shQuote(pair),
-                  " ORDER BY microtimestamp")
+                  " ORDER BY 2")
   if(debug.query) cat(query)
   events <- DBI::dbGetQuery(conn, query)
   write.csv(events, file = file, row.names = FALSE)

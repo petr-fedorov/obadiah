@@ -436,6 +436,7 @@ ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with t
 
 CREATE FUNCTION bitstamp.depth_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT false) RETURNS TABLE(microtimestamp timestamp with time zone, price numeric, amount numeric, direction bitstamp.direction, pair_id smallint)
     LANGUAGE plpgsql STABLE
+    SET work_mem TO '4GB'
     AS $$
 
 -- ARGUMENTS
@@ -445,46 +446,41 @@ CREATE FUNCTION bitstamp.depth_by_episode(p_start_time timestamp with time zone,
 --		p_strict  	 - whether to calculate the spread using events before p_start_time (false) or not (true). 
 
 DECLARE
-	v_ob_before_event bitstamp.order_book_record[];
-	v_ob_after_event bitstamp.order_book_record[];
-	v_e bitstamp.live_orders;
+	v_ob_before_episode bitstamp.order_book_record[];
+	v_ob_after_episode bitstamp.order_book_record[];
 	
 BEGIN
 	IF p_strict THEN 
-		v_ob_before_event := '{}';	-- only the events within the [p_start_time, p_end_time] interval will be used
+		v_ob_before_episode := '{}';	-- only the events within the [p_start_time, p_end_time] interval will be used
 	ELSE
-		v_ob_before_event := NULL;	-- this will force bitstamp._order_book_after_event() to load events before the p_start_time and thus to calculate an entry depth for the interval
+		v_ob_before_episode := NULL;	-- this will force bitstamp._order_book_after_event() to load events before the p_start_time and thus to calculate an entry depth for the interval
 	END IF;
 	
-	FOR v_e IN SELECT live_orders.* FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
-			  WHERE live_orders.microtimestamp BETWEEN p_start_time AND p_end_time 
-			    AND pairs.pair = p_pair 
-			  ORDER BY live_orders.microtimestamp LOOP
+	FOR v_ob_after_episode IN SELECT bitstamp.order_book_by_episodes(p_start_time, p_end_time, p_pair, p_strict)
+	LOOP
 
-		IF v_ob_before_event IS NULL THEN 
-			v_ob_before_event := ARRAY(SELECT bitstamp.order_book_before( v_e.microtimestamp, p_pair, FALSE));
+		IF v_ob_before_episode IS NULL THEN 
+			v_ob_before_episode := ARRAY(SELECT bitstamp.order_book_before( v_ob_after_episode[1].ts, p_pair, FALSE));
 		END IF;
 																  
-		v_ob_after_event := bitstamp._order_book_after_event(v_ob_before_event, v_e, "only.makers" := FALSE);
-		
 		RETURN QUERY WITH dynamics AS (
 							SELECT * 
 							FROM (  SELECT b.price, SUM(b.amount) AS amount_b, b.direction, b.pair_id 
-								  	 FROM unnest(v_ob_before_event) b 
+								  	 FROM unnest(v_ob_before_episode) b 
 								     WHERE b.is_maker
 								 	 GROUP BY b.price, b.direction, b.pair_id ) b 
 					  		 	  FULL JOIN 
 							 	  ( SELECT a.price, SUM(a.amount) AS amount_a, a.direction, a.pair_id 
-								    FROM unnest(v_ob_after_event) a 
+								    FROM unnest(v_ob_after_episode) a 
 								    WHERE a.is_maker 
 								    GROUP BY a.price, a.direction, a.pair_id ) a 
 							 	  USING (price, pair_id, direction)
 					  )
-					  SELECT v_e.microtimestamp, dynamics.price, COALESCE(amount_a,0), dynamics.direction, dynamics.pair_id
+					  SELECT v_ob_after_episode[1].ts, dynamics.price, COALESCE(amount_a,0), dynamics.direction, dynamics.pair_id
 					  FROM dynamics
 					  WHERE amount_a IS DISTINCT FROM amount_b;
 																  
-		v_ob_before_event := v_ob_after_event;
+		v_ob_before_episode := v_ob_after_episode;
 										   
 	END LOOP;
 	
@@ -773,7 +769,7 @@ BEGIN
 		END IF;
 	END LOOP;
 	
-	RAISE LOG 'Number of not matched trade parts: %  ', array_length(trade_parts,1);
+	RAISE DEBUG 'Number of not matched trade parts: %  ', array_length(trade_parts,1);
 	RAISE DEBUG 'Not matched trade parts: %', trade_parts;
 	RETURN;
 END;
@@ -1272,8 +1268,8 @@ CREATE FUNCTION bitstamp.oba_event("start.time" timestamp with time zone, "end.t
 				WHEN NOT is_ever_resting AND is_ever_aggressor AND is_deleted AND is_ever_filled THEN 'market'::text
 				-- when two market orders have been placed simulltaneously, the first might take all liquidity 
 				-- so the second will not be executed and no change event will be generated for it so is_ever_resting will be 'False'.
-				-- In spite of this it will be resting the order book for some time so its type is 'market-limit'.
-				WHEN NOT is_ever_resting AND is_ever_aggressor AND is_deleted AND NOT is_ever_filled THEN 'market-limit'::text	
+				-- In spite of this it will be resting the order book for some time so its type is 'flashed-limit'.
+				WHEN NOT is_ever_resting AND is_ever_aggressor AND is_deleted AND NOT is_ever_filled THEN 'flashed-limit'::text	
 				WHEN is_ever_resting AND is_ever_aggressor THEN 'market-limit'::text
 		  		ELSE 'unknown'::text 
 		  END AS "type",
@@ -1336,13 +1332,13 @@ CREATE FUNCTION bitstamp.oba_trade(p_start_time timestamp with time zone, p_end_
 
  WITH trades AS (
 		SELECT * 
-		FROM bitstamp.inferred_trades(oba_trade.p_start_time,oba_trade.p_end_time, p_pair, FALSE, p_strict)
+		FROM bitstamp.inferred_trades(p_start_time, p_end_time, p_pair, FALSE, p_strict)
 	   ),
 	  events AS (
 		SELECT row_number() OVER (ORDER BY order_id, event, microtimestamp) AS event_id,	-- ORDER BY must be the same as in oba_event(). Change both!
 		  		live_orders.*
 		FROM bitstamp.live_orders
-		WHERE microtimestamp BETWEEN oba_trade.p_start_time AND oba_trade.p_end_time 
+		WHERE microtimestamp BETWEEN p_start_time AND p_end_time 
 	  )
   SELECT trades.trade_timestamp AS "timestamp",
   		  trades.price,
@@ -1465,6 +1461,7 @@ ALTER FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair 
 
 CREATE FUNCTION bitstamp.order_book_by_episodes(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT false) RETURNS SETOF bitstamp.order_book_record[]
     LANGUAGE plpgsql STABLE
+    SET work_mem TO '4GB'
     AS $$
 
 -- ARGUMENTS
@@ -1541,6 +1538,7 @@ ALTER FUNCTION bitstamp.order_book_by_episodes(p_start_time timestamp with time 
 
 CREATE FUNCTION bitstamp.pga_process_transient_live_orders(p_pair text DEFAULT 'BTCUSD'::text) RETURNS void
     LANGUAGE plpgsql
+    SET work_mem TO '4GB'
     AS $$
 
 DECLARE
@@ -1605,6 +1603,7 @@ COMMENT ON FUNCTION bitstamp.pga_process_transient_live_orders(p_pair text) IS '
 
 CREATE FUNCTION bitstamp.spread_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_only_different boolean DEFAULT true, p_strict boolean DEFAULT false) RETURNS SETOF bitstamp.spread
     LANGUAGE plpgsql STABLE
+    SET work_mem TO '4GB'
     AS $$
 
 -- ARGUMENTS
