@@ -118,7 +118,8 @@ CREATE TABLE bitstamp.live_orders (
     trade_id bigint,
     matched_microtimestamp timestamp with time zone,
     matched_order_id bigint,
-    original_microtimestamp timestamp with time zone
+    episode_microtimestamp timestamp with time zone,
+    episode_order_id bigint
 );
 
 
