@@ -1497,30 +1497,44 @@ CREATE FUNCTION bitstamp.oba_trade(p_start_time timestamp with time zone, p_end_
     SET work_mem TO '1GB'
     AS $$
 
- WITH trades AS (
+ WITH 
+ 	episodes AS (
+		SELECT microtimestamp, order_id, 
+				COALESCE(episode_microtimestamp, microtimestamp) AS episode_microtimestamp,
+				COALESCE(episode_order_id, order_id) AS episode_order_id
+		FROM bitstamp.live_orders
+		WHERE microtimestamp BETWEEN p_start_time AND p_end_time 
+		  AND event = 'order_created'
+	),
+ 	trades AS (
 --		SELECT * 
 --		FROM bitstamp.inferred_trades(p_start_time, p_end_time, p_pair, FALSE, p_strict)
 	SELECT a.trade_id,
 			a.fill AS amount,
 			p.price,
 			a.order_type AS trade_type,
-			a.episode_microtimestamp AS trade_timestamp,
-			CASE a.order_type WHEN 'buy' THEN a.order_id ELSE p.order_id END AS buy_order_id, 
-			CASE a.order_type WHEN 'sell' THEN a.order_id ELSE p.order_id END AS sell_order_id, 
+			a.episode_microtimestamp ,
+			CASE a.order_type WHEN 'buy' THEN a.order_id ELSE a.matched_order_id END AS buy_order_id, 
+			CASE a.order_type WHEN 'sell' THEN a.order_id ELSE a.matched_order_id END AS sell_order_id, 
 			a.pair_id,
-			CASE a.order_type WHEN 'sell' THEN a.microtimestamp ELSE p.microtimestamp END AS sell_microtimestamp, 
-			CASE a.order_type WHEN 'buy' THEN a.microtimestamp ELSE p.microtimestamp END AS buy_microtimestamp
+			CASE a.order_type WHEN 'sell' THEN a.microtimestamp ELSE a.matched_microtimestamp END AS sell_microtimestamp, 
+			CASE a.order_type WHEN 'buy' THEN a.microtimestamp ELSE a.matched_microtimestamp END AS buy_microtimestamp
 	FROM bitstamp.live_orders a JOIN bitstamp.live_orders p ON a.matched_microtimestamp = p.microtimestamp AND a.order_id = p.matched_order_id
 	WHERE a.microtimestamp BETWEEN p_start_time AND p_end_time 
-	  AND a.order_id = a.episode_order_id
-	   ),
-	  events AS (
+	  AND  EXISTS (	SELECT '1' 
+				   	 FROM episodes 
+				     WHERE episodes.order_id = a.order_id 
+				       AND episodes.episode_microtimestamp = a.episode_microtimestamp
+				       AND episodes.episode_order_id = a.episode_order_id
+				   )
+	),
+	events AS (
 		SELECT row_number() OVER (ORDER BY order_id, event, microtimestamp) AS event_id,	-- ORDER BY must be the same as in oba_event(). Change both!
-		  		live_orders.*
+				live_orders.*
 		FROM bitstamp.live_orders
 		WHERE microtimestamp BETWEEN p_start_time AND p_end_time 
-	  )
-  SELECT trades.trade_timestamp AS "timestamp",
+	)
+  SELECT trades.episode_microtimestamp AS "timestamp",
   		  trades.price,
 		  trades.amount AS volume,
 		  trades.trade_type::text AS direction,
@@ -1543,7 +1557,7 @@ CREATE FUNCTION bitstamp.oba_trade(p_start_time timestamp with time zone, p_end_
 		  trades.trade_id 
   FROM trades JOIN events b ON buy_microtimestamp = b.microtimestamp AND buy_order_id = b.order_id 
   		JOIN events s ON sell_microtimestamp = s.microtimestamp AND sell_order_id = s.order_id 
-  ORDER BY trades.trade_timestamp;
+  ORDER BY trades.episode_microtimestamp;
 
 $$;
 
