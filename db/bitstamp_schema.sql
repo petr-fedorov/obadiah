@@ -440,24 +440,58 @@ CREATE FUNCTION bitstamp.assign_episodes(p_start_time timestamp with time zone, 
     LANGUAGE sql
     AS $$
 
-WITH order_created AS (
+WITH order_created_pass1 AS (
 	SELECT DISTINCT order_id, 
 			first_value(microtimestamp) OVER (PARTITION BY order_id ORDER BY microtimestamp) AS created_microtimestamp
 	FROM bitstamp.live_orders
 	WHERE microtimestamp BETWEEN ( SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= p_start_time ) AND p_end_time
 ),
-episodes AS (
+episodes_pass1 AS (
 	SELECT microtimestamp, live_orders.order_id, 
 		GREATEST(e.created_microtimestamp, m.created_microtimestamp) AS episode_microtimestamp,
 		CASE WHEN e.created_microtimestamp > m.created_microtimestamp THEN e.order_id ELSE m.order_id END AS episode_order_id
-	FROM bitstamp.live_orders JOIN order_created e USING (order_id) JOIN order_created m ON m.order_id = matched_order_id
+	FROM bitstamp.live_orders JOIN order_created_pass1 e USING (order_id) JOIN order_created_pass1 m ON m.order_id = matched_order_id
 	WHERE microtimestamp BETWEEN p_start_time AND p_end_time
+),
+-- Here we check whether Bitstamp has processed some market orders in the wrong order, i.e. those arrived later were processed eariler
+-- If there are no such orders, the query will be empty
+update_order_created_episodes AS (
+	SELECT DISTINCT (a.order_id), 
+			a.episode_microtimestamp AS created_microtimestamp, 
+			order_created_pass1.created_microtimestamp AS episode_microtimestamp,
+			order_created_pass1.order_id AS episode_order_id
+	FROM (
+		SELECT *, min(episode_microtimestamp) OVER ahead AS created_microtimestamp
+		FROM episodes_pass1
+		WINDOW ahead AS (ORDER BY microtimestamp DESC)
+	) a JOIN order_created_pass1 USING (created_microtimestamp) 
+	WHERE episode_microtimestamp > created_microtimestamp	
+),
+-- Usually 'order_created' is an episode on its own. But if Bitstamp has processed some market orders in the wrong order (the above queyr is non-empty)
+-- then we will assign wrong market orders to another episode - the episode of the market order which had to be processed first
+-- This newly assigned episode will be used afterwards for these orders
+order_created_pass2 AS (
+	SELECT order_id, created_microtimestamp, 
+			COALESCE(episode_order_id, order_id) AS episode_order_id,
+			COALESCE(episode_microtimestamp, created_microtimestamp) AS episode_microtimestamp
+	FROM order_created_pass1 LEFT JOIN update_order_created_episodes USING (order_id, created_microtimestamp)
+),
+episodes_pass2 AS (
+	SELECT live_orders.order_id,
+			microtimestamp, 
+			GREATEST(e.episode_microtimestamp, m.episode_microtimestamp) AS episode_microtimestamp,
+			CASE WHEN e.episode_microtimestamp > m.episode_microtimestamp THEN e.episode_order_id ELSE m.episode_order_id END AS episode_order_id
+	FROM bitstamp.live_orders JOIN order_created_pass2 e USING (order_id) JOIN order_created_pass2 m ON m.order_id = matched_order_id
+	WHERE microtimestamp BETWEEN p_start_time AND p_end_time
+	UNION ALL
+	SELECT * 
+	FROM update_order_created_episodes	-- the wrong 'order_created' events will receive episode_microtimestamp, episode_order_id too
 )
 UPDATE bitstamp.live_orders
-SET episode_microtimestamp = episodes.episode_microtimestamp,
-	episode_order_id = episodes.episode_order_id
-FROM episodes
-WHERE live_orders.microtimestamp = episodes.microtimestamp AND live_orders.order_id = episodes.order_id 
+SET episode_microtimestamp = episodes_pass2.episode_microtimestamp,
+	episode_order_id = episodes_pass2.episode_order_id
+FROM episodes_pass2
+WHERE live_orders.microtimestamp = episodes_pass2.microtimestamp AND live_orders.order_id = episodes_pass2.order_id 
 RETURNING live_orders.*
 	
 
