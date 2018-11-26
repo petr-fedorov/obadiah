@@ -928,6 +928,48 @@ $$;
 ALTER FUNCTION bitstamp.inferred_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_missing boolean, p_strict boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: live_order_manage_matched_without_trade(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.live_order_manage_matched_without_trade() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+BEGIN 
+	
+	IF TG_OP = 'UPDATE'  THEN 	-- DELETE is supposed to be handled by FOREING KEY constraint (matched_ ... will be set to NULL )
+		IF OLD.matched_microtimestamp IS NOT NULL THEN	-- FULL FOREIGN KEY ensures that matched_order_id IS NOT NULL too
+			UPDATE bitstamp.live_orders
+			SET matched_microtimestamp = NULL, matched_order_id = NULL
+			WHERE microtimestamp = OLD.matched_microtimestamp 
+			  AND order_id = OLD.matched_order_id
+			  -- to avoid circular update when A update B which in turn update A etc we check the condition below
+			  -- the same trigger will fire on matched_ live_order but will update nothing
+			  AND matched_microtimestamp = OLD.microtimestamp	
+			  AND matched_order_id = OLD.order_id;
+		END IF;
+	END IF;
+			
+	IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN 
+		IF NEW.matched_microtimestamp IS NOT NULL THEN 
+			UPDATE bitstamp.live_orders
+			SET matched_microtimestamp = NEW.microtimestamp, matched_order_id = NEW.order_id
+			WHERE microtimestamp = NEW.matched_microtimestamp 
+			  AND order_id = NEW.matched_order_id
+			  -- to avoid circular update when A update B which in turn update A etc we check the condition below
+			  -- the same trigger will fire on matched_ live_order but will update nothing
+			  AND ( matched_microtimestamp IS DISTINCT FROM NEW.microtimestamp	OR matched_order_id IS DISTINCT FROM NEW.order_id );
+		END IF;
+	END IF;
+	RETURN NULL;	
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.live_order_manage_matched_without_trade() OWNER TO "ob-analytics";
+
+--
 -- Name: live_orders_eras_v(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1234,8 +1276,8 @@ CREATE FUNCTION bitstamp.match_order_book_events(p_start_time timestamp with tim
     AS $$
 
 WITH trades AS (
-	SELECT buy_microtimestamp, buy_order_id, sell_microtimestamp, sell_order_id
-	FROM bitstamp.inferred_trades(p_start_time, p_end_time, p_pair, FALSE)
+	SELECT buy_microtimestamp, buy_order_id, sell_microtimestamp, sell_order_id, trade_type
+	FROM bitstamp.inferred_trades(p_start_time, p_end_time, p_pair, p_only_missing := TRUE)
 	ORDER BY trade_timestamp
 ),
 events AS (
@@ -1251,7 +1293,8 @@ matched_events AS (
 	FROM events LEFT JOIN trades ON CASE order_type 
 										WHEN 'buy' THEN microtimestamp = buy_microtimestamp AND order_id = buy_order_id
 										WHEN 'sell' THEN microtimestamp = sell_microtimestamp AND order_id = sell_order_id
-									  END
+									  END 
+							AND order_type = trade_type 
 )	
 UPDATE bitstamp.live_orders
 SET matched_microtimestamp = matched_events.matched_microtimestamp,
@@ -1262,6 +1305,7 @@ WHERE matched_events.matched_microtimestamp IS NOT NULL
   AND matched_events.order_id = live_orders.order_id
 RETURNING live_orders.*;
 	
+
 $$;
 
 
@@ -2085,6 +2129,20 @@ CREATE TRIGGER aa_update_previous AFTER UPDATE OF order_id, microtimestamp ON bi
 
 
 --
+-- Name: live_orders ab_manage_matched_without_trade_insert; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER ab_manage_matched_without_trade_insert AFTER INSERT ON bitstamp.live_orders FOR EACH ROW WHEN (((new.trade_id IS NULL) AND (new.trade_timestamp IS NULL) AND ((new.matched_microtimestamp IS NOT NULL) AND (new.matched_order_id IS NOT NULL)))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+
+
+--
+-- Name: live_orders ab_manage_matched_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER ab_manage_matched_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id ON bitstamp.live_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+
+
+--
 -- Name: live_orders ab_match_trade; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2121,11 +2179,19 @@ ALTER TABLE ONLY bitstamp.live_orders
 
 
 --
--- Name: live_orders live_orders_fkey_live_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_orders live_orders_fkey_live_orders_episode; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_fkey_live_orders FOREIGN KEY (matched_microtimestamp, matched_order_id) REFERENCES bitstamp.live_orders(microtimestamp, order_id) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE;
+    ADD CONSTRAINT live_orders_fkey_live_orders_episode FOREIGN KEY (episode_microtimestamp, episode_order_id) REFERENCES bitstamp.live_orders(microtimestamp, order_id) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_orders live_orders_fkey_live_orders_matched; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_orders
+    ADD CONSTRAINT live_orders_fkey_live_orders_matched FOREIGN KEY (matched_microtimestamp, matched_order_id) REFERENCES bitstamp.live_orders(microtimestamp, order_id) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
 
 
 --
