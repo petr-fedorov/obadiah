@@ -145,8 +145,9 @@ class LiveOrders(LiveStream):
                                                    0)
                     era.data = ("""
                                     INSERT INTO bitstamp.live_orders_eras
-                                    VALUES (%(era)s)
-                                     """, {"era": self.era})
+                                    VALUES (%(era)s, %(pair_id)s)
+                                """, {"era": self.era,
+                                      "pair_id": self.pair_id})
                     self.q_save.put(era)
                 data["era"] = self.era
                 data["datetime"] = datetime.fromtimestamp(
