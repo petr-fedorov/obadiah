@@ -402,30 +402,64 @@ $$;
 ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval) OWNER TO "ob-analytics";
 
 --
--- Name: assign_episodes(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: assign_episodes(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.assign_episodes(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.live_orders
+CREATE FUNCTION bitstamp.assign_episodes(p_ts_within_era timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.live_orders
     LANGUAGE sql
     AS $$
 
-WITH order_created_pass1 AS (
-	SELECT DISTINCT order_id, 
-			first_value(microtimestamp) OVER (PARTITION BY order_id ORDER BY microtimestamp) AS created_microtimestamp
-	FROM bitstamp.live_orders
-	WHERE microtimestamp BETWEEN ( SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= p_start_time ) AND p_end_time
+WITH time_range AS (
+	SELECT *
+	FROM (
+		SELECT era AS start_time, COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS end_time,
+				pair_id
+		FROM bitstamp.live_orders_eras JOIN bitstamp.pairs USING (pair_id)
+		WHERE pairs.pair = p_pair
+	) r
+	WHERE p_ts_within_era BETWEEN r.start_time AND r.end_time
+)
+UPDATE bitstamp.live_orders
+SET episode_microtimestamp = NULL,
+	episode_order_id = NULL
+FROM time_range	
+WHERE microtimestamp BETWEEN start_time AND end_time
+  AND episode_microtimestamp IS NOT NULL;
+
+
+WITH time_range AS (
+	SELECT *
+	FROM (
+		SELECT era AS start_time, COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS end_time,
+				pair_id
+		FROM bitstamp.live_orders_eras JOIN bitstamp.pairs USING (pair_id)
+		WHERE pairs.pair = p_pair
+	) r
+	WHERE p_ts_within_era BETWEEN r.start_time AND r.end_time
+),
+-- For episode assignment purposes, order is identified by its ID and its price.
+-- When order's price has been changed (currently by Bitstamp), we consider it as a newly created order
+order_created_pass1 AS (
+	SELECT DISTINCT order_id, first_value(microtimestamp) OVER order_life AS created_microtimestamp
+	FROM bitstamp.live_orders JOIN time_range USING (pair_id)
+	WHERE microtimestamp BETWEEN start_time AND end_time
+	WINDOW order_life AS (PARTITION BY order_id, price ORDER BY microtimestamp)
 ),
 episodes_pass1 AS (
-	SELECT microtimestamp, live_orders.order_id, 
+	SELECT DISTINCT ON (microtimestamp, live_orders.order_id)  microtimestamp, live_orders.order_id, 
 		GREATEST(e.created_microtimestamp, m.created_microtimestamp) AS episode_microtimestamp,
 		CASE WHEN e.created_microtimestamp > m.created_microtimestamp THEN e.order_id ELSE m.order_id END AS episode_order_id
-	FROM bitstamp.live_orders JOIN order_created_pass1 e USING (order_id) JOIN order_created_pass1 m ON m.order_id = matched_order_id
-	WHERE microtimestamp BETWEEN p_start_time AND p_end_time
+	FROM bitstamp.live_orders JOIN time_range USING (pair_id) 
+			JOIN order_created_pass1 e ON e.order_id = live_orders.order_id AND e.created_microtimestamp <= live_orders.microtimestamp
+			JOIN order_created_pass1 m ON m.order_id = matched_order_id AND m.created_microtimestamp <= live_orders.microtimestamp
+	WHERE microtimestamp BETWEEN start_time AND end_time
+	-- DISTINCT above and ORDER BY below gives us the most recent events for e. and m. 
+	ORDER BY microtimestamp, live_orders.order_id, e.created_microtimestamp DESC, m.created_microtimestamp DESC	
 ),
 -- Here we check whether Bitstamp has processed some market orders in the wrong order, i.e. those arrived later were processed eariler
 -- If there are no such orders, the query will be empty
-update_order_created_episodes AS (
-	SELECT DISTINCT (a.order_id), 
+update_order_created_wrong_processing_order AS (
+	SELECT a.order_id, 
 			a.episode_microtimestamp AS created_microtimestamp, 
 			order_created_pass1.created_microtimestamp AS episode_microtimestamp,
 			order_created_pass1.order_id AS episode_order_id
@@ -436,38 +470,74 @@ update_order_created_episodes AS (
 	) a JOIN order_created_pass1 USING (created_microtimestamp) 
 	WHERE episode_microtimestamp > created_microtimestamp	
 ),
--- Usually 'order_created' is an episode on its own. But if Bitstamp has processed some market orders in the wrong order (the above queyr is non-empty)
+-- Usually 'order_created' is an episode on its own. But if Bitstamp has processed some market orders in the wrong order (the above query is non-empty)
 -- then we will assign wrong market orders to another episode - the episode of the market order which had to be processed first
 -- This newly assigned episode will be used afterwards for these orders
 order_created_pass2 AS (
 	SELECT order_id, created_microtimestamp, 
 			COALESCE(episode_order_id, order_id) AS episode_order_id,
 			COALESCE(episode_microtimestamp, created_microtimestamp) AS episode_microtimestamp
-	FROM order_created_pass1 LEFT JOIN update_order_created_episodes USING (order_id, created_microtimestamp)
+	FROM order_created_pass1 LEFT JOIN update_order_created_wrong_processing_order USING (order_id, created_microtimestamp)
 ),
 episodes_pass2 AS (
-	SELECT live_orders.order_id,
-			microtimestamp, 
-			GREATEST(e.episode_microtimestamp, m.episode_microtimestamp) AS episode_microtimestamp,
-			CASE WHEN e.episode_microtimestamp > m.episode_microtimestamp THEN e.episode_order_id ELSE m.episode_order_id END AS episode_order_id
-	FROM bitstamp.live_orders JOIN order_created_pass2 e USING (order_id) JOIN order_created_pass2 m ON m.order_id = matched_order_id
-	WHERE microtimestamp BETWEEN p_start_time AND p_end_time
+	SELECT *
+	FROM (
+		SELECT DISTINCT ON (live_orders.order_id, microtimestamp)  
+				live_orders.order_id,
+				microtimestamp, 
+				GREATEST(e.episode_microtimestamp, m.episode_microtimestamp) AS episode_microtimestamp,
+				CASE WHEN e.episode_microtimestamp > m.episode_microtimestamp THEN e.episode_order_id ELSE m.episode_order_id END AS episode_order_id
+		FROM bitstamp.live_orders JOIN time_range USING (pair_id) 
+			JOIN order_created_pass2 e ON e.order_id = live_orders.order_id AND e.created_microtimestamp <= live_orders.microtimestamp
+			JOIN order_created_pass2 m ON m.order_id = matched_order_id AND m.created_microtimestamp <= live_orders.microtimestamp
+		WHERE microtimestamp BETWEEN start_time AND end_time
+		ORDER BY live_orders.order_id, microtimestamp, e.created_microtimestamp DESC, m.created_microtimestamp DESC
+	) a
 	UNION ALL
 	SELECT * 
-	FROM update_order_created_episodes	-- the wrong 'order_created' events will receive episode_microtimestamp, episode_order_id too
+	FROM update_order_created_wrong_processing_order	-- the wrong 'order_created' events will receive episode_microtimestamp, episode_order_id too
+),
+-- Now all unmatched events which have happened between two events assigned to the same episode in the previous passes, will be assigned to the episode too
+update_all_within_episode AS (
+	SELECT order_id, microtimestamp, previous_episode_microtimestamp AS episode_microtimestamp, previous_episode_order_id AS episode_order_id
+	FROM (
+		SELECT order_id, 
+				microtimestamp,
+				live_orders.matched_microtimestamp,
+				ep.episode_microtimestamp, 
+				last(ep.episode_microtimestamp) OVER ahead  AS next_episode_microtimestamp,
+				last(ep.episode_order_id) OVER ahead AS next_episode_order_id,
+				last(ep.episode_microtimestamp) OVER behind  AS previous_episode_microtimestamp,
+				last(ep.episode_order_id) OVER behind AS previous_episode_order_id
+		FROM bitstamp.live_orders JOIN time_range USING (pair_id) LEFT JOIN episodes_pass2 ep USING (order_id, microtimestamp)
+		WHERE microtimestamp BETWEEN start_time AND end_time
+		WINDOW ahead AS (ORDER BY microtimestamp DESC), behind  AS (ORDER BY microtimestamp)
+	) a
+	WHERE episode_microtimestamp IS NULL	-- we need only events which were not yet assigned to an episode
+	 AND matched_microtimestamp IS NULL		-- .. and definitely not matched (above condition implies this one, but just in case ...)
+	 AND next_episode_microtimestamp = previous_episode_microtimestamp
+	 AND next_episode_order_id = previous_episode_order_id
+),
+episodes_final_pass AS (
+	SELECT *
+	FROM update_all_within_episode
+	UNION ALL
+	SELECT *
+	FROM episodes_pass2
 )
 UPDATE bitstamp.live_orders
-SET episode_microtimestamp = episodes_pass2.episode_microtimestamp,
-	episode_order_id = episodes_pass2.episode_order_id
-FROM episodes_pass2
-WHERE live_orders.microtimestamp = episodes_pass2.microtimestamp AND live_orders.order_id = episodes_pass2.order_id 
+SET episode_microtimestamp = episodes_final_pass.episode_microtimestamp,
+	episode_order_id = episodes_final_pass.episode_order_id
+FROM episodes_final_pass
+WHERE live_orders.microtimestamp = episodes_final_pass.microtimestamp 
+  AND live_orders.order_id = episodes_final_pass.order_id 
 RETURNING live_orders.*
 	
 
 $$;
 
 
-ALTER FUNCTION bitstamp.assign_episodes(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.assign_episodes(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
 -- Name: capture_transient_orders(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -521,39 +591,40 @@ BEGIN
 			  ORDER BY microtimestamp 
 			  RETURNING *	-- while it is not guaranteed, it is highly likely that INSERT will not change the order of rows 
 			  LOOP
+		IF  e.event <> 'order_created' THEN 
+			IF e.order_type = 'buy' THEN
+				FOR t IN buy_match(e.microtimestamp, e.order_id, e.fill, e.amount, e.event ) LOOP
 
-		IF e.order_type = 'buy' THEN
-			FOR t IN buy_match(e.microtimestamp, e.order_id, e.fill, e.amount, e.event ) LOOP
+					UPDATE bitstamp.live_trades
+					SET buy_microtimestamp = e.microtimestamp,
+						buy_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
+																  trade_price := t.price,
+																  event_amount := e.amount,
+																  event_fill := e.fill,
+																  event := e.event,
+																  tolerance := v_tolerance
+																 )
+					WHERE CURRENT OF buy_match;
 
-				UPDATE bitstamp.live_trades
-				SET buy_microtimestamp = e.microtimestamp,
-					buy_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
-															  trade_price := t.price,
-															  event_amount := e.amount,
-															  event_fill := e.fill,
-															  event := e.event,
-															  tolerance := v_tolerance
-															 )
-				WHERE CURRENT OF buy_match;
+					EXIT;
+				END LOOP;
+			ELSE
+				FOR t IN sell_match(e.microtimestamp, e.order_id, e.fill, e.amount, e.event ) LOOP
 
-				EXIT;
-			END LOOP;
-		ELSE
-			FOR t IN sell_match(e.microtimestamp, e.order_id, e.fill, e.amount, e.event ) LOOP
-
-				UPDATE bitstamp.live_trades
-				SET sell_microtimestamp = e.microtimestamp,
-					sell_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
-															   trade_price := t.price,
-															   event_amount := e.amount,
-															   event_fill := e.fill,
-															   event := e.event,
-															   tolerance := v_tolerance
-															  ) 
-				WHERE CURRENT OF sell_match;
-				EXIT;
-			END LOOP;
-		END IF;
+					UPDATE bitstamp.live_trades
+					SET sell_microtimestamp = e.microtimestamp,
+						sell_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
+																   trade_price := t.price,
+																   event_amount := e.amount,
+																   event_fill := e.fill,
+																   event := e.event,
+																   tolerance := v_tolerance
+																  ) 
+					WHERE CURRENT OF sell_match;
+					EXIT;
+				END LOOP;
+			END IF;
+		END IF;			
 	END LOOP;
 	
 END;
@@ -1676,7 +1747,7 @@ $$;
 ALTER FUNCTION bitstamp.oba_trade(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean) OWNER TO "ob-analytics";
 
 --
--- Name: order_book_after(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: postgres
+-- Name: order_book_after(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_only_makers boolean DEFAULT true) RETURNS SETOF bitstamp.order_book_record
@@ -1715,10 +1786,11 @@ CREATE FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair 
 $$;
 
 
-ALTER FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO postgres;
+ALTER FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO "ob-analytics";
+
 
 --
--- Name: order_book_before(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: postgres
+-- Name: order_book_before(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_only_makers boolean DEFAULT true) RETURNS SETOF bitstamp.order_book_record
@@ -1758,7 +1830,7 @@ CREATE FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair
 $$;
 
 
-ALTER FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO postgres;
+ALTER FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_by_episode(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1872,7 +1944,7 @@ BEGIN
 		PERFORM bitstamp.find_and_repair_partially_matched(v_era, p_pair,  p_tolerance_percentage := 0.005);
 
 		PERFORM bitstamp.match_order_book_events(v_start_time, v_end_time, p_pair);
-		PERFORM bitstamp.assign_episodes(v_start_time, v_end_time, p_pair);
+		PERFORM bitstamp.assign_episodes(v_era, p_pair);
 
 		--INSERT INTO bitstamp.spread
 		--SELECT * FROM bitstamp.spread_by_episode(v_start_time, v_end_time, p_pair, TRUE, FALSE );
