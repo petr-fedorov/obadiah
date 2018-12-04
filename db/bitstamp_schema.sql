@@ -53,9 +53,11 @@ ALTER TYPE bitstamp.enum_neighborhood OWNER TO "ob-analytics";
 --
 
 CREATE TYPE bitstamp.live_orders_event AS ENUM (
+    'initial',
     'order_created',
     'order_changed',
-    'order_deleted'
+    'order_deleted',
+    'final'
 );
 
 
@@ -189,7 +191,7 @@ CREATE TABLE bitstamp.live_orders (
     pair_id smallint NOT NULL,
     price numeric NOT NULL,
     fill numeric,
-    next_microtimestamp timestamp with time zone,
+    next_microtimestamp timestamp with time zone NOT NULL,
     era timestamp with time zone NOT NULL,
     trade_timestamp timestamp with time zone,
     trade_id bigint,
@@ -197,8 +199,13 @@ CREATE TABLE bitstamp.live_orders (
     matched_order_id bigint,
     episode_microtimestamp timestamp with time zone,
     episode_order_id bigint,
+    matched_event bitstamp.live_orders_event,
+    episode_event bitstamp.live_orders_event,
+    next_event bitstamp.live_orders_event NOT NULL,
     CONSTRAINT created_amount_positive CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR (amount > (0)::numeric))),
-    CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((trade_id IS NULL) AND (trade_timestamp IS NULL) AND (matched_microtimestamp IS NULL) AND (matched_order_id IS NULL))))
+    CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((trade_id IS NULL) AND (trade_timestamp IS NULL) AND (matched_microtimestamp IS NULL) AND (matched_order_id IS NULL)))),
+    CONSTRAINT next_together CHECK ((((next_microtimestamp IS NOT NULL) AND (next_event IS NOT NULL)) OR ((next_microtimestamp IS NULL) AND (next_event IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
 );
 
 
@@ -321,7 +328,9 @@ CREATE TABLE bitstamp.live_trades (
     sell_microtimestamp timestamp with time zone,
     buy_microtimestamp timestamp with time zone,
     buy_match_rule smallint,
-    sell_match_rule smallint
+    sell_match_rule smallint,
+    buy_event bitstamp.live_orders_event,
+    sell_event bitstamp.live_orders_event
 );
 
 
@@ -578,19 +587,22 @@ BEGIN
 	USING duplicates
 	WHERE transient_live_orders.order_id = duplicates.order_id
 	  AND transient_live_orders.microtimestamp = duplicates.microtimestamp;	
+	  
+	  
+	WITH deleted AS (
+		DELETE FROM bitstamp.transient_live_orders 
+		WHERE pair_id = v_pair_id
+		  AND microtimestamp BETWEEN p_start_time AND p_end_time
+		RETURNING *
+	)
+	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era)
+	SELECT order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era
+	FROM deleted 
+	ORDER BY microtimestamp;
 	
-	FOR e IN WITH deleted AS (
-				DELETE FROM bitstamp.transient_live_orders 
-				WHERE pair_id = v_pair_id
-				  AND microtimestamp BETWEEN p_start_time AND p_end_time
-				RETURNING *
-			  )
-			  INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era)
-		  	  SELECT order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era
-			  FROM deleted 
-			  ORDER BY microtimestamp 
-			  RETURNING *	-- while it is not guaranteed, it is highly likely that INSERT will not change the order of rows 
-			  LOOP
+	FOR e IN SELECT * FROM bitstamp.live_orders WHERE microtimestamp BETWEEN p_start_time AND p_end_time ORDER BY microtimestamp
+		LOOP
+					  
 		IF  e.event <> 'order_created' THEN 
 			IF e.order_type = 'buy' THEN
 				FOR t IN buy_match(e.microtimestamp, e.order_id, e.fill, e.amount, e.event ) LOOP
@@ -1192,6 +1204,7 @@ DECLARE
 							  	  AND order_id = NEW.order_id 
 								  AND next_microtimestamp > NEW.microtimestamp FOR UPDATE;
 	eon timestamptz;
+	create_surrounding_events boolean := FALSE;
 BEGIN 
 
 	eon := bitstamp._get_live_orders_eon(NEW.microtimestamp);
@@ -1211,26 +1224,45 @@ BEGIN
 		CASE NEW.event 
 			WHEN 'order_created', 'order_changed'  THEN 
 				NEW.next_microtimestamp := 'infinity'::timestamptz;		-- later than all other timestamps
+				NEW.next_event := 'final';
 			WHEN 'order_deleted' THEN 
 				NEW.next_microtimestamp := '-infinity'::timestamptz;	-- earlier than all other timestamps
+				NEW.next_event := 'initial';
 		END CASE;
 	END IF;
 	
 	CASE NEW.event
 		WHEN 'order_created' THEN
 			NEW.fill = -NEW.amount;
+			create_surrounding_events := TRUE;
 			
 		WHEN 'order_changed', 'order_deleted' THEN
 			FOR e IN previous_event LOOP
 			
 				UPDATE bitstamp.live_orders
-				SET next_microtimestamp = NEW.microtimestamp
+				SET next_microtimestamp = NEW.microtimestamp, next_event = NEW.event
 				WHERE CURRENT OF previous_event;
+				
+				IF NOT FOUND THEN
+					create_surrounding_events := TRUE;
+				END IF;
 
 				NEW.fill = e.amount - NEW.amount;
 
 			END LOOP;
+		ELSE
+			NULL;
 	END CASE;
+	
+	IF create_surrounding_events THEN 
+		INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp, pair_id, price, next_microtimestamp, next_event, era)
+		VALUES (NEW.order_id, 0, 'initial', NEW.order_type, NEW.datetime, '-infinity', NEW.pair_id, NEW.price, '-infinity', 'initial', NEW.era);
+		
+		INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp, pair_id, price, next_microtimestamp, next_event, era)
+		VALUES (NEW.order_id, 0, 'final', NEW.order_type, NEW.datetime, 'infinity', NEW.pair_id, NEW.price, '-infinity', 'initial', NEW.era);
+
+	END IF;
+	
 	RETURN NEW;
 END;
 
@@ -1240,26 +1272,54 @@ $$;
 ALTER FUNCTION bitstamp.live_orders_incorporate_new_event() OWNER TO "ob-analytics";
 
 --
--- Name: live_orders_update_previous(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_orders_manage_chain(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.live_orders_update_previous() RETURNS trigger
+CREATE FUNCTION bitstamp.live_orders_manage_chain() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 
 BEGIN 
-	UPDATE bitstamp.live_orders
-	SET next_microtimestamp = NEW.microtimestamp,
-	     order_id = NEW.order_id
-	WHERE live_orders.order_id = OLD.order_id
-	  AND live_orders.next_microtimestamp = OLD.next_microtimestamp;
-	RETURN NEW;
+
+	IF TG_OP = 'DELETE' THEN
+		UPDATE bitstamp.live_orders
+		SET next_microtimestamp = OLD.next_microtimestamp,
+			 next_event = OLD.next_event
+		WHERE next_microtimestamp = OLD.microtimestamp
+		  AND order_id = OLD.order_id
+		  AND next_event = OLD.event;
+	END IF;
+	RETURN NULL;
+			
 END;
 
 $$;
 
 
-ALTER FUNCTION bitstamp.live_orders_update_previous() OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.live_orders_manage_chain() OWNER TO "ob-analytics";
+
+--
+-- Name: live_orders_redirect_insert(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.live_orders_redirect_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+BEGIN 
+
+	IF NEW.order_type = 'buy' THEN
+		INSERT INTO bitstamp.live_buy_orders VALUES (NEW.*);
+	ELSE 	
+		INSERT INTO bitstamp.live_sell_orders VALUES (NEW.*);
+	END IF;
+	RETURN NULL;
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.live_orders_redirect_insert() OWNER TO "ob-analytics";
 
 --
 -- Name: live_trades_manage_linked_events(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1788,6 +1848,47 @@ $$;
 
 ALTER FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO "ob-analytics";
 
+--
+-- Name: order_book_after_episode(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.order_book_after_episode(p_ts timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_only_makers boolean DEFAULT true) RETURNS SETOF bitstamp.order_book_record
+    LANGUAGE sql STABLE
+    AS $$
+
+	WITH orders AS (
+		SELECT *, 
+				COALESCE(
+					CASE order_type 
+						WHEN 'buy' THEN price < min(price) FILTER (WHERE order_type = 'sell') OVER (ORDER BY datetime, LEAST(microtimestamp, episode_microtimestamp))
+						WHEN 'sell' THEN price > max(price) FILTER (WHERE order_type = 'buy') OVER (ORDER BY datetime, LEAST(microtimestamp, episode_microtimestamp))
+					END,
+				TRUE )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
+				AS is_maker
+		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
+		WHERE LEAST(microtimestamp, episode_microtimestamp) BETWEEN (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= p_ts ) AND p_ts
+ 	   	  AND next_microtimestamp > p_ts 
+		  AND event <> 'order_deleted'
+		  AND pairs.pair = p_pair
+		)
+	SELECT p_ts,
+			price,
+			amount,
+			order_type,
+			order_id,
+			LEAST(microtimestamp, episode_microtimestamp) AS microtimestamp,
+			event,
+			pair_id,
+			is_maker,
+			datetime
+    FROM orders
+	WHERE is_maker OR NOT p_only_makers
+	ORDER BY order_type DESC, price DESC;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.order_book_after_episode(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_before(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -2053,6 +2154,18 @@ CREATE TABLE bitstamp.diff_order_book (
 ALTER TABLE bitstamp.diff_order_book OWNER TO "ob-analytics";
 
 --
+-- Name: live_buy_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.live_buy_orders (
+    CONSTRAINT is_buy_order CHECK ((order_type = 'buy'::bitstamp.direction))
+)
+INHERITS (bitstamp.live_orders);
+
+
+ALTER TABLE bitstamp.live_buy_orders OWNER TO "ob-analytics";
+
+--
 -- Name: live_orders_eras; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2063,6 +2176,18 @@ CREATE TABLE bitstamp.live_orders_eras (
 
 
 ALTER TABLE bitstamp.live_orders_eras OWNER TO "ob-analytics";
+
+--
+-- Name: live_sell_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.live_sell_orders (
+    CONSTRAINT is_sell_order CHECK ((order_type = 'sell'::bitstamp.direction))
+)
+INHERITS (bitstamp.live_orders);
+
+
+ALTER TABLE bitstamp.live_sell_orders OWNER TO "ob-analytics";
 
 --
 -- Name: pairs; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -2113,43 +2238,75 @@ ALTER TABLE ONLY bitstamp.diff_order_book
 
 
 --
--- Name: live_orders_eras eras_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_buy_orders live_buy_orders_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_pkey PRIMARY KEY (microtimestamp, order_id, event);
+
+
+--
+-- Name: live_buy_orders live_buy_orders_unique_matched; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_unique_matched UNIQUE (matched_microtimestamp, matched_order_id, matched_event) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_buy_orders live_buy_orders_unique_next; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_unique_next UNIQUE (next_microtimestamp, order_id, next_event) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_buy_orders live_buy_orders_unique_trade_match; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_unique_trade_match UNIQUE (microtimestamp, order_id, event, trade_id, matched_microtimestamp, matched_order_id, matched_event);
+
+
+--
+-- Name: live_orders_eras live_orders_eras_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitstamp.live_orders_eras
-    ADD CONSTRAINT eras_pkey PRIMARY KEY (era);
+    ADD CONSTRAINT live_orders_eras_pkey PRIMARY KEY (era, pair_id);
 
 
 --
--- Name: live_orders live_orders_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders live_sell_orders_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_pkey PRIMARY KEY (microtimestamp, order_id);
-
-
---
--- Name: live_orders live_orders_unique_matched_event; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_unique_matched_event UNIQUE (matched_microtimestamp, matched_order_id) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_pkey PRIMARY KEY (microtimestamp, order_id, event);
 
 
 --
--- Name: live_orders live_orders_unique_matched_trade; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders live_sell_orders_unique_matched; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_unique_matched_trade UNIQUE (microtimestamp, order_id, trade_timestamp, trade_id);
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_unique_matched UNIQUE (matched_microtimestamp, matched_order_id, matched_event) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
--- Name: live_orders live_orders_unique_next_event_for_order; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders live_sell_orders_unique_next; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_unique_next_event_for_order UNIQUE (order_id, next_microtimestamp) DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_unique_next UNIQUE (next_microtimestamp, order_id, next_event) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_sell_orders live_sell_orders_unique_trade_match; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_unique_trade_match UNIQUE (microtimestamp, order_id, event, trade_id, matched_microtimestamp, matched_order_id, matched_event);
 
 
 --
@@ -2165,7 +2322,7 @@ ALTER TABLE ONLY bitstamp.live_trades
 --
 
 ALTER TABLE ONLY bitstamp.live_trades
-    ADD CONSTRAINT live_trades_unique_buy_event UNIQUE (buy_microtimestamp, buy_order_id) DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT live_trades_unique_buy_event UNIQUE (buy_microtimestamp, buy_order_id, buy_event) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -2173,7 +2330,7 @@ ALTER TABLE ONLY bitstamp.live_trades
 --
 
 ALTER TABLE ONLY bitstamp.live_trades
-    ADD CONSTRAINT live_trades_unique_sell_event UNIQUE (sell_microtimestamp, sell_order_id) DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT live_trades_unique_sell_event UNIQUE (sell_microtimestamp, sell_order_id, sell_event) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -2201,10 +2358,45 @@ ALTER TABLE ONLY bitstamp.spread
 
 
 --
--- Name: live_orders_idx_order_id; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+-- Name: fki_live_buy_orders_fkey_live_buy_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE INDEX live_orders_idx_order_id ON bitstamp.live_orders USING btree (order_id);
+CREATE INDEX fki_live_buy_orders_fkey_live_buy_orders ON bitstamp.live_buy_orders USING btree (next_microtimestamp, order_id, next_event);
+
+
+--
+-- Name: fki_live_buy_orders_fkey_live_sell_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX fki_live_buy_orders_fkey_live_sell_orders ON bitstamp.live_buy_orders USING btree (matched_microtimestamp, matched_order_id, matched_event);
+
+
+--
+-- Name: fki_live_sell_orders_fkey_live_buy_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX fki_live_sell_orders_fkey_live_buy_orders ON bitstamp.live_sell_orders USING btree (matched_microtimestamp, matched_order_id, matched_event);
+
+
+--
+-- Name: fki_live_sell_orders_fkey_live_sell_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX fki_live_sell_orders_fkey_live_sell_orders ON bitstamp.live_sell_orders USING btree (next_microtimestamp, order_id, next_event);
+
+
+--
+-- Name: fki_live_trades_fkey_live_buy_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX fki_live_trades_fkey_live_buy_orders ON bitstamp.live_trades USING btree (buy_microtimestamp, buy_order_id, buy_event);
+
+
+--
+-- Name: fki_live_trades_fkey_live_sell_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX fki_live_trades_fkey_live_sell_orders ON bitstamp.live_trades USING btree (sell_microtimestamp, sell_order_id, sell_event);
 
 
 --
@@ -2215,24 +2407,45 @@ CREATE TRIGGER aa_manage_linked_events AFTER INSERT OR DELETE OR UPDATE OF buy_o
 
 
 --
--- Name: live_orders aa_update_previous; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders ab_manage_chain; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER aa_update_previous AFTER UPDATE OF order_id, microtimestamp ON bitstamp.live_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_update_previous();
-
-
---
--- Name: live_orders ab_manage_matched_without_trade_insert; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TRIGGER ab_manage_matched_without_trade_insert AFTER INSERT ON bitstamp.live_orders FOR EACH ROW WHEN (((new.trade_id IS NULL) AND (new.trade_timestamp IS NULL) AND ((new.matched_microtimestamp IS NOT NULL) AND (new.matched_order_id IS NOT NULL)))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+CREATE TRIGGER ab_manage_chain AFTER DELETE ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_chain();
 
 
 --
--- Name: live_orders ab_manage_matched_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_buy_orders ab_manage_chain; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER ab_manage_matched_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id ON bitstamp.live_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+CREATE TRIGGER ab_manage_chain AFTER DELETE ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_chain();
+
+
+--
+-- Name: live_sell_orders ab_manage_matched_without_trade_insert; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER ab_manage_matched_without_trade_insert AFTER INSERT ON bitstamp.live_sell_orders FOR EACH ROW WHEN (((new.trade_id IS NULL) AND (new.trade_timestamp IS NULL) AND ((new.matched_microtimestamp IS NOT NULL) AND (new.matched_order_id IS NOT NULL)))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+
+
+--
+-- Name: live_buy_orders ab_manage_matched_without_trade_insert; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER ab_manage_matched_without_trade_insert AFTER INSERT ON bitstamp.live_buy_orders FOR EACH ROW WHEN (((new.trade_id IS NULL) AND (new.trade_timestamp IS NULL) AND ((new.matched_microtimestamp IS NOT NULL) AND (new.matched_order_id IS NOT NULL)))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+
+
+--
+-- Name: live_sell_orders ab_managed_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER ab_managed_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id ON bitstamp.live_sell_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+
+
+--
+-- Name: live_buy_orders ab_managed_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER ab_managed_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id ON bitstamp.live_buy_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
 
 
 --
@@ -2243,17 +2456,48 @@ CREATE TRIGGER ba_protect_columns BEFORE UPDATE OF trade_id, amount, price, trad
 
 
 --
--- Name: live_orders ba_protect_columns; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_orders ba_redirect_insert; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER ba_protect_columns BEFORE UPDATE OF order_id, amount, event, order_type, datetime, microtimestamp, pair_id, price, era ON bitstamp.live_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.protect_columns();
+CREATE TRIGGER ba_redirect_insert BEFORE INSERT ON bitstamp.live_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_redirect_insert();
 
 
 --
--- Name: live_orders bb_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders bb_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER bb_incorporate_new_event BEFORE INSERT ON bitstamp.live_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
+CREATE TRIGGER bb_incorporate_new_event BEFORE INSERT ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
+
+
+--
+-- Name: live_buy_orders bb_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER bb_incorporate_new_event BEFORE INSERT ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
+
+
+--
+-- Name: live_buy_orders live_buy_orders_fkey_live_buy_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_fkey_live_buy_orders FOREIGN KEY (next_microtimestamp, order_id, next_event) REFERENCES bitstamp.live_buy_orders(microtimestamp, order_id, event) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_buy_orders live_buy_orders_fkey_live_sell_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_fkey_live_sell_orders FOREIGN KEY (matched_microtimestamp, matched_order_id, matched_event) REFERENCES bitstamp.live_sell_orders(microtimestamp, order_id, event) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_buy_orders live_buy_orders_fkey_pairs; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_fkey_pairs FOREIGN KEY (pair_id) REFERENCES bitstamp.pairs(pair_id) ON UPDATE CASCADE;
 
 
 --
@@ -2265,51 +2509,67 @@ ALTER TABLE ONLY bitstamp.live_orders_eras
 
 
 --
--- Name: live_orders live_orders_fkey_eras; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_buy_orders live_orders_fkey_era; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_fkey_eras FOREIGN KEY (era) REFERENCES bitstamp.live_orders_eras(era) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
-
-
---
--- Name: live_orders live_orders_fkey_live_orders_episode; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_fkey_live_orders_episode FOREIGN KEY (episode_microtimestamp, episode_order_id) REFERENCES bitstamp.live_orders(microtimestamp, order_id) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_orders_fkey_era FOREIGN KEY (era, pair_id) REFERENCES bitstamp.live_orders_eras(era, pair_id) ON UPDATE CASCADE;
 
 
 --
--- Name: live_orders live_orders_fkey_live_orders_matched; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders live_sell_orders_fkey_era; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_fkey_live_orders_matched FOREIGN KEY (matched_microtimestamp, matched_order_id) REFERENCES bitstamp.live_orders(microtimestamp, order_id) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
-
-
---
--- Name: live_orders live_orders_fkey_live_trades; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_fkey_live_trades FOREIGN KEY (trade_timestamp, trade_id) REFERENCES bitstamp.live_trades(trade_timestamp, trade_id) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE;
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_fkey_era FOREIGN KEY (era, pair_id) REFERENCES bitstamp.live_orders_eras(era, pair_id) MATCH FULL ON UPDATE CASCADE;
 
 
 --
--- Name: live_orders live_orders_fkey_pairs; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders live_sell_orders_fkey_live_buy_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
-ALTER TABLE ONLY bitstamp.live_orders
-    ADD CONSTRAINT live_orders_fkey_pairs FOREIGN KEY (pair_id) REFERENCES bitstamp.pairs(pair_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_fkey_live_buy_orders FOREIGN KEY (matched_microtimestamp, matched_order_id, matched_event) REFERENCES bitstamp.live_buy_orders(microtimestamp, order_id, event) MATCH FULL ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
 
 
 --
--- Name: live_trades live_trades_fkey_buy_live_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders live_sell_orders_fkey_live_sell_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_fkey_live_sell_orders FOREIGN KEY (next_microtimestamp, order_id, next_event) REFERENCES bitstamp.live_sell_orders(microtimestamp, order_id, event) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_sell_orders live_sell_orders_fkey_pairs; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_fkey_pairs FOREIGN KEY (pair_id) REFERENCES bitstamp.pairs(pair_id) ON UPDATE CASCADE;
+
+
+--
+-- Name: live_trades live_trades_fkey_live_buy_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitstamp.live_trades
-    ADD CONSTRAINT live_trades_fkey_buy_live_orders FOREIGN KEY (buy_microtimestamp, buy_order_id, trade_timestamp, trade_id) REFERENCES bitstamp.live_orders(microtimestamp, order_id, trade_timestamp, trade_id) DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT live_trades_fkey_live_buy_orders FOREIGN KEY (buy_microtimestamp, buy_order_id, buy_event) REFERENCES bitstamp.live_buy_orders(microtimestamp, order_id, event) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_trades live_trades_fkey_live_buy_orders_trade_match; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_trades
+    ADD CONSTRAINT live_trades_fkey_live_buy_orders_trade_match FOREIGN KEY (buy_microtimestamp, buy_order_id, buy_event, trade_id, sell_microtimestamp, sell_order_id, sell_event) REFERENCES bitstamp.live_buy_orders(microtimestamp, order_id, event, trade_id, matched_microtimestamp, matched_order_id, matched_event) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_trades live_trades_fkey_live_sell_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_trades
+    ADD CONSTRAINT live_trades_fkey_live_sell_orders FOREIGN KEY (sell_microtimestamp, sell_order_id, sell_event) REFERENCES bitstamp.live_sell_orders(microtimestamp, order_id, event) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -2317,15 +2577,15 @@ ALTER TABLE ONLY bitstamp.live_trades
 --
 
 ALTER TABLE ONLY bitstamp.live_trades
-    ADD CONSTRAINT live_trades_fkey_pairs FOREIGN KEY (pair_id) REFERENCES bitstamp.pairs(pair_id) ON UPDATE CASCADE ON DELETE CASCADE DEFERRABLE;
+    ADD CONSTRAINT live_trades_fkey_pairs FOREIGN KEY (pair_id) REFERENCES bitstamp.pairs(pair_id) MATCH FULL ON UPDATE CASCADE;
 
 
 --
--- Name: live_trades live_trades_fkey_sell_live_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_trades live_trades_fkey_sell_orders_trade_match; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitstamp.live_trades
-    ADD CONSTRAINT live_trades_fkey_sell_live_orders FOREIGN KEY (sell_microtimestamp, sell_order_id, trade_timestamp, trade_id) REFERENCES bitstamp.live_orders(microtimestamp, order_id, trade_timestamp, trade_id) DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT live_trades_fkey_sell_orders_trade_match FOREIGN KEY (sell_microtimestamp, sell_order_id, sell_event, trade_id, buy_microtimestamp, buy_order_id, buy_event) REFERENCES bitstamp.live_sell_orders(microtimestamp, order_id, event, trade_id, matched_microtimestamp, matched_order_id, matched_event) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
