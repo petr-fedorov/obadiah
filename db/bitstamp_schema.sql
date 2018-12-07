@@ -330,7 +330,9 @@ CREATE TABLE bitstamp.live_trades (
     buy_match_rule smallint,
     sell_match_rule smallint,
     buy_event bitstamp.live_orders_event,
-    sell_event bitstamp.live_orders_event
+    sell_event bitstamp.live_orders_event,
+    CONSTRAINT buy_event_full_match CHECK ((((buy_microtimestamp IS NOT NULL) AND (buy_event IS NOT NULL)) OR ((buy_microtimestamp IS NULL) AND (buy_event IS NULL)))),
+    CONSTRAINT sell_event_full_match CHECK ((((sell_microtimestamp IS NOT NULL) AND (sell_event IS NOT NULL)) OR ((sell_microtimestamp IS NULL) AND (sell_event IS NULL))))
 );
 
 
@@ -620,6 +622,7 @@ BEGIN
 
 					UPDATE bitstamp.live_trades
 					SET buy_microtimestamp = e.microtimestamp,
+						buy_event = e.event,
 						buy_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
 																  trade_price := t.price,
 																  event_amount := e.amount,
@@ -636,6 +639,7 @@ BEGIN
 
 					UPDATE bitstamp.live_trades
 					SET sell_microtimestamp = e.microtimestamp,
+						sell_event = e.event,
 						sell_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
 																   trade_price := t.price,
 																   event_amount := e.amount,
@@ -2541,7 +2545,7 @@ CREATE INDEX fki_live_trades_fkey_live_sell_orders ON bitstamp.live_trades USING
 -- Name: live_trades aa_manage_linked_events; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER aa_manage_linked_events AFTER INSERT OR DELETE OR UPDATE OF buy_order_id, sell_order_id, sell_microtimestamp, buy_microtimestamp ON bitstamp.live_trades FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_trades_manage_linked_events();
+CREATE TRIGGER aa_manage_linked_events AFTER INSERT OR DELETE OR UPDATE OF buy_order_id, sell_order_id, sell_microtimestamp, buy_microtimestamp, buy_event, sell_event ON bitstamp.live_trades FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_trades_manage_linked_events();
 
 
 --
