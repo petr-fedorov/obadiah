@@ -605,11 +605,23 @@ BEGIN
 		WHERE pair_id = v_pair_id
 		  AND microtimestamp BETWEEN p_start_time AND p_end_time
 		RETURNING *
-	)
-	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era)
-	SELECT order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era
-	FROM deleted 
-	ORDER BY microtimestamp;
+	),
+	deleted_with_chain AS (
+		SELECT first_value(microtimestamp) OVER o AS f_microtimestamp,
+				first_value(event) OVER o AS f_event,
+				lead(microtimestamp) OVER o AS n_microtimestamp,
+				lead(event) OVER o AS n_event,
+				lag(amount) OVER o - amount  AS fill,
+				* 
+		FROM deleted
+		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
+	) 
+	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, fill, local_timestamp, pair_id, price, era, next_microtimestamp, next_event)
+	SELECT order_id, amount, event, order_type, datetime, microtimestamp, fill, local_timestamp, pair_id, price, era,
+			COALESCE(n_microtimestamp, CASE WHEN event = 'order_deleted' AND f_event = 'order_created' THEN f_microtimestamp ELSE NULL END ) AS next_microtimestamp,
+			COALESCE(n_event, CASE WHEN event = 'order_deleted' AND f_event = 'order_created' THEN f_event ELSE NULL END ) AS next_event
+	FROM deleted_with_chain
+	ORDER BY microtimestamp, order_id, event;
 	
 	RAISE DEBUG 'capture_transient_orders() INSERT live_orders exec time: %', clock_timestamp() - v_statement_execution_start_time;
 	
@@ -1248,10 +1260,12 @@ DECLARE
 	v_eon timestamptz;
 	v_amount numeric;
 	
-	v_microtimestamp timestamptz;
-	v_event bitstamp.live_orders_event;
+	-- If inserted row is the first row for NEW.order_id, the variables below will refer to the first event
+	-- in the chain for the NEW.order_id. It will be either this row or a newly created 'order_created' row for ex-nihilo events.
+	-- Otherwise the variables will be NULL
+	v_first_microtimestamp timestamptz;
+	v_first_event bitstamp.live_orders_event;
 	
-	v_is_first_event_for_order boolean DEFAULT FALSE;
 	
 BEGIN 
 
@@ -1267,106 +1281,115 @@ BEGIN
 		NEW.era := v_eon;	
 	END IF;
 	
+	IF (NEW.fill IS NULL AND NEW.event <> 'order_created') OR NEW.next_microtimestamp IS NULL THEN 
+		RAISE DEBUG 'live_orders_incorporate_new_event() - slow processing of:  % % %', NEW.microtimestamp, NEW.order_id, NEW.event;
+	END IF;
+	
+	-- I. First, look behind. NEW.fill IS NULL when the inserter has not done it itself!
 	
 	IF NEW.fill IS NULL THEN 
+
 		IF NEW.event = 'order_created' THEN
 			NEW.fill = -NEW.amount;
-			NEW.next_microtimestamp := 'infinity'::timestamptz;		
-			NEW.next_event := 'order_deleted';
 			
-			v_microtimestamp := NEW.microtimestamp;
-			v_event := NEW.event;
-			v_is_first_event_for_order := TRUE;
+			v_first_microtimestamp := NEW.microtimestamp;
+			v_first_event := NEW.event;
+			
 		ELSE
-			IF NEW.order_type = 'buy' THEN
-				UPDATE bitstamp.live_buy_orders
-				   SET next_microtimestamp = NEW.microtimestamp,
-				       next_event = NEW.event
-				WHERE microtimestamp BETWEEN NEW.era AND NEW.microtimestamp
-			  	  AND order_id = NEW.order_id 
-			  	  AND next_microtimestamp > NEW.microtimestamp
-			      AND era = NEW.era
-				RETURNING amount INTO v_amount;
-			ELSE
-				UPDATE bitstamp.live_sell_orders
-				   SET next_microtimestamp = NEW.microtimestamp,
-				       next_event = NEW.event
-				WHERE microtimestamp BETWEEN NEW.era AND NEW.microtimestamp
-			  	  AND order_id = NEW.order_id 
-			  	  AND next_microtimestamp > NEW.microtimestamp
-			      AND era = NEW.era
-				RETURNING amount INTO v_amount;
-			END IF;
+			UPDATE bitstamp.live_buy_orders
+			   SET next_microtimestamp = NEW.microtimestamp,
+				   next_event = NEW.event
+			WHERE microtimestamp BETWEEN NEW.era AND NEW.microtimestamp
+			  AND order_id = NEW.order_id 
+			  AND order_type = NEW.order_type  	-- a query optimizer will choose either live_buy_orders OR live_sell_orders 
+			  AND next_microtimestamp >= NEW.microtimestamp
+			  AND era = NEW.era
+			RETURNING amount INTO v_amount;
+			
 			IF FOUND THEN 
-				NEW.fill = v_amount - NEW.amount; 	
-			ELSE -- it is ex-nihilo 'order_changed' or 'order_deleted' event
-				-- Free space for the new infinite order_deleted in this era
-				UPDATE bitstamp.live_orders
-				SET microtimestamp = NEW.era - '00:00:00.000001'::interval -- i.e.just before this era starts
-				WHERE microtimestamp = 'infinity'
-				  AND order_id = NEW.order_id
-				  AND event = 'order_deleted'
-				  AND era < NEW.era;
+				NEW.fill = v_amount - NEW.amount; 
+				-- Note that this also means that it is an insertion into the middle of the chain for NEW.order_id !
+				-- NEW. next_microtimestamp is null in this branch of code!
 				
+			ELSE -- it is ex-nihilo 'order_changed' or 'order_deleted' event
+
 				IF NEW.amount > 0 THEN 
-					v_microtimestamp := CASE WHEN NEW.datetime < NEW.era THEN NEW.era ELSE NEW.datetime END;
-					v_event := 'order_created'::bitstamp.live_orders_event;
+					v_first_microtimestamp := CASE WHEN NEW.datetime < NEW.era THEN NEW.era ELSE NEW.datetime END;
+					v_first_event := 'order_created'::bitstamp.live_orders_event;
 
 					NEW.fill := NULL;	-- we still don't know fill (yet). Can later try to figure it out from trade
 					-- INSERT the initial 'order_created' event when missing
-					RAISE DEBUG 'order_created originated by ex-nihilo %, %', NEW.order_id, NEW.microtimestamp;
 					INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp, 
 													  pair_id, price, fill, next_microtimestamp, next_event,era )
-					VALUES (NEW.order_id, NEW.amount, v_event, NEW.order_type, NEW.datetime, v_microtimestamp, 
+					VALUES (NEW.order_id, NEW.amount, v_first_event, NEW.order_type, NEW.datetime, v_first_microtimestamp, 
 							NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event, NEW.era);
-							
-				ELSE --	will not create 'order_created' for ex-nihilo
-					v_microtimestamp := NEW.microtimestamp;
-					v_event := NEW.event;
-				END IF;
-				
-				v_is_first_event_for_order := TRUE;
-				
-			END IF;
-		END IF;
-		IF v_is_first_event_for_order THEN 
 
-			NEW.next_microtimestamp := 'infinity'::timestamptz;		-- later than all other timestamps
-			NEW.next_event := 'order_deleted';
-			RAISE DEBUG 'Inserted order_deleted at infinity originated by  %, %', NEW.order_id, NEW.microtimestamp;
-			-- INSERT the final 'order_deleted' event - at infinity
-			INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp, pair_id, price, fill, next_microtimestamp,
-										  next_event,era )
-			VALUES (NEW.order_id, 0, 'order_deleted'::bitstamp.live_orders_event, NEW.order_type, NEW.datetime, 'infinity'::timestamptz, NEW.pair_id,
-			   NEW.price, 0, v_microtimestamp, v_event, NEW.era);
+				ELSE --	will not create 'order_created' for ex-nihilo, this order will be the first one
+					v_first_microtimestamp := NEW.microtimestamp;
+					v_first_event := NEW.event;
+				END IF;
+			
+			END IF;
 		END IF;
 		
 	END IF;
 	
-	-- 'next_microtimestamp' is a not-null column
 	
-	IF NEW.next_microtimestamp IS NULL THEN 
-		-- find the next event i.e. it is insertion in the middle of the chain
-		-- TBD: should we update also 'fill' of the next event? 
-		
-		SELECT microtimestamp, event INTO v_microtimestamp, v_event
+	-- II. Second, look ahead
+	
+	IF NEW.next_microtimestamp IS NULL AND v_first_microtimestamp IS NULL THEN 
+		-- Probably it is insertion into the middle of the chaine for NEW.order_id
+		-- First, try to find the next event ...
+		SELECT microtimestamp, event INTO NEW.next_microtimestamp, NEW.next_event
 		FROM bitstamp.live_orders
 		WHERE microtimestamp > NEW.microtimestamp
 		  AND order_id = NEW.order_id  
+		  AND order_type = NEW.order_type
 		  AND era = NEW.era
 		ORDER BY microtimestamp
 		LIMIT 1;
 
-		IF FOUND THEN 
-			NEW.next_microtimestamp := v_microtimestamp;
-			NEW.next_event := v_event;
-			-- if it is 'order_deleted' event, AFTER trigger will delete an infinite 'order_deleted' event and update next_microtimestap
-			-- for this record accordingly
-		ELSE
-			RAISE EXCEPTION 'Unexpected insert at the end of the chain %', NEW;
+		IF NOT FOUND THEN 
+			-- NEW is currently the last event for NEW.order_id. Then let's find the first one ...
+			SELECT DISTINCT ON (order_id) microtimestamp, event INTO v_first_microtimestamp, v_first_event
+			FROM bitstamp.live_orders
+			WHERE microtimestamp >= NEW.era
+			  AND order_id = NEW.order_id  
+			  AND order_type = NEW.order_type	-- a queyry optimizer will choose either live_buy_orders OR live_sell_orders 			  
+			  AND era = NEW.era
+			ORDER BY order_id, microtimestamp
+			LIMIT 1;
+
 		END IF;
 	END IF;
-	RAISE DEBUG 'Finished processing insert of %, %', NEW.order_id, NEW.microtimestamp;
+	
+	IF NEW.next_microtimestamp IS NULL THEN 
+		-- So NEW is currently the last event for NEW.order_id. Let's see whether we need to add 'order_deleted' at infinity
+		IF NEW.event <> 'order_deleted' THEN 
+		
+			IF NEW.event = 'order_changed' THEN 
+				-- Ensure free space for the new infinite 'order_deleted' for the NEW.order_id in this era
+				UPDATE bitstamp.live_orders
+				SET microtimestamp = NEW.era - '00:00:00.000001'::interval -- i.e.just before this era starts
+				WHERE microtimestamp = 'infinity'
+				  AND order_id = NEW.order_id
+				  AND order_type = NEW.order_type	-- a queyry optimizer will choose either live_buy_orders OR live_sell_orders 			  
+				  AND event = 'order_deleted'
+				  AND era < NEW.era;
+			END IF;				  
+			-- .. and inser it! ('order_deleted', infinity)
+			INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp, pair_id, price, fill, next_microtimestamp,
+										  next_event,era )
+			VALUES (NEW.order_id, 0, 'order_deleted'::bitstamp.live_orders_event, NEW.order_type, NEW.datetime, 'infinity'::timestamptz, NEW.pair_id,
+			   NEW.price, 0, v_first_microtimestamp, v_first_event, NEW.era);
+
+			NEW.next_microtimestamp := 'infinity'::timestamptz;		
+			NEW.next_event := 'order_deleted';
+		ELSE
+			NEW.next_microtimestamp := v_first_microtimestamp;
+			NEW.next_event := v_first_event;
+		END IF;
+	END IF;
 	RETURN NEW;
 END;
 
@@ -1410,17 +1433,16 @@ BEGIN
 
 	CASE TG_OP
 		WHEN 'INSERT' THEN
-			RAISE DEBUG 'AFTER INSERT %', NEW;
-		
-			IF NEW.microtimestamp <> 'infinity' AND NEW.event = 'order_deleted' THEN
-			
-				DELETE FROM bitstamp.live_orders
-				WHERE microtimestamp = 'infinity'
-				  AND order_id = NEW.order_id
-				  AND era = NEW.era;
-			END IF;
+			-- WHEN condition for tirgger is supposed to be:
+			-- NEW.microtimestamp <> 'infinity' AND NEW.event = 'order_deleted' AND NEW.next_event = 'infinity' 
+			RAISE DEBUG 'DELETE AFTER INSERT %', NEW;
+
+			DELETE FROM bitstamp.live_orders
+			WHERE microtimestamp = 'infinity'
+			  AND order_id = NEW.order_id
+			  AND era = NEW.era;
 		WHEN 'DELETE' THEN
-			RAISE DEBUG 'AFTER DELETE %', OLD;
+			RAISE DEBUG 'UPDATE AFTER DELETE %', OLD;
 		
 			UPDATE bitstamp.live_orders
 			SET next_microtimestamp = OLD.next_microtimestamp,
@@ -2549,6 +2571,34 @@ CREATE TRIGGER aa_manage_linked_events AFTER INSERT OR DELETE OR UPDATE OF buy_o
 
 
 --
+-- Name: live_buy_orders aa_remove_order_deleted_at_infinity; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER aa_remove_order_deleted_at_infinity AFTER INSERT ON bitstamp.live_buy_orders FOR EACH ROW WHEN (((new.microtimestamp <> 'infinity'::timestamp with time zone) AND (new.event = 'order_deleted'::bitstamp.live_orders_event) AND (new.next_microtimestamp = 'infinity'::timestamp with time zone))) EXECUTE PROCEDURE bitstamp.live_orders_update_chain();
+
+
+--
+-- Name: live_sell_orders aa_remove_order_deleted_at_infinity; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER aa_remove_order_deleted_at_infinity AFTER INSERT ON bitstamp.live_sell_orders FOR EACH ROW WHEN (((new.microtimestamp <> 'infinity'::timestamp with time zone) AND (new.event = 'order_deleted'::bitstamp.live_orders_event) AND (new.next_microtimestamp = 'infinity'::timestamp with time zone))) EXECUTE PROCEDURE bitstamp.live_orders_update_chain();
+
+
+--
+-- Name: live_buy_orders aa_restore_chain_after_delete; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER aa_restore_chain_after_delete AFTER DELETE ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_update_chain();
+
+
+--
+-- Name: live_sell_orders aa_restore_chain_after_delete; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER aa_restore_chain_after_delete AFTER DELETE ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_update_chain();
+
+
+--
 -- Name: live_sell_orders ab_manage_matched_without_trade_insert; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2574,20 +2624,6 @@ CREATE TRIGGER ab_managed_without_trade_update AFTER UPDATE OF matched_microtime
 --
 
 CREATE TRIGGER ab_managed_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id ON bitstamp.live_buy_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
-
-
---
--- Name: live_buy_orders ab_update_chain; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TRIGGER ab_update_chain AFTER INSERT OR DELETE OR UPDATE ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_update_chain();
-
-
---
--- Name: live_sell_orders ab_update_chain; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TRIGGER ab_update_chain AFTER INSERT OR DELETE OR UPDATE ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_update_chain();
 
 
 --
