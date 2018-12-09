@@ -3,7 +3,7 @@
 --
 
 -- Dumped from database version 10.5
--- Dumped by pg_dump version 10.5
+-- Dumped by pg_dump version 10.6
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -204,6 +204,8 @@ CREATE TABLE bitstamp.live_orders (
     next_event bitstamp.live_orders_event NOT NULL,
     CONSTRAINT created_amount_positive CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR (amount > (0)::numeric))),
     CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((trade_id IS NULL) AND (trade_timestamp IS NULL) AND (matched_microtimestamp IS NULL) AND (matched_order_id IS NULL)))),
+    CONSTRAINT live_orders_must_be_empty CHECK (((order_type <> 'buy'::bitstamp.direction) AND (order_type <> 'sell'::bitstamp.direction))) NO INHERIT,
+    CONSTRAINT next_is_usually_different CHECK ((((amount = (0)::numeric) AND (event = 'order_deleted'::bitstamp.live_orders_event)) OR (NOT ((next_microtimestamp = microtimestamp) AND (next_event = event))))),
     CONSTRAINT next_together CHECK ((((next_microtimestamp IS NOT NULL) AND (next_event IS NOT NULL)) OR ((next_microtimestamp IS NULL) AND (next_event IS NULL)))),
     CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
 );
@@ -418,7 +420,9 @@ ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with t
 
 CREATE FUNCTION bitstamp.assign_episodes(p_ts_within_era timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.live_orders
     LANGUAGE plpgsql
+    SET work_mem TO '4GB'
     AS $$
+
 DECLARE
 
 	v_execution_start_time timestamp with time zone;
@@ -794,8 +798,8 @@ BEGIN
 							NULL::timestamptz, -- we didn't receive this event from Bitstamp!
 							o.pair_id,
 							o.price,
-							0.0::numeric,	-- the order had been cancelled 
-							'Infinity'::timestamptz,
+							NULL::numeric,	-- a trigger will update chain appropriately only if 'fill' and 'next_microtimestamp' are both NULLs
+							NULL::timestamptz,
 							o.era,
 							NULL::timestamptz,
 							NULL::bigint
@@ -822,60 +826,6 @@ $$;
 
 
 ALTER FUNCTION bitstamp.find_and_repair_eternal_orders(ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
-
---
--- Name: find_and_repair_ex_nihilo_orders(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.find_and_repair_ex_nihilo_orders(ts_within_era timestamp with time zone) RETURNS SETOF bitstamp.live_orders
-    LANGUAGE sql
-    AS $$
-
-WITH time_range AS (
-	SELECT *
-	FROM (
-		SELECT era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
-		FROM bitstamp.live_orders_eras
-	) r
-	WHERE find_and_repair_ex_nihilo_orders.ts_within_era BETWEEN r."start.time" AND r."end.time"
-),
-events_with_first_event AS (
-	SELECT *, first_value(event) OVER o AS first_event, first_value(microtimestamp) OVER o AS first_microtimestamp
-	FROM bitstamp.live_orders 
-	WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
-	WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
-)
-INSERT INTO bitstamp.live_orders
-SELECT o.order_id,
-		o.amount + COALESCE(o.fill,0),			-- our best guess of the order amount when it was created
-		'order_created'::bitstamp.live_orders_event,
-		o.order_type,
-		o.datetime,
-		CASE WHEN o.datetime < o.era THEN o.era ELSE o.datetime END,	  -- the creation event will be at the start of the current era if the order 
-																			 -- was created earlier or it's creation time known up to a second
-		NULL::timestamptz, -- we didn't receive this event from Bitstamp!
-		o.pair_id,
-		o.price,
-		o.fill,	
-		o.microtimestamp, 	-- we know the next event microtimestamp precisely!
-		o.era,
-		NULL::timestamptz,
-		NULL::bigint
-FROM events_with_first_event o
-WHERE o.first_event <> 'order_created' 
-  AND microtimestamp = first_microtimestamp	-- i.e. only the first known event for each order_id
-  AND ( ( trade_id IS NULL AND fill IS NULL )	-- fill is used to determine 'order_created' amount, so we temporarily ignore inconsisten events.
-	    OR 										 -- They might be included later when they are repaired.
-	    ( trade_id IS NOT NULL AND fill IS NOT NULL )
-	   )
-  AND microtimestamp > (SELECT "start.time" FROM time_range)  
-  AND o.amount + COALESCE(o.fill,0) > 0
-RETURNING *	
-
-$$;
-
-
-ALTER FUNCTION bitstamp.find_and_repair_ex_nihilo_orders(ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: find_and_repair_missing_fill(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -979,17 +929,19 @@ BEGIN
 			v_statement_execution_start_time := clock_timestamp();
 			RETURN QUERY
 				WITH matching_event AS (
-					SELECT microtimestamp AS buy_microtimestamp, order_id AS buy_order_id, buy_match_rule
+					SELECT microtimestamp AS buy_microtimestamp, order_id AS buy_order_id, event AS buy_event,  buy_match_rule
 					FROM (
 						SELECT ABS(EXTRACT(epoch FROM e.microtimestamp - COALESCE(t.sell_microtimestamp, t.trade_timestamp))) AS distance, 
 								MIN(ABS(EXTRACT(epoch FROM e.microtimestamp - COALESCE(t.sell_microtimestamp, t.trade_timestamp)))) OVER (PARTITION BY t.trade_id) AS min_distance,
 								e.microtimestamp,
 								e.order_id,
+								e.event,
 								bitstamp._get_match_rule(t.amount, t.price, e.amount,e.fill, e.event, t.price * p_tolerance_percentage) AS buy_match_rule
 						FROM bitstamp.live_orders e 
 						WHERE e.microtimestamp BETWEEN COALESCE(t.sell_microtimestamp, t.trade_timestamp) - p_look_around AND COALESCE(t.sell_microtimestamp, t.trade_timestamp) + p_look_around
 						  AND pair_id = v_pair_id
-						  AND order_id = t.buy_order_id																					   
+						  AND order_id = t.buy_order_id
+						  AND order_type = 'buy'
 						  AND e.trade_id IS NULL
 						  AND bitstamp._get_match_rule(t.amount, t.price, e.amount,e.fill, e.event, t.price * p_tolerance_percentage) IS NOT NULL
 					) a
@@ -997,6 +949,7 @@ BEGIN
 				)
 				UPDATE bitstamp.live_trades
 				SET buy_microtimestamp = matching_event.buy_microtimestamp,
+					buy_event = matching_event.buy_event,
 					buy_match_rule = matching_event.buy_match_rule
 				FROM matching_event
 				WHERE CURRENT OF trades
@@ -1007,17 +960,19 @@ BEGIN
 			v_statement_execution_start_time := clock_timestamp();
 			RETURN QUERY
 				WITH matching_event AS (
-					SELECT microtimestamp AS sell_microtimestamp, order_id AS sell_order_id, sell_match_rule
+					SELECT microtimestamp AS sell_microtimestamp, order_id AS sell_order_id, event AS sell_event, sell_match_rule
 					FROM (
 						SELECT ABS(EXTRACT(epoch FROM e.microtimestamp - COALESCE(t.buy_microtimestamp, t.trade_timestamp))) AS distance, 
 								MIN(ABS(EXTRACT(epoch FROM e.microtimestamp - COALESCE(t.buy_microtimestamp, t.trade_timestamp)))) OVER (PARTITION BY t.trade_id) AS min_distance,
 								e.microtimestamp,
+								e.event,
 								e.order_id,
 								bitstamp._get_match_rule(t.amount, t.price, e.amount,e.fill, e.event, t.price * p_tolerance_percentage) AS sell_match_rule
 						FROM bitstamp.live_orders e 
 						WHERE e.microtimestamp BETWEEN COALESCE(t.buy_microtimestamp, t.trade_timestamp) - p_look_around AND COALESCE(t.buy_microtimestamp, t.trade_timestamp) + p_look_around
 						  AND pair_id = v_pair_id
 						  AND order_id = t.sell_order_id																					   
+						  AND order_type = 'sell'
 						  AND e.trade_id IS NULL
 						  AND bitstamp._get_match_rule(t.amount, t.price, e.amount,e.fill, e.event, t.price * p_tolerance_percentage) IS NOT NULL
 					) a
@@ -1025,6 +980,7 @@ BEGIN
 				)
 				UPDATE bitstamp.live_trades
 				SET sell_microtimestamp = matching_event.sell_microtimestamp,
+					sell_event = matching_event.sell_event,
 					sell_match_rule = matching_event.sell_match_rule
 				FROM matching_event
 				WHERE CURRENT OF trades
@@ -1087,7 +1043,9 @@ BEGIN
 							  sell_microtimestamp,
 							  buy_microtimestamp,
 							  buy_match_rule,
-							  sell_match_rule
+							  sell_match_rule,
+							  buy_event,
+							  sell_event
 					  FROM bitstamp.live_trades JOIN bitstamp.pairs USING (pair_id)
 					  WHERE pairs.pair = p_pair
 					    AND GREATEST(buy_microtimestamp, sell_microtimestamp) BETWEEN inferred_trades.p_start_time AND inferred_trades.p_end_time ;
@@ -1143,7 +1101,9 @@ BEGIN
 							   CASE e.order_type WHEN 'sell' THEN e.microtimestamp ELSE trade_part.microtimestamp END, 								 
 							   CASE e.order_type WHEN 'buy' THEN e.microtimestamp ELSE trade_part.microtimestamp END,
 							   NULL::smallint,
-							   NULL::smallint); 
+							   NULL::smallint,
+							   CASE e.order_type WHEN 'buy' THEN e.event ELSE trade_part.event END, 
+							   CASE e.order_type WHEN 'sell' THEN e.event ELSE trade_part.event END); 
 			ELSE -- the first par has NOT been seen, so e is the first part - save it!
 
 				trade_parts := array_append(trade_parts, e);
@@ -1153,7 +1113,18 @@ BEGIN
 	END LOOP;
 	
 	RAISE DEBUG 'Number of not matched trade parts: %  ', array_length(trade_parts,1);
-	RAISE DEBUG 'Not matched trade parts: %', trade_parts;
+	DECLARE
+		i integer DEFAULT 0;
+	BEGIN
+		FOREACH trade_part IN ARRAY trade_parts LOOP
+			IF trade_part.fill IS NOT NULL THEN 
+				RAISE DEBUG 'Not matched and fill IS NOT NULL: %, %, %, %, %, %', trade_part.microtimestamp, trade_part.order_id, trade_part.event, trade_part.fill, trade_part.price, trade_part.amount;
+			ELSE
+				i := i + 1;
+			END IF;
+		END LOOP;
+		RAISE DEBUG 'Number of not matched where fill IS NULL: %', i;
+	END;
 	RETURN;
 END;
 
@@ -1173,15 +1144,20 @@ CREATE FUNCTION bitstamp.live_order_manage_matched_without_trade() RETURNS trigg
 BEGIN 
 	
 	IF TG_OP = 'UPDATE'  THEN 	-- DELETE is supposed to be handled by FOREING KEY constraint (matched_ ... will be set to NULL )
-		IF OLD.matched_microtimestamp IS NOT NULL THEN	-- FULL FOREIGN KEY ensures that matched_order_id IS NOT NULL too
+		IF OLD.matched_microtimestamp IS NOT NULL AND 
+		(OLD.matched_microtimestamp IS DISTINCT FROM NEW.matched_microtimestamp OR OLD.matched_order_id IS DISTINCT FROM NEW.matched_order_id
+		 OR OLD.matched_event IS DISTINCT FROM NEW.matched_event ) THEN	-- FULL FOREIGN KEY ensures that matched_order_id IS NOT NULL too
 			UPDATE bitstamp.live_orders
 			SET matched_microtimestamp = NULL, matched_order_id = NULL, matched_event = NULL
 			WHERE microtimestamp = OLD.matched_microtimestamp 
 			  AND order_id = OLD.matched_order_id
+			  AND event = OLD.matched_event
+			  AND order_type = OLD.order_type
 			  -- to avoid circular update when A update B which in turn update A etc we check the condition below
 			  -- the same trigger will fire on matched_ live_order but will update nothing
 			  AND matched_microtimestamp = OLD.microtimestamp	
-			  AND matched_order_id = OLD.order_id;
+			  AND matched_order_id = OLD.order_id
+			  AND matched_event = OLD.event;
 		END IF;
 	END IF;
 			
@@ -1191,6 +1167,7 @@ BEGIN
 			SET matched_microtimestamp = NEW.microtimestamp, matched_order_id = NEW.order_id, matched_event = NEW.event
 			WHERE microtimestamp = NEW.matched_microtimestamp 
 			  AND order_id = NEW.matched_order_id
+			  AND order_type = NEW.order_type
 			  AND event = NEW.matched_event
 			  -- to avoid circular update when A update B which in turn update A etc we check the condition below
 			  -- the same trigger will fire on matched_ live_order but will update nothing
@@ -1296,7 +1273,7 @@ BEGIN
 			v_first_event := NEW.event;
 			
 		ELSE
-			UPDATE bitstamp.live_buy_orders
+			UPDATE bitstamp.live_orders
 			   SET next_microtimestamp = NEW.microtimestamp,
 				   next_event = NEW.event
 			WHERE microtimestamp BETWEEN NEW.era AND NEW.microtimestamp
@@ -1593,6 +1570,7 @@ ALTER FUNCTION bitstamp.live_trades_manage_linked_events() OWNER TO "ob-analytic
 CREATE FUNCTION bitstamp.match_order_book_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.live_orders
     LANGUAGE plpgsql
     AS $$
+
 DECLARE
 	v_execution_start_time timestamp with time zone;
 
@@ -1600,7 +1578,7 @@ BEGIN
 	v_execution_start_time := clock_timestamp();
 
 	RETURN QUERY   WITH trades AS (
-						SELECT buy_microtimestamp, buy_order_id, sell_microtimestamp, sell_order_id, trade_type
+						SELECT buy_microtimestamp, buy_order_id, buy_event, sell_microtimestamp, sell_order_id, sell_event, trade_type
 						FROM bitstamp.inferred_trades(p_start_time, p_end_time, p_pair, p_only_missing := TRUE)
 						ORDER BY trade_timestamp
 					),
@@ -1613,7 +1591,8 @@ BEGIN
 						SELECT order_id, amount, event, order_type, datetime, microtimestamp, local_timestamp, pair_id, price, fill, next_microtimestamp, 
 								era, trade_timestamp, trade_id,
 								CASE order_type WHEN 'buy' THEN sell_microtimestamp WHEN 'sell' THEN buy_microtimestamp END AS matched_microtimestamp,
-								CASE order_type WHEN 'buy' THEN sell_order_id WHEN 'sell' THEN buy_order_id END AS matched_order_id
+								CASE order_type WHEN 'buy' THEN sell_order_id WHEN 'sell' THEN buy_order_id END AS matched_order_id,
+								CASE order_type WHEN 'buy' THEN sell_event WHEN 'sell' THEN buy_event END AS matched_event
 						FROM events LEFT JOIN trades ON CASE order_type 
 															WHEN 'buy' THEN microtimestamp = buy_microtimestamp AND order_id = buy_order_id
 															WHEN 'sell' THEN microtimestamp = sell_microtimestamp AND order_id = sell_order_id
@@ -1622,7 +1601,8 @@ BEGIN
 					)	
 					UPDATE bitstamp.live_orders
 					SET matched_microtimestamp = matched_events.matched_microtimestamp,
-						matched_order_id = matched_events.matched_order_id
+						matched_order_id = matched_events.matched_order_id,
+						matched_event = matched_events.matched_event
 					FROM matched_events
 					WHERE matched_events.matched_microtimestamp IS NOT NULL 
 					  AND matched_events.microtimestamp = live_orders.microtimestamp
@@ -2204,12 +2184,11 @@ BEGIN
 		PERFORM bitstamp.capture_transient_trades(v_start_time, v_end_time, p_pair);
 		PERFORM bitstamp.capture_transient_orders(v_start_time, v_end_time, p_pair);
 		PERFORM bitstamp.find_and_repair_missing_fill(v_era);
-		-- PERFORM bitstamp.find_and_repair_ex_nihilo_orders(v_era);
 		PERFORM bitstamp.find_and_repair_eternal_orders(v_era);
-		-- PERFORM bitstamp.find_and_repair_partially_matched(v_era, p_pair,  p_tolerance_percentage := 0.005);
+		PERFORM bitstamp.find_and_repair_partially_matched(v_era, p_pair,  p_tolerance_percentage := 0.005);
 
-		-- PERFORM bitstamp.match_order_book_events(v_start_time, v_end_time, p_pair);
-		-- PERFORM bitstamp.assign_episodes(v_era, p_pair);
+		PERFORM bitstamp.match_order_book_events(v_start_time, v_end_time, p_pair);
+		PERFORM bitstamp.assign_episodes(v_era, p_pair);
 
 		--INSERT INTO bitstamp.spread
 		--SELECT * FROM bitstamp.spread_by_episode(v_start_time, v_end_time, p_pair, TRUE, FALSE );
@@ -2324,7 +2303,8 @@ ALTER TABLE bitstamp.diff_order_book OWNER TO "ob-analytics";
 CREATE TABLE bitstamp.live_buy_orders (
     CONSTRAINT is_buy_order CHECK ((order_type = 'buy'::bitstamp.direction))
 )
-INHERITS (bitstamp.live_orders);
+INHERITS (bitstamp.live_orders)
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE bitstamp.live_buy_orders OWNER TO "ob-analytics";
@@ -2348,7 +2328,8 @@ ALTER TABLE bitstamp.live_orders_eras OWNER TO "ob-analytics";
 CREATE TABLE bitstamp.live_sell_orders (
     CONSTRAINT is_sell_order CHECK ((order_type = 'sell'::bitstamp.direction))
 )
-INHERITS (bitstamp.live_orders);
+INHERITS (bitstamp.live_orders)
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE bitstamp.live_sell_orders OWNER TO "ob-analytics";
@@ -2613,17 +2594,17 @@ CREATE TRIGGER ab_manage_matched_without_trade_insert AFTER INSERT ON bitstamp.l
 
 
 --
--- Name: live_sell_orders ab_managed_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_buy_orders ab_manage_matched_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER ab_managed_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id ON bitstamp.live_sell_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+CREATE TRIGGER ab_manage_matched_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id, matched_event ON bitstamp.live_buy_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
 
 
 --
--- Name: live_buy_orders ab_managed_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders ab_manage_matched_without_trade_update; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER ab_managed_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id ON bitstamp.live_buy_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
+CREATE TRIGGER ab_manage_matched_without_trade_update AFTER UPDATE OF matched_microtimestamp, matched_order_id, matched_event ON bitstamp.live_sell_orders FOR EACH ROW WHEN (((old.trade_id IS NULL) AND (old.trade_timestamp IS NULL) AND (new.trade_id IS NULL) AND (new.trade_timestamp IS NULL))) EXECUTE PROCEDURE bitstamp.live_order_manage_matched_without_trade();
 
 
 --
