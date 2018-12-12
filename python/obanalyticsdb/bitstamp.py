@@ -232,8 +232,8 @@ class LiveTrades(LiveStream):
                                                  data["timestamp"],
                                                  2)
                 trade.data = ("""
-                            INSERT INTO bitstamp.live_trades
-                            (trade_id, amount, price, trade_timestamp,
+                            INSERT INTO bitstamp.transient_live_trades
+                            (bitstamp_trade_id, amount, price, trade_timestamp,
                             trade_type, buy_order_id, sell_order_id,
                             pair_id, local_timestamp )
                             VALUES (%(id)s, %(amount)s, %(price)s,
