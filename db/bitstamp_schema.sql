@@ -197,9 +197,12 @@ CREATE TABLE bitstamp.live_orders (
     pair_id smallint NOT NULL,
     local_timestamp timestamp with time zone,
     datetime timestamp with time zone NOT NULL,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no smallint,
     CONSTRAINT created_amount_positive CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR (amount > (0)::numeric))),
     CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
-    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((next_microtimestamp = 'infinity'::timestamp with time zone) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT only_ex_nihilo_may_have_price_event_no_null CHECK (((price_event_no IS NOT NULL) OR ((price_event_no IS NULL) AND (event_no = 1) AND (event <> 'order_created'::bitstamp.live_orders_event)))),
     CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
 )
 PARTITION BY LIST (order_type);
@@ -328,6 +331,7 @@ CREATE TABLE bitstamp.live_trades (
     buy_event_no smallint,
     sell_event_no smallint,
     trade_id bigint NOT NULL,
+    orig_trade_type bitstamp.direction,
     CONSTRAINT microtimestamp_and_event_no_must_be_changed_together CHECK (((((sell_microtimestamp IS NULL) AND (sell_event_no IS NULL)) OR ((sell_microtimestamp IS NOT NULL) AND (sell_event_no IS NOT NULL))) AND (((buy_microtimestamp IS NULL) AND (buy_event_no IS NULL)) OR ((buy_microtimestamp IS NOT NULL) AND (buy_event_no IS NOT NULL)))))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
@@ -1011,66 +1015,36 @@ BEGIN
 						) r
 						WHERE p_ts_within_era BETWEEN r.start_time AND r.end_time
 						),
-						-- For episode assignment purposes, order is identified by its ID and its price.
-						-- When order's price has been changed (currently by Bitstamp), we consider it as a newly created order
-						buy_order_created AS (
-							SELECT DISTINCT pair_id, order_id, 
-											first_value(microtimestamp) OVER order_life AS created_microtimestamp,
-											first_value(event_no) OVER order_life AS created_event_no
-							FROM bitstamp.live_buy_orders JOIN time_range USING (pair_id)
-							WHERE microtimestamp BETWEEN start_time AND end_time
-							WINDOW order_life AS (PARTITION BY order_id, price ORDER BY microtimestamp)
-						),
-						sell_order_created AS (
-							SELECT DISTINCT pair_id, order_id, 
-									first_value(microtimestamp) OVER order_life AS created_microtimestamp,
-									first_value(event_no) OVER order_life AS created_event_no
-							FROM bitstamp.live_sell_orders JOIN time_range USING (pair_id)
-							WHERE microtimestamp BETWEEN start_time AND end_time
-							WINDOW order_life AS (PARTITION BY order_id, price ORDER BY microtimestamp)
-						),
-						trades_with_created AS (
+						trades_with_price_microtimestamp AS (
 							SELECT sell_microtimestamp AS r_microtimestamp, sell_order_id AS r_order_id, sell_event_no AS r_event_no,
-									created_microtimestamp, created_event_no, buy_microtimestamp AS a_microtimestamp, buy_order_id AS a_order_id, buy_event_no AS a_event_no,
+									price_microtimestamp, price_event_no, buy_microtimestamp AS a_microtimestamp, buy_order_id AS a_order_id, buy_event_no AS a_event_no,
 									trade_type
 							FROM bitstamp.live_trades JOIN time_range USING (pair_id) 
-									JOIN LATERAL ( SELECT *
-													FROM buy_order_created 
-													WHERE order_id = live_trades.buy_order_id 
-													  AND created_microtimestamp <= live_trades.buy_microtimestamp
-													ORDER BY created_microtimestamp DESC
-													LIMIT 1
-												   ) b USING (pair_id)
+									JOIN bitstamp.live_buy_orders ON buy_microtimestamp = microtimestamp AND buy_order_id = order_id AND buy_event_no = event_no 
 							WHERE trade_timestamp BETWEEN start_time AND end_time
 							  AND trade_type = 'buy'
 							UNION ALL
 							SELECT buy_microtimestamp AS r_microtimestamp, buy_order_id AS r_order_id, buy_event_no AS r_event_no,
-									created_microtimestamp, created_event_no, sell_microtimestamp AS a_microtimestamp, sell_order_id AS a_order_id, sell_event_no AS a_event_no,
+									price_microtimestamp, price_event_no, sell_microtimestamp AS a_microtimestamp, sell_order_id AS a_order_id, sell_event_no AS a_event_no,
 									trade_type
 							FROM bitstamp.live_trades JOIN time_range USING (pair_id) 
-									JOIN LATERAL ( SELECT *
-													FROM sell_order_created 
-													WHERE order_id = live_trades.sell_order_id 
-													  AND created_microtimestamp <= live_trades.sell_microtimestamp
-													ORDER BY created_microtimestamp DESC
-													LIMIT 1
-												   ) b USING (pair_id)
+									JOIN bitstamp.live_sell_orders ON sell_microtimestamp = microtimestamp AND sell_order_id = order_id AND sell_event_no = event_no 
 							WHERE trade_timestamp BETWEEN start_time AND end_time
 							  AND trade_type = 'sell'						
 						),
 						new_created_microtimestamps AS (
-							SELECT l.a_order_id, l.created_microtimestamp, l.created_event_no, MIN(r.created_microtimestamp) AS new_microtimestamp
-							FROM trades_with_created l JOIN trades_with_created r USING (r_order_id)
-							WHERE l.created_microtimestamp > r.created_microtimestamp 
+							SELECT l.a_order_id, l.price_microtimestamp, l.price_event_no, MIN(r.price_microtimestamp) AS new_microtimestamp
+							FROM trades_with_price_microtimestamp l JOIN trades_with_price_microtimestamp r USING (r_order_id)
+							WHERE l.price_microtimestamp > r.price_microtimestamp 
 							  AND l.r_microtimestamp < r.r_microtimestamp 
-							GROUP BY l.a_order_id, l.created_microtimestamp, l.created_event_no
+							GROUP BY l.a_order_id, l.price_microtimestamp, l.price_event_no
 						)
 					UPDATE bitstamp.live_orders					
 					SET microtimestamp = new_microtimestamp
 					FROM new_created_microtimestamps
-					WHERE microtimestamp = created_microtimestamp
-					  AND order_id = a_order_id
-					  AND event_no = created_event_no
+					WHERE microtimestamp = new_created_microtimestamps.price_microtimestamp
+					  AND order_id = new_created_microtimestamps.a_order_id
+					  AND event_no = new_created_microtimestamps.price_event_no
 					RETURNING live_orders.* ;
 	RAISE DEBUG 'fix_aggressor_creation_order() exec time: %', clock_timestamp() - v_execution_start_time;
 	RETURN;
@@ -1290,6 +1264,8 @@ DECLARE
 	v_eon timestamptz;
 	v_amount numeric;
 	
+	prev_event bitstamp.live_orders;
+	
 BEGIN 
 
 	v_eon := bitstamp._get_live_orders_eon(NEW.microtimestamp);
@@ -1319,12 +1295,21 @@ BEGIN
 			  AND order_id = NEW.order_id 
 			  AND next_microtimestamp > NEW.microtimestamp
 			  AND era = NEW.era
-			RETURNING amount, next_event_no INTO v_amount, NEW.event_no;
+			RETURNING *
+			INTO prev_event;
+			-- amount, next_event_no INTO v_amount, NEW.event_no;
 			
 			IF FOUND THEN 
-				NEW.fill = v_amount - NEW.amount; 
-				-- Note that this also means that it is an insertion into the middle of the chain for NEW.order_id !
-				-- NEW. next_microtimestamp is null in this branch of code!
+				NEW.fill := prev_event.amount - NEW.amount; 
+				NEW.event_no := prev_event.next_event_no;
+				
+				IF prev_event.price = NEW.price THEN 
+					NEW.price_microtimestamp := prev_event.price_microtimestamp;
+					NEW.price_event_no := prev_event.price_event_no;
+				ELSE	-- currently, it's an instant-type order (Bitstamp changes its price on its own)
+					NEW.price_microtimestamp := NEW.microtimestamp;
+					NEW.price_event_no := NEW.event_no;
+				END IF;
 				
 			ELSE -- it is ex-nihilo 'order_changed' or 'order_deleted' event
 
@@ -1342,6 +1327,8 @@ BEGIN
 
 				ELSE --	will not create 'order_created' for ex-nihilo, this order will be the first one
 					NEW.event_no := 1;
+					NEW.price_microtimestamp := NEW.datetime;
+					NEW.price_event_no := NULL;	-- this is allowed only for ex-nihilo orders
 				END IF;
 			
 			END IF;
@@ -1350,7 +1337,11 @@ BEGIN
 	END IF;
 	
 	IF NEW.next_microtimestamp IS NULL THEN 
-		NEW.next_microtimestamp := 'infinity'::timestamptz;		
+		IF NEW.event <> 'order_deleted' THEN 
+			NEW.next_microtimestamp := 'infinity'::timestamptz;		
+		ELSE
+			NEW.next_microtimestamp := '-infinity'::timestamptz;		
+		END IF;
 	END IF;
 
 	--RAISE DEBUG '%', NEW;
@@ -1576,6 +1567,57 @@ $$;
 
 
 ALTER FUNCTION bitstamp.live_trades_manage_linked_events() OWNER TO "ob-analytics";
+
+--
+-- Name: live_trades_manage_trade_type(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.live_trades_manage_trade_type() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ 
+
+BEGIN
+
+	IF NEW.buy_microtimestamp IS NOT NULL AND NEW.sell_microtimestamp IS NOT NULL THEN 
+		IF ( SELECT price_microtimestamp FROM bitstamp.live_orders WHERE microtimestamp = NEW.buy_microtimestamp AND order_id = NEW.buy_order_id AND event_no = NEW.buy_event_no ) >
+		   ( SELECT price_microtimestamp FROM bitstamp.live_orders WHERE microtimestamp = NEW.sell_microtimestamp AND order_id = NEW.sell_order_id AND event_no = NEW.sell_event_no )
+		   THEN 
+			IF NEW.trade_type <> 'buy' THEN 
+				IF NEW.orig_trade_type IS NULL THEN -- we save orig_trade_type only once per trade. It is supposed to be genetrated by Bitstamp
+					NEW.orig_trade_type := NEW.trade_type;
+				END IF;
+				NEW.trade_type := 'buy';
+			END IF;
+		ELSE
+			IF NEW.trade_type <> 'sell' THEN 
+				IF NEW.orig_trade_type IS NULL THEN 
+					NEW.orig_trade_type := NEW.trade_type;
+				END IF;
+				NEW.trade_type := 'sell';
+		   END IF;
+		END IF;
+	END IF;
+	
+	IF TG_OP = 'UPDATE' THEN 
+		IF OLD.orig_trade_type IS NULL THEN
+			IF OLD.trade_type <> NEW.trade_type THEN
+				NEW.orig_trade_type := OLD.trade_type;	-- we save orig_trade_type only once per trade. It is supposed to be genetrated by Bitstamp
+			END IF;
+		ELSE
+			IF NEW.orig_trade_type IS DISTINCT FROM OLD.orig_trade_type THEN 
+				RAISE EXCEPTION 'Attempt to change orig_trade_type for trade % from % to %', OLD.trade_id, OLD.orig_trade_type, NEW.orig_trade_type;
+			END IF;
+		END IF;
+	END IF;
+	
+	RETURN NEW;
+END;
+	
+
+$$;
+
+
+ALTER FUNCTION bitstamp.live_trades_manage_trade_type() OWNER TO "ob-analytics";
 
 --
 -- Name: live_trades_validate(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -2298,42 +2340,28 @@ BEGIN
 						) r
 						WHERE p_ts_within_era BETWEEN r.start_time AND r.end_time
 					),
-					-- For episode assignment purposes, order is identified by its ID and its price.
-					-- When order's price has been changed (currently by Bitstamp), we consider it as a newly created order
-					order_created AS (
-						SELECT DISTINCT pair_id, order_id, first_value(microtimestamp) OVER order_life AS created_microtimestamp
-						FROM bitstamp.live_orders JOIN time_range USING (pair_id)
-						WHERE microtimestamp BETWEEN start_time AND end_time
-						WINDOW order_life AS (PARTITION BY order_id, price ORDER BY microtimestamp)
-					),
 					trades_with_created AS (
-						SELECT sell_created_microtimestamp, sell_microtimestamp, sell_order_id, sell_event_no,
-								buy_created_microtimestamp, buy_microtimestamp, buy_order_id, buy_event_no,
+						SELECT sell_microtimestamp AS r_microtimestamp, sell_order_id AS r_order_id, sell_event_no AS r_event_no,
+								price_microtimestamp AS created_microtimestamp, price_event_no AS created_event_no, buy_microtimestamp AS a_microtimestamp, buy_order_id AS a_order_id, buy_event_no AS a_event_no,
 								trade_type
 						FROM bitstamp.live_trades JOIN time_range USING (pair_id) 
-								JOIN LATERAL ( SELECT created_microtimestamp AS buy_created_microtimestamp, pair_id
-											  	FROM order_created 
-											    WHERE order_id = live_trades.buy_order_id 
-											      AND created_microtimestamp <= live_trades.buy_microtimestamp
-											    ORDER BY created_microtimestamp DESC
-											    LIMIT 1
-											   ) b USING (pair_id)
-								JOIN LATERAL ( SELECT created_microtimestamp AS sell_created_microtimestamp , pair_id
-											  	FROM order_created 
-											    WHERE order_id = live_trades.sell_order_id 
-											      AND created_microtimestamp <= live_trades.sell_microtimestamp
-											    ORDER BY created_microtimestamp DESC
-											    LIMIT 1
-											   ) s USING (pair_id)
+								JOIN bitstamp.live_buy_orders ON buy_microtimestamp = microtimestamp AND buy_order_id = order_id AND buy_event_no = event_no 
 						WHERE trade_timestamp BETWEEN start_time AND end_time
+						  AND trade_type = 'buy'
+						UNION ALL
+						SELECT buy_microtimestamp AS r_microtimestamp, buy_order_id AS r_order_id, buy_event_no AS r_event_no,
+								price_microtimestamp, price_event_no, sell_microtimestamp AS a_microtimestamp, sell_order_id AS a_order_id, sell_event_no AS a_event_no,
+								trade_type
+						FROM bitstamp.live_trades JOIN time_range USING (pair_id) 
+								JOIN bitstamp.live_sell_orders ON sell_microtimestamp = microtimestamp AND sell_order_id = order_id AND sell_event_no = event_no 
+						WHERE trade_timestamp BETWEEN start_time AND end_time
+						  AND trade_type = 'sell'						
 					),
 					episodes AS (
-						SELECT buy_microtimestamp AS microtimestamp, buy_order_id AS order_id, buy_event_no AS event_no,
-								CASE trade_type WHEN 'sell' THEN sell_created_microtimestamp WHEN 'buy' THEN buy_created_microtimestamp END AS episode_microtimestamp
+						SELECT r_microtimestamp AS microtimestamp, r_order_id AS order_id, r_event_no AS event_no, created_microtimestamp AS episode_microtimestamp
 						FROM trades_with_created
 						UNION ALL
-						SELECT sell_microtimestamp AS microtimestamp, sell_order_id AS order_id, sell_event_no AS event_no,
-								CASE trade_type WHEN 'sell' THEN sell_created_microtimestamp WHEN 'buy' THEN buy_created_microtimestamp END AS episode_microtimestamp
+						SELECT a_microtimestamp AS microtimestamp, a_order_id AS order_id, a_event_no AS event_no, created_microtimestamp AS episode_microtimestamp
 						FROM trades_with_created
 					)
 					UPDATE bitstamp.live_orders
@@ -2665,13 +2693,6 @@ ALTER TABLE ONLY bitstamp.transient_live_trades
 
 
 --
--- Name: fki_live_buy_orders_fkey_live_buy_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE INDEX fki_live_buy_orders_fkey_live_buy_orders ON bitstamp.live_buy_orders USING btree (next_microtimestamp, order_id, next_event_no);
-
-
---
 -- Name: fki_live_sell_orders_fkey_live_sell_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2693,10 +2714,31 @@ CREATE INDEX fki_live_trades_fkey_live_sell_orders ON bitstamp.live_trades USING
 
 
 --
+-- Name: live_buy_orders_fkey_live_buy_orders_next; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX live_buy_orders_fkey_live_buy_orders_next ON bitstamp.live_buy_orders USING btree (next_microtimestamp, order_id, next_event_no);
+
+
+--
+-- Name: live_buy_orders_fkey_live_buy_orders_price; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX live_buy_orders_fkey_live_buy_orders_price ON bitstamp.live_buy_orders USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
 -- Name: live_buy_orders_unique_chain_end; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE UNIQUE INDEX live_buy_orders_unique_chain_end ON bitstamp.live_buy_orders USING btree (order_id, era) WHERE (next_event_no IS NULL);
+
+
+--
+-- Name: live_sell_orders_fkey_live_sell_orders_price; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX live_sell_orders_fkey_live_sell_orders_price ON bitstamp.live_sell_orders USING btree (price_microtimestamp, order_id, price_event_no);
 
 
 --
@@ -2721,40 +2763,38 @@ CREATE CONSTRAINT TRIGGER aa_validate AFTER UPDATE ON bitstamp.live_trades DEFER
 
 
 --
--- Name: live_buy_orders ba_manage_orig_microtimestamp; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders ba_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER ba_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtimestamp, orig_microtimestamp ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_orig_microtimestamp();
-
-
---
--- Name: live_sell_orders ba_manage_orig_microtimestamp; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TRIGGER ba_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtimestamp, orig_microtimestamp ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_orig_microtimestamp();
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
 
 
 --
--- Name: live_trades ba_protect_columns; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_buy_orders ba_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER ba_protect_columns BEFORE UPDATE OF bitstamp_trade_id, amount, price, trade_type, trade_timestamp, buy_order_id, sell_order_id, pair_id ON bitstamp.live_trades FOR EACH ROW EXECUTE PROCEDURE bitstamp.protect_columns();
-
-ALTER TABLE bitstamp.live_trades DISABLE TRIGGER ba_protect_columns;
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
 
 
 --
--- Name: live_sell_orders bb_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_buy_orders bz_manage_orig_microtimestamp; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER bb_incorporate_new_event BEFORE INSERT ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
+CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtimestamp, orig_microtimestamp ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_orig_microtimestamp();
 
 
 --
--- Name: live_buy_orders bb_incorporate_new_event; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders bz_manage_orig_microtimestamp; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TRIGGER bb_incorporate_new_event BEFORE INSERT ON bitstamp.live_buy_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_incorporate_new_event();
+CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtimestamp, orig_microtimestamp ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_orig_microtimestamp();
+
+
+--
+-- Name: live_trades bz_manage_trade_type; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_manage_trade_type BEFORE INSERT OR UPDATE OF trade_type, buy_microtimestamp, sell_microtimestamp ON bitstamp.live_trades FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_trades_manage_trade_type();
 
 
 --
@@ -2766,11 +2806,19 @@ ALTER TABLE ONLY bitstamp.live_buy_orders
 
 
 --
--- Name: live_buy_orders live_buy_orders_fkey_live_buy_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_buy_orders live_buy_orders_fkey_live_buy_orders_next; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitstamp.live_buy_orders
-    ADD CONSTRAINT live_buy_orders_fkey_live_buy_orders FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES bitstamp.live_buy_orders(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT live_buy_orders_fkey_live_buy_orders_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES bitstamp.live_buy_orders(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_buy_orders live_buy_orders_fkey_live_buy_orders_price; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_buy_orders
+    ADD CONSTRAINT live_buy_orders_fkey_live_buy_orders_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES bitstamp.live_buy_orders(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -2814,11 +2862,19 @@ ALTER TABLE ONLY bitstamp.live_sell_orders
 
 
 --
--- Name: live_sell_orders live_sell_orders_fkey_live_sell_orders; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+-- Name: live_sell_orders live_sell_orders_fkey_live_sell_orders_next; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
 ALTER TABLE ONLY bitstamp.live_sell_orders
-    ADD CONSTRAINT live_sell_orders_fkey_live_sell_orders FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES bitstamp.live_sell_orders(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT live_sell_orders_fkey_live_sell_orders_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES bitstamp.live_sell_orders(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: live_sell_orders live_sell_orders_fkey_live_sell_orders_price; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.live_sell_orders
+    ADD CONSTRAINT live_sell_orders_fkey_live_sell_orders_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES bitstamp.live_sell_orders(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
