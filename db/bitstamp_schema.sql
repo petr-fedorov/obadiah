@@ -1109,7 +1109,8 @@ BEGIN
 							  sell_match_rule,
 							  buy_event_no,
 							  sell_event_no,
-							  trade_id
+							  trade_id,
+							  orig_trade_type
 					  FROM bitstamp.live_trades JOIN bitstamp.pairs USING (pair_id)
 					  WHERE pairs.pair = p_pair
 					    AND GREATEST(buy_microtimestamp, sell_microtimestamp) BETWEEN inferred_trades.p_start_time AND inferred_trades.p_end_time ;
@@ -1181,7 +1182,8 @@ BEGIN
 							   NULL::smallint,
 							   CASE e.order_type WHEN 'buy' THEN e.event_no ELSE trade_part.event_no END, 
 							   CASE e.order_type WHEN 'sell' THEN e.event_no ELSE trade_part.event_no END,
-							   NULL::bigint); 	-- trade_id is always NULL here
+							   NULL::bigint,
+							   NULL::bitstamp.direction); 	-- trade_id is always NULL here
 			ELSE -- the first par has NOT been seen, so e is the first part - save it!
 
 				trade_parts := array_append(trade_parts, e);
@@ -1216,7 +1218,7 @@ ALTER FUNCTION bitstamp.inferred_trades(p_start_time timestamp with time zone, p
 -- Name: live_orders_eras_v(text, integer); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.live_orders_eras_v(p_pair text DEFAULT 'BTCUSD'::text, p_limit integer DEFAULT 5) RETURNS TABLE(era timestamp with time zone, pair text, last_event timestamp with time zone, events bigint, e_per_sec numeric, trades bigint, fully_matched_trades bigint, partially_matched_trades bigint, not_matched_trades bigint, bitstamp_trades bigint)
+CREATE FUNCTION bitstamp.live_orders_eras_v(p_pair text DEFAULT 'BTCUSD'::text, p_limit integer DEFAULT 5) RETURNS TABLE(era timestamp with time zone, pair text, last_event timestamp with time zone, events bigint, e_per_sec numeric, matched_events bigint, unmatched_events bigint, trades bigint, fully_matched_trades bigint, partially_matched_trades bigint, not_matched_trades bigint, bitstamp_trades bigint)
     LANGUAGE sql STABLE
     AS $$
 
@@ -1228,9 +1230,11 @@ WITH eras AS (
 		LIMIT p_limit
 ),
 eras_orders_trades AS (
-SELECT era, pair, last_event, events, trades, fully_matched_trades, partially_matched_trades, not_matched_trades, first_event, bitstamp_trades
+SELECT era, pair, last_event, events, matched_events, unmatched_events, trades, fully_matched_trades, partially_matched_trades, not_matched_trades, first_event, bitstamp_trades
 
-FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last_event, min(microtimestamp) AS first_event 
+FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last_event, min(microtimestamp) AS first_event,
+							count(*) FILTER (WHERE trade_id IS NULL AND fill > 0 ) AS unmatched_events,
+							count(*) FILTER (WHERE trade_id IS NOT NULL ) AS matched_events
 							FROM bitstamp.live_orders 
 			  				WHERE microtimestamp >= eras.era AND microtimestamp < eras.next_era
 			 			 ) e ON TRUE
@@ -1243,7 +1247,9 @@ FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last
 			  WHERE trade_timestamp >= eras.era AND trade_timestamp < eras.next_era
 			 ) t ON TRUE
 )
-SELECT era, pair, last_event, events, CASE WHEN EXTRACT( EPOCH FROM last_event - first_event ) > 0 THEN round((events/EXTRACT( EPOCH FROM last_event - first_event ))::numeric,2) ELSE 0 END AS e_per_sec, trades, fully_matched_trades, partially_matched_trades, not_matched_trades, bitstamp_trades
+SELECT era, pair, last_event, events, 
+						 CASE WHEN EXTRACT( EPOCH FROM last_event - first_event ) > 0 THEN round((events/EXTRACT( EPOCH FROM last_event - first_event ))::numeric,2) ELSE 0 END AS e_per_sec,
+						  matched_events, unmatched_events,trades,  fully_matched_trades, partially_matched_trades, not_matched_trades, bitstamp_trades
 FROM eras_orders_trades
 ORDER BY era DESC;
 
@@ -1627,11 +1633,6 @@ CREATE FUNCTION bitstamp.live_trades_validate() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN 
-	IF NOT (NEW.buy_microtimestamp IS NULL 
-			OR NEW.sell_microtimestamp IS NULL 
-			OR abs(date_part('epoch'::text, NEW.buy_microtimestamp) - date_part('epoch'::text, NEW.sell_microtimestamp)) < 2::double precision) THEN
-		RAISE EXCEPTION 'An interval between events must be less than 2 seconds: %', NEW;
-	END IF;
 	IF OLD.buy_order_id <> NEW.buy_order_id THEN 
 		RAISE EXCEPTION 'Attempt to change buy_order_id from % to %', OLD.buy_order_id, NEW.buy_order_id;
 	END IF;
@@ -2276,8 +2277,9 @@ BEGIN
 		SELECT amount, price, trade_type, trade_timestamp, buy_order_id, sell_order_id, local_timestamp,
 										 pair_id, sell_microtimestamp, buy_microtimestamp, buy_match_rule, sell_match_rule, buy_event_no, sell_event_no
 		FROM bitstamp.inferred_trades(v_start_time, v_end_time, p_pair, p_only_missing := TRUE, p_strict := FALSE);
-		--PERFORM bitstamp.match_order_book_events(v_start_time, v_end_time, p_pair);
-		--PERFORM bitstamp.assign_episodes(v_era, p_pair);
+		
+		PERFORM bitstamp.fix_aggressor_creation_order(v_era, p_pair);
+		PERFORM bitstamp.reveal_episodes(v_era, p_pair);
 
 		--INSERT INTO bitstamp.spread
 		--SELECT * FROM bitstamp.spread_by_episode(v_start_time, v_end_time, p_pair, TRUE, FALSE );
@@ -2342,16 +2344,23 @@ BEGIN
 					),
 					trades_with_created AS (
 						SELECT sell_microtimestamp AS r_microtimestamp, sell_order_id AS r_order_id, sell_event_no AS r_event_no,
-								price_microtimestamp AS created_microtimestamp, price_event_no AS created_event_no, buy_microtimestamp AS a_microtimestamp, buy_order_id AS a_order_id, buy_event_no AS a_event_no,
-								trade_type
+								buy_microtimestamp AS a_microtimestamp, buy_order_id AS a_order_id, buy_event_no AS a_event_no,
+								trade_type,
+								LEAST(price_microtimestamp, sell_microtimestamp) AS created_microtimestamp	
+								-- In general for any event price_microtimestamp <= microtimestamp. Thus we always move aggressor event 
+								-- (buy_microtimestamp) back in time
+								-- LEAST handles the rare case when the resting event (sell_microtimestamp) is simultaneously the latest 
+								-- price-setting event for the given order_id and we would move it forward in time without LEAST, which is wrong.
 						FROM bitstamp.live_trades JOIN time_range USING (pair_id) 
 								JOIN bitstamp.live_buy_orders ON buy_microtimestamp = microtimestamp AND buy_order_id = order_id AND buy_event_no = event_no 
 						WHERE trade_timestamp BETWEEN start_time AND end_time
 						  AND trade_type = 'buy'
 						UNION ALL
 						SELECT buy_microtimestamp AS r_microtimestamp, buy_order_id AS r_order_id, buy_event_no AS r_event_no,
-								price_microtimestamp, price_event_no, sell_microtimestamp AS a_microtimestamp, sell_order_id AS a_order_id, sell_event_no AS a_event_no,
-								trade_type
+								sell_microtimestamp AS a_microtimestamp, sell_order_id AS a_order_id, sell_event_no AS a_event_no,
+								trade_type,
+								LEAST(price_microtimestamp, buy_microtimestamp) AS created_microtimestamp 
+								-- See comments above regarding LEAST
 						FROM bitstamp.live_trades JOIN time_range USING (pair_id) 
 								JOIN bitstamp.live_sell_orders ON sell_microtimestamp = microtimestamp AND sell_order_id = order_id AND sell_event_no = event_no 
 						WHERE trade_timestamp BETWEEN start_time AND end_time
@@ -2728,6 +2737,13 @@ CREATE INDEX live_buy_orders_fkey_live_buy_orders_price ON bitstamp.live_buy_ord
 
 
 --
+-- Name: live_buy_orders_fkey_live_trades_trade_id; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE UNIQUE INDEX live_buy_orders_fkey_live_trades_trade_id ON bitstamp.live_buy_orders USING btree (trade_id);
+
+
+--
 -- Name: live_buy_orders_unique_chain_end; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2739,6 +2755,13 @@ CREATE UNIQUE INDEX live_buy_orders_unique_chain_end ON bitstamp.live_buy_orders
 --
 
 CREATE INDEX live_sell_orders_fkey_live_sell_orders_price ON bitstamp.live_sell_orders USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: live_sell_orders_fkey_live_trades_trade_id; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE UNIQUE INDEX live_sell_orders_fkey_live_trades_trade_id ON bitstamp.live_sell_orders USING btree (trade_id);
 
 
 --
