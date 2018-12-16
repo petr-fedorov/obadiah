@@ -1292,6 +1292,8 @@ BEGIN
 
 		IF NEW.event = 'order_created' THEN
 			NEW.fill := -NEW.amount;
+			NEW.price_microtimestamp := NEW.microtimestamp;
+			NEW.price_event_no := 1;
 			NEW.event_no := 1;
 		ELSE
 			UPDATE bitstamp.live_orders
@@ -1323,13 +1325,17 @@ BEGIN
 
 					NEW.fill := NULL;	-- we still don't know fill (yet). Can later try to figure it out from trade
 					-- INSERT the initial 'order_created' event when missing
+					NEW.price_microtimestamp := CASE WHEN NEW.datetime < NEW.era THEN NEW.era ELSE NEW.datetime END;
+					NEW.price_event_no := 1;
 					NEW.event_no := 2;
 					
 					INSERT INTO bitstamp.live_orders (order_id, amount, event, event_no, order_type, datetime, microtimestamp, 
-													  pair_id, price, fill, next_microtimestamp, next_event_no,era )
-					VALUES (NEW.order_id, NEW.amount, 'order_created'::bitstamp.live_orders_event, 1, NEW.order_type,
-							NEW.datetime, CASE WHEN NEW.datetime < NEW.era THEN NEW.era ELSE NEW.datetime END, 
-							NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event_no, NEW.era);
+													  pair_id, price, fill, next_microtimestamp, next_event_no,era,
+													  price_microtimestamp, price_event_no )
+					VALUES (NEW.order_id, NEW.amount, 'order_created'::bitstamp.live_orders_event, NEW.price_event_no, NEW.order_type,
+							NEW.datetime, NEW.price_microtimestamp, 
+							NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event_no, NEW.era, NEW.price_microtimestamp, 
+						   NEW.price_event_no);
 
 				ELSE --	will not create 'order_created' for ex-nihilo, this order will be the first one
 					NEW.event_no := 1;
