@@ -93,7 +93,7 @@ bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 #' @export
 bsExportEvents <- function(conn, start.time, end.time, pair="BTCUSD", file = "events.csv", debug.query = FALSE) {
   query <- paste0(" SELECT 	order_id AS id,
-                            bitstamp._in_milliseconds(GREATEST(microtimestamp, matched_microtimestamp)) AS timestamp,
+                            bitstamp._in_milliseconds(microtimestamp) AS timestamp,
                             bitstamp._in_milliseconds(datetime) AS \"exchange.timestamp\",
                             price,
                             round(amount,8) AS volume,
