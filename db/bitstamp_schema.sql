@@ -835,7 +835,7 @@ BEGIN
 	v_execution_start_time := clock_timestamp();
 
 RETURN QUERY 
-	WITH time_range AS (
+	WITH RECURSIVE time_range AS (
 		SELECT *
 		FROM (
 			SELECT era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
@@ -844,30 +844,30 @@ RETURN QUERY
 		WHERE find_and_repair_missing_fill.ts_within_era BETWEEN r."start.time" AND r."end.time"
 	),
 	events_fill_missing AS (
-		SELECT o.order_id,
-				o.amount,			
+		SELECT o.microtimestamp,
+				o.order_id,
 				o.event_no,
-				o.order_type,
-				o.datetime,
-				o.microtimestamp,
-				o.local_timestamp,
-				o.pair_id,
-				o.price,
-				t.amount AS fill,					-- fill is equal to the matched trade's amount
-				o.next_microtimestamp, 	
-				o.era,
-				o.trade_id
+				o.amount,			
+				t.amount AS fill					-- fill is equal to the matched trade's amount
 		FROM bitstamp.live_orders o JOIN bitstamp.live_trades t USING (trade_id)
 		WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
 		  AND fill IS NULL
-		  AND o.trade_id IS NOT NULL
+	),
+	base AS (
+		SELECT microtimestamp, order_id, event_no, amount, fill
+		FROM events_fill_missing
+		UNION ALL 
+		SELECT live_orders.microtimestamp, live_orders.order_id, live_orders.event_no, base.amount + base.fill AS amount, 
+				CASE live_orders.event_no WHEN 1 THEN -(base.amount + base.fill) ELSE live_orders.fill END AS fill
+		FROM bitstamp.live_orders JOIN base ON live_orders.order_id = base.order_id
+		 AND live_orders.event_no = base.event_no - 1
 	)	
 	UPDATE bitstamp.live_orders
-	SET fill = events_fill_missing.fill
-	FROM events_fill_missing
-	WHERE live_orders.microtimestamp = events_fill_missing.microtimestamp
-	  AND live_orders.order_id = events_fill_missing.order_id
-	  AND live_orders.event_no = events_fill_missing.event_no
+	SET amount = base.amount, fill = base.fill
+	FROM base
+	WHERE live_orders.microtimestamp = base.microtimestamp
+	  AND live_orders.order_id = base.order_id
+	  AND live_orders.event_no = base.event_no
 	RETURNING live_orders.*	;
 	RAISE DEBUG 'find_and_repair_missing_fill() exec time: %', clock_timestamp() - v_execution_start_time;	
 	RETURN;
@@ -1365,57 +1365,6 @@ $$;
 
 
 ALTER FUNCTION bitstamp.live_orders_incorporate_new_event() OWNER TO "ob-analytics";
-
---
--- Name: live_orders_manage_matched_without_trade(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.live_orders_manage_matched_without_trade() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-
-BEGIN 
-	
-	IF TG_OP = 'UPDATE'  THEN 	-- DELETE is supposed to be handled by FOREING KEY constraint (matched_ ... will be set to NULL )
-		IF OLD.matched_microtimestamp IS NOT NULL AND 
-		(OLD.matched_microtimestamp IS DISTINCT FROM NEW.matched_microtimestamp OR OLD.matched_order_id IS DISTINCT FROM NEW.matched_order_id
-		 OR OLD.matched_event_no IS DISTINCT FROM NEW.matched_event_no ) THEN	-- FULL FOREIGN KEY ensures that matched_order_id IS NOT NULL too
-			UPDATE bitstamp.live_orders
-			SET matched_microtimestamp = NULL, matched_order_id = NULL, matched_event_no = NULL
-			WHERE microtimestamp = OLD.matched_microtimestamp 
-			  AND order_id = OLD.matched_order_id
-			  AND event_no = OLD.matched_event_no
-			  AND order_type = OLD.order_type
-			  -- to avoid circular update when A update B which in turn update A etc we check the condition below
-			  -- the same trigger will fire on matched_ live_order but will update nothing
-			  AND matched_microtimestamp = OLD.microtimestamp	
-			  AND matched_order_id = OLD.order_id
-			  AND matched_event_no = OLD.event_no;
-		END IF;
-	END IF;
-			
-	IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN 
-		IF NEW.matched_microtimestamp IS NOT NULL THEN 
-			UPDATE bitstamp.live_orders
-			SET matched_microtimestamp = NEW.microtimestamp, matched_order_id = NEW.order_id, matched_event_no = NEW.event_no
-			WHERE microtimestamp = NEW.matched_microtimestamp 
-			  AND order_id = NEW.matched_order_id
-			  AND order_type = NEW.order_type
-			  AND event_no = NEW.matched_event_no
-			  -- to avoid circular update when A update B which in turn update A etc we check the condition below
-			  -- the same trigger will fire on matched_ live_order but will update nothing
-			  AND ( matched_microtimestamp IS DISTINCT FROM NEW.microtimestamp	
-				   	OR matched_order_id IS DISTINCT FROM NEW.order_id 
-				  	OR matched_event_no IS DISTINCT FROM NEW.event_no );
-		END IF;
-	END IF;
-	RETURN NULL;	
-END;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.live_orders_manage_matched_without_trade() OWNER TO "ob-analytics";
 
 --
 -- Name: live_orders_manage_orig_microtimestamp(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
