@@ -73,8 +73,7 @@ bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
                   fill,
                   \"matching.event\"::integer,
                   \"type\",
-                  \"aggressiveness.bps\",
-                  \"real.trade.id\"
+                  \"aggressiveness.bps\"
                   FROM bitstamp.oba_event(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
