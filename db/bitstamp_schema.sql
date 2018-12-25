@@ -311,6 +311,79 @@ $$;
 ALTER FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book_record[]) OWNER TO "ob-analytics";
 
 --
+-- Name: capture_transient_orders(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.capture_transient_orders(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.live_orders
+    LANGUAGE plpgsql
+    AS $$
+
+DECLARE 
+
+	v_tolerance numeric;
+	v_pair_id smallint;
+	v_execution_start_time timestamp with time zone;
+
+BEGIN 
+	v_execution_start_time := clock_timestamp();
+	
+	SELECT pair_id, 0.1::numeric^"R0" INTO v_pair_id, v_tolerance
+	FROM bitstamp.pairs 
+	WHERE pairs.pair = p_pair;
+	
+	-- Keep the first  'order_created' and 'order_deleted' events for the given order id and delete the other
+	WITH duplicates AS (
+		SELECT order_id, event, lead(microtimestamp) OVER (PARTITION BY event, order_id ORDER BY microtimestamp) AS microtimestamp
+		FROM bitstamp.transient_live_orders
+		WHERE event <> 'order_changed'
+		  AND pair_id = v_pair_id
+		  AND microtimestamp BETWEEN p_start_time AND p_end_time
+		
+	)
+	DELETE FROM bitstamp.transient_live_orders
+	USING duplicates
+	WHERE transient_live_orders.order_id = duplicates.order_id
+	  AND transient_live_orders.microtimestamp = duplicates.microtimestamp;	
+	  
+	WITH deleted AS (
+		DELETE FROM bitstamp.transient_live_orders 
+		WHERE pair_id = v_pair_id
+		  AND microtimestamp BETWEEN p_start_time AND p_end_time
+		RETURNING *
+	),
+	deleted_with_event_no AS (
+		SELECT *,
+				first_value(event) OVER o AS first_event,
+				row_number() OVER o AS event_no,
+				COALESCE(lag(amount) OVER o, 0) - amount AS fill,
+				COALESCE(lead(microtimestamp) OVER o, 'infinity'::timestamptz) AS next_microtimestamp,
+				CASE WHEN lead(microtimestamp) OVER o IS NOT NULL THEN row_number() OVER o + 1 ELSE NULL END AS next_event_no
+		FROM deleted
+		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
+		
+	)
+	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era,
+									 	event_no, fill, next_microtimestamp, next_event_no, price_microtimestamp, price_event_no)
+	SELECT order_id, amount, event, order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era,
+			CASE first_event WHEN 'order_created' THEN event_no ELSE NULL END AS event_no,
+			CASE first_event WHEN 'order_created' THEN fill ELSE NULL END AS fill,
+			CASE first_event WHEN 'order_created' THEN next_microtimestamp ELSE NULL END AS next_microtimestamp,									  
+			CASE first_event WHEN 'order_created' THEN next_event_no ELSE NULL END AS next_event_no,
+			CASE first_event WHEN 'order_created' THEN first_value(microtimestamp) OVER p ELSE NULL END AS price_microtimestamp,
+			CASE first_event WHEN 'order_created' THEN first_value(event_no) OVER p ELSE NULL END AS price_event_no
+	FROM deleted_with_event_no
+	WINDOW p AS (PARTITION BY order_id, price ORDER BY microtimestamp)
+	ORDER BY microtimestamp, order_id, event;
+	
+	RAISE DEBUG 'capture_transient_orders() exec time: %', clock_timestamp() - v_execution_start_time; 
+END;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.capture_transient_orders(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+
+--
 -- Name: live_trades; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -352,192 +425,6 @@ COMMENT ON COLUMN bitstamp.live_trades.buy_match_rule IS 'A two-digit code of th
 
 COMMENT ON COLUMN bitstamp.live_trades.sell_match_rule IS 'A two-digit code of the match rule used to match this trade with a sell order event. ''tens'' digit determines whether the event was matched to the previously saved trade (''1'') or vice versa (''2''). ''ones'' part is given by _get_match_rule() function.';
 
-
---
--- Name: _trades_match_buy_event(timestamp with time zone, bigint, numeric, numeric, bitstamp.live_orders_event, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval DEFAULT '00:00:00.5'::interval) RETURNS SETOF bitstamp.live_trades
-    LANGUAGE sql STABLE
-    AS $$
-
-SELECT live_trades.*
-FROM bitstamp.live_trades  
-WHERE trade_timestamp BETWEEN _trades_match_buy_event.microtimestamp - _trades_match_buy_event.look_around  
-									AND _trades_match_buy_event.microtimestamp + _trades_match_buy_event.look_around  
-  AND buy_order_id = _trades_match_buy_event.order_id
-  AND bitstamp._get_match_rule(trade_amount := amount,
-							   trade_price := price,
-							   event_amount := _trades_match_buy_event.amount,
-							   event_fill := _trades_match_buy_event.fill,
-							   event := _trades_match_buy_event.event,
-							   tolerance := 0.1::numeric^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )
-							  ) IS NOT NULL
-   AND buy_microtimestamp IS NULL
-ORDER BY trade_id -- we want the earliest one available 
-FOR UPDATE;
-  
-
-$$;
-
-
-ALTER FUNCTION bitstamp._trades_match_buy_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval) OWNER TO "ob-analytics";
-
---
--- Name: _trades_match_sell_event(timestamp with time zone, bigint, numeric, numeric, bitstamp.live_orders_event, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval DEFAULT '00:00:00.5'::interval) RETURNS SETOF bitstamp.live_trades
-    LANGUAGE sql STABLE
-    AS $$
-
-SELECT live_trades.*
-FROM bitstamp.live_trades
-WHERE trade_timestamp BETWEEN _trades_match_sell_event.microtimestamp - _trades_match_sell_event.look_around  
-									AND _trades_match_sell_event.microtimestamp + _trades_match_sell_event.look_around  
-  AND sell_order_id = _trades_match_sell_event.order_id
-  AND bitstamp._get_match_rule(trade_amount := amount,
-							   trade_price := price,
-							   event_amount := _trades_match_sell_event.amount,
-							   event_fill := _trades_match_sell_event.fill,
-							   event := _trades_match_sell_event.event,
-							   tolerance := 0.1::numeric^(SELECT "R0" FROM bitstamp.pairs WHERE pairs.pair_id = live_trades.pair_id )
-							  ) IS NOT NULL
-  AND sell_microtimestamp IS NULL
-ORDER BY trade_id -- we want the earliest one available 
-FOR UPDATE;
-  
-
-$$;
-
-
-ALTER FUNCTION bitstamp._trades_match_sell_event(microtimestamp timestamp with time zone, order_id bigint, fill numeric, amount numeric, event bitstamp.live_orders_event, look_around interval) OWNER TO "ob-analytics";
-
---
--- Name: capture_transient_orders(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.capture_transient_orders(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.live_orders
-    LANGUAGE plpgsql
-    AS $$
-
-DECLARE 
-
-	e record;
-	t record;						   
-	
-	buy_match CURSOR (c_microtimestamp timestamptz, c_order_id bigint, c_fill numeric, c_amount numeric, c_event bitstamp.live_orders_event )
-					  FOR SELECT * FROM bitstamp._trades_match_buy_event(c_microtimestamp, c_order_id, c_fill, c_amount, c_event);
-
-	sell_match CURSOR (c_microtimestamp timestamptz, c_order_id bigint, c_fill numeric,  c_amount numeric, c_event bitstamp.live_orders_event )
-					  FOR SELECT * FROM bitstamp._trades_match_sell_event(c_microtimestamp, c_order_id, c_fill, c_amount, c_event);	
-	v_tolerance numeric;
-	v_pair_id smallint;
-	v_execution_start_time timestamp with time zone;
-	v_statement_execution_start_time timestamp with time zone;
-
-BEGIN 
-	v_execution_start_time := clock_timestamp();
-	
-	SELECT pair_id, 0.1::numeric^"R0" INTO v_pair_id, v_tolerance
-	FROM bitstamp.pairs 
-	WHERE pairs.pair = p_pair;
-	
-	-- Keep the first  'order_created' and 'order_deleted' events for the given order id and delete the other
-	WITH duplicates AS (
-		SELECT order_id, event, lead(microtimestamp) OVER (PARTITION BY event, order_id ORDER BY microtimestamp) AS microtimestamp
-		FROM bitstamp.transient_live_orders
-		WHERE event <> 'order_changed'
-		  AND pair_id = v_pair_id
-		  AND microtimestamp BETWEEN p_start_time AND p_end_time
-		
-	)
-	DELETE FROM bitstamp.transient_live_orders
-	USING duplicates
-	WHERE transient_live_orders.order_id = duplicates.order_id
-	  AND transient_live_orders.microtimestamp = duplicates.microtimestamp;	
-	  
-	v_statement_execution_start_time := clock_timestamp();
-	WITH deleted AS (
-		DELETE FROM bitstamp.transient_live_orders 
-		WHERE pair_id = v_pair_id
-		  AND microtimestamp BETWEEN p_start_time AND p_end_time
-		RETURNING *
-	),
-	deleted_with_event_no AS (
-		SELECT *,
-				first_value(event) OVER o AS first_event,
-				row_number() OVER o AS event_no,
-				COALESCE(lag(amount) OVER o, 0) - amount AS fill,
-				COALESCE(lead(microtimestamp) OVER o, 'infinity'::timestamptz) AS next_microtimestamp,
-				CASE WHEN lead(microtimestamp) OVER o IS NOT NULL THEN row_number() OVER o + 1 ELSE NULL END AS next_event_no
-		FROM deleted
-		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
-		
-	)
-	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era,
-									 	event_no, fill, next_microtimestamp, next_event_no, price_microtimestamp, price_event_no)
-	SELECT order_id, amount, event, order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era,
-			CASE first_event WHEN 'order_created' THEN event_no ELSE NULL END AS event_no,
-			CASE first_event WHEN 'order_created' THEN fill ELSE NULL END AS fill,
-			CASE first_event WHEN 'order_created' THEN next_microtimestamp ELSE NULL END AS next_microtimestamp,									  
-			CASE first_event WHEN 'order_created' THEN next_event_no ELSE NULL END AS next_event_no,
-			CASE first_event WHEN 'order_created' THEN first_value(microtimestamp) OVER p ELSE NULL END AS price_microtimestamp,
-			CASE first_event WHEN 'order_created' THEN first_value(event_no) OVER p ELSE NULL END AS price_event_no
-	FROM deleted_with_event_no
-	WINDOW p AS (PARTITION BY order_id, price ORDER BY microtimestamp)
-	ORDER BY microtimestamp, order_id, event;
-	
-	
-	RAISE DEBUG 'capture_transient_orders() INSERT live_orders exec time: %', clock_timestamp() - v_statement_execution_start_time;
-	
-/*	FOR e IN SELECT * FROM bitstamp.live_orders WHERE microtimestamp BETWEEN p_start_time AND p_end_time ORDER BY microtimestamp
-		LOOP
-					  
-		IF  e.event <> 'order_created' THEN 
-			IF e.order_type = 'buy' THEN
-				FOR t IN buy_match(e.microtimestamp, e.order_id, e.fill, e.amount, e.event ) LOOP
-
-					UPDATE bitstamp.live_trades
-					SET buy_microtimestamp = e.microtimestamp,
-						buy_event_no = e.event_no,
-						buy_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
-																  trade_price := t.price,
-																  event_amount := e.amount,
-																  event_fill := e.fill,
-																  event := e.event,
-																  tolerance := v_tolerance
-																 )
-					WHERE CURRENT OF buy_match;
-
-					EXIT;
-				END LOOP;
-			ELSE
-				FOR t IN sell_match(e.microtimestamp, e.order_id, e.fill, e.amount, e.event ) LOOP
-
-					UPDATE bitstamp.live_trades
-					SET sell_microtimestamp = e.microtimestamp,
-						sell_event_no = e.event_no,
-						sell_match_rule = bitstamp._get_match_rule(trade_amount := t.amount,
-																   trade_price := t.price,
-																   event_amount := e.amount,
-																   event_fill := e.fill,
-																   event := e.event,
-																   tolerance := v_tolerance
-																  ) 
-					WHERE CURRENT OF sell_match;
-					EXIT;
-				END LOOP;
-			END IF;
-		END IF;			
-	END LOOP; */
-	RAISE DEBUG 'capture_transient_orders() exec time: %', clock_timestamp() - v_execution_start_time; 
-END;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.capture_transient_orders(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
 -- Name: capture_transient_trades(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1901,7 +1788,7 @@ CREATE FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair
 			order_type,
 			order_id,
 			microtimestamp,
-			event,
+			event_no,
 			pair_id,
 			is_maker,
 			datetime
@@ -2067,6 +1954,13 @@ begin
 		return query select * from bitstamp.find_and_repair_missing_fill(v_start, p_pair);																	   
 		return query select * from bitstamp.fix_aggressor_creation_order(v_start, p_pair);
 		return query select * from bitstamp.reveal_episodes(v_start, p_pair);
+								
+		-- update microtimestamp of trade-part events that couldn't be matched and which are in the wrong order (i.e. later that its subsequent event)
+		update bitstamp.live_orders
+		set microtimestamp = next_microtimestamp
+		where microtimestamp between v_start and v_end
+          and fill > 0 and trade_id is null	-- this event should has been matched to some trade but couldn't
+		  and next_microtimestamp < microtimestamp;
 																	   
 		if (select count(*)
 			from (
