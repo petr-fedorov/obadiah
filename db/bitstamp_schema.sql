@@ -811,7 +811,7 @@ BEGIN
 				SELECT * INTO trade_part
 				FROM unnest(trade_parts) AS a
 				WHERE a.order_type  = 'sell'::bitstamp.direction
-				  AND abs( (a.fill - e.fill)*CASE WHEN e.datetime < a.datetime THEN e.price ELSE a.price END) <= tolerance
+				  AND abs( (a.fill - e.fill)*CASE WHEN e.price_microtimestamp < a.price_microtimestamp THEN e.price ELSE a.price END) <= tolerance
 				  AND extract(epoch from e.microtimestamp) - extract(epoch from a.microtimestamp) < max_interval
 				ORDER BY price, microtimestamp
 				LIMIT 1;
@@ -819,7 +819,7 @@ BEGIN
 				SELECT * INTO trade_part
 				FROM unnest(trade_parts) AS a
 				WHERE a.order_type  = 'buy'::bitstamp.direction
-				  AND abs( (a.fill - e.fill)*CASE WHEN e.datetime < a.datetime THEN e.price ELSE a.price END) <= tolerance
+				  AND abs( (a.fill - e.fill)*CASE WHEN e.price_microtimestamp < a.price_microtimestamp THEN e.price ELSE a.price END) <= tolerance
 				  AND extract(epoch from e.microtimestamp) - extract(epoch from a.microtimestamp) < max_interval				  
 				ORDER BY price DESC, microtimestamp	
 				LIMIT 1;
@@ -835,7 +835,7 @@ BEGIN
 												  AND a.event_no = trade_part.event_no)
 									 );
 									   
-				is_e_agressor := NOT ( e.datetime < trade_part.datetime OR (e.datetime = trade_part.datetime AND e.order_id < trade_part.order_id ) );
+				is_e_agressor := NOT ( e.price_microtimestamp < trade_part.price_microtimestamp OR (e.price_microtimestamp = trade_part.price_microtimestamp AND e.order_id < trade_part.order_id ) );
 
 				RETURN NEXT ( NULL::bigint,	-- bitstamp_trade_id is always NULL here
 							   COALESCE(e.fill, trade_part.fill), 
@@ -1203,57 +1203,6 @@ $$;
 
 
 ALTER FUNCTION bitstamp.live_trades_manage_linked_events() OWNER TO "ob-analytics";
-
---
--- Name: live_trades_manage_trade_type(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.live_trades_manage_trade_type() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$ 
-
-BEGIN
-
-	IF NEW.buy_microtimestamp IS NOT NULL AND NEW.sell_microtimestamp IS NOT NULL THEN 
-		IF ( SELECT price_microtimestamp FROM bitstamp.live_orders WHERE microtimestamp = NEW.buy_microtimestamp AND order_id = NEW.buy_order_id AND event_no = NEW.buy_event_no ) >
-		   ( SELECT price_microtimestamp FROM bitstamp.live_orders WHERE microtimestamp = NEW.sell_microtimestamp AND order_id = NEW.sell_order_id AND event_no = NEW.sell_event_no )
-		   THEN 
-			IF NEW.trade_type <> 'buy' THEN 
-				IF NEW.orig_trade_type IS NULL THEN -- we save orig_trade_type only once per trade. It is supposed to be genetrated by Bitstamp
-					NEW.orig_trade_type := NEW.trade_type;
-				END IF;
-				NEW.trade_type := 'buy';
-			END IF;
-		ELSE
-			IF NEW.trade_type <> 'sell' THEN 
-				IF NEW.orig_trade_type IS NULL THEN 
-					NEW.orig_trade_type := NEW.trade_type;
-				END IF;
-				NEW.trade_type := 'sell';
-		   END IF;
-		END IF;
-	END IF;
-	
-	IF TG_OP = 'UPDATE' THEN 
-		IF OLD.orig_trade_type IS NULL THEN
-			IF OLD.trade_type <> NEW.trade_type THEN
-				NEW.orig_trade_type := OLD.trade_type;	-- we save orig_trade_type only once per trade. It is supposed to be genetrated by Bitstamp
-			END IF;
-		ELSE
-			IF NEW.orig_trade_type IS DISTINCT FROM OLD.orig_trade_type THEN 
-				RAISE EXCEPTION 'Attempt to change orig_trade_type for trade % from % to %', OLD.trade_id, OLD.orig_trade_type, NEW.orig_trade_type;
-			END IF;
-		END IF;
-	END IF;
-	
-	RETURN NEW;
-END;
-	
-
-$$;
-
-
-ALTER FUNCTION bitstamp.live_trades_manage_trade_type() OWNER TO "ob-analytics";
 
 --
 -- Name: live_trades_validate(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1956,11 +1905,17 @@ begin
 		return query select * from bitstamp.reveal_episodes(v_start, p_pair);
 								
 		-- update microtimestamp of trade-part events that couldn't be matched and which are in the wrong order (i.e. later that its subsequent event)
-		update bitstamp.live_orders
-		set microtimestamp = next_microtimestamp
-		where microtimestamp between v_start and v_end
-          and fill > 0 and trade_id is null	-- this event should has been matched to some trade but couldn't
-		  and next_microtimestamp < microtimestamp;
+		loop 																	   
+			update bitstamp.live_orders
+			set microtimestamp = next_microtimestamp
+			where microtimestamp between v_start and v_end
+			  and fill > 0 and trade_id is null	-- this event should has been matched to some trade but couldn't
+			  and next_microtimestamp > '-infinity'
+			  and next_microtimestamp < microtimestamp;
+			if not found then
+				exit;
+			end if;
+		end loop;														   
 																	   
 		if (select count(*)
 			from (
@@ -2021,7 +1976,9 @@ begin
 				 	 	  set buy_microtimestamp = v_trade.buy_microtimestamp, buy_event_no = v_trade.buy_event_no,
 					 		   sell_microtimestamp = v_trade.sell_microtimestamp, sell_event_no = v_trade.sell_event_no,
 							   buy_match_rule = v_trade.buy_match_rule,
-							   sell_match_rule = v_trade.sell_match_rule
+							   sell_match_rule = v_trade.sell_match_rule,
+							   trade_type = v_trade.trade_type,
+							   orig_trade_type = case when v_trade.trade_type <> trade_type then trade_type else null end
 						  where buy_order_id = v_trade.buy_order_id 
 						    and sell_order_id = v_trade.sell_order_id
 							and pair_id = v_trade.pair_id
@@ -2634,13 +2591,6 @@ CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtim
 --
 
 CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtimestamp, orig_microtimestamp ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_orig_microtimestamp();
-
-
---
--- Name: live_trades bz_manage_trade_type; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TRIGGER bz_manage_trade_type BEFORE INSERT OR UPDATE OF trade_type, buy_microtimestamp, sell_microtimestamp ON bitstamp.live_trades FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_trades_manage_trade_type();
 
 
 --
