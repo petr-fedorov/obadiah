@@ -655,11 +655,13 @@ CREATE FUNCTION bitstamp.fix_aggressor_creation_order(p_ts_within_era timestamp 
 declare
 
 	v_execution_start_time timestamp with time zone;
-
+	v_repeat boolean;
 begin 
 	v_execution_start_time := clock_timestamp();
 	loop 
-		return QUERY 
+		v_repeat := false;
+		
+		return query 
 			with time_range as (
 				select  *
 					from (
@@ -712,11 +714,58 @@ begin
 				from adjusted_episodes
 				where live_orders.microtimestamp = adjusted_episodes.episode_microtimestamp and live_orders.order_id = adjusted_episodes.episode_order_id and live_orders.event_no = episode_event_no
 				returning live_orders.*;
+				
+		if found then
+			v_repeat := true;
+		end if;
+		
+		return query 
+		  with time_range as (
+				select  *
+					from (
+						select era as start_time, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) as end_time,
+								pair_id
+						from bitstamp.live_orders_eras join bitstamp.pairs using (pair_id)
+						where pairs.pair = p_pair
+					) r
+				where p_ts_within_era between r.start_time and r.end_time
+				),
+				trades as (
+					select t.buy_order_id, t.sell_order_id, t.trade_type, 
+							b.price_microtimestamp as buy_price_microtimestamp,
+							b.price_event_no as buy_price_event_no,
+							s.price_microtimestamp as sell_price_microtimestamp,
+							s.price_event_no as sell_price_event_no
+					from bitstamp.live_trades t join time_range using (pair_id)
+							join bitstamp.live_buy_orders b on buy_microtimestamp = b.microtimestamp and buy_order_id = b.order_id and buy_event_no = b.event_no
+							join bitstamp.live_sell_orders s on sell_microtimestamp = s.microtimestamp and sell_order_id = s.order_id and sell_event_no = s.event_no	
+					where buy_microtimestamp between start_time and end_time or sell_microtimestamp between start_time and end_time 
+				),
+				episodes as (
+					select sell_price_microtimestamp as episode_microtimestamp, sell_order_id as episode_order_id, sell_price_event_no as episode_event_no, buy_price_microtimestamp as new_episode_microtimestamp 
+					from trades
+					where trade_type = 'buy' and buy_price_microtimestamp < sell_price_microtimestamp 
+					union all 
+					select  buy_price_microtimestamp as episode_microtimestamp, buy_order_id as episode_order_id, buy_price_event_no as episode_event_no, sell_price_microtimestamp as new_episode_no 
+					from trades
+					where trade_type = 'sell' and sell_price_microtimestamp < buy_price_microtimestamp 
+				)
+				update bitstamp.live_orders
+				set microtimestamp = new_episode_microtimestamp
+				from episodes
+				where microtimestamp = episode_microtimestamp
+				  and order_id = episode_order_id
+				  and event_no = episode_event_no
+				returning live_orders.*;
+				
+		if found then
+			v_repeat := true;
+		end if;
 		-- We loop until all agressors processed by Bitstamp in wrong order are merged together. A single iteration is able to merge
 		-- only one aggressor into the First Aggressor. 
 		-- Only after that the second agressor (if any) to be merged  into the First Aggressor will become visible and will be merged
 		-- If Bitstamp processed ALL aggressors in wrong order then this loop would merge all of them into one and stop
-		if not found then 
+		if not v_repeat then 
 			raise debug 'fix_aggressor_creation_order() exec time: %', clock_timestamp() - v_execution_start_time;
 			return;
 		end if;
@@ -1284,6 +1333,18 @@ begin
 					from events join unmatched_trades on (order_id = buy_order_id and n_order_id = sell_order_id) or (n_order_id = buy_order_id and order_id = sell_order_id) 
 					where bitstamp._get_match_rule(unmatched_trades.amount, unmatched_trades.price, events.amount, events.fill, events.event, p_tolerance_percentage* unmatched_trades.price) is not null 
 					  and bitstamp._get_match_rule(unmatched_trades.amount, unmatched_trades.price, events.n_amount, events.n_fill, events.n_event, p_tolerance_percentage* unmatched_trades.price) is not null					
+					  and case trade_type 
+							when 'buy' then 
+								case order_type 
+									when 'buy' then	price_microtimestamp > n_price_microtimestamp
+									when 'sell' then price_microtimestamp < n_price_microtimestamp
+								end
+							when 'sell' then 
+								case order_type 
+									when 'sell' then price_microtimestamp > n_price_microtimestamp
+									when 'buy' then	price_microtimestamp < n_price_microtimestamp
+								end
+							end 
 				),
 				matches as (
 					select *
@@ -1811,8 +1872,8 @@ BEGIN
 													 
 		IF NOT ( v_event.microtimestamp = v_next_microtimestamp ) THEN
 			IF ob = '{}' THEN
-				RETURN NEXT ARRAY[ ROW(v_event.microtimestamp, NULL, NULL, 'sell'::bitstamp.direction, NULL, NULL, NULL, e.pair_id, TRUE, NULL),
-  					      			 ROW(v_event.microtimestamp, NULL, NULL, 'buy'::bitstamp.direction, NULL, NULL, NULL, e.pair_id, TRUE, NULL)
+				RETURN NEXT ARRAY[ ROW(v_event.microtimestamp, NULL, NULL, 'sell'::bitstamp.direction, NULL, NULL, NULL, v_pair_id, TRUE, NULL),
+  					      			 ROW(v_event.microtimestamp, NULL, NULL, 'buy'::bitstamp.direction, NULL, NULL, NULL, v_pair_id, TRUE, NULL)
 									  ];
 			ELSE
 				RETURN NEXT ob;
