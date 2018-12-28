@@ -273,8 +273,9 @@ CREATE TABLE bitstamp.spread (
     best_bid_qty numeric,
     best_ask_price numeric,
     best_ask_qty numeric,
-    episode_microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    order_book bitstamp.order_book_record[]
 );
 
 
@@ -284,7 +285,7 @@ ALTER TABLE bitstamp.spread OWNER TO "ob-analytics";
 -- Name: _spread_from_order_book(bitstamp.order_book_record[]); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book_record[]) RETURNS bitstamp.spread
+CREATE FUNCTION bitstamp._spread_from_order_book(p_s bitstamp.order_book_record[]) RETURNS bitstamp.spread
     LANGUAGE sql IMMUTABLE
     AS $$
 
@@ -298,17 +299,17 @@ CREATE FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book_record[])
 						WHEN 'buy' THEN price IS NOT DISTINCT FROM max(price) FILTER (WHERE direction = 'buy') OVER ()
 				END AS is_best,
 				pair_id
-		FROM unnest(s)
+		FROM unnest(p_s)
 		WHERE is_maker
 		GROUP BY pair_id, ts, direction, price
 	)
-	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), pair_id
+	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), pair_id, p_s
 	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND is_best) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND is_best) s USING (pair_id);
 
 $$;
 
 
-ALTER FUNCTION bitstamp._spread_from_order_book(s bitstamp.order_book_record[]) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp._spread_from_order_book(p_s bitstamp.order_book_record[]) OWNER TO "ob-analytics";
 
 --
 -- Name: capture_transient_orders(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1719,54 +1720,12 @@ CREATE FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair 
 			datetime
     FROM orders
 	WHERE is_maker OR NOT p_only_makers
-	ORDER BY order_type DESC, price DESC;
+	ORDER BY order_type DESC, price DESC, order_id;	-- ORDER BY must be the same as in spread_after_episode. Change both!
 
 $$;
 
 
 ALTER FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO "ob-analytics";
-
---
--- Name: order_book_after_episode(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.order_book_after_episode(p_ts timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_only_makers boolean DEFAULT true) RETURNS SETOF bitstamp.order_book_record
-    LANGUAGE sql STABLE
-    AS $$
-
-	WITH orders AS (
-		SELECT *, 
-				COALESCE(
-					CASE order_type 
-						WHEN 'buy' THEN price < min(price) FILTER (WHERE order_type = 'sell') OVER (ORDER BY datetime, microtimestamp)
-						WHEN 'sell' THEN price > max(price) FILTER (WHERE order_type = 'buy') OVER (ORDER BY datetime, microtimestamp)
-					END,
-				TRUE )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
-				AS is_maker
-		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
-		WHERE microtimestamp BETWEEN (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= p_ts ) AND p_ts
- 	   	  AND next_microtimestamp > p_ts 
-		  AND event <> 'order_deleted'
-		  AND pairs.pair = p_pair
-		)
-	SELECT p_ts,
-			price,
-			amount,
-			order_type,
-			order_id,
-			microtimestamp,
-			event_no,
-			pair_id,
-			is_maker,
-			datetime
-    FROM orders
-	WHERE is_maker OR NOT p_only_makers
-	ORDER BY order_type DESC, price DESC;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.order_book_after_episode(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_before(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1870,7 +1829,7 @@ BEGIN
 			ob := bitstamp._order_book_after_event(ob, v_event, p_only_makers := FALSE);
 		END IF;
 													 
-		IF NOT ( v_event.microtimestamp = v_next_microtimestamp ) THEN
+		IF NOT ( v_event.microtimestamp IS NOT DISTINCT FROM v_next_microtimestamp ) THEN
 			IF ob = '{}' THEN
 				RETURN NEXT ARRAY[ ROW(v_event.microtimestamp, NULL, NULL, 'sell'::bitstamp.direction, NULL, NULL, NULL, v_pair_id, TRUE, NULL),
   					      			 ROW(v_event.microtimestamp, NULL, NULL, 'buy'::bitstamp.direction, NULL, NULL, NULL, v_pair_id, TRUE, NULL)
@@ -1970,7 +1929,8 @@ begin
 			update bitstamp.live_orders
 			set microtimestamp = next_microtimestamp
 			where microtimestamp between v_start and v_end
-			  and fill > 0 and trade_id is null	-- this event should has been matched to some trade but couldn't
+			  and ( fill > 0 or fill is null )
+			  and trade_id is null	-- this event should has been matched to some trade but couldn't
 			  and next_microtimestamp > '-infinity'
 			  and next_microtimestamp < microtimestamp;
 			if not found then
@@ -2212,10 +2172,10 @@ BEGIN
 		    best_ask_price := v_cur.best_ask_price;
 			best_bid_qty := v_cur.best_bid_qty;
 			best_ask_qty := v_cur.best_ask_qty;
-			microtimestamp := v_cur.episode_microtimestamp;
+			microtimestamp := v_cur.microtimestamp;
 			pair_id := v_cur.pair_id;
 			IF p_with_order_book THEN 
-		    	order_book := v_ob;
+		    	order_book := array(select a from unnest(v_ob)a order by direction desc, price desc, order_id); -- order by must be the same as in order_book_after(). Change both!
 			END IF;
 			RETURN NEXT;
 		END IF;
@@ -2531,7 +2491,7 @@ ALTER TABLE ONLY bitstamp.pairs
 --
 
 ALTER TABLE ONLY bitstamp.spread
-    ADD CONSTRAINT spread_pkey PRIMARY KEY (pair_id, episode_microtimestamp);
+    ADD CONSTRAINT spread_pkey PRIMARY KEY (pair_id, microtimestamp);
 
 
 --
