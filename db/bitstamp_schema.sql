@@ -274,8 +274,7 @@ CREATE TABLE bitstamp.spread (
     best_ask_price numeric,
     best_ask_qty numeric,
     microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    order_book bitstamp.order_book_record[]
+    pair_id smallint NOT NULL
 );
 
 
@@ -303,7 +302,7 @@ CREATE FUNCTION bitstamp._spread_from_order_book(p_s bitstamp.order_book_record[
 		WHERE is_maker
 		GROUP BY pair_id, ts, direction, price
 	)
-	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), pair_id, p_s
+	SELECT b.price, b.qty, s.price, s.qty, COALESCE(b.ts, s.ts), pair_id
 	FROM (SELECT * FROM price_levels WHERE direction = 'buy' AND is_best) b FULL JOIN (SELECT * FROM price_levels WHERE direction = 'sell' AND is_best) s USING (pair_id);
 
 $$;
@@ -2041,6 +2040,66 @@ $$;
 ALTER FUNCTION bitstamp.pga_match(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
+-- Name: pga_spread(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.pga_spread(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.spread
+    LANGUAGE plpgsql
+    AS $$
+declare 
+	v_current_timestamp timestamptz;
+	v_start timestamptz;
+	v_end timestamptz;
+	v_last_spread timestamptz;
+	v_pair_id bitstamp.pairs.pair_id%type;
+	
+begin 
+	v_current_timestamp := clock_timestamp();
+	
+	select pair_id into v_pair_id
+	from bitstamp.pairs 
+	where pair = p_pair;
+	
+	select era_starts, era_ends into v_start, v_end
+	from (
+		select era as era_starts,
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
+				last_cleanse_run
+		from bitstamp.live_orders_eras 
+		where pair_id = v_pair_id
+	) a
+	where coalesce(p_ts_within_era,  ( select max(era) 
+										 from bitstamp.live_orders_eras 
+										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
+
+	select max(microtimestamp) into v_last_spread
+	from bitstamp.spread join bitstamp.pairs using (pair_id)
+	where microtimestamp between v_start and v_end
+	  and pair_id = v_pair_id;
+	
+	-- delete the latest spread because it could be calculated using incomplete data
+	
+	delete from bitstamp.spread
+	where microtimestamp = v_last_spread
+	  and pair_id = v_pair_id;
+	  
+	return query insert into bitstamp.spread (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id)
+				  select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id
+				  from bitstamp.spread_after_episode(coalesce(v_last_spread, v_start), v_end, p_pair,
+									   p_only_different := true, p_strict := false, p_with_order_book := false)
+				  returning *;									   
+	
+	raise debug 'pga_spread() exec time: %', clock_timestamp() - v_current_timestamp;
+	
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.pga_spread(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+
+--
 -- Name: protect_columns(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2149,39 +2208,75 @@ CREATE FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time z
 --		p_strict		- whether to calculate the spread using events before p_start_time (false) or not (false). 
 -- DETAILS
 --		If p_only_different is FALSE returns spread after each episode
---		If p_only_different is TRUE then will check whether the spread has changed and will skip if it does not.
+--		If p_only_different is true then will check whether the spread has changed and will skip if it does not.
 
-DECLARE
+declare
 	v_cur bitstamp.spread;
 	v_prev bitstamp.spread;
 	v_ob bitstamp.order_book_record[];
-BEGIN
-
-	v_prev := ROW(NULL, NULL, NULL, NULL, NULL, NULL);
-											 
-	FOR v_ob IN SELECT * FROM bitstamp.order_book_by_episode(p_start_time, p_end_time, p_pair, p_strict)
-	LOOP
-		v_cur := bitstamp._spread_from_order_book(v_ob);	
-		IF  (v_cur.best_bid_price IS DISTINCT FROM  v_prev.best_bid_price OR 
-			v_cur.best_bid_qty IS DISTINCT FROM  v_prev.best_bid_qty OR
-			v_cur.best_ask_price IS DISTINCT FROM  v_prev.best_ask_price OR
-			v_cur.best_ask_qty IS DISTINCT FROM  v_prev.best_ask_qty ) 
-			OR NOT p_only_different THEN
-			v_prev := v_cur;
-			best_bid_price := v_cur.best_bid_price;
-		    best_ask_price := v_cur.best_ask_price;
-			best_bid_qty := v_cur.best_bid_qty;
-			best_ask_qty := v_cur.best_ask_qty;
-			microtimestamp := v_cur.microtimestamp;
-			pair_id := v_cur.pair_id;
-			IF p_with_order_book THEN 
-		    	order_book := array(select a from unnest(v_ob)a order by direction desc, price desc, order_id); -- order by must be the same as in order_book_after(). Change both!
-			END IF;
-			RETURN NEXT;
-		END IF;
-	END LOOP;
+				  
+	v_event bitstamp.live_orders;
+	v_next_microtimestamp timestamp with time zone;
 	
-END;
+	v_pair_id smallint;
+	
+	v_r record;
+				  
+begin
+
+	v_prev := row(null, null, null, null, null, null);
+				  
+	if p_strict then
+		v_ob := '{}';	-- only the events within the [p_start_time, p_end_time] interval will be used
+	else
+		v_ob := null;
+	end if;
+	
+	select pairs.pair_id into v_pair_id
+	from bitstamp.pairs where pairs.pair = p_pair;
+				  
+	for v_r in select row(live_orders.*) as e, lead(live_orders.microtimestamp) over (order by live_orders.microtimestamp, event_no) as n
+										   from bitstamp.live_orders
+			  							   where live_orders.microtimestamp between p_start_time and p_end_time 
+			    							 and live_orders.pair_id = v_pair_id
+			  							   order by live_orders.microtimestamp, event_no
+	loop
+		v_event := v_r.e;
+		v_next_microtimestamp 	:= v_r.n;
+		
+		if v_ob is null then 
+			v_ob := array(select bitstamp.order_book_after(v_event.microtimestamp, p_pair, false));
+		else													 
+			v_ob := bitstamp._order_book_after_event(v_ob, v_event, p_only_makers := false);
+		end if;
+													 
+		if not ( v_event.microtimestamp is not distinct from  v_next_microtimestamp ) then
+			if v_ob = '{}' then 
+				v_ob := array[ row(v_event.microtimestamp, null, null, 'sell'::bitstamp.direction, null, null, null, v_pair_id, true, null),
+  					      		row(v_event.microtimestamp, null, null, 'buy'::bitstamp.direction, null, null, null, v_pair_id, true, null)
+									  ];
+			end if;
+			v_cur := bitstamp._spread_from_order_book(v_ob);	
+			if  (v_cur.best_bid_price is distinct from  v_prev.best_bid_price or 
+				v_cur.best_bid_qty is distinct from  v_prev.best_bid_qty or
+				v_cur.best_ask_price is distinct from  v_prev.best_ask_price or
+				v_cur.best_ask_qty is distinct from  v_prev.best_ask_qty ) 
+				or not p_only_different then
+				v_prev := v_cur;
+				best_bid_price := v_cur.best_bid_price;
+				best_ask_price := v_cur.best_ask_price;
+				best_bid_qty := v_cur.best_bid_qty;
+				best_ask_qty := v_cur.best_ask_qty;
+				microtimestamp := v_cur.microtimestamp;
+				pair_id := v_cur.pair_id;
+				if p_with_order_book then 
+					order_book := array(select a from unnest(v_ob)a order by direction desc, price desc, order_id); -- order by must be the same as in order_book_after(). Change both!
+				end if;
+				return next;
+			end if;
+		end if;
+	end loop;
+end;
 
 $$;
 
@@ -2192,7 +2287,7 @@ ALTER FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zo
 -- Name: FUNCTION spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_different boolean, p_strict boolean, p_with_order_book boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
 --
 
-COMMENT ON FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_different boolean, p_strict boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each episode in the ''live_orders'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time unless "p_p_strict" is set to TRUE. In the latter case the spread is caclulated using only events within the interval between p_start_time and p_end_time';
+COMMENT ON FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_different boolean, p_strict boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each episode in the ''live_orders'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time unless "p_p_strict" is set to true. In the latter case the spread is caclulated using only events within the interval between p_start_time and p_end_time';
 
 
 --
