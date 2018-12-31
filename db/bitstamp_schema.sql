@@ -937,50 +937,6 @@ $$;
 ALTER FUNCTION bitstamp.inferred_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_missing boolean, p_strict boolean) OWNER TO "ob-analytics";
 
 --
--- Name: live_orders_eras_v(text, integer); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.live_orders_eras_v(p_pair text DEFAULT 'BTCUSD'::text, p_limit integer DEFAULT 5) RETURNS TABLE(era timestamp with time zone, pair text, last_event timestamp with time zone, events bigint, e_per_sec numeric, matched_events bigint, unmatched_events bigint, trades bigint, fully_matched_trades bigint, partially_matched_trades bigint, not_matched_trades bigint, bitstamp_trades bigint)
-    LANGUAGE sql STABLE
-    AS $$
-
-WITH eras AS (
-		SELECT era, pair, COALESCE(lead(era) OVER (ORDER BY era), 'infinity'::timestamptz) AS next_era
-		FROM bitstamp.live_orders_eras JOIN bitstamp.pairs USING (pair_id)
-	    WHERE pairs.pair = p_pair
-		ORDER BY era DESC
-		LIMIT p_limit
-),
-eras_orders_trades AS (
-SELECT era, pair, last_event, events, matched_events, unmatched_events, trades, fully_matched_trades, partially_matched_trades, not_matched_trades, first_event, bitstamp_trades
-
-FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last_event, min(microtimestamp) AS first_event,
-							count(*) FILTER (WHERE trade_id IS NULL AND fill > 0 ) AS unmatched_events,
-							count(*) FILTER (WHERE trade_id IS NOT NULL ) AS matched_events
-							FROM bitstamp.live_orders 
-			  				WHERE microtimestamp >= eras.era AND microtimestamp < eras.next_era
-			 			 ) e ON TRUE
-		   JOIN LATERAL (SELECT count(*) AS trades, 
-						  count(*) FILTER (WHERE buy_microtimestamp IS NOT NULL AND sell_microtimestamp IS NOT NULL) AS fully_matched_trades,
-						  count(*) FILTER (WHERE ( buy_microtimestamp IS NOT NULL AND sell_microtimestamp IS NULL) OR ( buy_microtimestamp IS NULL AND sell_microtimestamp IS NOT NULL)) AS partially_matched_trades,
-						  count(*) FILTER (WHERE buy_microtimestamp IS NULL AND sell_microtimestamp IS NULL) AS not_matched_trades,
-						  count(*) FILTER (WHERE bitstamp_trade_id IS NOT NULL) AS bitstamp_trades
-			  FROM bitstamp.live_trades
-			  WHERE trade_timestamp >= eras.era AND trade_timestamp < eras.next_era
-			 ) t ON TRUE
-)
-SELECT era, pair, last_event, events, 
-						 CASE WHEN EXTRACT( EPOCH FROM last_event - first_event ) > 0 THEN round((events/EXTRACT( EPOCH FROM last_event - first_event ))::numeric,2) ELSE 0 END AS e_per_sec,
-						  matched_events, unmatched_events,trades,  fully_matched_trades, partially_matched_trades, not_matched_trades, bitstamp_trades
-FROM eras_orders_trades
-ORDER BY era DESC;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.live_orders_eras_v(p_pair text, p_limit integer) OWNER TO "ob-analytics";
-
---
 -- Name: live_orders_incorporate_new_event(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2329,6 +2285,54 @@ ALTER FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with time z
 
 COMMENT ON FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_different boolean, p_strict boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") before each episode (i.e. after previous episode) in the ''live_orders'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time unless "p_p_strict" is set to TRUE. In the latter case the spread is caclulated using only events within the interval between p_start_time and p_end_time';
 
+
+--
+-- Name: summary(text, integer); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.summary(p_pair text DEFAULT 'BTCUSD'::text, p_limit integer DEFAULT 5) RETURNS TABLE(era timestamp with time zone, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text)
+    LANGUAGE sql STABLE
+    AS $$
+
+WITH eras AS (
+		SELECT era, pair, COALESCE(lead(era) OVER (ORDER BY era), 'infinity'::timestamptz) AS next_era
+		FROM bitstamp.live_orders_eras JOIN bitstamp.pairs USING (pair_id)
+	    WHERE pairs.pair = p_pair
+		ORDER BY era DESC
+		LIMIT p_limit
+),
+eras_orders_trades AS (
+SELECT era, pair, last_event, events, matched_events, unmatched_events, trades, fully_matched_trades, not_matched_trades, first_event, bitstamp_trades,
+	   spreads, last_spread
+
+FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last_event, min(microtimestamp) AS first_event,
+							count(*) FILTER (WHERE trade_id IS NULL AND fill > 0 ) AS unmatched_events,
+							count(*) FILTER (WHERE trade_id IS NOT NULL ) AS matched_events
+							FROM bitstamp.live_orders 
+			  				WHERE microtimestamp >= eras.era AND microtimestamp < eras.next_era
+			 			 ) e ON TRUE
+		   JOIN LATERAL (SELECT   count(*) AS trades, 
+						  			count(*) FILTER (WHERE buy_microtimestamp IS NOT NULL AND sell_microtimestamp IS NOT NULL) AS fully_matched_trades,
+						  			count(*) FILTER (WHERE buy_microtimestamp IS NULL AND sell_microtimestamp IS NULL) AS not_matched_trades,
+						  			count(*) FILTER (WHERE bitstamp_trade_id IS NOT NULL) AS bitstamp_trades
+			  			  FROM bitstamp.live_trades
+			  WHERE trade_timestamp >= eras.era AND trade_timestamp < eras.next_era
+			 ) t ON TRUE
+		  join lateral ( select count(*) as spreads,
+								  max(microtimestamp) as last_spread
+					   	  from bitstamp.spread
+					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era) s on true
+)
+SELECT era, pair,  events, last_event::text,
+						 CASE WHEN EXTRACT( EPOCH FROM last_event - first_event ) > 0 THEN round((events/EXTRACT( EPOCH FROM last_event - first_event ))::numeric,2) ELSE 0 END AS e_per_sec,
+						  matched_events, unmatched_events,trades,  fully_matched_trades, not_matched_trades, bitstamp_trades, spreads, last_spread::text
+FROM eras_orders_trades
+ORDER BY era DESC;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.summary(p_pair text, p_limit integer) OWNER TO "ob-analytics";
 
 --
 -- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
