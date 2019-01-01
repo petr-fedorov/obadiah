@@ -25,6 +25,31 @@ CREATE SCHEMA bitstamp;
 ALTER SCHEMA bitstamp OWNER TO "ob-analytics";
 
 --
+-- Name: side; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.side AS ENUM (
+    'ask',
+    'bid'
+);
+
+
+ALTER TYPE bitstamp.side OWNER TO "ob-analytics";
+
+--
+-- Name: depth_record; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.depth_record AS (
+	price numeric,
+	volume numeric,
+	side bitstamp.side
+);
+
+
+ALTER TYPE bitstamp.depth_record OWNER TO "ob-analytics";
+
+--
 -- Name: direction; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -82,18 +107,6 @@ CREATE TYPE bitstamp.order_book_record AS (
 
 
 ALTER TYPE bitstamp.order_book_record OWNER TO "ob-analytics";
-
---
--- Name: side; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TYPE bitstamp.side AS ENUM (
-    'ask',
-    'bid'
-);
-
-
-ALTER TYPE bitstamp.side OWNER TO "ob-analytics";
 
 --
 -- Name: _get_live_orders_eon(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -309,6 +322,92 @@ $$;
 
 
 ALTER FUNCTION bitstamp._spread_from_order_book(p_s bitstamp.order_book_record[]) OWNER TO "ob-analytics";
+
+--
+-- Name: capture_depth(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.capture_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT false) RETURNS void
+    LANGUAGE plpgsql
+    SET work_mem TO '4GB'
+    AS $$
+
+-- ARGUMENTS
+--		p_start_time - the start of the interval for the calculation of depths
+--		p_end_time	 - the end of the interval
+--		p_pair		 - the pair for which depths will be calculated
+--		p_only_different	- whether to output the depth only when it is different from the v_previous one (true) or after each event (false). true is the default.
+--		p_strict		- whether to calculate the depth using events before p_start_time (false) or not (false). 
+-- DETAILS
+--		If p_only_different is FALSE returns depth after each episode
+--		If p_only_different is true then will check whether the depth has changed and will skip if it does not.
+
+declare
+	v_cur bitstamp.depth;
+	v_prev bitstamp.depth;
+	
+	v_ob_after bitstamp.order_book_record[];
+	v_ob_before bitstamp.order_book_record[];
+				  
+	v_event bitstamp.live_orders;
+	v_next_microtimestamp timestamp with time zone;
+	
+	v_pair_id smallint;
+	
+	v_r record;
+				  
+begin
+
+	v_prev := row(null, null, null, null, null, null);
+				  
+	if p_strict then
+		v_ob_after := '{}';	-- only the events within the [p_start_time, p_end_time] interval will be used
+		v_ob_before := '{}';
+	else
+		v_ob_after := null;
+		v_ob_before := null;
+	end if;
+	
+	select pairs.pair_id into v_pair_id
+	from bitstamp.pairs where pairs.pair = p_pair;
+				  
+	for v_r in select row(live_orders.*) as e, lead(live_orders.microtimestamp) over (order by live_orders.microtimestamp, event_no) as n
+										   from bitstamp.live_orders
+			  							   where live_orders.microtimestamp between p_start_time and p_end_time 
+			    							 and live_orders.pair_id = v_pair_id
+			  							   order by live_orders.microtimestamp, event_no
+	loop
+		v_event := v_r.e;
+		v_next_microtimestamp 	:= v_r.n;
+		
+		if v_ob_before is null then 
+			v_ob_before := array(select bitstamp.order_book_before(v_event.microtimestamp, p_pair, false));
+			v_ob_after := v_ob_before;																   
+		end if;
+																   
+		v_ob_after := bitstamp._order_book_after_event(v_ob_after, v_event, p_only_makers := false);
+													 
+		if not ( v_event.microtimestamp is not distinct from  v_next_microtimestamp ) then
+			insert into bitstamp.depth (microtimestamp, pair_id, depth)																   
+			values(v_event.microtimestamp, 
+							  v_event.pair_id,
+							array( select row(a.price, sum(a.amount),
+								  		case a.direction when 'buy' then 'bid'::bitstamp.side when 'sell' then 'ask'::bitstamp.side end)::bitstamp.depth_record
+									from unnest(v_ob_after) a 
+									where a.is_maker 
+									group by a.price, a.direction, a.pair_id
+								  	order by a.direction, a.price desc
+							));
+			v_ob_before := v_ob_after;
+								
+		end if;
+	end loop;
+end;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.capture_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: capture_transient_orders(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1344,9 +1443,16 @@ CREATE FUNCTION bitstamp.oba_depth(p_start_time timestamp with time zone, p_end_
     LANGUAGE sql STABLE
     AS $$
 
-  SELECT episode_microtimestamp AS "timestamp", price, amount AS volume, CASE direction WHEN 'buy' THEN 'bid'::text WHEN 'sell' THEN 'ask'::text END
-  FROM bitstamp.depth_by_episode(p_start_time, p_end_time, p_pair, p_strict);
- 
+	with depth as (
+		select 	microtimestamp, pair_id, depth, lag(depth) over (partition by pair_id order by microtimestamp) as prev_depth
+		from bitstamp.depth join bitstamp.pairs using (pair_id)
+		where pairs.pair = p_pair
+		  and  microtimestamp between p_start_time and p_end_time
+	)
+	select microtimestamp as "timestamp", a.price, a.volume, a.side::text
+	from depth join lateral (select side, price, coalesce(c.volume, 0) as volume
+								from unnest(depth) c full join unnest(prev_depth) p using (side, price) 
+								where c.volume is distinct from p.volume ) a on true 
 
 $$;
 
@@ -1570,8 +1676,11 @@ CREATE FUNCTION bitstamp.oba_spread(p_start_time timestamp with time zone, p_end
 -- ARGUMENTS
 --	See bitstamp.spread_by_episode()
 
-	SELECT best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
-	FROM bitstamp.spread_after_episode(p_start_time , p_end_time, p_pair, p_only_different, p_strict)
+	select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+	from bitstamp.spread join bitstamp.pairs using (pair_id)
+	where pairs.pair = p_pair
+	  and microtimestamp between p_start_time and p_end_time;
+	
 
 $$;
 
@@ -1919,6 +2028,62 @@ $$;
 ALTER FUNCTION bitstamp.pga_cleanse(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
+-- Name: pga_depth(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+declare 
+	v_current_timestamp timestamptz;
+	v_start timestamptz;
+	v_end timestamptz;
+	v_last_depth timestamptz;
+	v_pair_id bitstamp.pairs.pair_id%type;
+	
+begin 
+	v_current_timestamp := clock_timestamp();
+	
+	select pair_id into v_pair_id
+	from bitstamp.pairs 
+	where pair = p_pair;
+	
+	select era_starts, era_ends into v_start, v_end
+	from (
+		select era as era_starts,
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
+				last_cleanse_run
+		from bitstamp.live_orders_eras 
+		where pair_id = v_pair_id
+	) a
+	where coalesce(p_ts_within_era,  ( select max(era) 
+										 from bitstamp.live_orders_eras 
+										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
+
+	select max(microtimestamp) into v_last_depth
+	from bitstamp.depth join bitstamp.pairs using (pair_id)
+	where microtimestamp between v_start and v_end
+	  and pair_id = v_pair_id;
+	
+	-- delete the latest depth because it could be calculated using incomplete data
+	
+	delete from bitstamp.depth
+	where microtimestamp = v_last_depth
+	  and pair_id = v_pair_id;
+	  
+	perform bitstamp.capture_depth(coalesce(v_last_depth, v_start), v_end, p_pair, p_strict := false);
+	
+	raise debug 'pga_depth() exec time: %', clock_timestamp() - v_current_timestamp;
+	
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+
+--
 -- Name: pga_match(text, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2201,10 +2366,10 @@ begin
 		v_next_microtimestamp 	:= v_r.n;
 		
 		if v_ob is null then 
-			v_ob := array(select bitstamp.order_book_after(v_event.microtimestamp, p_pair, false));
-		else													 
-			v_ob := bitstamp._order_book_after_event(v_ob, v_event, p_only_makers := false);
+			v_ob := array(select bitstamp.order_book_before(v_event.microtimestamp, p_pair, false));
 		end if;
+															
+		v_ob := bitstamp._order_book_after_event(v_ob, v_event, p_only_makers := false);
 													 
 		if not ( v_event.microtimestamp is not distinct from  v_next_microtimestamp ) then
 			if v_ob = '{}' then 
@@ -2333,6 +2498,19 @@ $$;
 
 
 ALTER FUNCTION bitstamp.summary(p_pair text, p_limit integer) OWNER TO "ob-analytics";
+
+--
+-- Name: depth; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.depth (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    depth bitstamp.depth_record[] NOT NULL
+);
+
+
+ALTER TABLE bitstamp.depth OWNER TO "ob-analytics";
 
 --
 -- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -2471,6 +2649,14 @@ ALTER TABLE bitstamp.transient_live_trades OWNER TO "ob-analytics";
 --
 
 ALTER TABLE ONLY bitstamp.live_trades ALTER COLUMN trade_id SET DEFAULT nextval('bitstamp.live_trades_trade_id_seq'::regclass);
+
+
+--
+-- Name: depth depth_pkey; Type: CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.depth
+    ADD CONSTRAINT depth_pkey PRIMARY KEY (microtimestamp, pair_id);
 
 
 --
@@ -2711,6 +2897,14 @@ CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtim
 --
 
 CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtimestamp, orig_microtimestamp ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_orig_microtimestamp();
+
+
+--
+-- Name: depth depth_fkey_pairs; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitstamp.depth
+    ADD CONSTRAINT depth_fkey_pairs FOREIGN KEY (pair_id) REFERENCES bitstamp.pairs(pair_id) MATCH FULL ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
