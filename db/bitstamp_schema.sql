@@ -200,7 +200,7 @@ CREATE TABLE bitstamp.live_orders (
     event bitstamp.live_orders_event NOT NULL,
     order_type bitstamp.direction NOT NULL,
     price numeric NOT NULL,
-    amount numeric NOT NULL,
+    amount numeric,
     fill numeric,
     next_microtimestamp timestamp with time zone NOT NULL,
     next_event_no smallint,
@@ -212,10 +212,8 @@ CREATE TABLE bitstamp.live_orders (
     datetime timestamp with time zone NOT NULL,
     price_microtimestamp timestamp with time zone NOT NULL,
     price_event_no smallint,
-    CONSTRAINT created_amount_positive CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR (amount > (0)::numeric))),
     CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT only_ex_nihilo_may_have_price_event_no_null CHECK (((price_event_no IS NOT NULL) OR ((price_event_no IS NULL) AND (event_no = 1) AND (event <> 'order_created'::bitstamp.live_orders_event)))),
     CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
 )
 PARTITION BY LIST (order_type);
@@ -1032,27 +1030,19 @@ BEGIN
 				
 			ELSE -- it is ex-nihilo 'order_changed' or 'order_deleted' event
 
-				IF NEW.amount > 0 THEN 
+				NEW.fill := NULL;	-- we still don't know fill (yet). Can later try to figure it out from trade. amount will be null too
+				-- INSERT the initial 'order_created' event when missing
+				NEW.price_microtimestamp := CASE WHEN NEW.datetime < NEW.era THEN NEW.era ELSE NEW.datetime END;
+				NEW.price_event_no := 1;
+				NEW.event_no := 2;
 
-					NEW.fill := NULL;	-- we still don't know fill (yet). Can later try to figure it out from trade
-					-- INSERT the initial 'order_created' event when missing
-					NEW.price_microtimestamp := CASE WHEN NEW.datetime < NEW.era THEN NEW.era ELSE NEW.datetime END;
-					NEW.price_event_no := 1;
-					NEW.event_no := 2;
-					
-					INSERT INTO bitstamp.live_orders (order_id, amount, event, event_no, order_type, datetime, microtimestamp, 
-													  pair_id, price, fill, next_microtimestamp, next_event_no,era,
-													  price_microtimestamp, price_event_no )
-					VALUES (NEW.order_id, NEW.amount, 'order_created'::bitstamp.live_orders_event, NEW.price_event_no, NEW.order_type,
-							NEW.datetime, NEW.price_microtimestamp, 
-							NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event_no, NEW.era, NEW.price_microtimestamp, 
-						   NEW.price_event_no);
-
-				ELSE --	will not create 'order_created' for ex-nihilo, this order will be the first one
-					NEW.event_no := 1;
-					NEW.price_microtimestamp := NEW.datetime;
-					NEW.price_event_no := NULL;	-- this is allowed only for ex-nihilo orders
-				END IF;
+				INSERT INTO bitstamp.live_orders (order_id, amount, event, event_no, order_type, datetime, microtimestamp, 
+												  pair_id, price, fill, next_microtimestamp, next_event_no,era,
+												  price_microtimestamp, price_event_no )
+				VALUES (NEW.order_id, NEW.amount, 'order_created'::bitstamp.live_orders_event, NEW.price_event_no, NEW.order_type,
+						NEW.datetime, NEW.price_microtimestamp, 
+						NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event_no, NEW.era, NEW.price_microtimestamp, 
+					   NEW.price_event_no);
 			
 			END IF;
 		END IF;
@@ -2273,10 +2263,10 @@ $$;
 ALTER FUNCTION bitstamp.reveal_episodes(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
--- Name: spread_after_episode(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: spread_after_episode(timestamp with time zone, timestamp with time zone, text, boolean, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT false, p_with_order_book boolean DEFAULT false) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, order_book bitstamp.order_book_record[])
+CREATE FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT false, p_only_different boolean DEFAULT true, p_with_order_book boolean DEFAULT false) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, order_book bitstamp.order_book_record[])
     LANGUAGE sql STABLE
     AS $$
 
@@ -2286,26 +2276,39 @@ CREATE FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time z
 --		p_pair		 - the pair for which spreads will be calculated
 --		p_strict		- whether to calculate the spread using events before p_start_time (false) or not (false). 
 
+with spread as (
+	select (bitstamp._spread_from_order_book(ob)).*, case  when p_with_order_book then ob else null end as ob
+	from bitstamp.order_book_by_episode(p_start_time, p_end_time, p_pair, p_strict) ob
+)
 select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, ob
 from (
-	select distinct on (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty) (bitstamp._spread_from_order_book(ob)).*,
-			case  when p_with_order_book then ob else null end as ob
-	from bitstamp.order_book_by_episode(p_start_time, p_end_time, p_pair, p_strict) ob
-	order by best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+	select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, ob,
+		    lag(best_bid_price) over w as p_best_bid_price, 
+			lag(best_bid_qty) over w as p_best_bid_qty,
+			lag(best_ask_price) over w as p_best_ask_price,
+			lag(best_ask_qty) over w as p_best_ask_qty
+	from spread
+	window w as (order by microtimestamp)
 ) a
-where microtimestamp is not null
+where microtimestamp is not null 
+  and ( not p_only_different 
+	   	 or best_bid_price is distinct from p_best_bid_price
+	     or best_bid_qty is distinct from p_best_bid_qty
+	     or best_ask_price is distinct from p_best_ask_price
+	     or best_ask_qty is distinct from p_best_ask_qty
+	   )
 order by microtimestamp
 
 $$;
 
 
-ALTER FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_with_order_book boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_only_different boolean, p_with_order_book boolean) OWNER TO "ob-analytics";
 
 --
--- Name: FUNCTION spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_with_order_book boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+-- Name: FUNCTION spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_only_different boolean, p_with_order_book boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
 --
 
-COMMENT ON FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each episode in the ''live_orders'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time unless "p_p_strict" is set to true. In the latter case the spread is caclulated using only events within the interval between p_start_time and p_end_time';
+COMMENT ON FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_only_different boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each episode in the ''live_orders'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time unless "p_p_strict" is set to true. In the latter case the spread is caclulated using only events within the interval between p_start_time and p_end_time';
 
 
 --
