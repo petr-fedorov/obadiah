@@ -1621,7 +1621,29 @@ CREATE FUNCTION bitstamp.oba_spread(p_start_time timestamp with time zone, p_end
 	select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
 	from bitstamp.spread join bitstamp.pairs using (pair_id)
 	where pairs.pair = p_pair
-	  and microtimestamp between p_start_time and p_end_time;
+	  and microtimestamp between p_start_time and p_end_time
+	union all
+	select *
+	from (
+		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_start_time
+		from bitstamp.spread join bitstamp.pairs using (pair_id)
+		where pairs.pair = p_pair
+		  and microtimestamp < p_start_time
+		order by microtimestamp desc
+		limit 1
+	) a
+	union all
+	select *
+	from (
+		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_end_time
+		from bitstamp.spread join bitstamp.pairs using (pair_id)
+		where pairs.pair = p_pair
+		  and microtimestamp <= p_end_time
+		order by microtimestamp desc
+		limit 1
+	) a
+	
+
 	
 
 $$;
@@ -1892,54 +1914,61 @@ declare
 	v_end timestamptz;
 	v_trade bitstamp.live_trades;
 	v_trade_id bigint;
+	v_pair_id bitstamp.pairs.pair_id%type;
 begin 
 	v_current_timestamp := current_timestamp;
-	for v_start, v_end in 	select era_starts, era_ends
-							 from (
-								 select era as era_starts,
-								 		 coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
-								 		 last_cleanse_run
-								 from bitstamp.live_orders_eras join bitstamp.pairs using (pair_id)
-								 where pairs.pair = p_pair
-							 ) a
-							 where coalesce(p_ts_within_era,  coalesce(last_cleanse_run,era_starts)) between era_starts and era_ends loop
+	
+	select pair_id into v_pair_id
+	from bitstamp.pairs 
+	where pair = p_pair;
+	
+	select era_starts, era_ends into v_start, v_end
+	from (
+		select era as era_starts,
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
+				last_cleanse_run
+		from bitstamp.live_orders_eras 
+		where pair_id = v_pair_id
+	) a
+	where coalesce(p_ts_within_era,  ( select max(era) 
+										 from bitstamp.live_orders_eras 
+										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
 
-		return query select * from bitstamp.find_and_repair_eternal_orders(v_start);																	   
-		return query select * from bitstamp.find_and_repair_missing_fill(v_start, p_pair);																	   
-		return query select * from bitstamp.fix_aggressor_creation_order(v_start, p_pair);
-		return query select * from bitstamp.reveal_episodes(v_start, p_pair);
-								
-		-- update microtimestamp of trade-part events that couldn't be matched and which are in the wrong order (i.e. later that its subsequent event)
-		loop 																	   
-			update bitstamp.live_orders
-			set microtimestamp = next_microtimestamp
+	return query select * from bitstamp.find_and_repair_eternal_orders(v_start);																	   
+	return query select * from bitstamp.find_and_repair_missing_fill(v_start, p_pair);																	   
+	return query select * from bitstamp.fix_aggressor_creation_order(v_start, p_pair);
+	return query select * from bitstamp.reveal_episodes(v_start, p_pair);
+
+	-- update microtimestamp of trade-part events that couldn't be matched and which are in the wrong order (i.e. later that its subsequent event)
+	loop 																	   
+		update bitstamp.live_orders
+		set microtimestamp = next_microtimestamp
+		where microtimestamp between v_start and v_end
+		  and ( fill > 0 or fill is null )
+		  and trade_id is null	-- this event should has been matched to some trade but couldn't
+		  and next_microtimestamp > '-infinity'
+		  and next_microtimestamp < microtimestamp;
+		if not found then
+			exit;
+		end if;
+	end loop;														   
+
+	if (select count(*)
+		from (
+			select *, min(microtimestamp) over (partition by order_id order by event_no desc) as min_microtimestamp
+			from bitstamp.live_orders
 			where microtimestamp between v_start and v_end
-			  and ( fill > 0 or fill is null )
-			  and trade_id is null	-- this event should has been matched to some trade but couldn't
-			  and next_microtimestamp > '-infinity'
-			  and next_microtimestamp < microtimestamp;
-			if not found then
-				exit;
-			end if;
-		end loop;														   
-																	   
-		if (select count(*)
-			from (
-				select *, min(microtimestamp) over (partition by order_id order by event_no desc) as min_microtimestamp
-				from bitstamp.live_orders
-				where microtimestamp between v_start and v_end
-			) a 
-			where microtimestamp > min_microtimestamp 
-			) > 0 then
-			raise exception 'An inconsistent event orderding would be created for era %, exiting ...', v_start;
-		end if;																	   
-		update bitstamp.live_orders_eras
-		set last_cleanse_run = v_current_timestamp
-		from bitstamp.pairs
-		where era = v_start 
-		  and live_orders_eras.pair_id = pairs.pair_id
-		  and pairs.pair = p_pair;
-	end loop;												   
+		) a 
+		where microtimestamp > min_microtimestamp 
+		) > 0 then
+		raise exception 'An inconsistent event orderding would be created for era %, exiting ...', v_start;
+	end if;																	   
+	update bitstamp.live_orders_eras
+	set last_cleanse_run = v_current_timestamp
+	from bitstamp.pairs
+	where era = v_start 
+	  and live_orders_eras.pair_id = pairs.pair_id
+	  and pairs.pair = p_pair;
 	return;
 end;
 
@@ -2019,60 +2048,70 @@ declare
 	v_trade bitstamp.live_trades;
 	v_trade_id bigint;
 	v_tolerance_percentage numeric;
+	v_pair_id bitstamp.pairs.pair_id%type;
+	
 	MAX_OFFSET constant integer := 4;	-- the maximum distance (in terms of events) between considered as caused by one trade
 	
 begin 
 	v_current_timestamp := current_timestamp;
-	for v_start, v_end in 	select era_starts, era_ends
-							 from (
-								 select era as era_starts, coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends, last_match_run
-								 from bitstamp.live_orders_eras join bitstamp.pairs using (pair_id)
-								 where pairs.pair = p_pair
-							 ) a
-							 where coalesce(p_ts_within_era,  coalesce(last_match_run,era_starts)) between era_starts and era_ends loop
+	
+	select pair_id into v_pair_id
+	from bitstamp.pairs 
+	where pair = p_pair;
+	
+	select era_starts, era_ends into v_start, v_end
+	from (
+		select era as era_starts,
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
+				last_cleanse_run
+		from bitstamp.live_orders_eras 
+		where pair_id = v_pair_id
+	) a
+	where coalesce(p_ts_within_era,  ( select max(era) 
+										 from bitstamp.live_orders_eras 
+										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
 							 
-		for v_trade in select * from bitstamp.inferred_trades(v_start, v_end, p_pair, p_only_missing := TRUE, p_strict := TRUE) loop
-		
-			
-			return query update bitstamp.live_trades 
-				 	 	  set buy_microtimestamp = v_trade.buy_microtimestamp, buy_event_no = v_trade.buy_event_no,
-					 		   sell_microtimestamp = v_trade.sell_microtimestamp, sell_event_no = v_trade.sell_event_no,
-							   buy_match_rule = v_trade.buy_match_rule,
-							   sell_match_rule = v_trade.sell_match_rule,
-							   trade_type = v_trade.trade_type,
-							   orig_trade_type = case when v_trade.trade_type <> trade_type then trade_type else null end
-						  where buy_order_id = v_trade.buy_order_id 
-						    and sell_order_id = v_trade.sell_order_id
-							and pair_id = v_trade.pair_id
+	for v_trade in select * from bitstamp.inferred_trades(v_start, v_end, p_pair, p_only_missing := TRUE, p_strict := TRUE) loop
+
+
+		return query update bitstamp.live_trades 
+					  set buy_microtimestamp = v_trade.buy_microtimestamp, buy_event_no = v_trade.buy_event_no,
+						   sell_microtimestamp = v_trade.sell_microtimestamp, sell_event_no = v_trade.sell_event_no,
+						   buy_match_rule = v_trade.buy_match_rule,
+						   sell_match_rule = v_trade.sell_match_rule,
+						   trade_type = v_trade.trade_type,
+						   orig_trade_type = case when v_trade.trade_type <> trade_type then trade_type else null end
+					  where buy_order_id = v_trade.buy_order_id 
+						and sell_order_id = v_trade.sell_order_id
+						and pair_id = v_trade.pair_id
+					  returning *;
+
+		if not found then 
+			return query insert into bitstamp.live_trades (amount, price, trade_type, trade_timestamp, buy_order_id, sell_order_id, 
+									 pair_id, sell_microtimestamp, buy_microtimestamp, buy_match_rule, sell_match_rule, buy_event_no, sell_event_no)
+						  values (v_trade.amount, v_trade.price, v_trade.trade_type, v_trade.trade_timestamp, v_trade.buy_order_id, v_trade.sell_order_id,
+								  v_trade.pair_id, v_trade.sell_microtimestamp, v_trade.buy_microtimestamp, v_trade.buy_match_rule, v_trade.sell_match_rule,
+								  v_trade.buy_event_no, v_trade.sell_event_no)
 						  returning *;
-			
-			if not found then 
-				return query insert into bitstamp.live_trades (amount, price, trade_type, trade_timestamp, buy_order_id, sell_order_id, 
-										 pair_id, sell_microtimestamp, buy_microtimestamp, buy_match_rule, sell_match_rule, buy_event_no, sell_event_no)
-							  values (v_trade.amount, v_trade.price, v_trade.trade_type, v_trade.trade_timestamp, v_trade.buy_order_id, v_trade.sell_order_id,
-									  v_trade.pair_id, v_trade.sell_microtimestamp, v_trade.buy_microtimestamp, v_trade.buy_match_rule, v_trade.sell_match_rule,
-									  v_trade.buy_event_no, v_trade.sell_event_no)
-							  returning *;
-			end if;
-			
-		end loop;
-		
-		foreach v_tolerance_percentage in array '{0.0001, 0.001, 0.01, 0.1, 1}'::numeric[] loop
-			for v_offset in 1..MAX_OFFSET loop
-				return query select * from bitstamp.match_trades_to_sequential_events(v_start, p_pair, 
-																					  	p_tolerance_percentage := v_tolerance_percentage,
-																					  	p_offset := v_offset);
-			end loop;
-		end loop; 
-																	   
-		update bitstamp.live_orders_eras
-		set last_match_run = v_current_timestamp
-		from bitstamp.pairs
-		where era = v_start 
-		  and live_orders_eras.pair_id = pairs.pair_id
-		  and pairs.pair = p_pair;
-		
+		end if;
+
 	end loop;
+
+	foreach v_tolerance_percentage in array '{0.0001, 0.001, 0.01, 0.1, 1}'::numeric[] loop
+		for v_offset in 1..MAX_OFFSET loop
+			return query select * from bitstamp.match_trades_to_sequential_events(v_start, p_pair, 
+																					p_tolerance_percentage := v_tolerance_percentage,
+																					p_offset := v_offset);
+		end loop;
+	end loop; 
+
+	update bitstamp.live_orders_eras
+	set last_match_run = v_current_timestamp
+	from bitstamp.pairs
+	where era = v_start 
+	  and live_orders_eras.pair_id = pairs.pair_id
+	  and pairs.pair = p_pair;
+		
 	return;
 end;
 
@@ -2128,7 +2167,7 @@ begin
 	return query insert into bitstamp.spread (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id)
 				  select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id
 				  from bitstamp.spread_after_episode(coalesce(v_last_spread, v_start), v_end, p_pair,
-									   p_only_different := true, p_strict := false, p_with_order_book := false)
+									   p_strict := false, p_with_order_book := false)
 				  returning *;									   
 	
 	raise debug 'pga_spread() exec time: %', clock_timestamp() - v_current_timestamp;
@@ -2234,102 +2273,39 @@ $$;
 ALTER FUNCTION bitstamp.reveal_episodes(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
--- Name: spread_after_episode(timestamp with time zone, timestamp with time zone, text, boolean, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: spread_after_episode(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_only_different boolean DEFAULT true, p_strict boolean DEFAULT false, p_with_order_book boolean DEFAULT false) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, order_book bitstamp.order_book_record[])
-    LANGUAGE plpgsql STABLE
-    SET work_mem TO '4GB'
+CREATE FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT false, p_with_order_book boolean DEFAULT false) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, order_book bitstamp.order_book_record[])
+    LANGUAGE sql STABLE
     AS $$
 
 -- ARGUMENTS
 --		p_start_time - the start of the interval for the calculation of spreads
 --		p_end_time	 - the end of the interval
 --		p_pair		 - the pair for which spreads will be calculated
---		p_only_different	- whether to output the spread only when it is different from the v_previous one (true) or after each event (false). true is the default.
 --		p_strict		- whether to calculate the spread using events before p_start_time (false) or not (false). 
--- DETAILS
---		If p_only_different is FALSE returns spread after each episode
---		If p_only_different is true then will check whether the spread has changed and will skip if it does not.
 
-declare
-	v_cur bitstamp.spread;
-	v_prev bitstamp.spread;
-	v_ob bitstamp.order_book_record[];
-				  
-	v_event bitstamp.live_orders;
-	v_next_microtimestamp timestamp with time zone;
-	
-	v_pair_id smallint;
-	
-	v_r record;
-				  
-begin
-
-	v_prev := row(null, null, null, null, null, null);
-				  
-	if p_strict then
-		v_ob := '{}';	-- only the events within the [p_start_time, p_end_time] interval will be used
-	else
-		v_ob := null;
-	end if;
-	
-	select pairs.pair_id into v_pair_id
-	from bitstamp.pairs where pairs.pair = p_pair;
-				  
-	for v_r in select row(live_orders.*) as e, lead(live_orders.microtimestamp) over (order by live_orders.microtimestamp, event_no) as n
-										   from bitstamp.live_orders
-			  							   where live_orders.microtimestamp between p_start_time and p_end_time 
-			    							 and live_orders.pair_id = v_pair_id
-			  							   order by live_orders.microtimestamp, event_no
-	loop
-		v_event := v_r.e;
-		v_next_microtimestamp 	:= v_r.n;
-		
-		if v_ob is null then 
-			v_ob := array(select bitstamp.order_book_before(v_event.microtimestamp, p_pair, false));
-		end if;
-															
-		v_ob := bitstamp._order_book_after_event(v_ob, v_event, p_only_makers := false);
-													 
-		if not ( v_event.microtimestamp is not distinct from  v_next_microtimestamp ) then
-			if v_ob = '{}' then 
-				v_ob := array[ row(v_event.microtimestamp, null, null, 'sell'::bitstamp.direction, null, null, null, v_pair_id, true, null),
-  					      		row(v_event.microtimestamp, null, null, 'buy'::bitstamp.direction, null, null, null, v_pair_id, true, null)
-									  ];
-			end if;
-			v_cur := bitstamp._spread_from_order_book(v_ob);	
-			if  (v_cur.best_bid_price is distinct from  v_prev.best_bid_price or 
-				v_cur.best_bid_qty is distinct from  v_prev.best_bid_qty or
-				v_cur.best_ask_price is distinct from  v_prev.best_ask_price or
-				v_cur.best_ask_qty is distinct from  v_prev.best_ask_qty ) 
-				or not p_only_different then
-				v_prev := v_cur;
-				best_bid_price := v_cur.best_bid_price;
-				best_ask_price := v_cur.best_ask_price;
-				best_bid_qty := v_cur.best_bid_qty;
-				best_ask_qty := v_cur.best_ask_qty;
-				microtimestamp := v_cur.microtimestamp;
-				pair_id := v_cur.pair_id;
-				if p_with_order_book then 
-					order_book := array(select a from unnest(v_ob)a order by direction desc, price desc, order_id); -- order by must be the same as in order_book_after(). Change both!
-				end if;
-				return next;
-			end if;
-		end if;
-	end loop;
-end;
+select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, ob
+from (
+	select distinct on (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty) (bitstamp._spread_from_order_book(ob)).*,
+			case  when p_with_order_book then ob else null end as ob
+	from bitstamp.order_book_by_episode(p_start_time, p_end_time, p_pair, p_strict) ob
+	order by best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+) a
+where microtimestamp is not null
+order by microtimestamp
 
 $$;
 
 
-ALTER FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_different boolean, p_strict boolean, p_with_order_book boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_with_order_book boolean) OWNER TO "ob-analytics";
 
 --
--- Name: FUNCTION spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_different boolean, p_strict boolean, p_with_order_book boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
+-- Name: FUNCTION spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_with_order_book boolean); Type: COMMENT; Schema: bitstamp; Owner: ob-analytics
 --
 
-COMMENT ON FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_only_different boolean, p_strict boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each episode in the ''live_orders'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time unless "p_p_strict" is set to true. In the latter case the spread is caclulated using only events within the interval between p_start_time and p_end_time';
+COMMENT ON FUNCTION bitstamp.spread_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each episode in the ''live_orders'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time unless "p_p_strict" is set to true. In the latter case the spread is caclulated using only events within the interval between p_start_time and p_end_time';
 
 
 --
