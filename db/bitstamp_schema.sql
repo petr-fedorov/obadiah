@@ -449,7 +449,7 @@ BEGIN
 				first_value(event) OVER o AS first_event,
 				row_number() OVER o AS event_no,
 				COALESCE(lag(amount) OVER o, 0) - amount AS fill,
-				COALESCE(lead(microtimestamp) OVER o, 'infinity'::timestamptz) AS next_microtimestamp,
+				COALESCE(lead(microtimestamp) OVER o, case event when 'order_deleted' then '-infinity'::timestamptz else 'infinity'::timestamptz end) AS next_microtimestamp,
 				CASE WHEN lead(microtimestamp) OVER o IS NOT NULL THEN row_number() OVER o + 1 ELSE NULL END AS next_event_no
 		FROM deleted
 		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
@@ -655,7 +655,8 @@ RETURN QUERY
 		UNION ALL 
 		SELECT live_orders.microtimestamp, live_orders.order_id, live_orders.event_no, base.amount + base.fill AS amount, 
 				CASE live_orders.event_no WHEN 1 THEN -(base.amount + base.fill) ELSE live_orders.fill END AS fill
-		FROM bitstamp.live_orders JOIN base ON live_orders.order_id = base.order_id
+		FROM bitstamp.live_orders join time_range using (pair_id) JOIN base ON live_orders.order_id = base.order_id
+		 and live_orders.microtimestamp between era_starts and era_ends
 		 AND live_orders.event_no = base.event_no - 1
 	)	
 	UPDATE bitstamp.live_orders
@@ -1929,20 +1930,54 @@ begin
 	return query select * from bitstamp.fix_aggressor_creation_order(v_start, p_pair);
 	return query select * from bitstamp.reveal_episodes(v_start, p_pair);
 
-	-- update microtimestamp of trade-part events that couldn't be matched and which are in the wrong order (i.e. later that its subsequent event)
-	loop 																	   
-		update bitstamp.live_orders
-		set microtimestamp = next_microtimestamp
-		where microtimestamp between v_start and v_end
-		  and ( fill > 0 or fill is null )
-		  and trade_id is null	-- this event should has been matched to some trade but couldn't
-		  and next_microtimestamp > '-infinity'
-		  and next_microtimestamp < microtimestamp;
-		if not found then
-			exit;
-		end if;
-	end loop;														   
-
+	-- update microtimestamp of events that couldn't be or shouldn't be matched and which are in the wrong order (i.e. later that its subsequent event)
+	declare 
+		nothing_updated boolean default false;
+	begin		
+		while not nothing_updated loop
+			
+			nothing_updated := true; 
+			
+			return query 
+				update bitstamp.live_orders
+				set microtimestamp = next_microtimestamp
+				where microtimestamp between v_start and v_end
+				  and ( fill > 0 or fill is null )
+				  and trade_id is null	-- this event should has been matched to some trade but couldn't
+				  and next_microtimestamp > '-infinity'
+				  and next_microtimestamp < microtimestamp
+				returning *;
+			  
+			if found then
+				nothing_updated := false;
+			end if;
+			
+			return query 
+				with to_be_moved_forward as (
+					select *
+					from (
+						select microtimestamp, order_id, event_no, max(microtimestamp) over (partition by order_id order by event_no) as max_microtimestamp
+						from bitstamp.live_orders
+						where microtimestamp between v_start and v_end
+					) a 
+					where microtimestamp < max_microtimestamp 
+				)
+				update bitstamp.live_orders
+				set microtimestamp = max_microtimestamp
+				from to_be_moved_forward
+				where live_orders.microtimestamp between v_start and v_end
+				  and trade_id is null	-- this event should has been matched to some trade but couldn't
+				  and live_orders.microtimestamp = to_be_moved_forward.microtimestamp
+				  and live_orders.order_id = to_be_moved_forward.order_id
+				  and live_orders.event_no = to_be_moved_forward.event_no
+				returning live_orders.*;
+			  
+			if found then
+				nothing_updated := false;
+			end if;
+			
+		end loop;														   
+	end;
 	if (select count(*)
 		from (
 			select *, min(microtimestamp) over (partition by order_id order by event_no desc) as min_microtimestamp
