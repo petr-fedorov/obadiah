@@ -213,6 +213,7 @@ CREATE TABLE bitstamp.live_orders (
     price_microtimestamp timestamp with time zone NOT NULL,
     price_event_no smallint,
     CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
+    CONSTRAINT minus_infinity CHECK (((event <> 'order_deleted'::bitstamp.live_orders_event) OR (next_microtimestamp = '-infinity'::timestamp with time zone))),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
     CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
 )
@@ -230,7 +231,7 @@ CREATE FUNCTION bitstamp._order_book_after_event(p_ob bitstamp.order_book_record
     AS $$
 begin
 	if p_ob is null and not p_strict then
-		p_ob := array( select order_book_before from bitstamp.order_book_before(p_ev.microtimestamp, p_ev.pair_id, p_only_makers := false));
+		p_ob := array( select order_book from bitstamp.order_book(p_ev.microtimestamp, p_ev.pair_id, p_only_makers := false, p_before := true ));
 	end if;
 	
 	return ( with orders as (
@@ -261,8 +262,11 @@ begin
 							where p_ev.event <> 'order_deleted' 
 							) a
 				)
-				select array_agg(orders::bitstamp.order_book_record)
-				from orders	
+				select array(
+					select orders::bitstamp.order_book_record
+					from orders
+					order by microtimestamp, order_id, event_no 
+				)
 		);
 end;   
 
@@ -1705,6 +1709,55 @@ $$;
 ALTER FUNCTION bitstamp.oba_trade(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: order_book(timestamp with time zone, smallint, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.order_book(p_ts timestamp with time zone, p_pair_id smallint, p_only_makers boolean, p_before boolean) RETURNS SETOF bitstamp.order_book_record
+    LANGUAGE sql STABLE
+    AS $$
+
+	with episode as (
+			select microtimestamp as e, pair_id, era as s
+			from bitstamp.live_orders
+			where ( microtimestamp < p_ts or ( microtimestamp = p_ts and not p_before ) )
+		      and pair_id = p_pair_id
+			order by microtimestamp desc
+			limit 1
+		), 
+		orders as (
+			select *, 
+					coalesce(
+						case order_type 
+							when 'buy' then price < min(price) filter (where order_type = 'sell') over (order by price_microtimestamp, microtimestamp)
+							when 'sell' then price > max(price) filter (where order_type = 'buy') over (order by price_microtimestamp, microtimestamp)
+						end,
+					true )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
+					as is_maker
+			from bitstamp.live_orders join episode using (pair_id)
+			where microtimestamp between episode.s and episode.e
+			  and next_microtimestamp > episode.e
+			  and event <> 'order_deleted'
+		)
+	select e,
+			price,
+			amount,
+			order_type,
+			order_id,
+			microtimestamp,
+			event_no,
+			pair_id,
+			is_maker,
+			datetime
+    from orders
+	where is_maker OR NOT p_only_makers
+	order by microtimestamp, order_id, event_no;	-- order by must be the same as in spread_after_episode. Change both!
+
+$$;
+
+
+ALTER FUNCTION bitstamp.order_book(p_ts timestamp with time zone, p_pair_id smallint, p_only_makers boolean, p_before boolean) OWNER TO "ob-analytics";
+
+--
 -- Name: order_book_after(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1712,82 +1765,14 @@ CREATE FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair 
     LANGUAGE sql STABLE
     AS $$
 
-	WITH orders AS (
-		SELECT *, 
-				COALESCE(
-					CASE order_type 
-						WHEN 'buy' THEN price < min(price) FILTER (WHERE order_type = 'sell') OVER (ORDER BY datetime, microtimestamp)
-						WHEN 'sell' THEN price > max(price) FILTER (WHERE order_type = 'buy') OVER (ORDER BY datetime, microtimestamp)
-					END,
-				TRUE )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
-				AS is_maker
-		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
-		WHERE microtimestamp BETWEEN (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= p_ts ) AND p_ts
- 	   	  AND next_microtimestamp > p_ts 
-		  AND event <> 'order_deleted'
-		  AND pairs.pair = p_pair
-		)
-	SELECT p_ts,
-			price,
-			amount,
-			order_type,
-			order_id,
-			microtimestamp,
-			event_no,
-			pair_id,
-			is_maker,
-			datetime
-    FROM orders
-	WHERE is_maker OR NOT p_only_makers
-	ORDER BY order_type DESC, price DESC, order_id;	-- ORDER BY must be the same as in spread_after_episode. Change both!
+	select order_book.*
+	from bitstamp.pairs join bitstamp.order_book(p_ts, pair_id, p_only_makers, p_before := false ) on true
+	where pairs.pair = p_pair
 
 $$;
 
 
 ALTER FUNCTION bitstamp.order_book_after(p_ts timestamp with time zone, p_pair text, p_only_makers boolean) OWNER TO "ob-analytics";
-
---
--- Name: order_book_before(timestamp with time zone, smallint, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair_id smallint, p_only_makers boolean DEFAULT true) RETURNS SETOF bitstamp.order_book_record
-    LANGUAGE sql STABLE
-    AS $$
-
-	WITH orders AS (
-		SELECT *, 
-				COALESCE(
-					CASE order_type 
-						WHEN 'buy' THEN price < min(price) FILTER (WHERE order_type = 'sell') OVER (ORDER BY datetime, microtimestamp)
-						WHEN 'sell' THEN price > max(price) FILTER (WHERE order_type = 'buy') OVER (ORDER BY datetime, microtimestamp)
-					END,
-				TRUE )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
-				AS is_maker
-		FROM bitstamp.live_orders 
-		WHERE microtimestamp >= (SELECT MAX(era) FROM bitstamp.live_orders_eras WHERE era <= p_ts ) 
- 		  AND microtimestamp < p_ts 
- 	   	  AND next_microtimestamp >= p_ts 
-		  AND event <> 'order_deleted'
-		  AND pair_id = p_pair_id
-		)
-	SELECT p_ts,
-			price,
-			amount,
-			order_type,
-			order_id,
-			microtimestamp,
-			event_no,
-			pair_id,
-			is_maker,
-			datetime
-    FROM orders
-	WHERE is_maker OR NOT p_only_makers
-	ORDER BY order_type DESC, price DESC;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair_id smallint, p_only_makers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_before(timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1797,8 +1782,8 @@ CREATE FUNCTION bitstamp.order_book_before(p_ts timestamp with time zone, p_pair
     LANGUAGE sql STABLE
     AS $$
 
-	select order_book_before.*
-	from bitstamp.pairs join bitstamp.order_book_before(p_ts, pair_id, p_only_makers) on true
+	select order_book.*
+	from bitstamp.pairs join bitstamp.order_book(p_ts, pair_id, p_only_makers, p_before := true ) on true
 	where pairs.pair = p_pair
 
 $$;
