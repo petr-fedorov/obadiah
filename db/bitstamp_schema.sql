@@ -1356,7 +1356,39 @@ CREATE FUNCTION bitstamp.oba_depth(p_start_time timestamp with time zone, p_end_
     LANGUAGE sql STABLE
     AS $$
 
-	with depth as (
+	with time_range as (
+		select pair_id, min(microtimestamp) as start_time
+		from bitstamp.depth join bitstamp.pairs using (pair_id)
+		where microtimestamp >= p_start_time
+		  and pairs.pair = p_pair
+		group by pair_id
+	)
+	select ts, price, amount, side
+	from time_range 
+		join lateral (
+				select ts,
+						pair_id,
+						price, 
+						sum(amount) as amount,
+						case direction 
+							when 'buy' then 'bid'::text
+							when 'sell' then 'ask'::text
+						end as side
+				from bitstamp.order_book(start_time, pair_id, p_only_makers := true, p_before := true)
+				where is_maker 
+				group by ts, price, direction, pair_id
+		) a using (pair_id)
+	where not p_strict or (p_strict and ts >= p_start_time)
+	union all
+	select microtimestamp, price, volume, side::text
+	from time_range join bitstamp.depth using (pair_id) join lateral ( select price, volume, side from unnest(depth.depth_change) ) d on true
+	where microtimestamp between start_time and p_end_time 
+	  and price is not null;   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
+	  							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
+								-- 'not null' constraint is to be added to price and depth_change columns of bitstamp.depth table. Then this check
+								-- will be redundant
+
+/*	with depth as (
 		select 	microtimestamp, pair_id, depth, lag(depth) over (partition by pair_id order by microtimestamp) as prev_depth
 		from (select ob[1].ts as microtimestamp,
 			  		  ob[1].pair_id as pair_id, 
@@ -1374,6 +1406,7 @@ CREATE FUNCTION bitstamp.oba_depth(p_start_time timestamp with time zone, p_end_
 	from depth join lateral (select side, price, coalesce(c.volume, 0) as volume
 								from unnest(depth) c full join unnest(prev_depth) p using (side, price) 
 								where c.volume is distinct from p.volume ) a on true 
+*/
 
 $$;
 
@@ -2362,7 +2395,7 @@ COMMENT ON FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with t
 -- Name: summary(text, integer); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.summary(p_pair text DEFAULT 'BTCUSD'::text, p_limit integer DEFAULT 5) RETURNS TABLE(era timestamp with time zone, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text)
+CREATE FUNCTION bitstamp.summary(p_pair text DEFAULT 'BTCUSD'::text, p_limit integer DEFAULT 5) RETURNS TABLE(era timestamp with time zone, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
     LANGUAGE sql STABLE
     AS $$
 
@@ -2375,7 +2408,7 @@ WITH eras AS (
 ),
 eras_orders_trades AS (
 SELECT era, pair, last_event, events, matched_events, unmatched_events, trades, fully_matched_trades, not_matched_trades, first_event, bitstamp_trades,
-	   spreads, last_spread
+	   spreads, last_spread, depth, last_depth
 
 FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last_event, min(microtimestamp) AS first_event,
 							count(*) FILTER (WHERE trade_id IS NULL AND fill > 0 ) AS unmatched_events,
@@ -2394,10 +2427,15 @@ FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last
 								  max(microtimestamp) as last_spread
 					   	  from bitstamp.spread
 					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era) s on true
+		join lateral ( select count(*) as depth,
+								  max(microtimestamp) as last_depth
+					   	  from bitstamp.depth
+					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era) d on true
 )
 SELECT era, pair,  events, last_event::text,
 						 CASE WHEN EXTRACT( EPOCH FROM last_event - first_event ) > 0 THEN round((events/EXTRACT( EPOCH FROM last_event - first_event ))::numeric,2) ELSE 0 END AS e_per_sec,
-						  matched_events, unmatched_events,trades,  fully_matched_trades, not_matched_trades, bitstamp_trades, spreads, last_spread::text
+						  matched_events, unmatched_events,trades,  fully_matched_trades, not_matched_trades, bitstamp_trades, spreads, last_spread::text,
+						  depth, last_depth::text
 FROM eras_orders_trades
 ORDER BY era DESC;
 
