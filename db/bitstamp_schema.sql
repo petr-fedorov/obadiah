@@ -1853,6 +1853,7 @@ ALTER FUNCTION bitstamp.order_book_by_episode(p_start_time timestamp with time z
 
 CREATE FUNCTION bitstamp.pga_capture_transient(p_pair text DEFAULT 'BTCUSD'::text) RETURNS void
     LANGUAGE plpgsql
+    SET work_mem TO '4GB'
     AS $$
 
 DECLARE
@@ -2018,6 +2019,7 @@ declare
 	v_end timestamptz;
 	v_last_depth timestamptz;
 	v_pair_id bitstamp.pairs.pair_id%type;
+	MAX_INTERVAL constant interval DEFAULT '4 hour';
 	
 begin 
 	v_current_timestamp := clock_timestamp();
@@ -2037,7 +2039,6 @@ begin
 	where coalesce(p_ts_within_era,  ( select max(era) 
 										 from bitstamp.live_orders_eras 
 										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
-
 	select coalesce(max(microtimestamp), v_start) into v_last_depth
 	from bitstamp.depth join bitstamp.pairs using (pair_id)
 	where microtimestamp between v_start and v_end
@@ -2048,6 +2049,12 @@ begin
 	delete from bitstamp.depth
 	where microtimestamp = v_last_depth
 	  and pair_id = v_pair_id;
+	  
+	if v_end > v_last_depth + MAX_INTERVAL then
+		v_end := v_last_depth + MAX_INTERVAL;
+	end if;
+	
+	raise debug 'pga_depth(): from: %  till: %', v_last_depth, v_end;
 	  
 	insert into bitstamp.depth (microtimestamp, pair_id, depth_change)
 	select microtimestamp, pair_id, depth_change
@@ -2400,7 +2407,7 @@ CREATE FUNCTION bitstamp.summary(p_pair text DEFAULT 'BTCUSD'::text, p_limit int
     AS $$
 
 WITH eras AS (
-		SELECT era, pair, COALESCE(lead(era) OVER (ORDER BY era), 'infinity'::timestamptz) AS next_era
+		SELECT era, pair, COALESCE(lead(era) OVER (ORDER BY era), 'infinity'::timestamptz) AS next_era, pair_id
 		FROM bitstamp.live_orders_eras JOIN bitstamp.pairs USING (pair_id)
 	    WHERE pairs.pair = p_pair
 		ORDER BY era DESC
@@ -2415,6 +2422,7 @@ FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last
 							count(*) FILTER (WHERE trade_id IS NOT NULL ) AS matched_events
 							FROM bitstamp.live_orders 
 			  				WHERE microtimestamp >= eras.era AND microtimestamp < eras.next_era
+						      and eras.pair_id = live_orders.pair_id
 			 			 ) e ON TRUE
 		   JOIN LATERAL (SELECT   count(*) AS trades, 
 						  			count(*) FILTER (WHERE buy_microtimestamp IS NOT NULL AND sell_microtimestamp IS NOT NULL) AS fully_matched_trades,
@@ -2422,15 +2430,19 @@ FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last
 						  			count(*) FILTER (WHERE bitstamp_trade_id IS NOT NULL) AS bitstamp_trades
 			  			  FROM bitstamp.live_trades
 			  WHERE trade_timestamp >= eras.era AND trade_timestamp < eras.next_era
+			    and eras.pair_id = live_trades.pair_id
 			 ) t ON TRUE
 		  join lateral ( select count(*) as spreads,
 								  max(microtimestamp) as last_spread
 					   	  from bitstamp.spread
-					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era) s on true
+					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era
+					        and eras.pair_id = spread.pair_id
+					   	  ) s on true
 		join lateral ( select count(*) as depth,
 								  max(microtimestamp) as last_depth
 					   	  from bitstamp.depth
-					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era) d on true
+					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era
+					        and eras.pair_id = depth.pair_id ) d on true
 )
 SELECT era, pair,  events, last_event::text,
 						 CASE WHEN EXTRACT( EPOCH FROM last_event - first_event ) > 0 THEN round((events/EXTRACT( EPOCH FROM last_event - first_event ))::numeric,2) ELSE 0 END AS e_per_sec,
