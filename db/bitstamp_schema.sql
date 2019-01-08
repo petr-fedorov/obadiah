@@ -2012,6 +2012,7 @@ ALTER FUNCTION bitstamp.pga_cleanse(p_pair text, p_ts_within_era timestamp with 
 
 CREATE FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS void
     LANGUAGE plpgsql
+    SET work_mem TO '6GB'
     AS $$
 declare 
 	v_current_timestamp timestamptz;
@@ -2071,6 +2072,70 @@ $$;
 ALTER FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
+-- Name: pga_depth(timestamp with time zone, text, interval); Type: FUNCTION; Schema: bitstamp; Owner: postgres
+--
+
+CREATE FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_max_interval interval DEFAULT '04:00:00'::interval) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+declare 
+	v_current_timestamp timestamptz;
+	v_start timestamptz;
+	v_end timestamptz;
+	v_last_depth timestamptz;
+	v_pair_id bitstamp.pairs.pair_id%type;
+
+	
+begin 
+	v_current_timestamp := clock_timestamp();
+	
+	select pair_id into v_pair_id
+	from bitstamp.pairs 
+	where pair = p_pair;
+	
+	select era_starts, era_ends into v_start, v_end
+	from (
+		select era as era_starts,
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
+				last_cleanse_run
+		from bitstamp.live_orders_eras 
+		where pair_id = v_pair_id
+	) a
+	where coalesce(p_ts_within_era,  ( select max(era) 
+										 from bitstamp.live_orders_eras 
+										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
+	select coalesce(max(microtimestamp), v_start) into v_last_depth
+	from bitstamp.depth join bitstamp.pairs using (pair_id)
+	where microtimestamp between v_start and v_end
+	  and pair_id = v_pair_id;
+	
+	-- delete the latest depth because it could be calculated using incomplete data
+	
+	delete from bitstamp.depth
+	where microtimestamp = v_last_depth
+	  and pair_id = v_pair_id;
+	  
+	if v_end > v_last_depth + p_max_interval then
+		v_end := v_last_depth + p_max_interval;
+	end if;
+	
+	raise debug 'pga_depth(): from: %  till: %', v_last_depth, v_end;
+	  
+	insert into bitstamp.depth (microtimestamp, pair_id, depth_change)
+	select microtimestamp, pair_id, depth_change
+	from bitstamp.depth_change_after_episode(v_last_depth, v_end, p_pair, p_strict := false);
+	
+	raise debug 'pga_depth() exec time: %', clock_timestamp() - v_current_timestamp;
+	
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone, p_pair text, p_max_interval interval) OWNER TO postgres;
+
+--
 -- Name: pga_match(text, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2107,9 +2172,14 @@ begin
 	where coalesce(p_ts_within_era,  ( select max(era) 
 										 from bitstamp.live_orders_eras 
 										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
+										 
+	select max(microtimestamp) into v_start	-- let's find the latest matched event. 
+	from bitstamp.live_orders
+	where microtimestamp between v_start and v_end
+	  and pair_id = v_pair_id
+	  and trade_id is not null;
 							 
-	for v_trade in select * from bitstamp.inferred_trades(v_start, v_end, p_pair, p_only_missing := TRUE, p_strict := TRUE) loop
-
+	for v_trade in select * from bitstamp.inferred_trades(v_start, v_end, p_pair, p_only_missing := true, p_strict := false) loop
 
 		return query update bitstamp.live_trades 
 					  set buy_microtimestamp = v_trade.buy_microtimestamp, buy_event_no = v_trade.buy_event_no,
@@ -2163,6 +2233,7 @@ ALTER FUNCTION bitstamp.pga_match(p_pair text, p_ts_within_era timestamp with ti
 
 CREATE FUNCTION bitstamp.pga_spread(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.spread
     LANGUAGE plpgsql
+    SET work_mem TO '4GB'
     AS $$
 declare 
 	v_current_timestamp timestamptz;
@@ -2429,7 +2500,7 @@ FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last
 						  			count(*) FILTER (WHERE buy_microtimestamp IS NULL AND sell_microtimestamp IS NULL) AS not_matched_trades,
 						  			count(*) FILTER (WHERE bitstamp_trade_id IS NOT NULL) AS bitstamp_trades
 			  			  FROM bitstamp.live_trades
-			  WHERE trade_timestamp >= eras.era AND trade_timestamp < eras.next_era
+			  WHERE buy_microtimestamp >= eras.era AND buy_microtimestamp < eras.next_era	-- it is assumed that (after cleanse) buy_microtimestamp = sell_microtimestamp
 			    and eras.pair_id = live_trades.pair_id
 			 ) t ON TRUE
 		  join lateral ( select count(*) as spreads,
