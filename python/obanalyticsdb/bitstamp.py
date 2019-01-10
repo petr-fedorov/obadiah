@@ -359,9 +359,9 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
               # Process(target=LiveOrderBook(pair_id, pair, dbname, user,
               #                               stop_flag, log_queue,
               #                               log_level=logging.INFO)),
-              Process(target=LiveDiffOrderBook(pair_id, pair, dbname, user,
-                                               stop_flag, log_queue,
-                                               log_level=logging.INFO)),
+              #Process(target=LiveDiffOrderBook(pair_id, pair, dbname, user,
+              #                                 stop_flag, log_queue,
+              #                                 log_level=logging.INFO)),
               ]
         for t in ts:
             t.start()

@@ -447,7 +447,10 @@ CREATE FUNCTION bitstamp.capture_transient_trades(p_start_time timestamp with ti
     AS $$
 WITH deleted AS (
 	DELETE FROM bitstamp.transient_live_trades
-	RETURNING *
+	using bitstamp.pairs
+	where pairs.pair = p_pair 
+	  and transient_live_trades.pair_id = pairs.pair_id
+	RETURNING transient_live_trades.*
 )
 INSERT INTO bitstamp.live_trades (bitstamp_trade_id, amount, price, trade_type, trade_timestamp, buy_order_id, sell_order_id, local_timestamp, pair_id)
 SELECT 	bitstamp_trade_id, amount, price, trade_type, trade_timestamp, buy_order_id, sell_order_id, local_timestamp, pair_id
@@ -545,22 +548,23 @@ BEGIN
 	RETURN QUERY  WITH time_range AS (
 						SELECT *
 						FROM (
-							SELECT era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
-							FROM bitstamp.live_orders_eras
+							SELECT pairs.pair_id, era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
+							FROM bitstamp.live_orders_eras join bitstamp.pairs using (pair_id)
+							where pairs.pair = p_pair
 						) r
 						WHERE find_and_repair_eternal_orders.ts_within_era BETWEEN r."start.time" AND r."end.time"
 					),
 					eternal_orders AS (
-						SELECT *
-						FROM bitstamp.live_orders 
-						WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
+						SELECT live_orders.*
+						FROM bitstamp.live_orders join time_range using (pair_id)
+						WHERE microtimestamp BETWEEN "start.time" AND "end.time"
 						  AND event <> 'order_deleted'
 						  AND next_microtimestamp = 'Infinity'::timestamptz
 					),
 					filled_orders AS (
-						SELECT *
-						FROM bitstamp.live_orders 
-						WHERE microtimestamp BETWEEN (SELECT "start.time" FROM time_range) AND (SELECT "end.time" FROM time_range)
+						SELECT live_orders.*
+						FROM bitstamp.live_orders  join time_range using (pair_id)
+						WHERE microtimestamp BETWEEN "start.time" AND "end.time"
 						  AND fill > 0
 					)
 					INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp,local_timestamp,pair_id,
@@ -1251,10 +1255,12 @@ CREATE FUNCTION bitstamp.match_trades_to_sequential_events(p_start_time timestam
     LANGUAGE sql
     AS $$
 	with  unmatched_trades as (
-			select *  from bitstamp.live_trades 
+			select *  
+		    from bitstamp.live_trades join bitstamp.pairs using (pair_id)
 			where trade_timestamp between p_start_time and p_end_time  
 			  and buy_microtimestamp is null 
 			  and sell_microtimestamp is null
+		      and pairs.pair = p_pair
 		), 
 		events as (
 			select microtimestamp, order_id, event_no, amount, fill, order_type, price_microtimestamp, event,
@@ -1270,8 +1276,9 @@ CREATE FUNCTION bitstamp.match_trades_to_sequential_events(p_start_time timestam
 						lead(order_type, p_offset) over m as n_order_type,
 						lead(price_microtimestamp, p_offset) over m as n_price_microtimestamp,
 						lead(trade_id, p_offset) over m as n_trade_id
-				from bitstamp.live_orders 
+				from bitstamp.live_orders join bitstamp.pairs using (pair_id)
 				where microtimestamp between p_start_time and p_end_time
+				  and pairs.pair = p_pair
 				window m as (order by microtimestamp)
 			) a
 			where order_type <> n_order_type
@@ -1914,7 +1921,7 @@ begin
 										 from bitstamp.live_orders_eras 
 										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
 
-	return query select * from bitstamp.find_and_repair_eternal_orders(v_start);																	   
+	return query select * from bitstamp.find_and_repair_eternal_orders(v_start, p_pair);																	   
 	return query select * from bitstamp.find_and_repair_missing_fill(v_start, p_pair);																	   
 	return query select * from bitstamp.fix_aggressor_creation_order(v_start, p_pair);
 	return query select * from bitstamp.reveal_episodes(v_start, p_pair);
@@ -1935,6 +1942,7 @@ begin
 				  and trade_id is null	-- this event should has been matched to some trade but couldn't
 				  and next_microtimestamp > '-infinity'
 				  and next_microtimestamp < microtimestamp
+				  and pair_id = v_pair_id
 				returning *;
 			  
 			if found then
@@ -1948,6 +1956,7 @@ begin
 						select microtimestamp, order_id, event_no, max(microtimestamp) over (partition by order_id order by event_no) as max_microtimestamp
 						from bitstamp.live_orders
 						where microtimestamp between v_start and v_end
+						  and pair_id = v_pair_id
 					) a 
 					where microtimestamp < max_microtimestamp 
 				)
@@ -1959,6 +1968,7 @@ begin
 				  and live_orders.microtimestamp = to_be_moved_forward.microtimestamp
 				  and live_orders.order_id = to_be_moved_forward.order_id
 				  and live_orders.event_no = to_be_moved_forward.event_no
+				  and pair_id = v_pair_id
 				returning live_orders.*;
 			  
 			if found then
@@ -1972,6 +1982,7 @@ begin
 			select *, min(microtimestamp) over (partition by order_id order by event_no desc) as min_microtimestamp
 			from bitstamp.live_orders
 			where microtimestamp between v_start and v_end
+			  and pair_id = v_pair_id
 		) a 
 		where microtimestamp > min_microtimestamp 
 		) > 0 then
@@ -1992,75 +2003,10 @@ $$;
 ALTER FUNCTION bitstamp.pga_cleanse(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: pga_depth(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: pga_depth(text, interval, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: postgres
 --
 
-CREATE FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS void
-    LANGUAGE plpgsql
-    SET work_mem TO '6GB'
-    AS $$
-declare 
-	v_current_timestamp timestamptz;
-	v_start timestamptz;
-	v_end timestamptz;
-	v_last_depth timestamptz;
-	v_pair_id bitstamp.pairs.pair_id%type;
-	MAX_INTERVAL constant interval DEFAULT '4 hour';
-	
-begin 
-	v_current_timestamp := clock_timestamp();
-	
-	select pair_id into v_pair_id
-	from bitstamp.pairs 
-	where pair = p_pair;
-	
-	select era_starts, era_ends into v_start, v_end
-	from (
-		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
-				last_cleanse_run
-		from bitstamp.live_orders_eras 
-		where pair_id = v_pair_id
-	) a
-	where coalesce(p_ts_within_era,  ( select max(era) 
-										 from bitstamp.live_orders_eras 
-										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
-	select coalesce(max(microtimestamp), v_start) into v_last_depth
-	from bitstamp.depth join bitstamp.pairs using (pair_id)
-	where microtimestamp between v_start and v_end
-	  and pair_id = v_pair_id;
-	
-	-- delete the latest depth because it could be calculated using incomplete data
-	
-	delete from bitstamp.depth
-	where microtimestamp = v_last_depth
-	  and pair_id = v_pair_id;
-	  
-	if v_end > v_last_depth + MAX_INTERVAL then
-		v_end := v_last_depth + MAX_INTERVAL;
-	end if;
-	
-	raise debug 'pga_depth(): from: %  till: %', v_last_depth, v_end;
-	  
-	insert into bitstamp.depth (microtimestamp, pair_id, depth_change)
-	select microtimestamp, pair_id, depth_change
-	from bitstamp.depth_change_after_episode(v_last_depth, v_end, p_pair, p_strict := false);
-	
-	raise debug 'pga_depth() exec time: %', clock_timestamp() - v_current_timestamp;
-	
-	return;
-end;
-
-$$;
-
-
-ALTER FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
-
---
--- Name: pga_depth(timestamp with time zone, text, interval); Type: FUNCTION; Schema: bitstamp; Owner: postgres
---
-
-CREATE FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_max_interval interval DEFAULT '04:00:00'::interval) RETURNS void
+CREATE FUNCTION bitstamp.pga_depth(p_pair text DEFAULT 'BTCUSD'::text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS void
     LANGUAGE plpgsql
     AS $$
 declare 
@@ -2118,7 +2064,7 @@ end;
 $$;
 
 
-ALTER FUNCTION bitstamp.pga_depth(p_ts_within_era timestamp with time zone, p_pair text, p_max_interval interval) OWNER TO postgres;
+ALTER FUNCTION bitstamp.pga_depth(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO postgres;
 
 --
 -- Name: pga_match(text, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -2159,7 +2105,7 @@ begin
 										 from bitstamp.live_orders_eras 
 										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
 										 
-	select max(microtimestamp) into v_start	-- let's find the latest matched event. 
+	select coalesce(max(microtimestamp), v_start) into v_start	-- let's find the latest matched event. 
 	from bitstamp.live_orders
 	where microtimestamp between v_start and v_end
 	  and pair_id = v_pair_id
@@ -2220,10 +2166,10 @@ $$;
 ALTER FUNCTION bitstamp.pga_match(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: pga_spread(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: pga_spread(text, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.pga_spread(p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.spread
+CREATE FUNCTION bitstamp.pga_spread(p_pair text DEFAULT 'BTCUSD'::text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS SETOF bitstamp.spread
     LANGUAGE plpgsql
     SET work_mem TO '4GB'
     AS $$
@@ -2278,7 +2224,7 @@ end;
 $$;
 
 
-ALTER FUNCTION bitstamp.pga_spread(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.pga_spread(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: protect_columns(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
