@@ -386,6 +386,10 @@ BEGIN
 	FROM deleted_with_event_no
 	WINDOW p AS (PARTITION BY order_id, price ORDER BY microtimestamp)
 	ORDER BY microtimestamp, order_id, event;
+	/*  to be uncommented after migration to release 11 where upsert is supported on partitioned tables
+		on conflict (order_id, era ) where next_event_no is null do update 
+																  set microtimestamp = excluded.microtimestamp,
+																  	  local_timestamp = excluded.local_timestamp;*/
 	
 	RAISE DEBUG 'capture_transient_orders() exec time: %', clock_timestamp() - v_execution_start_time; 
 END;
@@ -1929,10 +1933,9 @@ begin
 	-- update microtimestamp of events that couldn't be or shouldn't be matched and which are in the wrong order (i.e. later that its subsequent event)
 	declare 
 		nothing_updated boolean default false;
+		rows_processed integer;
 	begin		
-		while not nothing_updated loop
-			
-			nothing_updated := true; 
+		loop
 			
 			return query 
 				update bitstamp.live_orders
@@ -1944,11 +1947,15 @@ begin
 				  and next_microtimestamp < microtimestamp
 				  and pair_id = v_pair_id
 				returning *;
-			  
+			get diagnostics rows_processed := row_count;
 			if found then
-				nothing_updated := false;
+				raise debug 'pga_cleanse(%) moved backwards (to earlier next_mcirotimestamp)  %', p_pair, rows_processed;
+			else
+				exit;
 			end if;
-			
+		end loop;
+		
+		loop
 			return query 
 				with to_be_moved_forward as (
 					select *
@@ -1970,11 +1977,12 @@ begin
 				  and live_orders.event_no = to_be_moved_forward.event_no
 				  and pair_id = v_pair_id
 				returning live_orders.*;
-			  
+			get diagnostics rows_processed := row_count;			  
 			if found then
-				nothing_updated := false;
+				raise debug 'pga_cleanse(%) moved forward (to max_microtimestamap)  %', p_pair,  rows_processed;
+			else
+				exit;
 			end if;
-			
 		end loop;														   
 	end;
 	if (select count(*)
@@ -2008,6 +2016,7 @@ ALTER FUNCTION bitstamp.pga_cleanse(p_pair text, p_ts_within_era timestamp with 
 
 CREATE FUNCTION bitstamp.pga_depth(p_pair text DEFAULT 'BTCUSD'::text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS void
     LANGUAGE plpgsql
+    SET work_mem TO '4GB'
     AS $$
 declare 
 	v_current_timestamp timestamptz;
@@ -2411,54 +2420,61 @@ COMMENT ON FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with t
 -- Name: summary(integer, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT 'BTCUSD'::text) RETURNS TABLE(era timestamp with time zone, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
+CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT NULL::text) RETURNS TABLE(era timestamp with time zone, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
     LANGUAGE sql STABLE
     AS $$
 
-WITH eras AS (
-		SELECT era, pair, COALESCE(lead(era) OVER (ORDER BY era), 'infinity'::timestamptz) AS next_era, pair_id
-		FROM bitstamp.live_orders_eras JOIN bitstamp.pairs USING (pair_id)
-	    WHERE pairs.pair = p_pair
-		ORDER BY era DESC
-		LIMIT p_limit
+with eras as (
+		select pair_id as era_pair_id, era as era_start, next_era as era_end
+		from bitstamp.pairs join lateral (
+			select era, coalesce(lead(era) over (partition by pair_id order by era) - '00:00:00.000001'::interval, 'infinity'::timestamptz) as next_era, pair_id
+			from bitstamp.live_orders_eras 
+			where pair_id = pairs.pair_id 
+			order by era desc
+			limit p_limit
+		) a using (pair_id)
+		where pairs.pair = coalesce(p_pair, pairs.pair)
 ),
-eras_orders_trades AS (
-SELECT era, pair, last_event, events, matched_events, unmatched_events, trades, fully_matched_trades, not_matched_trades, first_event, bitstamp_trades,
-	   spreads, last_spread, depth, last_depth
-
-FROM eras JOIN LATERAL (  SELECT count(*) AS events, max(microtimestamp) AS last_event, min(microtimestamp) AS first_event,
-							count(*) FILTER (WHERE trade_id IS NULL AND fill > 0 ) AS unmatched_events,
-							count(*) FILTER (WHERE trade_id IS NOT NULL ) AS matched_events
-							FROM bitstamp.live_orders 
-			  				WHERE microtimestamp >= eras.era AND microtimestamp < eras.next_era
-						      and eras.pair_id = live_orders.pair_id
-			 			 ) e ON TRUE
-		   JOIN LATERAL (SELECT   count(*) AS trades, 
-						  			count(*) FILTER (WHERE buy_microtimestamp IS NOT NULL AND sell_microtimestamp IS NOT NULL) AS fully_matched_trades,
-						  			count(*) FILTER (WHERE buy_microtimestamp IS NULL AND sell_microtimestamp IS NULL) AS not_matched_trades,
-						  			count(*) FILTER (WHERE bitstamp_trade_id IS NOT NULL) AS bitstamp_trades
-			  			  FROM bitstamp.live_trades
-			  WHERE buy_microtimestamp >= eras.era AND buy_microtimestamp < eras.next_era	-- it is assumed that (after cleanse) buy_microtimestamp = sell_microtimestamp
-			    and eras.pair_id = live_trades.pair_id
-			 ) t ON TRUE
-		  join lateral ( select count(*) as spreads,
-								  max(microtimestamp) as last_spread
-					   	  from bitstamp.spread
-					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era
-					        and eras.pair_id = spread.pair_id
-					   	  ) s on true
-		join lateral ( select count(*) as depth,
-								  max(microtimestamp) as last_depth
-					   	  from bitstamp.depth
-					   	  where microtimestamp >= eras.era AND microtimestamp < eras.next_era
-					        and eras.pair_id = depth.pair_id ) d on true
+events_stat as (
+	select era_start, pair_id, count(*) as events, max(microtimestamp) as last_event, min(microtimestamp) as first_event,
+			count(*) filter (where trade_id is null and fill > 0 ) as unmatched_events,
+			count(*) filter (where trade_id is not null ) as matched_events	
+	from eras join bitstamp.live_orders on pair_id = era_pair_id and microtimestamp between era_start and era_end
+	group by pair_id, era_start 
+),
+trades_stat as (
+	select era_start, pair_id, count(*) as trades, 
+			count(*) filter (where buy_microtimestamp is not null and sell_microtimestamp is not null) as fully_matched_trades,
+			count(*) filter (where buy_microtimestamp is null and sell_microtimestamp is null) as not_matched_trades,
+			count(*) filter (where bitstamp_trade_id is not null) as bitstamp_trades
+	from eras join bitstamp.live_trades on pair_id = era_pair_id and buy_microtimestamp between era_start and era_end
+	group by pair_id, era_start 
+),
+spread_stat as (
+	select era_start, pair_id, count(*) as spreads, max(microtimestamp) as last_spread
+	from eras join bitstamp.spread on pair_id = era_pair_id and microtimestamp between era_start and era_end
+	group by pair_id, era_start 
+),
+depth_stat as (
+	select era_start, pair_id, count(*) as depth, max(microtimestamp) as last_depth
+	from eras join bitstamp.depth on pair_id = era_pair_id and microtimestamp between era_start and era_end
+	group by pair_id, era_start 
 )
-SELECT era, pair,  events, last_event::text,
-						 CASE WHEN EXTRACT( EPOCH FROM last_event - first_event ) > 0 THEN round((events/EXTRACT( EPOCH FROM last_event - first_event ))::numeric,2) ELSE 0 END AS e_per_sec,
-						  matched_events, unmatched_events,trades,  fully_matched_trades, not_matched_trades, bitstamp_trades, spreads, last_spread::text,
-						  depth, last_depth::text
-FROM eras_orders_trades
-ORDER BY era DESC;
+select era_start, pair,  
+		events, last_event::text, case 
+									when extract( epoch from last_event - first_event ) > 0 then round((events/extract( epoch from last_event - first_event ))::numeric,2)
+									else 0 end as e_per_sec,
+  	  	matched_events, unmatched_events
+		,trades,  fully_matched_trades, not_matched_trades, bitstamp_trades
+		,spreads, last_spread::text 
+		,depth, last_depth::text
+from eras 
+		join bitstamp.pairs on pair_id = era_pair_id
+		left join  events_stat using (era_start, pair_id)
+		left join  trades_stat using (era_start, pair_id)
+		left join  spread_stat using (era_start, pair_id) 
+		left join  depth_stat using (era_start, pair_id) 
+order by pair, last_event desc;
 
 $$;
 
@@ -2753,6 +2769,13 @@ ALTER TABLE ONLY bitstamp.transient_live_trades
 
 
 --
+-- Name: depth_idx_pair_selection; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX depth_idx_pair_selection ON bitstamp.depth USING btree (pair_id, microtimestamp);
+
+
+--
 -- Name: fki_live_sell_orders_fkey_live_sell_orders; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2795,6 +2818,13 @@ CREATE UNIQUE INDEX live_buy_orders_fkey_live_trades_trade_id ON bitstamp.live_b
 
 
 --
+-- Name: live_buy_orders_idx_pair_selection; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX live_buy_orders_idx_pair_selection ON bitstamp.live_buy_orders USING btree (pair_id, microtimestamp);
+
+
+--
 -- Name: live_buy_orders_unique_chain_end; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2816,10 +2846,24 @@ CREATE UNIQUE INDEX live_sell_orders_fkey_live_trades_trade_id ON bitstamp.live_
 
 
 --
+-- Name: live_sell_orders_idx_pair_selection; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX live_sell_orders_idx_pair_selection ON bitstamp.live_sell_orders USING btree (pair_id, microtimestamp);
+
+
+--
 -- Name: live_sell_orders_unique_chain_end; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE UNIQUE INDEX live_sell_orders_unique_chain_end ON bitstamp.live_sell_orders USING btree (order_id, era) WHERE (next_event_no IS NULL);
+
+
+--
+-- Name: spread_idx_pair_selection; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX spread_idx_pair_selection ON bitstamp.spread USING btree (pair_id, microtimestamp);
 
 
 --
