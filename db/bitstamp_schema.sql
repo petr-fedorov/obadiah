@@ -1916,8 +1916,7 @@ begin
 	select era_starts, era_ends into v_start, v_end
 	from (
 		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
-				last_cleanse_run
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
 		from bitstamp.live_orders_eras 
 		where pair_id = v_pair_id
 	) a
@@ -1996,12 +1995,6 @@ begin
 		) > 0 then
 		raise exception 'An inconsistent event orderding would be created for era %, exiting ...', v_start;
 	end if;																	   
-	update bitstamp.live_orders_eras
-	set last_cleanse_run = v_current_timestamp
-	from bitstamp.pairs
-	where era = v_start 
-	  and live_orders_eras.pair_id = pairs.pair_id
-	  and pairs.pair = p_pair;
 	return;
 end;
 
@@ -2036,8 +2029,7 @@ begin
 	select era_starts, era_ends into v_start, v_end
 	from (
 		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
-				last_cleanse_run
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
 		from bitstamp.live_orders_eras 
 		where pair_id = v_pair_id
 	) a
@@ -2105,8 +2097,7 @@ begin
 	select era_starts, era_ends into v_start, v_end
 	from (
 		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
-				last_cleanse_run
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
 		from bitstamp.live_orders_eras 
 		where pair_id = v_pair_id
 	) a
@@ -2159,12 +2150,6 @@ begin
 		end loop;
 	end loop; 
 
-	update bitstamp.live_orders_eras
-	set last_match_run = v_current_timestamp
-	from bitstamp.pairs
-	where era = v_start 
-	  and live_orders_eras.pair_id = pairs.pair_id
-	  and pairs.pair = p_pair;
 	raise debug 'pga_match() exec time: %', clock_timestamp() - v_current_timestamp;		
 	return;
 end;
@@ -2199,8 +2184,7 @@ begin
 	select era_starts, era_ends into v_start, v_end
 	from (
 		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends,
-				last_cleanse_run
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
 		from bitstamp.live_orders_eras 
 		where pair_id = v_pair_id
 	) a
@@ -2219,11 +2203,10 @@ begin
 	where microtimestamp = v_last_spread
 	  and pair_id = v_pair_id;
 	  
-	return query insert into bitstamp.spread (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id)
-				  select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id
-				  from bitstamp.spread_after_episode(coalesce(v_last_spread, v_start), v_end, p_pair,
-									   p_strict := false, p_with_order_book := false)
-				  returning *;									   
+	insert into bitstamp.spread (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id)
+    select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id
+	from bitstamp.spread_after_episode(coalesce(v_last_spread, v_start), v_end, p_pair,
+						   p_strict := false, p_with_order_book := false);
 	
 	raise debug 'pga_spread() exec time: %', clock_timestamp() - v_current_timestamp;
 	
@@ -2526,9 +2509,7 @@ ALTER TABLE bitstamp.live_buy_orders OWNER TO "ob-analytics";
 
 CREATE TABLE bitstamp.live_orders_eras (
     era timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    last_match_run timestamp with time zone,
-    last_cleanse_run timestamp with time zone
+    pair_id smallint NOT NULL
 );
 
 
