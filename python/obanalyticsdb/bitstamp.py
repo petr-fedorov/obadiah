@@ -281,6 +281,7 @@ class LiveDiffOrderBook(LiveStream):
 
     def _saving_thread(self):
         with connect_db(self.dbname, self.user) as con:
+            con.set_session(autocommit=True)
             with con.cursor() as curr:
                 while not self.stop_flag.is_set():
                     try:
