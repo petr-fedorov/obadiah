@@ -982,16 +982,20 @@ BEGIN
 	from bitstamp.live_orders_eras
 	where pair_id = new.pair_id
 	  and era <= new.microtimestamp;
+	  
+	-- An emergency workaround: to be replaced with something more reasonable in the future
+	if new.event = 'order_created' then 
+		if exists (select 'x' from bitstamp.live_orders where microtimestamp >= v_era and  order_id = new.order_id and order_type = new.order_type and event = 'order_created' ) then
+			raise exception 'order_created already exists in era % for %', v_era, new.order_id;
+		end if;
+	end if;
+	  
 
 	-- I. First, look behind. NEW.fill IS NULL when the inserter has not done it itself!
 	
 	IF NEW.fill IS NULL THEN 
 
 		IF NEW.event = 'order_created' THEN
-			-- An emergency workaround: to be replaced with something more reasonable in the future
-			if exists (select * from bitstamp.live_orders where microtimestamp >= v_era and order_id = new.order_id and event = 'order_created' ) then
-				raise exception 'order_created already exists in era % for %', v_era, new.order_id;
-			end if;
 			
 			NEW.fill := -NEW.amount;
 			NEW.price_microtimestamp := NEW.microtimestamp;
@@ -1003,6 +1007,7 @@ BEGIN
 				   next_event_no = event_no + 1
 			WHERE microtimestamp BETWEEN v_era AND NEW.microtimestamp
 			  AND order_id = NEW.order_id 
+			  and order_type = new.order_type
 			  AND next_microtimestamp > NEW.microtimestamp
 			RETURNING *
 			INTO prev_event;
@@ -2794,6 +2799,13 @@ CREATE UNIQUE INDEX live_buy_orders_fkey_live_trades_trade_id ON bitstamp.live_b
 
 
 --
+-- Name: live_buy_orders_idx_order_created; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE UNIQUE INDEX live_buy_orders_idx_order_created ON bitstamp.live_buy_orders USING btree (order_id, microtimestamp) WHERE (event = 'order_created'::bitstamp.live_orders_event);
+
+
+--
 -- Name: live_buy_orders_idx_pair_selection; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2812,6 +2824,13 @@ CREATE INDEX live_sell_orders_fkey_live_sell_orders_price ON bitstamp.live_sell_
 --
 
 CREATE UNIQUE INDEX live_sell_orders_fkey_live_trades_trade_id ON bitstamp.live_sell_orders USING btree (trade_id);
+
+
+--
+-- Name: live_sell_orders_idx_order_created; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE UNIQUE INDEX live_sell_orders_idx_order_created ON bitstamp.live_sell_orders USING btree (order_id, microtimestamp) WHERE (event = 'order_created'::bitstamp.live_orders_event);
 
 
 --
