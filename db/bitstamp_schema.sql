@@ -206,7 +206,6 @@ CREATE TABLE bitstamp.live_orders (
     next_event_no smallint,
     trade_id bigint,
     orig_microtimestamp timestamp with time zone,
-    era timestamp with time zone NOT NULL,
     pair_id smallint NOT NULL,
     local_timestamp timestamp with time zone,
     datetime timestamp with time zone NOT NULL,
@@ -374,9 +373,9 @@ BEGIN
 		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
 		
 	)
-	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era,
+	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price,
 									 	event_no, fill, next_microtimestamp, next_event_no, price_microtimestamp, price_event_no)
-	SELECT order_id, amount, event, order_type, datetime, microtimestamp, local_timestamp, pair_id, price, era,
+	SELECT order_id, amount, event, order_type, datetime, microtimestamp, local_timestamp, pair_id, price, 
 			CASE first_event WHEN 'order_created' THEN event_no ELSE NULL END AS event_no,
 			CASE first_event WHEN 'order_created' THEN fill ELSE NULL END AS fill,
 			CASE first_event WHEN 'order_created' THEN next_microtimestamp ELSE NULL END AS next_microtimestamp,									  
@@ -552,7 +551,7 @@ BEGIN
 	RETURN QUERY  WITH time_range AS (
 						SELECT *
 						FROM (
-							SELECT pairs.pair_id, era AS "start.time", COALESCE(lead(era) OVER (ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
+							SELECT pairs.pair_id, era AS "start.time", COALESCE(lead(era) OVER (partition by pair_id ORDER BY era) - '00:00:00.000001'::interval, 'Infinity'::timestamptz ) AS "end.time"
 							FROM bitstamp.live_orders_eras join bitstamp.pairs using (pair_id)
 							where pairs.pair = p_pair
 						) r
@@ -572,7 +571,7 @@ BEGIN
 						  AND fill > 0
 					)
 					INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp,local_timestamp,pair_id,
-													 price, fill, next_microtimestamp, era )
+													 price, fill, next_microtimestamp)
 					SELECT o.order_id,
 							o.amount,
 							'order_deleted'::bitstamp.live_orders_event,
@@ -583,8 +582,7 @@ BEGIN
 							o.pair_id,
 							o.price,
 							NULL::numeric,	-- a trigger will update chain appropriately only if 'fill' and 'next_microtimestamp' are both NULLs
-							NULL::timestamptz,
-							o.era
+							NULL::timestamptz
 					FROM eternal_orders o
 						 JOIN LATERAL (	 -- the first 'filled' order that crossed the 'eternal' order. The latter had to be cancelled before but for some reason wasn't
 										  SELECT microtimestamp	
@@ -973,30 +971,28 @@ CREATE FUNCTION bitstamp.live_orders_incorporate_new_event() RETURNS trigger
     AS $$
 
 DECLARE
-	v_eon timestamptz;
+	v_era timestamptz;
 	v_amount numeric;
 	
 	prev_event bitstamp.live_orders;
 	
 BEGIN 
 
-	v_eon := bitstamp._get_live_orders_eon(NEW.microtimestamp);
-	
-	-- 'eon' is a period of time covered by a single live_orders partition
-	-- 'era' is a period that started when a Websocket connection to Bitstamp had been successfully established 
-	
-	-- Events in the era can't cross an eon boundary. An event will be assigned to the new era starting when the most recent eon eon starts
-	-- if the eon bondary has been crossed.
-	
-	IF v_eon > NEW.era THEN 
-		NEW.era := v_eon;	
-	END IF;
-	
+	select max(era) into v_era
+	from bitstamp.live_orders_eras
+	where pair_id = new.pair_id
+	  and era <= new.microtimestamp;
+
 	-- I. First, look behind. NEW.fill IS NULL when the inserter has not done it itself!
 	
 	IF NEW.fill IS NULL THEN 
 
 		IF NEW.event = 'order_created' THEN
+			-- An emergency workaround: to be replaced with something more reasonable in the future
+			if exists (select * from bitstamp.live_orders where microtimestamp >= v_era and order_id = new.order_id and event = 'order_created' ) then
+				raise exception 'order_created already exists in era % for %', v_era, new.order_id;
+			end if;
+			
 			NEW.fill := -NEW.amount;
 			NEW.price_microtimestamp := NEW.microtimestamp;
 			NEW.price_event_no := 1;
@@ -1005,10 +1001,9 @@ BEGIN
 			UPDATE bitstamp.live_orders
 			   SET next_microtimestamp = NEW.microtimestamp,
 				   next_event_no = event_no + 1
-			WHERE microtimestamp BETWEEN NEW.era AND NEW.microtimestamp
+			WHERE microtimestamp BETWEEN v_era AND NEW.microtimestamp
 			  AND order_id = NEW.order_id 
 			  AND next_microtimestamp > NEW.microtimestamp
-			  AND era = NEW.era
 			RETURNING *
 			INTO prev_event;
 			-- amount, next_event_no INTO v_amount, NEW.event_no;
@@ -1029,16 +1024,16 @@ BEGIN
 
 				NEW.fill := NULL;	-- we still don't know fill (yet). Can later try to figure it out from trade. amount will be null too
 				-- INSERT the initial 'order_created' event when missing
-				NEW.price_microtimestamp := CASE WHEN NEW.datetime < NEW.era THEN NEW.era ELSE NEW.datetime END;
+				NEW.price_microtimestamp := CASE WHEN NEW.datetime < v_era THEN v_era ELSE NEW.datetime END;
 				NEW.price_event_no := 1;
 				NEW.event_no := 2;
 
 				INSERT INTO bitstamp.live_orders (order_id, amount, event, event_no, order_type, datetime, microtimestamp, 
-												  pair_id, price, fill, next_microtimestamp, next_event_no,era,
+												  pair_id, price, fill, next_microtimestamp, next_event_no,
 												  price_microtimestamp, price_event_no )
 				VALUES (NEW.order_id, NEW.amount, 'order_created'::bitstamp.live_orders_event, NEW.price_event_no, NEW.order_type,
 						NEW.datetime, NEW.price_microtimestamp, 
-						NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event_no, NEW.era, NEW.price_microtimestamp, 
+						NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event_no, NEW.price_microtimestamp, 
 					   NEW.price_event_no);
 			
 			END IF;
@@ -1730,9 +1725,9 @@ CREATE FUNCTION bitstamp.order_book(p_ts timestamp with time zone, p_pair_id sma
     AS $$
 
 	with episode as (
-			select microtimestamp as e, pair_id, era as s
+			select microtimestamp as e, pair_id, (select max(era) from bitstamp.live_orders_eras where era <= p_ts and pair_id = p_pair_id ) as s
 			from bitstamp.live_orders
-			where microtimestamp >= (select max(era) from bitstamp.live_orders_eras where era <= p_ts)
+			where microtimestamp >= (select max(era) from bitstamp.live_orders_eras where era <= p_ts and pair_id = p_pair_id )
 			  and ( microtimestamp < p_ts or ( microtimestamp = p_ts and not p_before ) )
 		      and pair_id = p_pair_id
 			order by microtimestamp desc
@@ -2806,13 +2801,6 @@ CREATE INDEX live_buy_orders_idx_pair_selection ON bitstamp.live_buy_orders USIN
 
 
 --
--- Name: live_buy_orders_unique_chain_end; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE UNIQUE INDEX live_buy_orders_unique_chain_end ON bitstamp.live_buy_orders USING btree (order_id, era) WHERE (next_event_no IS NULL);
-
-
---
 -- Name: live_sell_orders_fkey_live_sell_orders_price; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2831,13 +2819,6 @@ CREATE UNIQUE INDEX live_sell_orders_fkey_live_trades_trade_id ON bitstamp.live_
 --
 
 CREATE INDEX live_sell_orders_idx_pair_selection ON bitstamp.live_sell_orders USING btree (pair_id, microtimestamp);
-
-
---
--- Name: live_sell_orders_unique_chain_end; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE UNIQUE INDEX live_sell_orders_unique_chain_end ON bitstamp.live_sell_orders USING btree (order_id, era) WHERE (next_event_no IS NULL);
 
 
 --
@@ -2898,14 +2879,6 @@ ALTER TABLE ONLY bitstamp.depth
 
 
 --
--- Name: live_buy_orders live_buy_orders_fkey_era; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitstamp.live_buy_orders
-    ADD CONSTRAINT live_buy_orders_fkey_era FOREIGN KEY (era, pair_id) REFERENCES bitstamp.live_orders_eras(era, pair_id) ON UPDATE CASCADE;
-
-
---
 -- Name: live_buy_orders live_buy_orders_fkey_live_buy_orders_next; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -2951,14 +2924,6 @@ ALTER TABLE ONLY bitstamp.live_buy_orders
 
 ALTER TABLE ONLY bitstamp.live_orders_eras
     ADD CONSTRAINT live_orders_eras_fkey_pairs FOREIGN KEY (pair_id) REFERENCES bitstamp.pairs(pair_id) ON UPDATE CASCADE;
-
-
---
--- Name: live_sell_orders live_sell_orders_fkey_era; Type: FK CONSTRAINT; Schema: bitstamp; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitstamp.live_sell_orders
-    ADD CONSTRAINT live_sell_orders_fkey_era FOREIGN KEY (era, pair_id) REFERENCES bitstamp.live_orders_eras(era, pair_id) MATCH FULL ON UPDATE CASCADE;
 
 
 --
