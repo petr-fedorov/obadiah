@@ -108,6 +108,70 @@ CREATE TYPE bitstamp.order_book_record AS (
 
 ALTER TYPE bitstamp.order_book_record OWNER TO "ob-analytics";
 
+SET default_tablespace = '';
+
+SET default_with_oids = false;
+
+--
+-- Name: depth; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TABLE bitstamp.depth (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    depth_change bitstamp.depth_record[] NOT NULL
+);
+
+
+ALTER TABLE bitstamp.depth OWNER TO "ob-analytics";
+
+--
+-- Name: _depth_after_depth_change(bitstamp.depth, bitstamp.depth, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._depth_after_depth_change(p_depth bitstamp.depth, p_depth_change bitstamp.depth, p_strict boolean) RETURNS bitstamp.depth
+    LANGUAGE plpgsql
+    AS $$
+begin 
+	if p_depth is null then
+		if p_strict then
+			p_depth := row(p_depth_change.microtimestamp, p_depth_change.pair_id, '{}');
+		else
+			p_depth := row(p_depth_change.microtimestamp,
+						   p_depth_change.pair_id, 
+						   array(	select row(price, 
+												sum(amount),
+												case direction 
+													when 'buy' then 'bid'::text
+													when 'sell' then 'ask'::text
+												end
+											 )::bitstamp.depth_record
+									 from bitstamp.order_book( p_depth_change.microtimestamp, 
+															    p_depth_change.pair_id,
+															    p_only_makers := true,
+															    p_before := true)
+								     where is_maker 
+								     group by ts, price, direction, pair_id
+						  ));
+		end if;
+	end if;
+	return row(p_depth_change.microtimestamp, 
+			    p_depth_change.pair_id,
+			    array(
+					select row(price, volume, side)::bitstamp.depth_record
+					from (
+						select coalesce(d.price, c.price) as price, coalesce(c.volume, d.volume) as volume, coalesce(d.side, c.side) as side
+						from unnest(p_depth.depth_change) d full join unnest(p_depth_change.depth_change) c using (price, side)
+					) a
+					where volume <> 0
+				)
+			  );
+end;
+$$;
+
+
+ALTER FUNCTION bitstamp._depth_after_depth_change(p_depth bitstamp.depth, p_depth_change bitstamp.depth, p_strict boolean) OWNER TO "ob-analytics";
+
 --
 -- Name: _get_live_orders_eon(timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
@@ -185,10 +249,6 @@ ALTER FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) OWNER TO "
 COMMENT ON FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) IS 'Since R''s POSIXct is not able to handle time with the precision higher than 0.1 of millisecond, this function converts timestamp to text with this precision to ensure that the timestamps are not mangled by an interface between Postgres and R somehow.';
 
 
-SET default_tablespace = '';
-
-SET default_with_oids = false;
-
 --
 -- Name: live_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
@@ -239,8 +299,8 @@ begin
 							coalesce(
 								case direction
 									-- below 'datetime' is actually 'price_microtimestamp'
-									when 'buy' then price < min(price) filter (where direction = 'sell') over (order by datetime, microtimestamp)
-									when 'sell' then price > max(price) filter (where direction = 'buy') over (order by datetime, microtimestamp)
+									when 'buy' then price < min(price) filter (where direction = 'sell' and amount > 0 ) over (order by datetime, microtimestamp)
+									when 'sell' then price > max(price) filter (where direction = 'buy' and amount > 0 ) over (order by datetime, microtimestamp)
 								end,
 							true) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
 							as is_maker,
@@ -465,19 +525,6 @@ $$;
 
 
 ALTER FUNCTION bitstamp.capture_transient_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
-
---
--- Name: depth; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
---
-
-CREATE TABLE bitstamp.depth (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    depth_change bitstamp.depth_record[] NOT NULL
-);
-
-
-ALTER TABLE bitstamp.depth OWNER TO "ob-analytics";
 
 --
 -- Name: depth_change_after_episode(timestamp with time zone, timestamp with time zone, text, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -1417,53 +1464,57 @@ CREATE FUNCTION bitstamp.oba_depth_summary(p_start_time timestamp with time zone
     LANGUAGE sql STABLE
     AS $$
 
-WITH events AS (
-	SELECT MIN(price) FILTER (WHERE direction = 'sell') OVER (PARTITION BY ts) AS best_ask_price, 
-			MAX(price) FILTER (WHERE direction = 'buy') OVER (PARTITION BY ts) AS best_bid_price, * 
-	FROM 	( SELECT order_book_entry.* 
-			   FROM bitstamp.order_book_by_episode(p_start_time,p_end_time, p_pair,p_strict) 
-					 JOIN LATERAL unnest(order_book_by_episode) AS order_book_entry ON TRUE
-			 ) a
-	WHERE is_maker 
+with
+depth as (
+	select microtimestamp as ts, pair_id, (unnest((d).depth_change)).*
+	from (
+		select depth.microtimestamp, pair_id, bitstamp.depth_agg(depth, p_strict) over (order by microtimestamp) as d
+		from bitstamp.depth  join bitstamp.pairs using (pair_id)
+		where microtimestamp between p_start_time and  p_end_time 
+		  and pairs.pair = p_pair
+	) a 
+	),
+	depth_with_best_prices as (
+		select min(price) filter(where side = 'ask') over (partition by ts) as best_ask_price, 
+				max(price) filter(where side = 'bid') over (partition by ts) as best_bid_price, 
+				ts, price, volume as amount, side, pair_id
+		from depth
 ),
-events_with_bps_levels AS (
-	SELECT ts, 
+depth_with_bps_levels as (
+	select ts, 
 			amount, 
 			price,
-			direction,
-			CASE direction
-				WHEN 'sell' THEN ceiling((price-best_ask_price)/best_ask_price/p_bps_step*10000)::integer
-				WHEN 'buy' THEN ceiling((best_bid_price - price)/best_bid_price/p_bps_step*10000)::integer 
-			END AS bps_level,
+			side,
+			case side
+				when 'ask' then ceiling((price-best_ask_price)/best_ask_price/p_bps_step*10000)::integer
+				when 'bid' then ceiling((best_bid_price - price)/best_bid_price/p_bps_step*10000)::integer 
+			end as bps_level,
 			best_ask_price,
 			best_bid_price,
 			pair_id
-	FROM events 
+	from depth_with_best_prices
 ),
-events_with_price_adjusted AS (
-	SELECT ts,
+depth_with_price_adjusted as (
+	select ts,
 			amount,
-			CASE direction
-				WHEN 'sell' THEN round(best_ask_price*(1 + bps_level*p_bps_step/10000), pairs."R0")
-				WHEN 'buy' THEN round(best_bid_price*(1 - bps_level*p_bps_step/10000), pairs."R0") 
-			END AS price,
-			CASE direction
-				WHEN 'sell' THEN 'ask'::text
-				WHEN 'buy'	THEN 'bid'::text
-			END AS side,
+			case side
+				when 'ask' then round(best_ask_price*(1 + bps_level*p_bps_step/10000), pairs."R0")
+				when 'bid' then round(best_bid_price*(1 - bps_level*p_bps_step/10000), pairs."R0") 
+			end as price,
+			side,
 			bps_level,
-			rank() OVER (PARTITION BY bitstamp._in_milliseconds(ts) ORDER BY ts DESC) AS r
-	FROM events_with_bps_levels JOIN bitstamp.pairs USING (pair_id)
+			rank() over (partition by bitstamp._in_milliseconds(ts) order by ts desc) as r
+	from depth_with_bps_levels join bitstamp.pairs using (pair_id)
 )
-SELECT ts, 
+select ts, 
 		price, 
-		SUM(amount) AS volume, 
-		side, 
+		sum(amount) as volume, 
+		side::text, 
 		bps_level*p_bps_step::integer
-FROM events_with_price_adjusted
-WHERE r = 1	-- if rounded to milliseconds ts are not unique, we'll take the LAST one and will drop the first silently
+from depth_with_price_adjusted
+where r = 1	-- if rounded to milliseconds ts are not unique, we'll take the LasT one and will drop the first silently
 			 -- this is a workaround for the inability of R to handle microseconds in POSIXct 
-GROUP BY 1, 2, 4, 5
+group by 1, 2, 4, 5
 
 $$;
 
@@ -1742,8 +1793,8 @@ CREATE FUNCTION bitstamp.order_book(p_ts timestamp with time zone, p_pair_id sma
 			select *, 
 					coalesce(
 						case order_type 
-							when 'buy' then price < min(price) filter (where order_type = 'sell') over (order by price_microtimestamp, microtimestamp)
-							when 'sell' then price > max(price) filter (where order_type = 'buy') over (order by price_microtimestamp, microtimestamp)
+							when 'buy' then price < min(price) filter (where order_type = 'sell' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+							when 'sell' then price > max(price) filter (where order_type = 'buy' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
 						end,
 					true )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
 					as is_maker
@@ -2463,6 +2514,18 @@ $$;
 
 
 ALTER FUNCTION bitstamp.summary(p_limit integer, p_pair text) OWNER TO "ob-analytics";
+
+--
+-- Name: depth_agg(bitstamp.depth, boolean); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE AGGREGATE bitstamp.depth_agg(depth_change bitstamp.depth, boolean) (
+    SFUNC = bitstamp._depth_after_depth_change,
+    STYPE = bitstamp.depth
+);
+
+
+ALTER AGGREGATE bitstamp.depth_agg(depth_change bitstamp.depth, boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_agg(bitstamp.live_orders, boolean); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
