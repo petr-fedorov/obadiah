@@ -1553,10 +1553,35 @@ CREATE FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_
 		  FROM trades
 		  WHERE trade_type = 'buy'				
 		),
-	  spread AS (
-		  SELECT *
-		  FROM bitstamp.spread_before_episode(p_start_time, p_end_time, p_pair, TRUE, TRUE)
+	  spread_before AS (
+		  SELECT lead(microtimestamp) over (order by microtimestamp) as microtimestamp, 
+		  		  best_ask_price, best_bid_price
+		  from bitstamp.spread join bitstamp.pairs using (pair_id)
+		  where microtimestamp between p_start_time and p_end_time 
+		    and pairs.pair = p_pair
 		  ),
+	  events_after as (
+		  select microtimestamp, price, amount, order_type, order_id, event, datetime, fill, trade_id,
+		  		  min(price) filter (where is_maker and order_type = 'sell') over (partition by microtimestamp) as best_ask_price,
+		  		  max(price) filter (where is_maker and order_type = 'buy') over (partition by microtimestamp) as best_bid_price,
+		  		  not is_maker as is_aggressor,
+		  		  event_no
+		  from (
+			  select   microtimestamp,
+						ob.price,
+						ob.amount,
+						direction as order_type,
+						order_id,
+			  			event,
+						ob.datetime,
+			  			fill,
+			  			trade_id,
+			  			event_no,
+			  			is_maker
+			  from bitstamp.order_book_after(p_start_time, p_pair, p_only_makers := false) ob 
+			  		join bitstamp.live_orders using (microtimestamp, order_id, event_no)
+			) a
+	  ),
 	  base_events AS (
 		  SELECT microtimestamp,
 		  		  live_orders.price,
@@ -1581,9 +1606,13 @@ CREATE FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_
 		  			ELSE NULL
 		  		  END AS is_aggressor,		  
 		  		  event_no
-		  FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id) LEFT JOIN spread USING(microtimestamp) 
-		  WHERE microtimestamp BETWEEN oba_event.p_start_time AND oba_event.p_end_time 
+		  FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id) LEFT JOIN spread_before USING(microtimestamp) 
+		  WHERE microtimestamp > oba_event.p_start_time 
+		  	AND microtimestamp <= oba_event.p_end_time 
 		  	AND pairs.pair = p_pair
+		  union all
+		  select *
+		  from events_after
 	  ),
 	  events AS (
 		SELECT row_number() OVER (ORDER BY order_id, amount DESC, event, microtimestamp ) AS event_id,		-- ORDER BY must be the same as in oba_trade(). Change both!
@@ -1665,6 +1694,55 @@ $$;
 
 
 ALTER FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_export(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS TABLE(id bigint, "timestamp" text, "exchange.timestamp" text, price numeric, volume numeric, action text, direction text)
+    LANGUAGE sql
+    AS $$
+select 	order_id,
+		bitstamp._in_milliseconds(microtimestamp),
+		bitstamp._in_milliseconds(datetime),
+		price,
+		round(amount,8),
+		case event
+		  when 'order_created' then 'created'::text
+		  when 'order_changed' then 'changed'::text
+		  when 'order_deleted' then 'deleted'::text
+		end,
+		case order_type
+		  when 'buy' then 'bid'::text
+		  when 'sell' then 'ask'::text
+		end 
+from bitstamp.live_orders join bitstamp.pairs using (pair_id)
+where microtimestamp > p_start_time  
+  and microtimestamp <= p_end_time
+  and pairs.pair = p_pair
+union all
+select order_id, 
+		bitstamp._in_milliseconds(ob.microtimestamp),
+		bitstamp._in_milliseconds(ob.datetime),
+		ob.price,
+		round(ob.amount,8),
+		case event
+		  when 'order_created' then 'created'::text
+		  when 'order_changed' then 'changed'::text
+		  when 'order_deleted' then 'deleted'::text
+		end,
+		case order_type
+		  when 'buy' then 'bid'::text
+		  when 'sell' then 'ask'::text
+		end 
+from bitstamp.order_book_after(p_start_time, p_pair, p_only_makers := false) ob 
+	join bitstamp.live_orders using (microtimestamp, order_id, event_no)
+
+  
+$$;
+
+
+ALTER FUNCTION bitstamp.oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_spread(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics

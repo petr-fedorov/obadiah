@@ -91,24 +91,10 @@ bsEvents <- function(conn, start.time, end.time, pair="BTCUSD", debug.query = FA
 
 #' @export
 bsExportEvents <- function(conn, start.time, end.time, pair="BTCUSD", file = "events.csv", debug.query = FALSE) {
-  query <- paste0(" SELECT 	order_id AS id,
-                            bitstamp._in_milliseconds(microtimestamp) AS timestamp,
-                            bitstamp._in_milliseconds(datetime) AS \"exchange.timestamp\",
-                            price,
-                            round(amount,8) AS volume,
-                            CASE event
-                              WHEN 'order_created' THEN 'created'::text
-                              WHEN 'order_changed' THEN 'changed'::text
-                              WHEN 'order_deleted' THEN 'deleted'::text
-                            END AS action,
-                            CASE order_type
-                              WHEN 'buy' THEN 'bid'::text
-                              WHEN 'sell' THEN 'ask'::text
-                            END AS direction
-                  FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
-                  WHERE microtimestamp BETWEEN ", shQuote(start.time), "  AND ", shQuote(end.time),
-                  " AND pair = ", shQuote(pair),
-                  " ORDER BY 2")
+  query <- paste0(" select * from bitstamp.oba_export(", shQuote(start.time),
+                  ", ", shQuote(end.time),
+                  ", ", shQuote(pair),
+                  ") order by timestamp")
   if(debug.query) cat(query)
   events <- DBI::dbGetQuery(conn, query)
   write.csv(events, file = file, row.names = FALSE)
