@@ -250,6 +250,35 @@ COMMENT ON FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) IS 'S
 
 
 --
+-- Name: _oba_events_with_id(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) RETURNS TABLE(event_id bigint, microtimestamp timestamp with time zone, order_id bigint, event_no smallint, event bitstamp.live_orders_event, order_type bitstamp.direction, price numeric, amount numeric, fill numeric, trade_id bigint, pair_id smallint, datetime timestamp with time zone)
+    LANGUAGE sql
+    AS $$
+
+with active_events as (
+	select live_orders.*
+	from bitstamp.live_orders join bitstamp.pairs using (pair_id) 
+	where microtimestamp between p_start_time and p_end_time
+	  and pairs.pair = p_pair
+	union -- not all !
+	select live_orders.*
+	from bitstamp.order_book_after(p_start_time, p_pair, p_only_makers := false)
+		  join bitstamp.live_orders using (microtimestamp, order_id, event_no)
+)
+select row_number() over (order by order_id, amount desc, event, microtimestamp ) as event_id,
+		microtimestamp, order_id,event_no,event,order_type,price, amount, fill, trade_id, pair_id,
+		price_microtimestamp as datetime
+from active_events
+where not (amount = 0 and event = 'order_created')	
+
+$$;
+
+
+ALTER FUNCTION bitstamp._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+
+--
 -- Name: live_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1601,9 +1630,10 @@ CREATE FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_
 			) a
 	  ),
 	  base_events AS (
-		  SELECT microtimestamp,
-		  		  live_orders.price,
-		  		  live_orders.amount,
+		  SELECT event_id,
+		  		  microtimestamp,
+		  		  price,
+		  		  amount,
 		  		  order_type,
 		  		  order_id,
 		  		  event,
@@ -1624,17 +1654,10 @@ CREATE FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_
 		  			ELSE NULL
 		  		  END AS is_aggressor,		  
 		  		  event_no
-		  FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id) LEFT JOIN spread_before USING(microtimestamp) 
-		  WHERE microtimestamp > oba_event.p_start_time 
-		  	AND microtimestamp <= oba_event.p_end_time 
-		  	AND pairs.pair = p_pair
-		  union all
-		  select *
-		  from events_after
+		  from bitstamp._oba_events_with_id(p_start_time, p_end_time, p_pair) left join spread_before using(microtimestamp) 
 	  ),
 	  events AS (
-		SELECT row_number() OVER (ORDER BY order_id, amount DESC, event, microtimestamp ) AS event_id,		-- ORDER BY must be the same as in oba_trade(). Change both!
-		  		base_events.*,
+		SELECT base_events.*,
 		  		MAX(price) OVER o_all <> MIN(price) OVER o_all AS is_price_ever_changed,
 				bool_or(NOT is_aggressor) OVER o_all AS is_ever_resting,
 		  		bool_or(is_aggressor) OVER o_all AS is_ever_aggressor, 	
@@ -1642,6 +1665,7 @@ CREATE FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_
 		  		first_value(event) OVER o_after = 'order_deleted' AS is_deleted,
 		  		first_value(event) OVER o_before = 'order_created' AS is_created
 		FROM base_events LEFT JOIN makers USING (order_id) LEFT JOIN takers USING (order_id) 
+  		
 		WINDOW o_all AS (PARTITION BY order_id), 
 		  		o_after AS (PARTITION BY order_id ORDER BY microtimestamp DESC, event_no DESC),
 		  		o_before AS (PARTITION BY order_id ORDER BY microtimestamp, event_no)
@@ -1706,6 +1730,7 @@ CREATE FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_
 		best_bid_price,
 		best_ask_price
   FROM events LEFT JOIN event_connection USING (microtimestamp, event_no, order_id) 
+
   ORDER BY 1;
 
 $$;
@@ -1720,7 +1745,7 @@ ALTER FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_t
 CREATE FUNCTION bitstamp.oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS TABLE(id bigint, "timestamp" text, "exchange.timestamp" text, price numeric, volume numeric, action text, direction text)
     LANGUAGE sql
     AS $$
-select 	order_id,
+select order_id,
 		bitstamp._in_milliseconds(microtimestamp),
 		bitstamp._in_milliseconds(datetime),
 		price,
@@ -1733,29 +1758,8 @@ select 	order_id,
 		case order_type
 		  when 'buy' then 'bid'::text
 		  when 'sell' then 'ask'::text
-		end 
-from bitstamp.live_orders join bitstamp.pairs using (pair_id)
-where microtimestamp > p_start_time  
-  and microtimestamp <= p_end_time
-  and pairs.pair = p_pair
-union all
-select order_id, 
-		bitstamp._in_milliseconds(ob.microtimestamp),
-		bitstamp._in_milliseconds(ob.datetime),
-		ob.price,
-		round(ob.amount,8),
-		case event
-		  when 'order_created' then 'created'::text
-		  when 'order_changed' then 'changed'::text
-		  when 'order_deleted' then 'deleted'::text
-		end,
-		case order_type
-		  when 'buy' then 'bid'::text
-		  when 'sell' then 'ask'::text
-		end 
-from bitstamp.order_book_after(p_start_time, p_pair, p_only_makers := false) ob 
-	join bitstamp.live_orders using (microtimestamp, order_id, event_no)
-
+		end
+from bitstamp._oba_events_with_id(p_start_time, p_end_time, p_pair)
   
 $$;
 
@@ -1828,13 +1832,10 @@ CREATE FUNCTION bitstamp.oba_trade(p_start_time timestamp with time zone, p_end_
 		WHERE trade_timestamp BETWEEN p_start_time AND p_end_time
 	      AND pairs.pair = p_pair
 	),
-	events AS (
-		SELECT row_number() OVER (ORDER BY order_id, amount DESC, event,  microtimestamp ) AS event_id,	-- ORDER BY must be the same as in oba_event(). Change both!
-				live_orders.*
-		FROM bitstamp.live_orders JOIN bitstamp.pairs USING (pair_id)
-		WHERE microtimestamp BETWEEN p_start_time AND p_end_time 
-	      AND pairs.pair = p_pair
-	)
+ events as (
+	 select *
+	 from bitstamp._oba_events_with_id(p_start_time, p_end_time, p_pair) 
+ )
   SELECT CASE trade_type
   			WHEN 'buy' THEN buy_microtimestamp
 			WHEN 'sell' THEN sell_microtimestamp
