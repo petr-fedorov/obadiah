@@ -1021,7 +1021,7 @@ DECLARE
 	v_era timestamptz;
 	v_amount numeric;
 	
-	prev_event bitstamp.live_orders;
+	v_event bitstamp.live_orders;
 	
 BEGIN 
 
@@ -1030,11 +1030,29 @@ BEGIN
 	where pair_id = new.pair_id
 	  and era <= new.microtimestamp;
 	  
-	-- An emergency workaround: to be replaced with something more reasonable in the future
 	if new.event = 'order_created' then 
-		if exists (select 'x' from bitstamp.live_orders where microtimestamp >= v_era and  order_id = new.order_id and order_type = new.order_type and event = 'order_created' ) then
-			raise exception 'order_created already exists in era % for %', v_era, new.order_id;
+	
+		update bitstamp.live_orders 
+		set microtimestamp = new.microtimestamp,
+			local_timestamp = new.local_timestamp
+		where microtimestamp >= v_era -- existing order_created's microtimestamp equals either v_era or datetime (in case ex-nihilo was received with datetime > v_era)
+		  and  order_id = new.order_id 
+		  and order_type = new.order_type 
+		  and event = 'order_created'
+		returning *
+		into v_event;
+		
+		if found then 
+			if v_event.next_microtimestamp < 'infinity'  then	-- does next event exist?
+				update bitstamp.live_orders
+				set fill = v_event.amount - amount
+				where microtimestamp = v_event.next_microtimestamp
+				  and order_id = v_event.order_id
+				  and event_no = v_event.next_event_no;
+			end if;
+			return null; -- skip insertion of a duplicated order_created event
 		end if;
+		
 	end if;
 	  
 
@@ -1057,16 +1075,16 @@ BEGIN
 			  and order_type = new.order_type
 			  AND next_microtimestamp > NEW.microtimestamp
 			RETURNING *
-			INTO prev_event;
+			INTO v_event;
 			-- amount, next_event_no INTO v_amount, NEW.event_no;
 			
 			IF FOUND THEN 
-				NEW.fill := prev_event.amount - NEW.amount; 
-				NEW.event_no := prev_event.next_event_no;
+				NEW.fill := v_event.amount - NEW.amount; 
+				NEW.event_no := v_event.next_event_no;
 				
-				IF prev_event.price = NEW.price THEN 
-					NEW.price_microtimestamp := prev_event.price_microtimestamp;
-					NEW.price_event_no := prev_event.price_event_no;
+				IF v_event.price = NEW.price THEN 
+					NEW.price_microtimestamp := v_event.price_microtimestamp;
+					NEW.price_event_no := v_event.price_event_no;
 				ELSE	-- currently, it's an instant-type order (Bitstamp changes its price on its own)
 					NEW.price_microtimestamp := NEW.microtimestamp;
 					NEW.price_event_no := NEW.event_no;
