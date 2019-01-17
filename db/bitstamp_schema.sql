@@ -89,6 +89,19 @@ CREATE TYPE bitstamp.live_orders_event AS ENUM (
 ALTER TYPE bitstamp.live_orders_event OWNER TO "ob-analytics";
 
 --
+-- Name: momentary_price; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE TYPE bitstamp.momentary_price AS (
+	microtimestamp timestamp with time zone,
+	pair_id smallint,
+	price numeric
+);
+
+
+ALTER TYPE bitstamp.momentary_price OWNER TO "ob-analytics";
+
+--
 -- Name: order_book_record; Type: TYPE; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -107,6 +120,44 @@ CREATE TYPE bitstamp.order_book_record AS (
 
 
 ALTER TYPE bitstamp.order_book_record OWNER TO "ob-analytics";
+
+--
+-- Name: _create_or_extend_draw(bitstamp.momentary_price[], timestamp with time zone, numeric, smallint, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp._create_or_extend_draw(p_draw bitstamp.momentary_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_pair smallint, p_epsilon numeric) RETURNS bitstamp.momentary_price[]
+    LANGUAGE plpgsql
+    AS $$
+begin 
+	if p_draw is null then	
+		-- p_draw[1] - the current draw start
+		-- p_draw[2] - the latest turning point (see below)
+		-- p_draw[3] - the current draw end
+		p_draw := array[row(p_microtimestamp, p_pair, p_price), row(p_microtimestamp, p_pair, p_price), row(p_microtimestamp, p_pair, p_price)];
+	else
+		-- The turning point helps us to decide whether the current draw is to be extended or a new draw is to be started
+		if p_draw[2].price = p_price then 										-- extend the draw, keep the turning point
+			p_draw[3] := row(p_microtimestamp, p_pair, p_price);
+		else
+			if ( (p_price >= p_draw[1].price and p_price > p_draw[2].price) or 	-- extend the draw, set the new turning point
+			    (p_price <= p_draw[1].price and p_price < p_draw[2].price) 	)  then 
+					p_draw[2] := row(p_microtimestamp, p_pair, p_price);
+					p_draw[3] := row(p_microtimestamp, p_pair, p_price);
+			else	-- check whether the current draw ended and new draw is to be started
+				if abs(p_price - p_draw[2].price)>= p_draw[2].price*p_epsilon then -- epsilon exceeded so start new draw FROM THE TURNING POINT (i.e. in the past)
+					p_draw := array[p_draw[2], row(p_microtimestamp, p_pair, p_price)::bitstamp.momentary_price, row(p_microtimestamp, p_pair, p_price)::bitstamp.momentary_price];
+				else	-- not yet, extend the draw but keep the turning point
+					p_draw[3] := row(p_microtimestamp, p_pair, p_price);
+				end if;
+			end if;
+		end if;
+	end if;
+	return p_draw;
+end;
+$$;
+
+
+ALTER FUNCTION bitstamp._create_or_extend_draw(p_draw bitstamp.momentary_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_pair smallint, p_epsilon numeric) OWNER TO "ob-analytics";
 
 SET default_tablespace = '';
 
@@ -2623,6 +2674,18 @@ CREATE AGGREGATE bitstamp.depth_agg(depth_change bitstamp.depth, boolean) (
 
 
 ALTER AGGREGATE bitstamp.depth_agg(depth_change bitstamp.depth, boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: draw_agg(timestamp with time zone, numeric, smallint, numeric); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, price numeric, pair_id smallint, epsilon numeric) (
+    SFUNC = bitstamp._create_or_extend_draw,
+    STYPE = bitstamp.momentary_price[]
+);
+
+
+ALTER AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, price numeric, pair_id smallint, epsilon numeric) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_agg(bitstamp.live_orders, boolean); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
