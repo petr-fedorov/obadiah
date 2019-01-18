@@ -663,6 +663,77 @@ $$;
 ALTER FUNCTION bitstamp.depth_change_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_strict boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, text, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_epsilon numeric DEFAULT 0.0) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, pair_id smallint, draw_type text)
+    LANGUAGE sql STABLE
+    AS $$ 
+with spread as (
+	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id 
+	from bitstamp.spread join bitstamp.pairs using (pair_id)
+	where microtimestamp between p_start_time and p_end_time 
+	 and pairs.pair = p_pair
+/*	union
+	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id  
+	from (
+		select p_start_time as microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id
+		from bitstamp.spread join bitstamp.pairs using (pair_id)
+		where microtimestamp <= p_start_time
+		 and pairs.pair = p_pair
+		order by microtimestamp desc
+		limit 1
+	) first_draw_start
+	union
+	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id  
+	from (
+		select p_end_time as microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id
+		from bitstamp.spread join bitstamp.pairs using (pair_id)
+		where microtimestamp <= p_end_time
+		 and pairs.pair = p_pair
+		order by microtimestamp desc
+		limit 1
+	) last_draw_end */
+),
+base_draws as (
+	select spread.*,
+			bitstamp.draw_agg(microtimestamp, best_bid_price, pair_id,  p_epsilon) over w as bid_draw,
+			'bid'::text as draw_type
+	from spread
+	window w as (order by microtimestamp)
+	union all
+	select spread.*,
+			bitstamp.draw_agg(microtimestamp, best_ask_price, pair_id,  p_epsilon) over w as bid_draw,
+			'ask'::text as draw_type
+	from spread
+	window w as (order by microtimestamp)
+	
+),
+draws as (
+	select bid_draw[1].microtimestamp as start_microtimestamp, 
+			bid_draw[1].price as start_price, 
+			bid_draw[2].microtimestamp as end_microtimestamp,
+			bid_draw[2].price as end_price,
+			draw_type,
+			pair_id
+	from base_draws
+)
+select distinct on (start_microtimestamp, draw_type ) start_microtimestamp, 
+					 last_value(end_microtimestamp) over w as end_microtimestamp,
+					 start_price, 
+					 last_value(end_price) over w as end_price,
+					 pair_id,
+					 draw_type
+from draws
+window w as ( partition by start_microtimestamp, draw_type order by end_microtimestamp )
+order by start_microtimestamp,draw_type, end_microtimestamp desc
+
+$$;
+
+
+ALTER FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_epsilon numeric) OWNER TO "ob-analytics";
+
+--
 -- Name: find_and_repair_eternal_orders(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
