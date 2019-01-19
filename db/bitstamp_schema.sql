@@ -2673,7 +2673,7 @@ COMMENT ON FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with t
 -- Name: summary(integer, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT NULL::text) RETURNS TABLE(era timestamp with time zone, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
+CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT NULL::text) RETURNS TABLE(era timestamp with time zone, pair_id smallint, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
     LANGUAGE sql STABLE
     AS $$
 
@@ -2713,7 +2713,7 @@ depth_stat as (
 	from eras join bitstamp.depth on pair_id = era_pair_id and microtimestamp between era_start and era_end
 	group by pair_id, era_start 
 )
-select era_start, pair,  
+select era_start, pair_id, pair,  
 		events, last_event::text, case 
 									when extract( epoch from last_event - first_event ) > 0 then round((events/extract( epoch from last_event - first_event ))::numeric,2)
 									else 0 end as e_per_sec,
