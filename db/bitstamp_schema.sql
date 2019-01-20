@@ -125,10 +125,13 @@ ALTER TYPE bitstamp.order_book_record OWNER TO "ob-analytics";
 -- Name: _create_or_extend_draw(bitstamp.momentary_price[], timestamp with time zone, numeric, smallint, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp._create_or_extend_draw(p_draw bitstamp.momentary_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_pair smallint, p_epsilon numeric) RETURNS bitstamp.momentary_price[]
+CREATE FUNCTION bitstamp._create_or_extend_draw(p_draw bitstamp.momentary_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_pair smallint, p_minimal_draw numeric) RETURNS bitstamp.momentary_price[]
     LANGUAGE plpgsql
     AS $$
+declare 
+	ONE_BPS constant numeric := 0.0001;	-- one BASIS POINT (see https://www.investopedia.com/ask/answers/what-basis-point-bps/)
 begin 
+	p_minimal_draw := p_minimal_draw*ONE_BPS;
 	if p_draw is null then	
 		-- p_draw[1] - the current draw start
 		-- p_draw[2] - the latest turning point (see below)
@@ -139,14 +142,19 @@ begin
 		if p_draw[2].price = p_price then 										-- extend the draw, keep the turning point
 			p_draw[3] := row(p_microtimestamp, p_pair, p_price);
 		else
-			if ( (p_price >= p_draw[1].price and p_price > p_draw[2].price) or 	-- extend the draw, set the new turning point
-			    (p_price <= p_draw[1].price and p_price < p_draw[2].price) 	)  then 
+			if ( (p_draw[2].price >= p_draw[1].price and p_price > p_draw[2].price) or 	-- extend the draw, set the new turning point
+			    (p_draw[2].price <= p_draw[1].price and p_price < p_draw[2].price) 	)  then 
 					p_draw[2] := row(p_microtimestamp, p_pair, p_price);
 					p_draw[3] := row(p_microtimestamp, p_pair, p_price);
 			else	-- check whether the current draw ended and new draw is to be started
-				if abs(p_price - p_draw[2].price)>= p_draw[2].price*p_epsilon then -- epsilon exceeded so start new draw FROM THE TURNING POINT (i.e. in the past)
-					p_draw := array[p_draw[2], row(p_microtimestamp, p_pair, p_price)::bitstamp.momentary_price, row(p_microtimestamp, p_pair, p_price)::bitstamp.momentary_price];
-				else	-- not yet, extend the draw but keep the turning point
+				if abs(p_draw[2].price - p_draw[1].price)>= p_draw[1].price*p_minimal_draw then -- the current draw has exceeded the minimal draw so check the turning (next) draw  ...
+					if abs(p_price - p_draw[2].price)>= p_draw[2].price*p_minimal_draw then -- the turn after the curent draw exceeded  the minmal draw too so start new draw FROM THE TURNING POINT (i.e. in the past)
+						p_draw := array[p_draw[2], row(p_microtimestamp, p_pair, p_price)::bitstamp.momentary_price, row(p_microtimestamp, p_pair, p_price)::bitstamp.momentary_price];
+					else	-- not yet, extend the turning draw from the turning point
+						p_draw[3] := row(p_microtimestamp, p_pair, p_price);
+					end if;
+				else
+					p_draw[2] := row(p_microtimestamp, p_pair, p_price);
 					p_draw[3] := row(p_microtimestamp, p_pair, p_price);
 				end if;
 			end if;
@@ -157,7 +165,7 @@ end;
 $$;
 
 
-ALTER FUNCTION bitstamp._create_or_extend_draw(p_draw bitstamp.momentary_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_pair smallint, p_epsilon numeric) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp._create_or_extend_draw(p_draw bitstamp.momentary_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_pair smallint, p_minimal_draw numeric) OWNER TO "ob-analytics";
 
 SET default_tablespace = '';
 
@@ -666,72 +674,84 @@ ALTER FUNCTION bitstamp.depth_change_after_episode(p_start_time timestamp with t
 -- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, text, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_epsilon numeric DEFAULT 0.0) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, pair_id smallint, draw_type text)
+CREATE FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_minimal_draw numeric DEFAULT 0.0) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, pair_id smallint, draw_type text, draw_size numeric)
     LANGUAGE sql STABLE
     AS $$ 
-with spread as (
-	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id 
-	from bitstamp.spread join bitstamp.pairs using (pair_id)
-	where microtimestamp between p_start_time and p_end_time 
-	 and pairs.pair = p_pair
-/*	union
-	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id  
+with time_range as (
+	select pair_id, era, p_start_time as period_start, case when era_end < p_end_time then era_end else p_end_time end as period_end
 	from (
-		select p_start_time as microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id
-		from bitstamp.spread join bitstamp.pairs using (pair_id)
-		where microtimestamp <= p_start_time
-		 and pairs.pair = p_pair
+		select era, coalesce( lead(era) over (order by era), 'infinity') as era_end, pair_id
+		from bitstamp.live_orders_eras join bitstamp.pairs using (pair_id)
+		where pairs.pair = p_pair
+	) tr
+	where p_start_time between era and era_end 
+),
+spread as (
+	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id 
+	from bitstamp.spread join time_range using (pair_id)
+	where microtimestamp between period_start and period_end
+	union all
+	select p_start_time as microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id  
+	from (
+		select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id
+		from bitstamp.spread join time_range using (pair_id)
+		where microtimestamp between era and period_start
 		order by microtimestamp desc
 		limit 1
 	) first_draw_start
-	union
-	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id  
+	union all
+	select p_end_time as microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id  
 	from (
-		select p_end_time as microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id
-		from bitstamp.spread join bitstamp.pairs using (pair_id)
+		select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id
+		from bitstamp.spread join time_range using (pair_id)
 		where microtimestamp <= p_end_time
-		 and pairs.pair = p_pair
 		order by microtimestamp desc
 		limit 1
-	) last_draw_end */
+	) last_draw_end
 ),
 base_draws as (
 	select spread.*,
-			bitstamp.draw_agg(microtimestamp, best_bid_price, pair_id,  p_epsilon) over w as bid_draw,
+			bitstamp.draw_agg(microtimestamp, best_bid_price, pair_id,  p_minimal_draw) over w as draw, 
 			'bid'::text as draw_type
 	from spread
 	window w as (order by microtimestamp)
 	union all
 	select spread.*,
-			bitstamp.draw_agg(microtimestamp, best_ask_price, pair_id,  p_epsilon) over w as bid_draw,
+			bitstamp.draw_agg(microtimestamp, best_ask_price, pair_id,  p_minimal_draw) over w as draw,
 			'ask'::text as draw_type
 	from spread
 	window w as (order by microtimestamp)
 	
 ),
 draws as (
-	select bid_draw[1].microtimestamp as start_microtimestamp, 
-			bid_draw[1].price as start_price, 
-			bid_draw[2].microtimestamp as end_microtimestamp,
-			bid_draw[2].price as end_price,
+	select draw[1].microtimestamp as start_microtimestamp, 
+			draw[1].price as start_price, 
+			draw[2].microtimestamp as end_microtimestamp,
+			draw[2].price as end_price,
+			draw[3].microtimestamp as last_microtimestamp,
+			draw[3].price as last_price,
 			draw_type,
 			pair_id
 	from base_draws
 )
-select distinct on (start_microtimestamp, draw_type ) start_microtimestamp, 
+select distinct on (start_microtimestamp, draw_type )
+					 start_microtimestamp, 
 					 last_value(end_microtimestamp) over w as end_microtimestamp,
+					 last_microtimestamp,
 					 start_price, 
 					 last_value(end_price) over w as end_price,
+					 last_price,
 					 pair_id,
-					 draw_type
+					 draw_type,
+					 round((end_price - start_price)/start_price * 10000.0)
 from draws
 window w as ( partition by start_microtimestamp, draw_type order by end_microtimestamp )
-order by start_microtimestamp,draw_type, end_microtimestamp desc
+order by draw_type, start_microtimestamp, end_microtimestamp desc, last_microtimestamp desc	
 
 $$;
 
 
-ALTER FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_epsilon numeric) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_minimal_draw numeric) OWNER TO "ob-analytics";
 
 --
 -- Name: find_and_repair_eternal_orders(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -2673,7 +2693,7 @@ COMMENT ON FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with t
 -- Name: summary(integer, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT NULL::text) RETURNS TABLE(era timestamp with time zone, pair_id smallint, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
+CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT NULL::text) RETURNS TABLE(era text, pair_id smallint, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
     LANGUAGE sql STABLE
     AS $$
 
@@ -2713,7 +2733,7 @@ depth_stat as (
 	from eras join bitstamp.depth on pair_id = era_pair_id and microtimestamp between era_start and era_end
 	group by pair_id, era_start 
 )
-select era_start, pair_id, pair,  
+select era_start::text, pair_id, pair,  
 		events, last_event::text, case 
 									when extract( epoch from last_event - first_event ) > 0 then round((events/extract( epoch from last_event - first_event ))::numeric,2)
 									else 0 end as e_per_sec,
@@ -2750,13 +2770,13 @@ ALTER AGGREGATE bitstamp.depth_agg(depth_change bitstamp.depth, boolean) OWNER T
 -- Name: draw_agg(timestamp with time zone, numeric, smallint, numeric); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, price numeric, pair_id smallint, epsilon numeric) (
+CREATE AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, price numeric, pair_id smallint, minimal_draw numeric) (
     SFUNC = bitstamp._create_or_extend_draw,
     STYPE = bitstamp.momentary_price[]
 );
 
 
-ALTER AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, price numeric, pair_id smallint, epsilon numeric) OWNER TO "ob-analytics";
+ALTER AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, price numeric, pair_id smallint, minimal_draw numeric) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_agg(bitstamp.live_orders, boolean); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
