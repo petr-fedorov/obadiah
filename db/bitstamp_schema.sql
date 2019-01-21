@@ -674,7 +674,7 @@ ALTER FUNCTION bitstamp.depth_change_after_episode(p_start_time timestamp with t
 -- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, text, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_minimal_draw numeric DEFAULT 0.0) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, pair_id smallint, draw_type text, draw_size numeric)
+CREATE FUNCTION bitstamp.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_minimal_draw numeric DEFAULT 0.0) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, pair_id smallint, draw_type text, draw_size numeric, minimal_draw numeric, pair text)
     LANGUAGE sql STABLE
     AS $$ 
 with time_range as (
@@ -743,7 +743,9 @@ select distinct on (start_microtimestamp, draw_type )
 					 last_price,
 					 pair_id,
 					 draw_type,
-					 round((end_price - start_price)/start_price * 10000.0)
+					 round((end_price - start_price)/start_price * 10000.0, 2),
+					 p_minimal_draw,
+					 p_pair
 from draws
 window w as ( partition by start_microtimestamp, draw_type order by end_microtimestamp )
 order by draw_type, start_microtimestamp, end_microtimestamp desc, last_microtimestamp desc	
