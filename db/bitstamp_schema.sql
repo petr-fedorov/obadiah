@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 10.6
--- Dumped by pg_dump version 10.6
+-- Dumped from database version 11.1
+-- Dumped by pg_dump version 11.1
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -2697,6 +2697,7 @@ COMMENT ON FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with t
 
 CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT NULL::text) RETURNS TABLE(era text, pair_id smallint, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
     LANGUAGE sql STABLE
+    SET work_mem TO '4GB'
     AS $$
 
 with eras as (
