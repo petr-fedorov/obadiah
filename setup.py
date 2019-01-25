@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 setup(
     name="obanalyticsdb",
-    version="0.1",
+    version="0.1.1",
     packages=find_packages('python'),
     package_dir={'': 'python'},
     entry_points={

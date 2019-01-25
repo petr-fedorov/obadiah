@@ -1,0 +1,28 @@
+# The obanalyticdb service unit file
+#
+# Quick HowTo:
+# 1. Copy this file to /etc/systemd/system/obanalyticsdb-<DATABASE>@.service, 
+#    substituting <DATABASE> with the name of PostgreSQL database where data will be saved (i.e. ob-analytics-devel)
+# 2. Edit <USER>, <DATABASE> and <ENVIRONMENT>, where <ENVIRONMENT> is a Python environment where obanalyticsdb is installed
+#    ("/bin/bash -c "source $HOME/envs/obanalyticsdb-devel/bin/activate; cd /var/log/$LOGNAME; $HOME/envs/obanalyticsdb-devel/bin/obanalyticsdb -d ob-analytics-devel -s %i"
+# 3. Create the directory to store log files: sudo mkdir /var/log/<USER>  sudo chown <USER>.<USER> /var/log/<USER>
+# 3. Run `systemctl daemon-reload`
+# 4. Start service `systemctl start obanalytics-<DATABASE>@PAIR:EXCHANGE.service` where PAIR and EXCHANGE are runtime parameters of obanalyticsdb (see obanalyticsdb --help)
+#
+
+
+[Unit]
+
+Description=A data loading service for Order Book Aalytics Database
+
+
+[Service]
+
+User=<USER>
+
+Type=simple
+Restart=on-failure
+RestartSec=30
+ExecStart=/bin/bash -c "source <ENVIRONMENT>/bin/activate; cd /var/log/$LOGNAME; <ENVIRONMENT>/bin/obanalyticsdb -d <DATABASE> -s %i"
+KillSignal=SIGINT
+TimeoutStopSec=120

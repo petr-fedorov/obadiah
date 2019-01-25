@@ -348,6 +348,7 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
 
     logger = logging.getLogger("bitstamp.capture")
     q_save = Queue()
+    exitcode = 0
 
     try:
         pair_id = get_pair(pair, dbname, user)
@@ -360,7 +361,7 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
               # Process(target=LiveOrderBook(pair_id, pair, dbname, user,
               #                               stop_flag, log_queue,
               #                               log_level=logging.INFO)),
-              #Process(target=LiveDiffOrderBook(pair_id, pair, dbname, user,
+              # Process(target=LiveDiffOrderBook(pair_id, pair, dbname, user,
               #                                 stop_flag, log_queue,
               #                                 log_level=logging.INFO)),
               ]
@@ -379,11 +380,13 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
             if t.exitcode:
                 logger.error('Process %i terminated, exitcode %i' %
                              (pid, t.exitcode))
+                exitcode = t.exitcode
             else:
                 logger.debug('Process %i terminated, exitcode %i' %
                              (pid, t.exitcode))
     except Exception as e:
         logger.exception('%s', e)
-        return
+        exitcode = 1
 
     logger.info("Exit")
+    return exitcode
