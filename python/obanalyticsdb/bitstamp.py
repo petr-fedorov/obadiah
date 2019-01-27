@@ -10,7 +10,7 @@ from obanalyticsdb.reorder import OrderedDatabaseInsertion, Reorderer
 
 
 def get_pair(pair, dbname, user):
-    with connect_db(dbname, user) as con:
+    with connect_db(dbname, user, f"'{pair}:BITSTAMP'") as con:
         with con.cursor() as curr:
             curr.execute(" SELECT pair_id "
                          " FROM bitstamp.pairs "
@@ -24,12 +24,13 @@ def get_pair(pair, dbname, user):
 
 class Stockkeeper(Spawned):
 
-    def __init__(self, q_unordered, dbname, user, stop_flag, log_queue,
+    def __init__(self, q_unordered, dbname, user, pair, stop_flag, log_queue,
                  log_level=logging.INFO):
         super().__init__(log_queue, stop_flag, log_level)
         self.q_unordered = q_unordered
         self.dbname = dbname
         self.user = user
+        self.pair = pair
 
     def __call__(self):
         self._call_init()
@@ -48,7 +49,8 @@ class Stockkeeper(Spawned):
         reorder.start()
 
         logger.info('Started')
-        with connect_db(self.dbname, self.user) as con:
+        with connect_db(self.dbname, self.user,
+                        f"'{self.pair}:BITSTAMP'") as con:
             con.set_session(autocommit=True)
             with con.cursor() as curr:
                 while True:
@@ -280,7 +282,8 @@ class LiveDiffOrderBook(LiveStream):
         channel.bind('data', self.data)
 
     def _saving_thread(self):
-        with connect_db(self.dbname, self.user) as con:
+        with connect_db(self.dbname, self.user,
+                        f"'{self.pair}:BITSTAMP'") as con:
             con.set_session(autocommit=True)
             with con.cursor() as curr:
                 while not self.stop_flag.is_set():
@@ -356,7 +359,7 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
                                         log_queue, log_level=logging.INFO)),
               Process(target=LiveTrades(pair_id, pair, q_save, stop_flag,
                                         log_queue, log_level=logging.INFO)),
-              Process(target=Stockkeeper(q_save, dbname, user, stop_flag,
+              Process(target=Stockkeeper(q_save, dbname, user, pair, stop_flag,
                                          log_queue, log_level=logging.DEBUG)),
               # Process(target=LiveOrderBook(pair_id, pair, dbname, user,
               #                               stop_flag, log_queue,

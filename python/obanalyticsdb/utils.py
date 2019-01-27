@@ -4,12 +4,19 @@ import sys
 import traceback
 import signal
 import psycopg2
+import asyncpg
 
 
-def connect_db(dbname, user):
+async def connect(dbname, user, application_name):
+    con = await asyncpg.connect(user=user, database=dbname)
+    await con.execute(f"set application_name to {application_name}")
+    return con
+
+
+def connect_db(dbname, user, application_name):
     return psycopg2.connect("dbname=%s user=%s password=%s "
-                            "application_name=obanalyticsdb" %
-                            (dbname, user, user))
+                            "application_name=%s" %
+                            (dbname, user, user, application_name))
 
 
 def listener_process(logging_queue, log_file_name):

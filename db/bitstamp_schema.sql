@@ -2452,10 +2452,10 @@ $$;
 ALTER FUNCTION bitstamp.pga_match(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: pga_spread(text, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: pga_spread(text, interval, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.pga_spread(p_pair text DEFAULT 'BTCUSD'::text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS SETOF bitstamp.spread
+CREATE FUNCTION bitstamp.pga_spread(p_pair text DEFAULT 'BTCUSD'::text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS SETOF bitstamp.spread
     LANGUAGE plpgsql
     SET work_mem TO '4GB'
     AS $$
@@ -2484,10 +2484,14 @@ begin
 										 from bitstamp.live_orders_eras 
 										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
 
-	select max(microtimestamp) into v_last_spread
+	select coalesce(max(microtimestamp), v_start) into v_last_spread
 	from bitstamp.spread join bitstamp.pairs using (pair_id)
 	where microtimestamp between v_start and v_end
 	  and pair_id = v_pair_id;
+	  
+	if v_end > v_last_spread + p_max_interval then
+		v_end := v_last_spread + p_max_interval;
+	end if;	  
 	
 	-- delete the latest spread because it could be calculated using incomplete data
 	
@@ -2497,7 +2501,7 @@ begin
 	  
 	insert into bitstamp.spread (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id)
     select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id
-	from bitstamp.spread_after_episode(coalesce(v_last_spread, v_start), v_end, p_pair,
+	from bitstamp.spread_after_episode(v_last_spread, v_end, p_pair,
 						   p_strict := false, p_with_order_book := false);
 	
 	raise debug 'pga_spread() exec time: %', clock_timestamp() - v_current_timestamp;
@@ -2508,7 +2512,7 @@ end;
 $$;
 
 
-ALTER FUNCTION bitstamp.pga_spread(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.pga_spread(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: protect_columns(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics

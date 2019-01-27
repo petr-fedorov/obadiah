@@ -1,12 +1,12 @@
 from queue import Empty, Full
-from multiprocessing import Process, Queue
 import logging
 import time
 from btfxwss import BtfxWss
 from datetime import datetime, timedelta
 from obanalyticsdb.utils import log_notices, QueueSizeLogger,\
-    connect_db, Spawned
+    connect_db, Spawned, connect
 from obanalyticsdb.reorder import OrderedDatabaseInsertion, Reorderer
+import asyncio
 
 
 class Episode(OrderedDatabaseInsertion):
@@ -718,20 +718,59 @@ def start_new_snapshot(ob_len, pair, dbname, user, prec="R0"):
     return snapshot_id
 
 
+async def capture_trades(con, stop_flag, log_queue, pair, q):
+    logger = logging.getLogger("bitfinex.capture_trades")
+    loop = asyncio.get_event_loop()
+
+    try:
+        pair_id = await con.fetchval('''
+                                     select pair_id
+                                     from bitfinex.pairs
+                                     where pair = $1
+                                     ''', pair)
+        while not stop_flag.is_set():
+            try:
+                data, lts = await loop.run_in_executor(None,
+                                                       lambda: q.get(timeout=5)
+                                                       )
+                logger.info("%s" % (data, ))
+                *data, _ = data
+                lts = datetime.fromtimestamp(lts)
+
+                if data[0] == 'tu':
+                    data = [data[1]]
+                elif data[0] == 'te':
+                    data = []
+                else:
+                    # skip initial snapshot of trades
+                    # since they usually can't be matched to any events
+                    continue
+                for d in data:
+                    await con.execute('''
+                                    insert into bitfinex.transient_trades
+                                    (id, qty, price, local_timestamp,
+                                    exchange_timestamp, pair_id)
+                                    values ($1, $2, $3, $4, $5, $6 )
+                                    ''', d[0], d[2], d[3], lts,
+                                      datetime.fromtimestamp(d[1]/1000),
+                                      pair_id)
+            except Empty:
+                continue
+
+    except Exception as e:
+        stop_flag.set()
+        logger.error(e)
+    return
+
+
 def capture(pair, dbname, user,  stop_flag, log_queue):
 
     logger = logging.getLogger("bitfinex.capture")
-    ob_len = 100
-
-    try:
-        check_pair(pair, dbname, user)
-    except Exception as e:
-        logger.exception('%s', e)
-        return
+#    ob_len = 100
 
     ob_R0 = BtfxWss(log_level=logging.INFO)
 
-    precs = ['P0', 'P1', 'P2', 'P3']
+    precs = []  # ['P0', 'P1', 'P2', 'P3']
     obs = [BtfxWss(log_level=logging.INFO) for p in precs]
 
     for ob in [ob_R0] + obs:
@@ -743,73 +782,91 @@ def capture(pair, dbname, user,  stop_flag, log_queue):
     for ob in [ob_R0] + obs:
         ob.config(ts=True)
 
-    ob_R0.subscribe_to_raw_order_book(pair, len=ob_len)
+#    ob_R0.subscribe_to_raw_order_book(pair, len=ob_len)
     ob_R0.subscribe_to_trades(pair)
     logger.info('%s %s' % ('R0', ob_R0.conn.socket.sock.sock.getpeername()[0]))
 
-    for prec, ob in zip(precs, obs):
-        ob.subscribe_to_order_book(pair, prec=prec, len=ob_len)
-        logger.info('%s %s' % (prec,
-                               ob.conn.socket.sock.sock.getpeername()[0]))
-
+#    for prec, ob in zip(precs, obs):
+#        ob.subscribe_to_order_book(pair, prec=prec, len=ob_len)
+#        logger.info('%s %s' % (prec,
+#                               ob.conn.socket.sock.sock.getpeername()[0]))
+#
     time.sleep(5)
 
-    q_snapshots = Queue()
-    q_unordered = Queue()
-    q_ordered = Queue()
+    try:
+        con = None
+        con = asyncio.get_event_loop().run_until_complete(
+            connect(dbname, user, f"'{pair}:BITFINEX'"))
+#    q_snapshots = Queue()
+#    q_unordered = Queue()
+#    q_ordered = Queue()
+#
+#    num_of_spreaders = 3
+#    q_spreader = Queue(num_of_spreaders)
 
-    num_of_spreaders = 3
-    q_spreader = Queue(num_of_spreaders)
+#    ts = [Process(target=TradeConverter(ob_R0.trades(pair), stop_flag,
+#                                        q_snapshots, q_unordered,
+#                                        log_queue)),
+#          Process(target=EventConverter(ob_R0.raw_books(pair), stop_flag,
+#          pair,
+#                                        dbname, user, q_snapshots, ob_len,
+#                                        q_unordered, log_queue)),
+#          Process(target=Orderer(q_unordered, q_ordered, stop_flag,
+#                                 log_queue,
+#                                 delay=2, log_level=logging.DEBUG)),
+#          Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag, pair,
+#                                     dbname, user, log_queue,
+#                                     log_level=logging.INFO)),
+#          ] + [Process(target=Spreader(n, q_spreader, dbname, user,
+#          stop_flag,
+#                                       log_queue, log_level=logging.INFO))
+#               for n in range(num_of_spreaders)] + [
+#                   Process(target=ConsEventConverter(ob.books(pair),
+#                                                     stop_flag, pair, dbname,
+#                                                     user, prec, ob_len,
+#                                                     log_queue,
+#                                                     log_level=logging.INFO))
+#                   for (prec, ob) in zip(precs, obs)]
+#
+#    for t in ts:
+#        t.start()
 
-    ts = [Process(target=TradeConverter(ob_R0.trades(pair), stop_flag,
-                                        q_snapshots, q_unordered,
-                                        log_queue)),
-          Process(target=EventConverter(ob_R0.raw_books(pair), stop_flag, pair,
-                                        dbname, user, q_snapshots, ob_len,
-                                        q_unordered, log_queue)),
-          Process(target=Orderer(q_unordered, q_ordered, stop_flag,
-                                 log_queue, delay=2)),
-          Process(target=Stockkeeper(q_ordered, q_spreader, stop_flag, pair,
-                                     dbname, user, log_queue,
-                                     log_level=logging.INFO)),
-          ] + [Process(target=Spreader(n, q_spreader, dbname, user, stop_flag,
-                                       log_queue, log_level=logging.INFO))
-               for n in range(num_of_spreaders)] + [
-                   Process(target=ConsEventConverter(ob.books(pair),
-                                                     stop_flag, pair, dbname,
-                                                     user, prec, ob_len,
-                                                     log_queue,
-                                                     log_level=logging.INFO))
-                   for (prec, ob) in zip(precs, obs)]
+        asyncio.get_event_loop().run_until_complete(
+            capture_trades(con,
+                           stop_flag,
+                           log_queue,
+                           pair,
+                           ob_R0.trades(pair)))
+    except Exception as e:
+        logger.error(e)
+    finally:
+        if con:
+            asyncio.get_event_loop().run_until_complete(con.close())
 
-    for t in ts:
-        t.start()
-
-    while not stop_flag.is_set():
-        time.sleep(1)
-
-    logger.info('Ctrl-C has been pressed, exiting from the application ...')
+    logger.info('Exiting from the application ...')
 
     ob_R0.unsubscribe_from_trades(pair)
-    ob_R0.unsubscribe_from_raw_order_book(pair)
 
-    for ob in obs:
-        ob.unsubscribe_from_order_book(pair)
+
+#    ob_R0.unsubscribe_from_raw_order_book(pair)
+#
+#    for ob in obs:
+#        ob.unsubscribe_from_order_book(pair)
 
     time.sleep(2)
 
-    ob_R0.stop()
-    for ob in obs:
-        ob.stop()
+#    ob_R0.stop()
+#    for ob in obs:
+#        ob.stop()
 ####
-    for t in ts:
-        pid = t.pid
-        t.join()
-        if t.exitcode:
-            logger.error('Process %i terminated, exitcode %i' %
-                         (pid, t.exitcode))
-        else:
-            logger.debug('Process %i terminated, exitcode %i' %
-                         (pid, t.exitcode))
-
+#    for t in ts:
+#        pid = t.pid
+#        t.join()
+#        if t.exitcode:
+#            logger.error('Process %i terminated, exitcode %i' %
+#                         (pid, t.exitcode))
+#        else:
+#            logger.debug('Process %i terminated, exitcode %i' %
+#                         (pid, t.exitcode))
+#
     logger.info("Exit")

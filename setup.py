@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 setup(
     name="obanalyticsdb",
-    version="0.1.1",
+    version="0.1.2",
     packages=find_packages('python'),
     package_dir={'': 'python'},
     entry_points={
@@ -13,7 +13,8 @@ setup(
         'psycopg2-binary',
         'websocket-client',
         'btfxwss',
-        'pusherclient'
+        'pusherclient',
+        'asyncpg'
     ],
 
 
