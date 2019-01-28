@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 10.5
--- Dumped by pg_dump version 10.5
+-- Dumped from database version 11.1
+-- Dumped by pg_dump version 11.1
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -57,7 +57,7 @@ ALTER TYPE bitfinex.raw_event_action OWNER TO "ob-analytics";
 --
 
 CREATE FUNCTION bitfinex._hidden_order_id(id bigint) RETURNS bigint
-    LANGUAGE sql STRICT 
+    LANGUAGE sql STRICT
     AS $$
 
 SELECT ('x'||md5(id::text||'hidden'))::bit(33)::bigint;
@@ -72,7 +72,7 @@ ALTER FUNCTION bitfinex._hidden_order_id(id bigint) OWNER TO "ob-analytics";
 --
 
 CREATE FUNCTION bitfinex._market_order_id(snapshot_id integer, episode_no integer, mo_id integer) RETURNS bigint
-    LANGUAGE sql STRICT 
+    LANGUAGE sql STRICT
     AS $$
 
 SELECT ('x'||md5(snapshot_id::text||episode_no::text||mo_id::text))::bit(33)::bigint;
@@ -87,7 +87,7 @@ ALTER FUNCTION bitfinex._market_order_id(snapshot_id integer, episode_no integer
 --
 
 CREATE FUNCTION bitfinex._revealed_order_id(order_id bigint, reincarnation bigint) RETURNS bigint
-    LANGUAGE sql STRICT 
+    LANGUAGE sql STRICT
     AS $$
 
 SELECT CASE WHEN reincarnation = 0 THEN order_id ELSE ('x'||md5(order_id::text||reincarnation::text||'revealed'))::bit(33)::bigint END;
@@ -2271,6 +2271,39 @@ CREATE VIEW bitfinex.bf_trades_v AS
 ALTER TABLE bitfinex.bf_trades_v OWNER TO "ob-analytics";
 
 --
+-- Name: pairs; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.pairs (
+    pair_id smallint NOT NULL,
+    pair text NOT NULL,
+    "R0" smallint,
+    "P0" smallint,
+    "P1" smallint,
+    "P2" smallint,
+    "P3" smallint
+);
+
+
+ALTER TABLE bitfinex.pairs OWNER TO "ob-analytics";
+
+--
+-- Name: transient_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.transient_trades (
+    id bigint NOT NULL,
+    qty numeric NOT NULL,
+    price numeric NOT NULL,
+    local_timestamp timestamp with time zone NOT NULL,
+    exchange_timestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL
+);
+
+
+ALTER TABLE bitfinex.transient_trades OWNER TO "ob-analytics";
+
+--
 -- Name: bf_snapshots snapshot_id; Type: DEFAULT; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -2323,6 +2356,14 @@ ALTER TABLE ONLY bitfinex.bf_spreads
 
 ALTER TABLE ONLY bitfinex.bf_trades
     ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (snapshot_id, id);
+
+
+--
+-- Name: pairs pairs_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.pairs
+    ADD CONSTRAINT pairs_pkey PRIMARY KEY (pair_id);
 
 
 --
