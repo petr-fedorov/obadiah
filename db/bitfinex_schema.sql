@@ -2288,6 +2288,39 @@ CREATE TABLE bitfinex.pairs (
 ALTER TABLE bitfinex.pairs OWNER TO "ob-analytics";
 
 --
+-- Name: subscriptions_for_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.subscriptions_for_trades (
+    first_exchange_timestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    channel_id integer NOT NULL,
+    subscribed_at_local_timestamp timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE bitfinex.subscriptions_for_trades OWNER TO "ob-analytics";
+
+--
+-- Name: transient_raw_book_events; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.transient_raw_book_events (
+    exchange_timestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    pair_id smallint NOT NULL,
+    local_timestamp timestamp with time zone NOT NULL,
+    channel_id integer NOT NULL,
+    subscribed_at_local_timestamp timestamp with time zone NOT NULL,
+    episode_timestamp timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE bitfinex.transient_raw_book_events OWNER TO "ob-analytics";
+
+--
 -- Name: transient_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -2297,7 +2330,9 @@ CREATE TABLE bitfinex.transient_trades (
     price numeric NOT NULL,
     local_timestamp timestamp with time zone NOT NULL,
     exchange_timestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL
+    pair_id smallint NOT NULL,
+    channel_id integer NOT NULL,
+    subscribed_at_local_timestamp timestamp with time zone NOT NULL
 );
 
 
@@ -2364,6 +2399,22 @@ ALTER TABLE ONLY bitfinex.bf_trades
 
 ALTER TABLE ONLY bitfinex.pairs
     ADD CONSTRAINT pairs_pkey PRIMARY KEY (pair_id);
+
+
+--
+-- Name: subscriptions_for_trades subscriptions_for_trades_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.subscriptions_for_trades
+    ADD CONSTRAINT subscriptions_for_trades_pkey PRIMARY KEY (pair_id, first_exchange_timestamp);
+
+
+--
+-- Name: subscriptions_for_trades subscriptions_for_trades_unique_channel; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.subscriptions_for_trades
+    ADD CONSTRAINT subscriptions_for_trades_unique_channel UNIQUE (channel_id, subscribed_at_local_timestamp);
 
 
 --
