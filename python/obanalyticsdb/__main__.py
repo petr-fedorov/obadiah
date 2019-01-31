@@ -7,6 +7,8 @@ import sys
 import obanalyticsdb.bitfinex as bf
 import obanalyticsdb.bitstamp as bs
 from obanalyticsdb.utils import listener_process, logging_configurer
+import asyncio
+import functools
 
 
 def main():
@@ -29,38 +31,71 @@ def main():
                         default="ob-analytics")
     args = parser.parse_args()
     stream = args.stream.split(':')
-    # We have to use the default context since BtfxWss uses it to create Queues
-    set_start_method('spawn')
+    if stream[1] == 'BITSTAMP':
+        set_start_method('spawn')
 
-    stop_flag = Event()
+        stop_flag = Event()
 
-    signal.signal(signal.SIGINT, lambda n, f: stop_flag.set())
+        signal.signal(signal.SIGINT, lambda n, f: stop_flag.set())
 
-    log_queue = Queue(-1)
-    listener = Process(target=listener_process,
-                       args=(log_queue, "./oba%s_%s_%s.log" %
-                             (tuple(stream) + (args.dbname.upper(),))))
-    listener.start()
+        log_queue = Queue(-1)
+        listener = Process(target=listener_process,
+                           args=(log_queue, "./oba%s_%s_%s.log" %
+                                 (tuple(stream) + (args.dbname.upper(),))))
+        listener.start()
 
-    logging_configurer(log_queue, logging.INFO)
-    logger = logging.getLogger("obanalyticsdb.main")
-    logger.info('Started')
+        logging_configurer(log_queue, logging.INFO)
+        logger = logging.getLogger("obanalyticsdb.main")
+        logger.info('Started')
 
-    exchanges = {'BITFINEX': bf.capture, 'BITSTAMP': bs.capture}
-    exitcode = 0
+        exchanges = {'BITFINEX': bf.capture, 'BITSTAMP': bs.capture}
+        exitcode = 0
 
-    try:
-        capture = exchanges[stream[1]]
+        try:
+            capture = exchanges[stream[1]]
+            print("Press Ctrl-C to stop ...")
+            exitcode = capture(stream[0], args.dbname, args.user, stop_flag,
+                               log_queue)
+        except KeyError as e:
+            logger.exception(e)
+
+        logger.info('Exit')
+        log_queue.put_nowait(None)
+        listener.join()
+
+    elif stream[1] == 'BITFINEX':
+
+        h = logging.handlers.RotatingFileHandler(
+            "./oba%s_%s_%s.log" % (tuple(stream) + (args.dbname.upper(),)),
+            'a', 2**24, 20)
+        logging.basicConfig(format='%(asctime)s %(process)-6d %(name)s '
+                            '%(levelname)-8s %(message)s',
+                            handlers=[h], level=logging.INFO)
+
+        logger = logging.getLogger("obanalyticsdb.main")
+
+        task = asyncio.ensure_future(bf.capture(stream[0],
+                                                args.user,
+                                                args.dbname))
+        loop = asyncio.get_event_loop()
+        #  loop.set_debug(True)
+        loop.add_signal_handler(getattr(signal, 'SIGINT'),
+                                functools.partial(
+                                    lambda task: task.cancel(), task))
+
         print("Press Ctrl-C to stop ...")
-        exitcode = capture(stream[0], args.dbname, args.user, stop_flag,
-                           log_queue)
-    except KeyError as e:
-        logger.exception(e)
+        try:
+            asyncio.get_event_loop().run_until_complete(task)
+        except asyncio.CancelledError:
+            logger.info('Cancelled, exiting ...')
+        except Exception as e:
+            logger.error(e)
+            exitcode = 1
+        exitcode = 0
+    else:
         print('Exchange %s is not supported (yet)' % stream[1])
+        exitcode = 1
 
-    logger.info('Exit')
-    log_queue.put_nowait(None)
-    listener.join()
     sys.exit(exitcode)
 
 

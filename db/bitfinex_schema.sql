@@ -2271,35 +2271,69 @@ CREATE VIEW bitfinex.bf_trades_v AS
 ALTER TABLE bitfinex.bf_trades_v OWNER TO "ob-analytics";
 
 --
--- Name: pairs; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+-- Name: trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE TABLE bitfinex.pairs (
+CREATE TABLE bitfinex.trades (
+    dir character(1) NOT NULL,
+    episode_timestamp timestamp with time zone NOT NULL,
+    a_order_id bigint,
+    r_order_id bigint,
+    price numeric NOT NULL,
+    qty numeric NOT NULL,
+    exchange_timestamp timestamp with time zone NOT NULL,
+    trade_id bigint NOT NULL,
     pair_id smallint NOT NULL,
-    pair text NOT NULL,
-    "R0" smallint,
-    "P0" smallint,
-    "P1" smallint,
-    "P2" smallint,
-    "P3" smallint
-);
+    local_timestamp timestamp with time zone
+)
+PARTITION BY LIST (dir);
 
 
-ALTER TABLE bitfinex.pairs OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.trades OWNER TO "ob-analytics";
 
 --
--- Name: subscriptions_for_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+-- Name: trades_b; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE TABLE bitfinex.subscriptions_for_trades (
-    first_exchange_timestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    channel_id integer NOT NULL,
-    subscribed_at_local_timestamp timestamp with time zone NOT NULL
-);
+CREATE TABLE bitfinex.trades_b PARTITION OF bitfinex.trades
+FOR VALUES IN ('B')
+PARTITION BY LIST (pair_id);
 
 
-ALTER TABLE bitfinex.subscriptions_for_trades OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.trades_b OWNER TO "ob-analytics";
+
+--
+-- Name: trades_b_001; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.trades_b_001 PARTITION OF bitfinex.trades_b
+FOR VALUES IN ('1')
+PARTITION BY RANGE (episode_timestamp);
+
+
+ALTER TABLE bitfinex.trades_b_001 OWNER TO "ob-analytics";
+
+--
+-- Name: trades_s; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.trades_s PARTITION OF bitfinex.trades
+FOR VALUES IN ('S')
+PARTITION BY LIST (pair_id);
+
+
+ALTER TABLE bitfinex.trades_s OWNER TO "ob-analytics";
+
+--
+-- Name: trades_s_001; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.trades_s_001 PARTITION OF bitfinex.trades_s
+FOR VALUES IN ('1')
+PARTITION BY RANGE (episode_timestamp);
+
+
+ALTER TABLE bitfinex.trades_s_001 OWNER TO "ob-analytics";
 
 --
 -- Name: transient_raw_book_events; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
@@ -2313,7 +2347,6 @@ CREATE TABLE bitfinex.transient_raw_book_events (
     pair_id smallint NOT NULL,
     local_timestamp timestamp with time zone NOT NULL,
     channel_id integer NOT NULL,
-    subscribed_at_local_timestamp timestamp with time zone NOT NULL,
     episode_timestamp timestamp with time zone NOT NULL
 );
 
@@ -2331,8 +2364,7 @@ CREATE TABLE bitfinex.transient_trades (
     local_timestamp timestamp with time zone NOT NULL,
     exchange_timestamp timestamp with time zone NOT NULL,
     pair_id smallint NOT NULL,
-    channel_id integer NOT NULL,
-    subscribed_at_local_timestamp timestamp with time zone NOT NULL
+    channel_id integer NOT NULL
 );
 
 
@@ -2391,30 +2423,6 @@ ALTER TABLE ONLY bitfinex.bf_spreads
 
 ALTER TABLE ONLY bitfinex.bf_trades
     ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (snapshot_id, id);
-
-
---
--- Name: pairs pairs_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitfinex.pairs
-    ADD CONSTRAINT pairs_pkey PRIMARY KEY (pair_id);
-
-
---
--- Name: subscriptions_for_trades subscriptions_for_trades_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitfinex.subscriptions_for_trades
-    ADD CONSTRAINT subscriptions_for_trades_pkey PRIMARY KEY (pair_id, first_exchange_timestamp);
-
-
---
--- Name: subscriptions_for_trades subscriptions_for_trades_unique_channel; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
---
-
-ALTER TABLE ONLY bitfinex.subscriptions_for_trades
-    ADD CONSTRAINT subscriptions_for_trades_unique_channel UNIQUE (channel_id, subscribed_at_local_timestamp);
 
 
 --
