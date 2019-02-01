@@ -1617,6 +1617,7 @@ CREATE FUNCTION bitstamp.oba_depth(p_start_time timestamp with time zone, p_end_
 	select microtimestamp, price, volume, side::text
 	from time_range join bitstamp.depth using (pair_id) join lateral ( select price, volume, side from unnest(depth.depth_change) ) d on true
 	where microtimestamp between start_time and p_end_time 
+	  and microtimestamp >= p_start_time -- otherwise, the query optimizer produces a crazy plan!
 	  and price is not null;   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
 	  							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
 								-- 'not null' constraint is to be added to price and depth_change columns of bitstamp.depth table. Then this check
