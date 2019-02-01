@@ -2228,16 +2228,18 @@ begin
 	begin		
 		loop
 			
-			return query 
-				update bitstamp.live_orders
-				set microtimestamp = next_microtimestamp
-				where microtimestamp between v_start and v_end
-				  and ( fill > 0 or fill is null )
-				  and trade_id is null	-- this event should has been matched to some trade but couldn't
-				  and next_microtimestamp > '-infinity'
-				  and next_microtimestamp < microtimestamp
-				  and pair_id = v_pair_id
-				returning *;
+			return query with upd as (
+					update bitstamp.live_orders
+					set microtimestamp = next_microtimestamp
+					where microtimestamp between v_start and v_end
+					  and ( fill > 0 or fill is null )
+					  and trade_id is null	-- this event should has been matched to some trade but couldn't
+					  and next_microtimestamp > '-infinity'
+					  and next_microtimestamp < microtimestamp
+					  and pair_id = v_pair_id
+					returning * 
+					)
+					select * from upd;	-- workaround of bug: live_orders is a partitioned table 
 			get diagnostics rows_processed := row_count;
 			if found then
 				raise debug 'pga_cleanse(%) moved backwards (to earlier next_mcirotimestamp)  %', p_pair, rows_processed;
@@ -2257,17 +2259,20 @@ begin
 						  and pair_id = v_pair_id
 					) a 
 					where microtimestamp < max_microtimestamp 
+				),
+				upd as (
+					update bitstamp.live_orders
+					set microtimestamp = max_microtimestamp
+					from to_be_moved_forward
+					where live_orders.microtimestamp between v_start and v_end
+					  and trade_id is null	-- this event should has been matched to some trade but couldn't
+					  and live_orders.microtimestamp = to_be_moved_forward.microtimestamp
+					  and live_orders.order_id = to_be_moved_forward.order_id
+					  and live_orders.event_no = to_be_moved_forward.event_no
+					  and pair_id = v_pair_id
+					returning live_orders.*
 				)
-				update bitstamp.live_orders
-				set microtimestamp = max_microtimestamp
-				from to_be_moved_forward
-				where live_orders.microtimestamp between v_start and v_end
-				  and trade_id is null	-- this event should has been matched to some trade but couldn't
-				  and live_orders.microtimestamp = to_be_moved_forward.microtimestamp
-				  and live_orders.order_id = to_be_moved_forward.order_id
-				  and live_orders.event_no = to_be_moved_forward.event_no
-				  and pair_id = v_pair_id
-				returning live_orders.*;
+				select * from upd; -- workaround of bug: live_orders is a partitioned table 
 			get diagnostics rows_processed := row_count;			  
 			if found then
 				raise debug 'pga_cleanse(%) moved forward (to max_microtimestamap)  %', p_pair,  rows_processed;
