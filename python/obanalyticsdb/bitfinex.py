@@ -1,5 +1,6 @@
 import asyncio
 import asyncpg
+import aiohttp
 import websockets
 import logging
 import json
@@ -125,7 +126,7 @@ class BitfinexMessageHandler:
 
 
 async def capture(pair, user, database):
-    logger = logging.getLogger("run")
+    logger = logging.getLogger("capture")
     logger.info(f'Started {pair}, {user}, {database}')
 
     con = await asyncpg.connect(user=user, database=database)
@@ -156,3 +157,40 @@ async def capture(pair, user, database):
         except Exception as e:
             logger.error(e)
             raise
+
+
+async def monitor(user, database):
+
+    logger = logging.getLogger("monitor")
+    logger.info(f'Started {user}, {database}')
+
+    con = await asyncpg.connect(user=user, database=database)
+    await con.execute(f"set application_name to 'BITFINEX'")
+
+    logger.info('Connecting to Bitfinex ...')
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get('https://api.bitfinex.com/v1/'
+                                       'symbols_details') as resp:
+                    details = json.loads(await resp.text())
+                    for d in details:
+                        if await con.fetchval('select * from bitfinex.'
+                                              'update_symbol_details($1, $2, '
+                                              '$3, $4, $5, $6, $7, $8)',
+                                              d['pair'],
+                                              d['price_precision'],
+                                              d['initial_margin'],
+                                              d['minimum_margin'],
+                                              d['maximum_order_size'],
+                                              d['minimum_order_size'],
+                                              d['expiration'],
+                                              d['margin']):
+                            logger.info('Updated %s', d)
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                logger.info('Cancelled, exiting ...')
+                raise
+            except Exception as e:
+                logger.error(e)
+                raise

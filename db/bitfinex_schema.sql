@@ -1879,6 +1879,52 @@ $$;
 ALTER FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer, OUT event_no smallint, OUT id bigint) OWNER TO "ob-analytics";
 
 --
+-- Name: update_symbol_details(text, smallint, numeric, numeric, numeric, numeric, text, boolean); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.update_symbol_details(p_pair text, p_price_precision smallint, p_initial_margin numeric, p_minimum_margin numeric, p_maximum_order_size numeric, p_minimum_order_size numeric, p_expiration text, p_margin boolean) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+
+declare
+	v_pair_id smallint;
+begin
+
+	select pair_id into v_pair_id
+	from obanalytics.pairs
+	where pair = upper(p_pair);
+	
+	if v_pair_id is not null then
+		if exists (select 1 from bitfinex.symbol_details where pair_id = v_pair_id ) then 
+			insert into bitfinex.symbol_details (pair_id, price_precision, initial_margin,minimum_margin,maximum_order_size,minimum_order_size,expiration,margin,known_since)					
+			select v_pair_id, p_price_precision, p_initial_margin,p_minimum_margin,p_maximum_order_size,p_minimum_order_size,p_expiration,p_margin,current_timestamp
+			from bitfinex.symbol_details
+			 where pair_id = v_pair_id and 
+			 known_since = (select max(known_since) from bitfinex.symbol_details where pair_id = v_pair_id ) and
+			 (	price_precision <> p_price_precision or
+				initial_margin <> p_initial_margin or
+				minimum_margin <> p_minimum_margin or
+				maximum_order_size <> p_maximum_order_size or
+				minimum_order_size <> p_minimum_order_size or
+				expiration <> p_expiration or
+				margin <> p_margin 
+			 );
+			 return found;
+		else
+			insert into bitfinex.symbol_details (pair_id, price_precision, initial_margin,minimum_margin,maximum_order_size,minimum_order_size,expiration,margin,known_since)					
+			values(v_pair_id, p_price_precision, p_initial_margin,p_minimum_margin,p_maximum_order_size,p_minimum_order_size,p_expiration,p_margin,current_timestamp);
+			return true;
+		end if;
+	else
+		return false;
+	end if;
+end;
+$$;
+
+
+ALTER FUNCTION bitfinex.update_symbol_details(p_pair text, p_price_precision smallint, p_initial_margin numeric, p_minimum_margin numeric, p_maximum_order_size numeric, p_minimum_order_size numeric, p_expiration text, p_margin boolean) OWNER TO "ob-analytics";
+
+--
 -- Name: bf_active_orders_between_episodes_v; Type: VIEW; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -2271,6 +2317,26 @@ CREATE VIEW bitfinex.bf_trades_v AS
 ALTER TABLE bitfinex.bf_trades_v OWNER TO "ob-analytics";
 
 --
+
+--
+-- Name: symbol_details; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE TABLE bitfinex.symbol_details (
+    pair_id smallint NOT NULL,
+    price_precision smallint NOT NULL,
+    initial_margin numeric NOT NULL,
+    minimum_margin numeric NOT NULL,
+    maximum_order_size numeric NOT NULL,
+    minimum_order_size numeric NOT NULL,
+    expiration text NOT NULL,
+    margin boolean NOT NULL,
+    known_since timestamp with time zone NOT NULL
+);
+
+
+ALTER TABLE bitfinex.symbol_details OWNER TO "ob-analytics";
+
 -- Name: trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -2423,6 +2489,14 @@ ALTER TABLE ONLY bitfinex.bf_spreads
 
 ALTER TABLE ONLY bitfinex.bf_trades
     ADD CONSTRAINT bf_trades_pkey PRIMARY KEY (snapshot_id, id);
+
+
+--
+-- Name: symbol_details symbol_details_pkey; Type: CONSTRAINT; Schema: bitfinex; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY bitfinex.symbol_details
+    ADD CONSTRAINT symbol_details_pkey PRIMARY KEY (pair_id, known_since);
 
 
 --

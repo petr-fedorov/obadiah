@@ -14,7 +14,10 @@ setup(
         'psycopg2-binary',
         'pusherclient',
         'websockets',
-        'asyncpg'
+        'asyncpg',
+        'aiohttp',
+        'cchardet',
+        'aiodns'
     ],
 
 
