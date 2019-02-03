@@ -29,7 +29,7 @@ class BitfinexBookDataHandler:
         rts = datetime.fromtimestamp(rts/1000)
 
         if isinstance(data[0][0], list):
-            episode_data = [(d, rts) for d in data[0]]
+            episode_data = [(d, rts, lts) for d in data[0]]
             is_episode_completed = True
             self.episode_rts = rts
             self.logger.info('%s %s', rts, data[0])
@@ -46,11 +46,11 @@ class BitfinexBookDataHandler:
             else:
                 self.is_episode_started = True
 
-            self.accumulated_data.append((data, rts))
+            self.accumulated_data.append((data, rts, lts))
 
         if is_episode_completed:
             records = [(rts, d[0], d[1], d[2], self.pair_id, lts, self.chanId,
-                        self.episode_rts) for d, rts in episode_data]
+                        self.episode_rts) for d, rts, lts in episode_data]
             await self.con.copy_records_to_table(self.table,
                                                  records=records,
                                                  schema_name='bitfinex',
@@ -193,4 +193,3 @@ async def monitor(user, database):
                 raise
             except Exception as e:
                 logger.error(e)
-                raise
