@@ -16,17 +16,13 @@ SET client_min_messages = warning;
 SET row_security = off;
 
 --
--- Data for Name: pairs; Type: TABLE DATA; Schema: bitstamp; Owner: ob-analytics
+-- Data for Name: exchanges; Type: TABLE DATA; Schema: obanalytics; Owner: ob-analytics
 --
 
-COPY bitstamp.pairs (pair_id, pair, "R0") FROM stdin;
-1	BTCUSD	2
-2	LTCUSD	2
-3	ETHUSD	2
-4	XRPUSD	2
-5	BCHUSD	2
-6	BTCEUR	2
-7	ETHBTC	8
+COPY obanalytics.exchanges (exchange_id, exchange) FROM stdin;
+1	bitfinex
+2	bitstamp
+3	coinbase
 \.
 
 

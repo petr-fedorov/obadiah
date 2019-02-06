@@ -19,13 +19,14 @@ SET row_security = off;
 -- Data for Name: pairs; Type: TABLE DATA; Schema: obanalytics; Owner: ob-analytics
 --
 
-COPY obanalytics.pairs (pair_id, pair, "R0", "P0", "P1", "P2", "P3") FROM stdin;
-1	BTCUSD	2	\N	\N	\N	\N
-2	LTCUSD	2	\N	\N	\N	\N
-3	ETHUSD	2	\N	\N	\N	\N
-4	XRPUSD	2	\N	\N	\N	\N
-5	BCHUSD	2	\N	\N	\N	\N
-6	BTCEUR	2	\N	\N	\N	\N
+COPY obanalytics.pairs (pair_id, pair, "R0", "P0", "P1", "P2", "P3", fmu) FROM stdin;
+2	LTCUSD	2	\N	\N	\N	\N	8
+1	BTCUSD	2	\N	\N	\N	\N	8
+4	XRPUSD	2	\N	\N	\N	\N	12
+3	ETHUSD	2	\N	\N	\N	\N	18
+6	BTCEUR	2	\N	\N	\N	\N	8
+5	BCHUSD	2	\N	\N	\N	\N	8
+7	ETHBTC	8	\N	\N	\N	\N	18
 \.
 
 
