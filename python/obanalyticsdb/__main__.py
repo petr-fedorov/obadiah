@@ -75,8 +75,8 @@ def main():
         elif stream[1] == 'BITFINEX':
 
             h = logging.handlers.RotatingFileHandler(
-                "./oba%s_%s_%s.log" % (
-                    tuple(stream) + (args.dbname.upper(),)), 'a', 2**24, 20)
+                "./oba%s_%s.log" % ('_'.join(stream), args.dbname.upper(),),
+                'a', 2**24, 20)
             logging.basicConfig(format='%(asctime)s %(process)-6d %(name)s '
                                 '%(levelname)-8s %(message)s',
                                 handlers=[h], level=logging.INFO)
