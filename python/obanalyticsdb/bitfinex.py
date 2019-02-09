@@ -151,6 +151,7 @@ async def capture(pair, user, database):
 
         except websockets.ConnectionClosed as e:
             logger.error(e)
+            # don't exit, re-connect
         except asyncio.CancelledError:
             logger.info('Cancelled, exiting ...')
             raise

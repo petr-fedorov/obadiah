@@ -25,10 +25,10 @@ CREATE SCHEMA obanalytics;
 ALTER SCHEMA obanalytics OWNER TO "ob-analytics";
 
 --
--- Name: level3_record; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+-- Name: level3_order_book_record; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TYPE obanalytics.level3_record AS (
+CREATE TYPE obanalytics.level3_order_book_record AS (
 	ts timestamp with time zone,
 	price numeric,
 	amount numeric,
@@ -43,11 +43,47 @@ CREATE TYPE obanalytics.level3_record AS (
 );
 
 
-ALTER TYPE obanalytics.level3_record OWNER TO "ob-analytics";
+ALTER TYPE obanalytics.level3_order_book_record OWNER TO "ob-analytics";
 
 SET default_tablespace = '';
 
 SET default_with_oids = false;
+
+--
+-- Name: level3; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no smallint NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no smallint,
+    trade_id bigint,
+    pair_id smallint NOT NULL,
+    exchange_id smallint NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no smallint,
+    exchange_microtimestamp timestamp with time zone,
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+PARTITION BY LIST (exchange_id);
+
+
+ALTER TABLE obanalytics.level3 OWNER TO "ob-analytics";
+
+--
+-- Name: COLUMN level3.exchange_microtimestamp; Type: COMMENT; Schema: obanalytics; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN obanalytics.level3.exchange_microtimestamp IS 'An microtimestamp of an event as asigned by an exchange. Not null if different from ''microtimestamp''';
+
 
 --
 -- Name: matches; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -336,6 +372,14 @@ begin
 	i := i+1;
 	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_enabled = TRUE,  autovacuum_vacuum_scale_factor= 0.0 , '||
 		'autovacuum_analyze_scale_factor = 0.0 ,  autovacuum_analyze_threshold = 10000, autovacuum_vacuum_threshold = 10000)';
+	
+	i := i+1;
+	v_statements[i] := 'create trigger ba_incorporate_new_event before insert on '||V_SCHEMA||v_table_name||
+		' for each row execute procedure obanalytics.level3_incorporate_new_event()';
+
+	i := i+1;
+	v_statements[i] := 'create trigger bz_save_exchange_microtimestamp before update of microtimestamp on '||V_SCHEMA||v_table_name||
+		' for each row execute procedure obanalytics.level3_save_exchange_microtimestamp()';
 
 	
 							
@@ -476,6 +520,160 @@ $$;
 ALTER FUNCTION obanalytics.create_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
 
 --
+-- Name: level3_incorporate_new_event(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level3_incorporate_new_event() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+
+declare
+	v_era timestamptz;
+	v_amount numeric;
+	
+	v_event obanalytics.level3;
+	
+begin
+
+	select max(era) into v_era
+	from obanalytics.level3_eras
+	where pair_id = new.pair_id
+	  and era <= new.microtimestamp;
+	  
+	if new.price_microtimestamp is null or new.event_no is null or new.price = 0 then 
+	-- The values of the above two columns depend on the previous event for the order_id if any and are mandatory (not null). 
+	-- They have be set by either by an inserter of the record (more effective) or here
+	
+		update obanalytics.level3
+		   set next_microtimestamp = new.microtimestamp,
+			   next_event_no = event_no + 1
+		where exchange_id = new.exchange_id
+		  and pair_id = new.pair_id
+		  and microtimestamp between v_era and new.microtimestamp
+		  and order_id = new.order_id 
+		  and side = new.side
+		  and next_microtimestamp > new.microtimestamp
+		returning *
+		into v_event;
+		-- amount, next_event_no INTO v_amount, NEW.event_no;
+
+		if found then
+		
+			if new.price = 0 then 
+				new.price = v_event.price;
+				new.amount = v_event.amount;
+				new.fill = null;
+			else
+				new.fill := v_event.amount - new.amount; 
+			end if;
+
+			new.event_no := v_event.next_event_no;
+
+			if v_event.price = new.price THEN 
+				new.price_microtimestamp := v_event.price_microtimestamp;
+				new.price_event_no := v_event.price_event_no;
+			else	
+				new.price_microtimestamp := new.microtimestamp;
+				new.price_event_no := new.event_no;
+			end if;
+
+		else -- it is the first event for order_id (or first after the latest 'deletion' )
+			-- new.fill will remain null. Might set it later from matched trade, if any
+			if new.price > 0 then 
+				new.price_microtimestamp := new.microtimestamp;
+				new.price_event_no := 1;
+				new.event_no := 1;
+			else
+				return null;	-- skip insertion
+			end if;
+		end if;
+		
+	end if;
+	return new;
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics.level3_incorporate_new_event() OWNER TO "ob-analytics";
+
+--
+-- Name: level3_order_book(timestamp with time zone, smallint, smallint, boolean, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id smallint, p_exchange_id smallint, p_only_makers boolean, p_before boolean) RETURNS SETOF obanalytics.level3_order_book_record
+    LANGUAGE sql STABLE
+    AS $$
+
+	with episode as (
+			select microtimestamp as e, pair_id, (select max(era) from obanalytics.level3_eras where era <= p_ts and pair_id = p_pair_id ) as s, exchange_id
+			from obanalytics.level3
+			where microtimestamp >= (select max(era) from obanalytics.level3_eras where era <= p_ts and pair_id = p_pair_id )
+			  and ( microtimestamp < p_ts or ( microtimestamp = p_ts and not p_before ) )
+		      and pair_id = p_pair_id
+			  and exchange_id = p_exchange_id
+			order by microtimestamp desc
+			limit 1
+		), 
+		orders as (
+			select *, 
+					coalesce(
+						case side 
+							when 'b' then price < min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+							when 's' then price > max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+						end,
+					true )	-- if there are only 'b' or 's' orders in the order book at some moment in time, then all of them are makers
+					as is_maker
+			from obanalytics.level3 join episode using (exchange_id, pair_id)
+			where microtimestamp between episode.s and episode.e
+			  and pair_id = p_pair_id				-- redundant, but will help query optimizer with partition elimination
+			  and exchange_id = p_exchange_id		-- redundant, but will help query optimizer with partition elimination
+			  and next_microtimestamp > episode.e
+		)
+	select e,
+			price,
+			amount,
+			side,
+			is_maker,
+			microtimestamp,
+			order_id,
+			event_no,
+			price_microtimestamp, 	
+			pair_id,
+			exchange_id
+    from orders
+	where is_maker OR NOT p_only_makers
+	order by microtimestamp, order_id, event_no;	-- order by must be the same as in spread_after_episode. Change both!
+
+$$;
+
+
+ALTER FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id smallint, p_exchange_id smallint, p_only_makers boolean, p_before boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: level3_save_exchange_microtimestamp(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level3_save_exchange_microtimestamp() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ 
+begin
+	-- It is assumed that the first-ever value of microtimestamp column is set by an exchange.
+	-- If it is changed for the first time, then save it to exchange_microtimestamp.
+	if old.exchange_microtimestamp is null then
+		if old.microtimestamp is distinct from new.microtimestamp then
+			new.exchange_microtimestamp := old.microtimestamp;
+		end if;
+	end if;		
+end;
+	
+
+$$;
+
+
+ALTER FUNCTION obanalytics.level3_save_exchange_microtimestamp() OWNER TO "ob-analytics";
+
+--
 -- Name: exchanges; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -486,42 +684,6 @@ CREATE TABLE obanalytics.exchanges (
 
 
 ALTER TABLE obanalytics.exchanges OWNER TO "ob-analytics";
-
---
--- Name: level3; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level3 (
-    microtimestamp timestamp with time zone NOT NULL,
-    order_id bigint NOT NULL,
-    event_no smallint NOT NULL,
-    side character(1) NOT NULL,
-    price numeric NOT NULL,
-    amount numeric NOT NULL,
-    fill numeric,
-    next_microtimestamp timestamp with time zone NOT NULL,
-    next_event_no smallint,
-    trade_id bigint,
-    pair_id smallint NOT NULL,
-    exchange_id smallint NOT NULL,
-    local_timestamp timestamp with time zone,
-    price_microtimestamp timestamp with time zone NOT NULL,
-    price_event_no smallint,
-    exchange_microtimestamp timestamp with time zone,
-    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
-)
-PARTITION BY LIST (exchange_id);
-
-
-ALTER TABLE obanalytics.level3 OWNER TO "ob-analytics";
-
---
--- Name: COLUMN level3.exchange_microtimestamp; Type: COMMENT; Schema: obanalytics; Owner: ob-analytics
---
-
-COMMENT ON COLUMN obanalytics.level3.exchange_microtimestamp IS 'An microtimestamp of an event as asigned by an exchange. Not null if different from ''microtimestamp''';
-
 
 --
 -- Name: level3_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -1308,6 +1470,62 @@ ALTER TABLE ONLY obanalytics.matches_02001201901
 
 ALTER TABLE ONLY obanalytics.pairs
     ADD CONSTRAINT pairs_pkey PRIMARY KEY (pair_id);
+
+
+--
+-- Name: level3_01b001201901 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01b001201901 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01s001201901 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01s001201901 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01b001201902 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01b001201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01s001201902 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01s001201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01b001201901 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01b001201901 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01s001201901 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01s001201901 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01b001201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01b001201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01s001201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01s001201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_save_exchange_microtimestamp();
 
 
 --
