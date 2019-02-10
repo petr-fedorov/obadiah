@@ -70,6 +70,7 @@ CREATE TABLE obanalytics.level3 (
     price_microtimestamp timestamp with time zone NOT NULL,
     price_event_no smallint,
     exchange_microtimestamp timestamp with time zone,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
     CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
 )
@@ -538,25 +539,29 @@ begin
 	select max(era) into v_era
 	from obanalytics.level3_eras
 	where pair_id = new.pair_id
+	  and exchange_id = new.exchange_id
 	  and era <= new.microtimestamp;
 	  
 	if new.price_microtimestamp is null or new.event_no is null or new.price = 0 then 
 	-- The values of the above two columns depend on the previous event for the order_id if any and are mandatory (not null). 
 	-- They have be set by either by an inserter of the record (more effective) or here
-	
-		update obanalytics.level3
-		   set next_microtimestamp = new.microtimestamp,
-			   next_event_no = event_no + 1
-		where exchange_id = new.exchange_id
-		  and pair_id = new.pair_id
-		  and microtimestamp between v_era and new.microtimestamp
-		  and order_id = new.order_id 
-		  and side = new.side
-		  and next_microtimestamp > new.microtimestamp
-		returning *
-		into v_event;
-		-- amount, next_event_no INTO v_amount, NEW.event_no;
-
+		begin
+			update obanalytics.level3
+			   set next_microtimestamp = new.microtimestamp,
+				   next_event_no = event_no + 1
+			where exchange_id = new.exchange_id
+			  and pair_id = new.pair_id
+			  and microtimestamp between v_era and new.microtimestamp
+			  and order_id = new.order_id 
+			  and side = new.side
+			  and next_microtimestamp > new.microtimestamp
+			returning *
+			into v_event;
+			-- amount, next_event_no INTO v_amount, NEW.event_no;
+		exception 
+			when too_many_rows then
+				raise exception 'too many rows for %, %, %', new.microtimestamp, new.order_id, new.event_no;
+		end;
 		if found then
 		
 			if new.price = 0 then 
