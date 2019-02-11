@@ -535,17 +535,18 @@ declare
 	v_event obanalytics.level3;
 	
 begin
-
-	select max(era) into v_era
-	from obanalytics.level3_eras
-	where pair_id = new.pair_id
-	  and exchange_id = new.exchange_id
-	  and era <= new.microtimestamp;
 	  
-	if new.price_microtimestamp is null or new.event_no is null or new.price = 0 then 
+	if new.price_microtimestamp is null or new.event_no is null then 
+		raise notice 'will do %, %', new.microtimestamp, new.order_id;
 	-- The values of the above two columns depend on the previous event for the order_id if any and are mandatory (not null). 
-	-- They have be set by either by an inserter of the record (more effective) or here
+	-- They have to be set by either an inserter of the record (more effective) or by this trigger
 		begin
+			select max(era) into v_era
+			from obanalytics.level3_eras
+			where pair_id = new.pair_id
+			  and exchange_id = new.exchange_id
+			  and era <= new.microtimestamp;
+		
 			update obanalytics.level3
 			   set next_microtimestamp = new.microtimestamp,
 				   next_event_no = event_no + 1
