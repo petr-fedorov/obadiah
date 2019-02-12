@@ -7,6 +7,10 @@ import json
 from datetime import datetime
 
 
+class DuplicatedChannel(Exception):
+    pass
+
+
 class BitfinexBookDataHandler:
     def __init__(self, con, pair_id, message):
         self.chanId = message['chanId']
@@ -75,8 +79,9 @@ class BitfinexTradeDataHandler:
         elif data[0] == 'te' or data[0] == 'hb':
             data = []
         else:
+            # initial snapshot of trades
             self.logger.info(data)
-            return
+            data = data[0]
         for d in data:
             await self.con.execute('''
                                    insert into bitfinex.transient_trades
@@ -116,6 +121,14 @@ class BitfinexMessageHandler:
     async def subscribed(self, lts, message):
         self.logger.info(message)
         if message['channel'] == 'book':
+            if await self.con.fetchval('''
+                   select exists (select 1
+                                  from bitfinex.transient_raw_book_events
+                                  where channel_id = $1 limit 1)''',
+                                       message['chanId']):
+                self.logger.info('Duplicated channel %i', message['chanId'])
+                raise DuplicatedChannel
+            self.logger.info('Unique channel %i', message['chanId'])
             handler = BitfinexBookDataHandler(self.con, self.pair_id, message)
         elif message['channel'] == 'trades':
             handler = BitfinexTradeDataHandler(self.con, self.pair_id, message)
@@ -132,18 +145,19 @@ async def capture(pair, user, database):
     con = await asyncpg.connect(user=user, database=database)
     pair_id = await con.fetchval(''' select pair_id from obanalytics.pairs
                                 where pair = $1 ''', pair)
-    await con.execute(f"set application_name to '{pair}:BITFINEX'")
+    await con.execute(f"set application_name to 'BITFINEX:{pair}'")
 
     while True:
         try:
             logger.info('Connecting to Bitfinex ...')
-            async with websockets.connect("wss://api.bitfinex.com/ws/2") as ws:
+            async with websockets.connect("wss://api.bitfinex.com/ws/2",
+                                          max_queue=1024) as ws:
                 await ws.send(json.dumps({'event': 'conf', 'flags': 32768}))
                 handler = BitfinexMessageHandler(ws, pair, pair_id, con)
                 async for message in ws:
                     lts = datetime.now()
                     message = json.loads(message)
-                    #  logger.debug(message)
+                    logger.debug(message)
                     if isinstance(message, dict):
                         await getattr(handler, message['event'])(lts, message)
                     else:
@@ -152,6 +166,8 @@ async def capture(pair, user, database):
         except websockets.ConnectionClosed as e:
             logger.error(e)
             # don't exit, re-connect
+        except DuplicatedChannel:
+            pass
         except asyncio.CancelledError:
             logger.info('Cancelled, exiting ...')
             raise
