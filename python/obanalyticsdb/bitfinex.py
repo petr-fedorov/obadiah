@@ -12,9 +12,13 @@ class DuplicatedChannel(Exception):
 
 
 class BitfinexBookDataHandler:
+    # Will send to Postgres using COPY only this number of events or more
+    MIN_SAVE_COUNT = 1000
+
     def __init__(self, con, pair_id, message):
         self.chanId = message['chanId']
         self.logger = logging.getLogger(__name__ + ".bookdatahandler")
+        #  self.logger.setLevel(logging.DEBUG)
         self.pair_id = pair_id
         self.con = con
 
@@ -25,6 +29,7 @@ class BitfinexBookDataHandler:
         self.columns = ['exchange_timestamp', 'order_id', 'price', 'amount',
                         'pair_id', 'local_timestamp', 'channel_id',
                         'episode_timestamp', 'bl']
+        self.records = []
 
     async def data(self, lts, data, bl):
         data = data[1:]
@@ -53,18 +58,45 @@ class BitfinexBookDataHandler:
             self.accumulated_data.append((data, rts, lts, bl))
 
         if is_episode_completed:
-            records = [(rts, d[0], d[1], d[2], self.pair_id, lts, self.chanId,
-                        self.episode_rts, bl)
-                       for d, rts, lts, bl in episode_data]
-            await self.con.copy_records_to_table(self.table,
-                                                 records=records,
-                                                 schema_name='bitfinex',
-                                                 columns=self.columns)
-            self.logger.debug(records)
+            self.records = self.records + [(rts, d[0], d[1], d[2],
+                                            self.pair_id, lts, self.chanId,
+                                            self.episode_rts, bl)
+                                           for d, rts, lts, bl in episode_data]
+            reccount = len(self.records)
+            if reccount > BitfinexBookDataHandler.MIN_SAVE_COUNT:
+                await self.con.copy_records_to_table(self.table,
+                                                     records=self.records,
+                                                     schema_name='bitfinex',
+                                                     columns=self.columns)
+                self.logger.debug('Saved %i raw book events: %s - %s',
+                                  reccount, self.records[0][0],
+                                  self.records[-1][0])
+                self.records = []
+            else:
+                self.logger.debug('Accumulated an episode to be saved with %i '
+                                  'raw book events ...', reccount)
             is_episode_completed = False
 
         if rts > self.episode_rts:
             self.episode_rts = rts
+
+    async def close(self):
+        reccount = len(self.records)
+        if reccount:
+
+            await self.con.copy_records_to_table(self.table,
+                                                 records=self.records,
+                                                 schema_name='bitfinex',
+                                                 columns=self.columns)
+            self.logger.info('Finally saved %i raw book events, pair_id %i '
+                             'episode_timestamp: %s - %s',
+                             reccount, self.pair_id, self.records[0][0],
+                             self.records[-1][0])
+            self.records = []
+        if len(self.accumulated_data):
+            self.logger.info('An incomplete episode, not saved: %s',
+                             self.accumulated_data)
+        self.logger.info('Closed handler for channel %i', self.chanId)
 
 
 class BitfinexTradeDataHandler:
@@ -96,6 +128,9 @@ class BitfinexTradeDataHandler:
 
             self.logger.debug(d)
 
+    async def close(self):
+        self.logger.info('Closed handler for channel %i', self.chanId)
+
 
 class BitfinexMessageHandler:
 
@@ -125,14 +160,8 @@ class BitfinexMessageHandler:
     async def subscribed(self, lts, message):
         self.logger.info(message)
         if message['channel'] == 'book':
-            if await asyncio.shield(self.con.fetchval('''
-                   select exists (select 1
-                                  from bitfinex.transient_raw_book_events
-                                  where channel_id = $1 limit 1)''',
-                                                      message['chanId'])):
-                self.logger.info('Duplicated channel %i', message['chanId'])
-                raise DuplicatedChannel
-            self.logger.debug('Unique channel %i', message['chanId'])
+            self.logger.info('Channel %i, pair_id %i',
+                             message['chanId'], self.pair_id)
             handler = BitfinexBookDataHandler(self.con, self.pair_id, message)
         elif message['channel'] == 'trades':
             handler = BitfinexTradeDataHandler(self.con, self.pair_id, message)
@@ -140,6 +169,10 @@ class BitfinexMessageHandler:
 
     async def data(self, lts, message, bl):
         await (self.channels[message[0]].data(lts, message, bl))
+
+    async def close(self):
+        for handler in self.channels.values():
+            await handler.close()
 
 
 async def capture(pair, user, database):
@@ -150,21 +183,21 @@ async def capture(pair, user, database):
     pair_id = await con.fetchval(''' select pair_id from obanalytics.pairs
                                 where pair = $1 ''', pair)
     await con.execute(f"set application_name to 'BITFINEX:{pair}'")
-    is_cancelled = False
-    MIN_MAX_QUEUE = 1000
+    is_closing = False
+    MIN_MAX_QUEUE = 100
 
     while True:
         try:
-            if is_cancelled:
-                logger.info('Cancelled, exiting ...')
+            if is_closing:
+                logger.info('Exiting ...')
                 return
             logger.info('Connecting to Bitfinex ...')
             max_queue = MIN_MAX_QUEUE
             async with websockets.connect("wss://api.bitfinex.com/ws/2",
                                           max_queue=2**20) as ws:
+                handler = BitfinexMessageHandler(ws, pair, pair_id, con)
                 await ws.send(json.dumps({'event': 'conf',
                                           'flags': 32768}))
-                handler = BitfinexMessageHandler(ws, pair, pair_id, con)
                 while True:
                     try:
                         message = await ws.recv()
@@ -172,9 +205,11 @@ async def capture(pair, user, database):
                         message = json.loads(message)
                         logger.debug(message)
                         bl = len(ws.messages)
-                        if bl > max_queue or is_cancelled:
+                        if bl > max_queue or is_closing:
                             logger.warning(
                                 'websockets internal queue size: %i', bl)
+                            if is_closing:
+                                logger.info(message)
                             max_queue = bl*1.25
                         elif bl >= MIN_MAX_QUEUE and bl < max_queue*0.75/1.25:
                             logger.warning(
@@ -188,10 +223,11 @@ async def capture(pair, user, database):
                             await handler.data(lts, message, bl)
                     except asyncio.CancelledError:
                         logger.info('Closing websocket ...')
-                        is_cancelled = True
+                        is_closing = True
                         await ws.close()
         except websockets.ConnectionClosed as e:
             logger.info(e)
+            await asyncio.shield(handler.close())
             # don't exit, re-connect
         except DuplicatedChannel:
             pass
