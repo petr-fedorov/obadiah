@@ -78,10 +78,11 @@ def main():
                 "./oba%s_%s.log" % ('_'.join(stream), args.dbname.upper(),),
                 'a', 2**24, 20)
             logging.basicConfig(format='%(asctime)s %(process)-6d %(name)s '
-                                '%(levelname)-8s %(message)s',
-                                handlers=[h], level=logging.INFO)
+                                '%(levelname)-8s %(message)s', handlers=[h])
 
-            logger = logging.getLogger("obanalyticsdb.main")
+            logging.getLogger("obanalyticsdb").setLevel(logging.INFO)
+            logging.getLogger("websockets").setLevel(logging.INFO)
+            logger = logging.getLogger(__name__ + ".main")
 
             task = asyncio.ensure_future(bf.capture(stream[0],
                                                     args.user,
@@ -113,8 +114,9 @@ def main():
                 'a', 2**24, 20)
             logging.basicConfig(format='%(asctime)s %(process)-6d %(name)s '
                                 '%(levelname)-8s %(message)s',
-                                handlers=[h], level=logging.DEBUG)
-            logger = logging.getLogger("obanalyticsdb.main")
+                                handlers=[h])
+            logging.getLogger(__name__.split('.')[0]).setLevel(logging.INFO)
+            logger = logging.getLogger(__name__ + ".main")
 
             task = asyncio.ensure_future(bf.monitor(args.user,
                                                     args.dbname))

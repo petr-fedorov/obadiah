@@ -14,7 +14,7 @@ class DuplicatedChannel(Exception):
 class BitfinexBookDataHandler:
     def __init__(self, con, pair_id, message):
         self.chanId = message['chanId']
-        self.logger = logging.getLogger("BitfinexBookDataHandler")
+        self.logger = logging.getLogger(__name__ + ".bookdatahandler")
         self.pair_id = pair_id
         self.con = con
 
@@ -24,16 +24,16 @@ class BitfinexBookDataHandler:
         self.table = 'transient_raw_book_events'
         self.columns = ['exchange_timestamp', 'order_id', 'price', 'amount',
                         'pair_id', 'local_timestamp', 'channel_id',
-                        'episode_timestamp']
+                        'episode_timestamp', 'bl']
 
-    async def data(self, lts, data):
+    async def data(self, lts, data, bl):
         data = data[1:]
         is_episode_completed = False
         rts = data[1]
         rts = datetime.fromtimestamp(rts/1000)
 
         if isinstance(data[0][0], list):
-            episode_data = [(d, rts, lts) for d in data[0]]
+            episode_data = [(d, rts, lts, bl) for d in data[0]]
             is_episode_completed = True
             self.episode_rts = rts
             self.logger.info('%s %s', rts, data[0])
@@ -50,15 +50,17 @@ class BitfinexBookDataHandler:
             else:
                 self.is_episode_started = True
 
-            self.accumulated_data.append((data, rts, lts))
+            self.accumulated_data.append((data, rts, lts, bl))
 
         if is_episode_completed:
             records = [(rts, d[0], d[1], d[2], self.pair_id, lts, self.chanId,
-                        self.episode_rts) for d, rts, lts in episode_data]
+                        self.episode_rts, bl)
+                       for d, rts, lts, bl in episode_data]
             await self.con.copy_records_to_table(self.table,
                                                  records=records,
                                                  schema_name='bitfinex',
                                                  columns=self.columns)
+            self.logger.debug(records)
             is_episode_completed = False
 
         if rts > self.episode_rts:
@@ -68,11 +70,11 @@ class BitfinexBookDataHandler:
 class BitfinexTradeDataHandler:
     def __init__(self, con, pair_id, message):
         self.chanId = message['chanId']
-        self.logger = logging.getLogger("BitfinexTradeDataHandler")
+        self.logger = logging.getLogger(__name__ + ".tradedatahandler")
         self.pair_id = pair_id
         self.con = con
 
-    async def data(self, lts, data):
+    async def data(self, lts, data, bl):
         data = data[1:]
         if data[0] == 'tu':
             data = [data[1]]
@@ -92,6 +94,8 @@ class BitfinexTradeDataHandler:
                                    datetime.fromtimestamp(d[1]/1000),
                                    self.pair_id, self.chanId)
 
+            self.logger.debug(d)
+
 
 class BitfinexMessageHandler:
 
@@ -101,7 +105,7 @@ class BitfinexMessageHandler:
         self.pair_id = pair_id
         self.con = con
         self.channels = {}
-        self.logger = logging.getLogger("BitfinexMessageHandler")
+        self.logger = logging.getLogger(__name__ + ".messagehandler")
 
     async def info(self, lts, message):
         self.logger.info(message)
@@ -121,64 +125,84 @@ class BitfinexMessageHandler:
     async def subscribed(self, lts, message):
         self.logger.info(message)
         if message['channel'] == 'book':
-            if await self.con.fetchval('''
+            if await asyncio.shield(self.con.fetchval('''
                    select exists (select 1
                                   from bitfinex.transient_raw_book_events
                                   where channel_id = $1 limit 1)''',
-                                       message['chanId']):
+                                                      message['chanId'])):
                 self.logger.info('Duplicated channel %i', message['chanId'])
                 raise DuplicatedChannel
-            self.logger.info('Unique channel %i', message['chanId'])
+            self.logger.debug('Unique channel %i', message['chanId'])
             handler = BitfinexBookDataHandler(self.con, self.pair_id, message)
         elif message['channel'] == 'trades':
             handler = BitfinexTradeDataHandler(self.con, self.pair_id, message)
         self.channels[message['chanId']] = handler
 
-    async def data(self, lts, message):
-        await (self.channels[message[0]].data(lts, message))
+    async def data(self, lts, message, bl):
+        await (self.channels[message[0]].data(lts, message, bl))
 
 
 async def capture(pair, user, database):
-    logger = logging.getLogger("capture")
+    logger = logging.getLogger(__name__ + ".capture")
     logger.info(f'Started {pair}, {user}, {database}')
 
     con = await asyncpg.connect(user=user, database=database)
     pair_id = await con.fetchval(''' select pair_id from obanalytics.pairs
                                 where pair = $1 ''', pair)
     await con.execute(f"set application_name to 'BITFINEX:{pair}'")
+    is_cancelled = False
+    MIN_MAX_QUEUE = 1000
 
     while True:
         try:
+            if is_cancelled:
+                logger.info('Cancelled, exiting ...')
+                return
             logger.info('Connecting to Bitfinex ...')
+            max_queue = MIN_MAX_QUEUE
             async with websockets.connect("wss://api.bitfinex.com/ws/2",
-                                          max_queue=1024) as ws:
-                await ws.send(json.dumps({'event': 'conf', 'flags': 32768}))
+                                          max_queue=2**20) as ws:
+                await ws.send(json.dumps({'event': 'conf',
+                                          'flags': 32768}))
                 handler = BitfinexMessageHandler(ws, pair, pair_id, con)
-                async for message in ws:
-                    lts = datetime.now()
-                    message = json.loads(message)
-                    logger.debug(message)
-                    if isinstance(message, dict):
-                        await getattr(handler, message['event'])(lts, message)
-                    else:
-                        await handler.data(lts, message)
-
+                while True:
+                    try:
+                        message = await ws.recv()
+                        lts = datetime.now()
+                        message = json.loads(message)
+                        logger.debug(message)
+                        bl = len(ws.messages)
+                        if bl > max_queue or is_cancelled:
+                            logger.warning(
+                                'websockets internal queue size: %i', bl)
+                            max_queue = bl*1.25
+                        elif bl >= MIN_MAX_QUEUE and bl < max_queue*0.75/1.25:
+                            logger.warning(
+                                'websockets internal queue size: %i '
+                                '(decreasing)', bl)
+                            max_queue = bl
+                        if isinstance(message, dict):
+                            await getattr(handler, message['event'])(lts,
+                                                                     message)
+                        else:
+                            await handler.data(lts, message, bl)
+                    except asyncio.CancelledError:
+                        logger.info('Closing websocket ...')
+                        is_cancelled = True
+                        await ws.close()
         except websockets.ConnectionClosed as e:
-            logger.error(e)
+            logger.info(e)
             # don't exit, re-connect
         except DuplicatedChannel:
             pass
-        except asyncio.CancelledError:
-            logger.info('Cancelled, exiting ...')
-            raise
         except Exception as e:
-            logger.error(e)
+            logger.exception(e)
             raise
 
 
 async def monitor(user, database):
 
-    logger = logging.getLogger("monitor")
+    logger = logging.getLogger(__name__ + ".monitor")
     logger.info(f'Started {user}, {database}')
 
     con = await asyncpg.connect(user=user, database=database)
