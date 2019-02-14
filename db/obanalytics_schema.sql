@@ -361,7 +361,7 @@ begin
 	v_statements[i] := v_statement || '_fkey_level3_next foreign key (next_microtimestamp, order_id, next_event_no) references '||V_SCHEMA ||v_table_name ||
 							' match simple on update cascade on delete no action deferrable initially deferred';
 	i := i + 1;
-	v_statements[i] := v_statement || '_fkey_level3_price foreign key (next_microtimestamp, order_id, next_event_no) references '||V_SCHEMA ||v_table_name ||
+	v_statements[i] := v_statement || '_fkey_level3_price foreign key (price_microtimestamp, order_id, price_event_no) references '||V_SCHEMA ||v_table_name ||
 							' match simple on update cascade on delete no action deferrable initially deferred';
 
 	i := i+1;
@@ -374,9 +374,9 @@ begin
 	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_enabled = TRUE,  autovacuum_vacuum_scale_factor= 0.0 , '||
 		'autovacuum_analyze_scale_factor = 0.0 ,  autovacuum_analyze_threshold = 10000, autovacuum_vacuum_threshold = 10000)';
 	
-	i := i+1;
+/*	i := i+1;
 	v_statements[i] := 'create trigger ba_incorporate_new_event before insert on '||V_SCHEMA||v_table_name||
-		' for each row execute procedure obanalytics.level3_incorporate_new_event()';
+		' for each row execute procedure obanalytics.level3_incorporate_new_event()'; */
 
 	i := i+1;
 	v_statements[i] := 'create trigger bz_save_exchange_microtimestamp before update of microtimestamp on '||V_SCHEMA||v_table_name||
@@ -1479,34 +1479,6 @@ ALTER TABLE ONLY obanalytics.pairs
 
 
 --
--- Name: level3_01b001201901 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01b001201901 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
-
-
---
--- Name: level3_01s001201901 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01s001201901 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
-
-
---
--- Name: level3_01b001201902 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01b001201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
-
-
---
--- Name: level3_01s001201902 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01s001201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
-
-
---
 -- Name: level3_01b001201901 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1547,7 +1519,7 @@ ALTER TABLE ONLY obanalytics.level3_01b001201901
 --
 
 ALTER TABLE ONLY obanalytics.level3_01b001201901
-    ADD CONSTRAINT level3_01b001201901_fkey_level3_price FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01b001201901(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT level3_01b001201901_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01b001201901(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -1579,7 +1551,7 @@ ALTER TABLE ONLY obanalytics.level3_01b001201902
 --
 
 ALTER TABLE ONLY obanalytics.level3_01b001201902
-    ADD CONSTRAINT level3_01b001201902_fkey_level3_price FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01b001201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT level3_01b001201902_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01b001201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -1611,7 +1583,7 @@ ALTER TABLE ONLY obanalytics.level3_01s001201901
 --
 
 ALTER TABLE ONLY obanalytics.level3_01s001201901
-    ADD CONSTRAINT level3_01s001201901_fkey_level3_price FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01s001201901(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT level3_01s001201901_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01s001201901(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -1643,7 +1615,7 @@ ALTER TABLE ONLY obanalytics.level3_01s001201902
 --
 
 ALTER TABLE ONLY obanalytics.level3_01s001201902
-    ADD CONSTRAINT level3_01s001201902_fkey_level3_price FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01s001201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT level3_01s001201902_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01s001201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
