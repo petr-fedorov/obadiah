@@ -1017,19 +1017,19 @@ $$;
 ALTER FUNCTION bitfinex.bf_trades_dress_new_row() OWNER TO "ob-analytics";
 
 --
--- Name: capture_transient_raw_book_events(timestamp with time zone, text, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+-- Name: capture_transient_raw_book_events(timestamp with time zone, timestamp with time zone, text, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.capture_transient_raw_book_events(p_end_time timestamp with time zone, p_pair text, p_new_era_start_threshold interval DEFAULT '00:00:02'::interval) RETURNS SETOF obanalytics.level3
+CREATE FUNCTION bitfinex.capture_transient_raw_book_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_new_era_start_threshold interval DEFAULT '00:00:02'::interval) RETURNS SETOF obanalytics.level3
     LANGUAGE plpgsql
     SET work_mem TO '1GB'
     AS $$
 declare
 	p record;
-	v_start_time timestamptz default '2019-02-14 03:08:58.749+03';
 	v_pair_id smallint;
 	v_exchange_id smallint;
-	v_last_saved_order_book bitfinex.transient_raw_book_events[];
+	v_last_order_book obanalytics.level3_order_book_record[];
+	v_open_orders bitfinex.transient_raw_book_events[];	
 	v_era timestamptz;
 begin
 	select pair_id into strict v_pair_id
@@ -1039,311 +1039,145 @@ begin
 	select exchange_id into strict v_exchange_id
 	from obanalytics.exchanges
 	where exchange = 'bitfinex';
-	
 
 	for p in with channels as (
 						select channel_id, episode_timestamp as start_time, 
 								coalesce(lead(episode_timestamp) over(partition by pair_id order by episode_timestamp) - '00:00:00.000001'::interval, 
 										 'infinity') as end_time
-						from bitfinex.transient_channel_id join obanalytics.pairs using (pair_id)
-						where pair = upper(p_pair)
+						from bitfinex.transient_raw_book_channels 
+						where pair_id = v_pair_id
 				)
 				select channel_id,
-						greatest(start_time, v_start_time) as start_time, 
+						greatest(start_time, p_start_time) as start_time, 
 						least(end_time, p_end_time) as end_time,
-						start_time between v_start_time and p_end_time as is_channel_starts
+						start_time between p_start_time and p_end_time as is_channel_starts
 				from channels
 				where start_time <= p_end_time
-				  and end_time >= v_start_time
-				order by start_time
+				  and end_time >= p_start_time
+				order by 2	-- i.e. output's start_time
 				loop
+		select array_agg(level3_order_book) into v_last_order_book
+		from obanalytics.level3_order_book(p.start_time, v_pair_id, v_exchange_id, true, true);
+
+		select array_agg(row(microtimestamp, order_id, price,
+				case side when 's' then -amount when 'b' then amount end,
+				pair_id, null::timestamptz,-1, microtimestamp ,event_no,null::integer)::bitfinex.transient_raw_book_events) 
+				into v_open_orders
+		from unnest(v_last_order_book);
 		if p.is_channel_starts then	
-			select array_agg(row(microtimestamp, order_id, price,
-					case side when 's' then -amount when 'b' then amount end,
-					pair_id, null::timestamptz,-1,ts,event_no,null::integer)::bitfinex.transient_raw_book_events) 
-					into v_last_saved_order_book
-			from obanalytics.level3_order_book(p.start_time, v_pair_id, v_exchange_id, true, true);
-			
-			if p.start_time - v_last_saved_order_book[1].episode_timestamp > p_new_era_start_threshold then
-			
-				raise notice 'New era because interval is big: %', p.start_time - v_last_saved_order_book[1].episode_timestamp;
-				
+			if v_last_order_book is null or p.start_time - v_last_order_book[1].ts > p_new_era_start_threshold then
+				raise log 'Start new era for new channel % because interval % between % and % is greater than threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
 				insert into obanalytics.level3_eras (era, pair_id, exchange_id)
 				values (p.start_time, v_pair_id, v_exchange_id);
 				
-				v_last_saved_order_book := null;	-- event_no will start from scratch
+				v_open_orders := null;	-- event_no will start from scratch
 			else
-				raise notice 'Old era %', v_last_saved_order_book[1].episode_timestamp;
+				raise log 'Continue previous era for new channel % because interval % between % and % is less than threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
 				with to_be_replaced as (
 					delete from bitfinex.transient_raw_book_events
 					where pair_id = v_pair_id
+					  and channel_id = p.channel_id
 					  and episode_timestamp = p.start_time
 					returning *
 				)
 				insert into bitfinex.transient_raw_book_events
 				select (d).* 
-				from unnest(bitfinex._diff_order_books(v_last_saved_order_book, array(select to_be_replaced::bitfinex.transient_raw_book_events
+				from unnest(bitfinex._diff_order_books(v_open_orders, array(select to_be_replaced::bitfinex.transient_raw_book_events
 																					  	from to_be_replaced))) d
 				;
 			end if;
+		else
+			raise log 'Continue previous era for old channel %', p.channel_id;
 		end if;
-
-		raise notice '%', p.start_time;
 		return query 
-			with deleted_events as (
+			with deleted_transient_events as (
 				delete from bitfinex.transient_raw_book_events
 				where pair_id = v_pair_id
+				  and channel_id = p.channel_id
 				  and episode_timestamp between p.start_time and p.end_time
 				returning *
 			),
+			base_events as (
+				select exchange_timestamp, order_id, round( price, price_precision) as price,
+					round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+				from deleted_transient_events join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
+				order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
+			),
 			base_for_insert_level3 as (
 				select *
-				from deleted_events
+				from base_events
 				union all	-- will be empty if new era starts
 				select *
-				from unnest(v_last_saved_order_book)	
+				from unnest(v_open_orders)	
 				),
-				for_insert_level3 as (
-					select episode_timestamp as microtimestamp,
-							order_id,
-							(coalesce(first_value(event_no) over oe, 1) - 1)::smallint + (row_number() over oe)::smallint as event_no,
-							case when amount < 0 then 's' when amount > 0 then 'b' end as side,
-							case when price = 0 then abs(lag(price) over oe) else abs(price) end as  price, 
-							case when price = 0 then abs(lag(amount) over oe) else abs(amount) end as amount,
-							case when price = 0 then null else abs(amount) - abs(lag(amount) over oe) end as fill, 
-							case when price > 0 then coalesce(lead(episode_timestamp) over oe, 'infinity'::timestamptz) when price = 0 then '-infinity'::timestamptz end  as next_microtimestamp,
-							case when price > 0 then (coalesce(first_value(event_no) over oe, 1) )::smallint + (row_number() over oe)::smallint end as next_event_no,
-							null::bigint as trade_id,
-							pair_id,
-							local_timestamp,
-							reincarnation_no,
-							coalesce((price <> lag(price) over oe and price > 0 )::integer, 1) as is_price_changed,
-							channel_id
+			for_insert_level3 as (
+				select episode_timestamp as microtimestamp,
+						order_id,
+						(coalesce(first_value(event_no) over oe, 1) - 1)::smallint + (row_number() over oe)::smallint as event_no,
+						case when amount < 0 then 's' when amount > 0 then 'b' end as side,
+						case when price = 0 then abs(lag(price) over oe) else abs(price) end as  price, 
+						case when price = 0 then abs(lag(amount) over oe) else abs(amount) end as amount,
+						case when price = 0 then null else abs(amount) - abs(lag(amount) over oe) end as fill, 
+						case when price > 0 then coalesce(lead(episode_timestamp) over oe, 'infinity'::timestamptz) when price = 0 then '-infinity'::timestamptz end  as next_microtimestamp,
+						case when price > 0 then (coalesce(first_value(event_no) over oe, 1) )::smallint + (row_number() over oe)::smallint end as next_event_no,
+						null::bigint as trade_id,
+						pair_id,
+						local_timestamp,
+						reincarnation_no,
+						coalesce((price <> lag(price) over oe and price > 0 )::integer, 1) as is_price_changed,
+						channel_id
+				from (
+					select *, sum(is_resurrected::integer) over o as reincarnation_no 
 					from (
-						select *, sum(is_resurrected::integer) over o as reincarnation_no 
-						from (
-							select *, coalesce(lag(price) over o = 0, false) as is_resurrected
-							from base_for_insert_level3
-							where episode_timestamp <= p_end_time	
-							window o as (partition by order_id order by exchange_timestamp, local_timestamp)
-						) a
+						select *, coalesce(lag(price) over o = 0, false) as is_resurrected
+						from base_for_insert_level3
+						where episode_timestamp <= p_end_time	
 						window o as (partition by order_id order by exchange_timestamp, local_timestamp)
 					) a
-					window oe as (partition by order_id, reincarnation_no order by exchange_timestamp, local_timestamp)
-				)		
-				insert into obanalytics.level3_bitfinex (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
-														 trade_id, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp )
-				select microtimestamp, order_id, 
-						event_no,
-						side::character(1), price, amount, 
-						fill,
-						next_microtimestamp,
-						case when next_microtimestamp = 'infinity' then null else next_event_no end,
-						trade_id, pair_id, 
-						-- null::smallint as exchange_id, 
-						local_timestamp,
-						price_microtimestamp, 
-						price_event_no,
-						null::timestamptz
-				from (
-					select *,
-							first_value(microtimestamp) over op as price_microtimestamp,
-							first_value(event_no) over op as price_event_no
-					from (
-						select *, sum(is_price_changed) over o as price_group
-						from  for_insert_level3
-						window o as (partition by order_id, reincarnation_no order by microtimestamp) 
-					) a						
-					window op as (partition by order_id, reincarnation_no, price_group order by microtimestamp, event_no)
+					window o as (partition by order_id order by exchange_timestamp, local_timestamp)
 				) a
-				where channel_id is distinct from -1 -- i.e. skip channel_id = -1 which represents the latest order book from level3 table
-				order by microtimestamp
-				returning *
-				;
+				window oe as (partition by order_id, reincarnation_no order by exchange_timestamp, local_timestamp)
+			)		
+			insert into obanalytics.level3_bitfinex (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
+													 trade_id, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp )
+			select microtimestamp, order_id, 
+					case when first_value(event_no) over o  > 1 and event_no = first_value(event_no) over o  and microtimestamp = first_value(microtimestamp) over o  then null 
+						else event_no end as event_no,	-- event_no MUST be set by BEFORE trigger in order to update the previous event 
+					side::character(1), price, amount, 
+					case when first_value(event_no) over o  > 1 and event_no = first_value(event_no) over o  and microtimestamp = first_value(microtimestamp) over o  then null 							
+						else fill end as fill,											-- see the comment for event_no
+					next_microtimestamp,
+					case when next_microtimestamp = 'infinity' then null else next_event_no end,
+					trade_id, pair_id, 
+					-- null::smallint as exchange_id, 
+					local_timestamp,
+					case when first_value(event_no) over o  > 1 and event_no = first_value(event_no) over o  and microtimestamp = first_value(microtimestamp) over o  then null 							
+						else price_microtimestamp end as price_microtimestamp,			-- see comment for event_no
+					case when first_value(event_no) over o  > 1 and event_no = first_value(event_no) over o  and microtimestamp = first_value(microtimestamp) over o  then null 							
+						else price_event_no end as price_event_no,						-- see comment for event_no
+					null::timestamptz
+			from (
+				select *,
+						first_value(microtimestamp) over op as price_microtimestamp,
+						first_value(event_no) over op as price_event_no
+				from (
+					select *, sum(is_price_changed) over (partition by order_id, reincarnation_no order by microtimestamp) as price_group 			-- within an reincarnation of order_id
+					from  for_insert_level3
+				) a						
+				window op as (partition by order_id, reincarnation_no, price_group order by microtimestamp, event_no)
+			) a
+			where channel_id is distinct from -1 -- i.e. skip channel_id = -1 which represents open orders from level3 table					
+			window o as (partition by order_id order by microtimestamp, event_no )   -- if the very first event_no for an order_id in this insert is not 1 then 
+			order by microtimestamp, event_no											-- we will set event_no, fill, price_microtimestamp and price event_no to nul
+			returning *																	-- so level3_incorporate_new_event() will set these fields AND UPDATE PREVIOUS EVENT
+			;
 	end loop;				
 	return;
 end;
 $$;
 
 
-ALTER FUNCTION bitfinex.capture_transient_raw_book_events(p_end_time timestamp with time zone, p_pair text, p_new_era_start_threshold interval) OWNER TO "ob-analytics";
-
---
--- Name: capture_transient_raw_book_events_old(timestamp with time zone, text, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
---
-
-CREATE FUNCTION bitfinex.capture_transient_raw_book_events_old(p_end_time timestamp with time zone, p_pair text, p_new_era_start_threshold interval DEFAULT '00:00:02'::interval) RETURNS SETOF obanalytics.level3
-    LANGUAGE sql
-    SET work_mem TO '6GB'
-    AS $$
-with ids as (
-	select exchange_id, pair_id, 
-			(select max(microtimestamp) from obanalytics.level3_bitfinex where pair_id = pairs.pair_id and exchange_id = exchanges.exchange_id ) as last_level3_microtimestamp
-	from obanalytics.exchanges join obanalytics.pairs on exchange = 'bitfinex' and pair = upper(p_pair)
-),
-channel_ends_late as (
-	select channel_id, min(episode_timestamp) as channel_ends
-	from bitfinex.transient_raw_book_events join ids using (pair_id)
-	where episode_timestamp > p_end_time
-	group by channel_id
-),
-channel_ends_early as (
-	select channel_id, pair_id, min(episode_timestamp) as channel_starts, max(episode_timestamp) as channel_ends
-	from bitfinex.transient_raw_book_events join ids using (pair_id)
-	where episode_timestamp <= p_end_time
-	group by pair_id, channel_id
-),
-channel_ranges as (
-	select channel_id, pair_id, greatest( channel_starts, last_level3_microtimestamp + '00:00:00.000001'::interval) as channel_starts, coalesce(channel_ends_late.channel_ends, channel_ends_early.channel_ends) as channel_ends
-	from channel_ends_early join ids using (pair_id) left join channel_ends_late using (channel_id) 
-),
-deleted_transient_events as (
-	delete from bitfinex.transient_raw_book_events 
-	using channel_ranges 
---	select transient_raw_book_events.*
---	from bitfinex.transient_raw_book_events  join channel_ranges on
-	where
-	 episode_timestamp between channel_starts and channel_ends
-	 and transient_raw_book_events.channel_id = channel_ranges.channel_id
-	 and transient_raw_book_events.pair_id = channel_ranges.pair_id
-	returning transient_raw_book_events.*
-),
-base_events as (
-	-- if there are more than one event per order per episode, will take the last within the episode
-	select distinct on (episode_timestamp, order_id, channel_id, pair_id ) exchange_timestamp, order_id, round( price, price_precision) as price,
-		round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no
-	from deleted_transient_events join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
-	order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc
-),
-aggregated_events as (
-	select pair_id, channel_id, episode_timestamp, max(local_timestamp) as local_timestamp, array_agg(base_events::bitfinex.transient_raw_book_events order by order_id) as e
-	from base_events
-	group by pair_id, channel_id, episode_timestamp
-),
-order_books as (
-	select *
-	from (
-		-- if threre are more than one snapshot per episode_timestamp will take the one that arrived earlier 
-		select distinct on (episode_timestamp) pair_id, channel_id, episode_timestamp,
-				bitfinex.transient_raw_book_agg(e) over (partition by pair_id, channel_id order by episode_timestamp) as ob
-		from aggregated_events
-		order by episode_timestamp, local_timestamp	
-	) a
-	union all
-	select pair_id, -1, last_level3_microtimestamp,  ( select array(
-					select row(microtimestamp, order_id, price, 
-								   case when side = 's' then -amount
-										when side = 'b' then amount
-								   end, pair_id, null::timestamptz, -1, ts, 
-							   event_no	-- this is the first event_no for those orders that have been saved into level3 earlier. For the other orders the first event_no will be 1
-							  )::bitfinex.transient_raw_book_events
-						from obanalytics.level3_order_book( last_level3_microtimestamp, pair_id, exchange_id, true, false) 
-					) ) as ob
-	from ids
-),
-new_eras as (
-	insert into obanalytics.level3_eras (era, pair_id, exchange_id )
-	select episode_timestamp as era, pair_id, exchange_id 
-	from (
-		select pair_id, episode_timestamp, lag(episode_timestamp) over (partition by pair_id order  by episode_timestamp) as previous_episode_timestamp, channel_id
-		from order_books
-		where episode_timestamp <= p_end_time		
-	) a join ids using (pair_id)
-	where episode_timestamp - previous_episode_timestamp > p_new_era_start_threshold or 
-			( previous_episode_timestamp is null and channel_id > 0 )
-	returning *
-),
-insert_new_channel_start as (
-	insert into bitfinex.transient_raw_book_events
-	select *
-	from (
-		-- no more than one ob per channel_id is expected -- see channel_ends_late above
-		select (unnest(ob)).*
-		from order_books
-		where episode_timestamp > p_end_time
-	) ob
-	where price > 0
-	returning *				 
-),
-base_for_insert_level3 as (	-- this query works m-u-u-u-u-ch faster when unnest() is done at the end
-	select d.*, e.era
-	from (
-		select episode_timestamp, diff as d
-		from (
-			select episode_timestamp, bitfinex._diff_order_books(lag(ob) over (partition by pair_id order by episode_timestamp), ob) as diff
-			from order_books ob 
-		) ob 
-		where ob.episode_timestamp not in (select era from new_eras)
-		union all
-		select episode_timestamp, ob 
-		from order_books -- join unnest(ob) ob on true
-		where order_books.episode_timestamp in (select era from new_eras)											  
-	) a join lateral ( select max(era) as era 
-						from obanalytics.level3_eras join ids using (exchange_id, pair_id)
-						where level3_eras.era <= a.episode_timestamp ) e on true join unnest(d) d on true 
-),
-for_insert_level3 as (
-	select episode_timestamp as microtimestamp,
-			order_id,
-			(coalesce(first_value(event_no) over oe, 1) - 1)::smallint + (row_number() over oe)::smallint as event_no,
-			case when amount < 0 then 's' when amount > 0 then 'b' end as side,
-			case when price = 0 then abs(lag(price) over oe) else abs(price) end as  price, 
-			case when price = 0 then abs(lag(amount) over oe) else abs(amount) end as amount,
-			case when price = 0 then null else abs(amount) - abs(lag(amount) over oe) end as fill, 
-			case when price > 0 then coalesce(lead(episode_timestamp) over oe, 'infinity'::timestamptz) when price = 0 then '-infinity'::timestamptz end  as next_microtimestamp,
-			case when price > 0 then (coalesce(first_value(event_no) over oe, 1) )::smallint + (row_number() over oe)::smallint end as next_event_no,
-			null::bigint as trade_id,
-			pair_id,
-			local_timestamp,
-			reincarnation_no,
-			era,
-			coalesce((price <> lag(price) over oe and price > 0 )::integer, 0) as is_price_changed,
-			channel_id
-	from (
-		select *, sum(is_resurrected::integer) over o as reincarnation_no 
-		from (
-			select *, coalesce(lag(price) over o = 0, false) as is_resurrected
-			from base_for_insert_level3
-			where episode_timestamp <= p_end_time	
-			window o as (partition by era, order_id order by episode_timestamp)
-		) a
-		window o as (partition by era, order_id order by episode_timestamp)
-	) a
-	window oe as (partition by era, order_id, reincarnation_no order by episode_timestamp)
-)		
-insert into obanalytics.level3_bitfinex (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
-										 trade_id, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp )
-select microtimestamp, order_id, 
-		case when first_event_no > 1 and event_no = first_event_no  and microtimestamp = first_microtimestamp then null -- event_no will be set by trigger and the previous event will be updated
-			else event_no end as event_no,
-		side, price, amount, 
-		case when first_event_no > 1 and event_no = first_event_no   and microtimestamp = first_microtimestamp then null 	-- see comment for event_no
-			else fill end as fill,
-		next_microtimestamp,
-		case when next_microtimestamp = 'infinity' then null else next_event_no end,
-		trade_id, pair_id, 
-		-- null::smallint as exchange_id, 
-		local_timestamp,
-		case when first_event_no > 1 and event_no = first_event_no and microtimestamp = first_microtimestamp then null 	-- see comment for event_no
-			else first_value(microtimestamp) over op end as price_microtimestamp,	
-		case when first_event_no > 1 and event_no = first_event_no  and microtimestamp = first_microtimestamp then null 	-- see comment for event_no
-			else first_value(event_no) over op end as price_event_no,
-		null::timestamptz
-from (
-	select *, sum(is_price_changed) over (partition by era, order_id, reincarnation_no order by microtimestamp) as price_group,
-				first_value(event_no) over o as first_event_no,
-				first_value(microtimestamp) over o as first_microtimestamp
-	from  for_insert_level3
-	where channel_id is distinct from -1 -- i.e. skip channel_id = -1 which represents the latest order book from level3 table
-	window o as (partition by era, order_id order by microtimestamp ) 
-) a
-window op as (partition by era, order_id, price_group order by microtimestamp)
-order by microtimestamp
-returning *
-$$;
-
-
-ALTER FUNCTION bitfinex.capture_transient_raw_book_events_old(p_end_time timestamp with time zone, p_pair text, p_new_era_start_threshold interval) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.capture_transient_raw_book_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_new_era_start_threshold interval) OWNER TO "ob-analytics";
 
 --
 -- Name: capture_transient_trades(timestamp with time zone, text); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
@@ -2849,17 +2683,17 @@ CREATE VIEW bitfinex.latest_symbol_details AS
 ALTER TABLE bitfinex.latest_symbol_details OWNER TO "ob-analytics";
 
 --
--- Name: transient_channel_id; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
+-- Name: transient_raw_book_channels; Type: TABLE; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE TABLE bitfinex.transient_channel_id (
+CREATE TABLE bitfinex.transient_raw_book_channels (
     episode_timestamp timestamp with time zone NOT NULL,
     pair_id smallint NOT NULL,
     channel_id integer NOT NULL
 );
 
 
-ALTER TABLE bitfinex.transient_channel_id OWNER TO "ob-analytics";
+ALTER TABLE bitfinex.transient_raw_book_channels OWNER TO "ob-analytics";
 
 --
 -- Name: transient_trades; Type: TABLE; Schema: bitfinex; Owner: ob-analytics

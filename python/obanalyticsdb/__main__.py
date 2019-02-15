@@ -95,13 +95,13 @@ def main():
 
             print("Press Ctrl-C to stop ...")
             try:
+                exitcode = 0
                 asyncio.get_event_loop().run_until_complete(task)
             except asyncio.CancelledError:
                 logger.info('Cancelled, exiting ...')
             except Exception as e:
                 logger.error(e)
                 exitcode = 1
-            exitcode = 0
         else:
             print('Exchange %s is not supported (yet)' % stream[1])
             exitcode = 1
@@ -128,18 +128,19 @@ def main():
 
             print("Press Ctrl-C to stop ...")
             try:
+                exitcode = 0
                 asyncio.get_event_loop().run_until_complete(task)
             except asyncio.CancelledError:
                 logger.info('Cancelled, exiting ...')
             except Exception as e:
-                logger.error(e)
+                logger.exception(e)
                 exitcode = 1
-            exitcode = 0
         else:
             print('Exchange %s is not supported (yet)' % args.monitor)
             exitcode = 1
 
         sys.exit(exitcode)
+
     else:
         parser.print_usage()
 

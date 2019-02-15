@@ -7,10 +7,6 @@ import json
 from datetime import datetime
 
 
-class DuplicatedChannel(Exception):
-    pass
-
-
 class BitfinexBookDataHandler:
     # Will send to Postgres using COPY only this number of events or more
     MIN_SAVE_COUNT = 1000
@@ -42,6 +38,10 @@ class BitfinexBookDataHandler:
             is_episode_completed = True
             self.episode_rts = rts
             self.logger.info('%s %s', rts, data[0])
+            await self.con.execute('''
+                insert into bitfinex.transient_raw_book_channels
+                (episode_timestamp, pair_id, channel_id)
+                values($1, $2, $3)''', rts, self.pair_id, self.chanId)
         else:
             if data[0] == 'hb':
                 return
@@ -225,12 +225,13 @@ async def capture(pair, user, database):
                         logger.info('Closing websocket ...')
                         is_closing = True
                         await ws.close()
-        except websockets.ConnectionClosed as e:
+        except (websockets.InvalidHandshake, websockets.InvalidState,
+                websockets.PayloadTooBig, websockets.ConnectionClosed,
+                websockets.WebSocketProtocolError) as e:
             logger.info(e)
             await asyncio.shield(handler.close())
             # don't exit, re-connect
-        except DuplicatedChannel:
-            pass
+
         except Exception as e:
             logger.exception(e)
             raise
