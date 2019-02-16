@@ -92,7 +92,7 @@ CREATE FUNCTION bitfinex._diff_order_books(p_order_book_before bitfinex.transien
 			from unnest(p_order_book_after) 
 		),
 		ts as (
-			select distinct episode_timestamp as ts	-- to be sure that ob_after has just one episode_timestamp or (select ts from ts) below will fail
+			select distinct episode_timestamp as ts, channel_id	
 			from  ob_after
 		),
 		ob_diff as (
@@ -101,8 +101,8 @@ CREATE FUNCTION bitfinex._diff_order_books(p_order_book_before bitfinex.transien
 				coalesce(a.price, 0), 
 				coalesce(a.amount, case when b.amount > 0 then 1 when b.amount < 0 then -1 end), 
 				coalesce(a.pair_id, b.pair_id), 
-				a.local_timestamp,		-- when the diff event is inferred by us, it will be null
-				a.channel_id,			-- when the diff event is inferred by us, it will be null
+				a.local_timestamp,											-- when the diff event is inferred by us, it will be null
+				coalesce(a.channel_id, (select channel_id from ts)),	  -- we need to set properly channel_id for the inferred deletion events too. Otherwise capture_transient_raw..() will miss them
 				coalesce(a.episode_timestamp, (select ts from ts)) as episode_timestamp,
 				a.event_no as event_no,
 				0::integer
@@ -1057,7 +1057,10 @@ begin
 				order by 2	-- i.e. output's start_time
 				loop
 		select array_agg(level3_order_book) into v_last_order_book
-		from obanalytics.level3_order_book(p.start_time, v_pair_id, v_exchange_id, true, true);
+		from obanalytics.level3_order_book(p.start_time, 
+										   v_pair_id, v_exchange_id,
+										   p_only_makers := false,	-- since exchanges sometimes output crossed order books, we'll consider ALL active orders
+										   p_before := true);	
 
 		select array_agg(row(microtimestamp, order_id, price,
 				case side when 's' then -amount when 'b' then amount end,
@@ -1079,11 +1082,17 @@ begin
 					  and channel_id = p.channel_id
 					  and episode_timestamp = p.start_time
 					returning *
+				),
+				base_events as (
+					select exchange_timestamp, order_id, round( price, price_precision) as price,
+						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from to_be_replaced join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
+					order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 				)
 				insert into bitfinex.transient_raw_book_events
 				select (d).* 
-				from unnest(bitfinex._diff_order_books(v_open_orders, array(select to_be_replaced::bitfinex.transient_raw_book_events
-																					  	from to_be_replaced))) d
+				from unnest(bitfinex._diff_order_books(v_open_orders, array(select base_events::bitfinex.transient_raw_book_events
+																					  	from base_events))) d
 				;
 			end if;
 		else
@@ -1098,10 +1107,15 @@ begin
 				returning *
 			),
 			base_events as (
-				select exchange_timestamp, order_id, round( price, price_precision) as price,
-					round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
-				from deleted_transient_events join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
-				order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
+				-- distinct on helps in particular against duplicate deletion events
+				select distinct on (episode_timestamp, order_id, channel_id, pair_id, price, amount ) exchange_timestamp, order_id, price, amount,
+						pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+				from (
+					select exchange_timestamp, order_id, round( price, price_precision) as price,
+						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from deleted_transient_events join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
+				) a
+				order by episode_timestamp, order_id, channel_id, pair_id, price, amount, exchange_timestamp desc, local_timestamp desc
 			),
 			base_for_insert_level3 as (
 				select *
@@ -1168,9 +1182,9 @@ begin
 			) a
 			where channel_id is distinct from -1 -- i.e. skip channel_id = -1 which represents open orders from level3 table					
 			window o as (partition by order_id order by microtimestamp, event_no )   -- if the very first event_no for an order_id in this insert is not 1 then 
-			order by microtimestamp, event_no											-- we will set event_no, fill, price_microtimestamp and price event_no to nul
+			order by microtimestamp, event_no nulls first  							  -- we will set event_no, fill, price_microtimestamp and price event_no to null
 			returning *																	-- so level3_incorporate_new_event() will set these fields AND UPDATE PREVIOUS EVENT
-			;
+			;																			-- nulls first in order by is important! 
 	end loop;				
 	return;
 end;

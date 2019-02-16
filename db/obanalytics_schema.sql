@@ -537,7 +537,7 @@ declare
 begin
 	  
 	if new.price_microtimestamp is null or new.event_no is null then 
-		raise notice 'will do %, %', new.microtimestamp, new.order_id;
+		raise debug 'Will process  %, %', new.microtimestamp, new.order_id;
 	-- The values of the above two columns depend on the previous event for the order_id if any and are mandatory (not null). 
 	-- They have to be set by either an inserter of the record (more effective) or by this trigger
 		begin
