@@ -2188,18 +2188,19 @@ ALTER FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.t
 CREATE FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval DEFAULT '00:02:00'::interval) RETURNS integer
     LANGUAGE plpgsql
     AS $$
+declare
+	v_start timestamptz;
+	v_end timestamptz;
 begin 
 	perform bitfinex.capture_transient_trades( 
 		( select max(exchange_timestamp)  - p_delay
 		  from bitfinex.transient_trades join obanalytics.pairs using (pair_id)
 		  where pair = upper(p_pair)
 		 ),  p_pair);
-	perform bitfinex.capture_transient_raw_book_events(
-		(	select max(episode_timestamp) - p_delay 
-			from bitfinex.transient_raw_book_events join obanalytics.pairs using (pair_id)
-			where pair = upper(p_pair)
-		),p_pair);
-		
+	select min(episode_timestamp), max(episode_timestamp) - p_delay into v_start, v_end
+	from bitfinex.transient_raw_book_events join obanalytics.pairs using (pair_id)
+	where pair = upper(p_pair);
+	perform bitfinex.capture_transient_raw_book_events(v_start, v_end, p_pair);
 	return 0;											   
 end;
 $$;
