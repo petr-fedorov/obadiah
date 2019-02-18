@@ -1107,33 +1107,33 @@ begin
 				returning *
 			),
 			base_events as (
-				-- distinct on helps in particular against duplicate deletion events
-				select distinct on (episode_timestamp, order_id, channel_id, pair_id, price, amount ) exchange_timestamp, order_id, price, amount,
+				-- takes only the latest event for given order_id within episode. If it is the lonely deletion, level3_incorporate_new_event() will simply drop it
+				select distinct on (episode_timestamp, order_id, channel_id, pair_id ) exchange_timestamp, order_id, price, amount,
 						pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
 				from (
 					select exchange_timestamp, order_id, round( price, price_precision) as price,
 						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
 					from deleted_transient_events join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
 				) a
-				order by episode_timestamp, order_id, channel_id, pair_id, price, amount, exchange_timestamp desc, local_timestamp desc
+				order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 			),
 			base_for_insert_level3 as (
 				select *
 				from base_events
-				union all	-- will be empty if new era starts
+				union all	-- will be empty if the new era starts
 				select *
 				from unnest(v_open_orders)	
 				),
 			for_insert_level3 as (
 				select episode_timestamp as microtimestamp,
 						order_id,
-						(coalesce(first_value(event_no) over oe, 1) - 1)::smallint + (row_number() over oe)::smallint as event_no,
+						(coalesce(first_value(event_no) over oe, 1) - 1)::integer + (row_number() over oe)::integer as event_no,
 						case when amount < 0 then 's' when amount > 0 then 'b' end as side,
 						case when price = 0 then abs(lag(price) over oe) else abs(price) end as  price, 
 						case when price = 0 then abs(lag(amount) over oe) else abs(amount) end as amount,
 						case when price = 0 then null else abs(amount) - abs(lag(amount) over oe) end as fill, 
 						case when price > 0 then coalesce(lead(episode_timestamp) over oe, 'infinity'::timestamptz) when price = 0 then '-infinity'::timestamptz end  as next_microtimestamp,
-						case when price > 0 then (coalesce(first_value(event_no) over oe, 1) )::smallint + (row_number() over oe)::smallint end as next_event_no,
+						case when price > 0 then (coalesce(first_value(event_no) over oe, 1) )::integer + (row_number() over oe)::integer end as next_event_no,
 						null::bigint as trade_id,
 						pair_id,
 						local_timestamp,
@@ -1172,8 +1172,17 @@ begin
 					null::timestamptz
 			from (
 				select *,
-						first_value(microtimestamp) over op as price_microtimestamp,
-						first_value(event_no) over op as price_event_no
+						-- checks that it is not a deletion event, when determining price_microtimestamp & price_event_no
+						case when first_value(price)  over op > 0 then 
+								first_value(microtimestamp)  over op
+							  else 
+								null	
+						end as price_microtimestamp,	
+						case when first_value(price) over op > 0 then 
+								first_value(event_no) over op
+							  else 
+								null	
+						end as price_event_no
 				from (
 					select *, sum(is_price_changed) over (partition by order_id, reincarnation_no order by microtimestamp) as price_group 			-- within an reincarnation of order_id
 					from  for_insert_level3

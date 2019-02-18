@@ -36,7 +36,7 @@ CREATE TYPE obanalytics.level3_order_book_record AS (
 	is_maker boolean,
 	microtimestamp timestamp with time zone,
 	order_id bigint,
-	event_no smallint,
+	event_no integer,
 	price_microtimestamp timestamp with time zone,
 	pair_id smallint,
 	exchange_id smallint
@@ -56,19 +56,19 @@ SET default_with_oids = false;
 CREATE TABLE obanalytics.level3 (
     microtimestamp timestamp with time zone NOT NULL,
     order_id bigint NOT NULL,
-    event_no smallint NOT NULL,
+    event_no integer NOT NULL,
     side character(1) NOT NULL,
     price numeric NOT NULL,
     amount numeric NOT NULL,
     fill numeric,
     next_microtimestamp timestamp with time zone NOT NULL,
-    next_event_no smallint,
+    next_event_no integer,
     trade_id bigint,
     pair_id smallint NOT NULL,
     exchange_id smallint NOT NULL,
     local_timestamp timestamp with time zone,
     price_microtimestamp timestamp with time zone NOT NULL,
-    price_event_no smallint,
+    price_event_no integer,
     exchange_microtimestamp timestamp with time zone,
     CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
@@ -97,9 +97,9 @@ CREATE TABLE obanalytics.matches (
     side character(1) NOT NULL,
     microtimestamp timestamp with time zone NOT NULL,
     buy_order_id bigint,
-    buy_event_no smallint,
+    buy_event_no integer,
     sell_order_id bigint,
-    sell_event_no smallint,
+    sell_event_no integer,
     buy_match_rule smallint,
     sell_match_rule smallint,
     local_timestamp timestamp with time zone,
@@ -590,6 +590,7 @@ begin
 				new.price_event_no := 1;
 				new.event_no := 1;
 			else
+				raise notice 'Skipped insertion of %, %, %, %', new.microtimestamp, new.order_id, new.event_no, new.local_timestamp;
 				return null;	-- skip insertion
 			end if;
 		end if;
