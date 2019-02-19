@@ -69,7 +69,7 @@ CREATE TABLE bitfinex.transient_raw_book_events (
     local_timestamp timestamp with time zone,
     channel_id integer,
     episode_timestamp timestamp with time zone NOT NULL,
-    event_no smallint,
+    event_no integer,
     bl integer
 );
 
