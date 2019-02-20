@@ -100,7 +100,7 @@ def main():
             except asyncio.CancelledError:
                 logger.info('Cancelled, exiting ...')
             except Exception as e:
-                logger.error(e)
+                logger.exception(e)
                 exitcode = 1
         else:
             print('Exchange %s is not supported (yet)' % stream[1])
