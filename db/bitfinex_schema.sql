@@ -1228,6 +1228,54 @@ $$;
 ALTER FUNCTION bitfinex.capture_transient_trades(p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
+-- Name: match_price_and_fill_exact(timestamp with time zone, timestamp with time zone, text, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.match_price_and_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_max_delay interval DEFAULT '00:00:01'::interval) RETURNS SETOF obanalytics.matches
+    LANGUAGE sql
+    SET work_mem TO '1GB'
+    AS $$
+
+with level3 as (
+	select * 
+	from obanalytics.level3_bitfinex
+	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
+	  and microtimestamp between p_start_time and p_end_time
+),
+matches as (
+	select ctid, exchange_trade_id, price, -amount as fill, microtimestamp as trade_microtimestamp
+	from obanalytics.matches_bitfinex
+	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
+	  and microtimestamp between p_start_time and p_end_time
+	  and buy_order_id is null and sell_order_id is null
+),
+joined as (
+	select * , row_number() over (partition by exchange_trade_id order by microtimestamp ) as r 
+	from level3 join matches using (price, fill)
+	where microtimestamp between trade_microtimestamp  and trade_microtimestamp + p_max_delay
+),
+for_update as (
+	select ctid, microtimestamp, order_id, event_no, side
+	from joined 
+	where r  = 1
+)
+update obanalytics.matches_bitfinex
+set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
+    buy_event_no = case when for_update.side = 'b' then event_no else buy_order_id end,
+	sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
+	sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
+	microtimestamp = for_update.microtimestamp
+from for_update
+where matches_bitfinex.pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
+  and for_update.ctid = matches_bitfinex.ctid
+returning matches_bitfinex.*;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.match_price_and_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_max_delay interval) OWNER TO "ob-analytics";
+
+--
 -- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying, character); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
@@ -2215,6 +2263,53 @@ $$;
 
 
 ALTER FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval) OWNER TO "ob-analytics";
+
+--
+-- Name: pga_match(text, interval, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.pga_match(p_pair text, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '01:00:00'::interval) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_start timestamptz;
+	v_end timestamptz;
+	v_pair_id smallint;
+begin 
+	
+	select pair_id into v_pair_id
+	from obanalytics.pairs
+	where pair = upper(p_pair);
+
+	select max(microtimestamp) into v_start
+	from obanalytics.matches_bitfinex 
+	where pair_id = v_pair_id
+	  and (buy_order_id is not null or sell_order_id is not null);
+	  
+	if v_start is not null then 
+		select coalesce(max(microtimestamp) - p_delay, 'infinity'::timestamptz) into v_end
+		from obanalytics.matches_bitfinex
+		where pair_id = v_pair_id;
+		
+		if v_start + p_max_interval < v_end then
+			v_end := v_start + p_max_interval;
+		end if;
+		
+	else
+		select min(microtimestamp) , min(microtimestamp) + p_max_interval into v_start, v_end
+		from obanalytics.matches_bitfinex 
+		where pair_id = v_pair_id;
+		
+	end if;	
+	raise debug 'v_start: %, v_end: %', v_start, v_end;
+	perform bitfinex.match_price_and_fill_exact(v_start, v_end, p_pair);
+
+	return 0;											   
+end;
+$$;
+
+
+ALTER FUNCTION bitfinex.pga_match(p_pair text, p_delay interval, p_max_interval interval) OWNER TO "ob-analytics";
 
 --
 -- Name: update_symbol_details(text, smallint, numeric, numeric, numeric, numeric, text, boolean); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics

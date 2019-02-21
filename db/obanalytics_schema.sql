@@ -217,9 +217,6 @@ begin
 	v_statements[i] := v_statement || '_unique_next unique (next_microtimestamp, order_id, next_event_no) deferrable initially deferred';
 	
 	i := i+1;
-	v_statements[i] := v_statement || '_unique_trade_id unique (microtimestamp, order_id, event_no, trade_id)';
-	
-	i := i+1;
 	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_enabled = TRUE,  autovacuum_vacuum_scale_factor= 0.0 , '||
 		'autovacuum_analyze_scale_factor = 0.0 ,  autovacuum_analyze_threshold = 10000, autovacuum_vacuum_threshold = 10000)';
 	
@@ -794,6 +791,61 @@ WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuu
 ALTER TABLE obanalytics.level3_01003s201903 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_bitfinex_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_bitfinex_xrpusd PARTITION OF obanalytics.level3_bitfinex
+FOR VALUES IN ('4')
+PARTITION BY LIST (side);
+
+
+ALTER TABLE obanalytics.level3_bitfinex_xrpusd OWNER TO "ob-analytics";
+
+--
+-- Name: level3_bitfinex_xrpusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_bitfinex_xrpusd_b PARTITION OF obanalytics.level3_bitfinex_xrpusd
+FOR VALUES IN ('b')
+PARTITION BY RANGE (microtimestamp);
+
+
+ALTER TABLE obanalytics.level3_bitfinex_xrpusd_b OWNER TO "ob-analytics";
+
+--
+-- Name: level3_01004b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01004b201902 PARTITION OF obanalytics.level3_bitfinex_xrpusd_b
+FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+
+
+ALTER TABLE obanalytics.level3_01004b201902 OWNER TO "ob-analytics";
+
+--
+-- Name: level3_bitfinex_xrpusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_bitfinex_xrpusd_s PARTITION OF obanalytics.level3_bitfinex_xrpusd
+FOR VALUES IN ('s')
+PARTITION BY RANGE (microtimestamp);
+
+
+ALTER TABLE obanalytics.level3_bitfinex_xrpusd_s OWNER TO "ob-analytics";
+
+--
+-- Name: level3_01004s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01004s201902 PARTITION OF obanalytics.level3_bitfinex_xrpusd_s
+FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+
+
+ALTER TABLE obanalytics.level3_01004s201902 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1003,6 +1055,28 @@ WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuu
 
 
 ALTER TABLE obanalytics.matches_01003201903 OWNER TO "ob-analytics";
+
+--
+-- Name: matches_bitfinex_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_bitfinex_xrpusd PARTITION OF obanalytics.matches_bitfinex
+FOR VALUES IN ('4')
+PARTITION BY RANGE (microtimestamp);
+
+
+ALTER TABLE obanalytics.matches_bitfinex_xrpusd OWNER TO "ob-analytics";
+
+--
+-- Name: matches_01004201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_01004201902 PARTITION OF obanalytics.matches_bitfinex_xrpusd
+FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+
+
+ALTER TABLE obanalytics.matches_01004201902 OWNER TO "ob-analytics";
 
 --
 -- Name: matches_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -1340,6 +1414,48 @@ ALTER TABLE ONLY obanalytics.level3_01003s201903 ALTER COLUMN exchange_id SET DE
 
 
 --
+-- Name: level3_01004b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
+
+
+--
+-- Name: level3_01004b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004b201902 ALTER COLUMN pair_id SET DEFAULT 4;
+
+
+--
+-- Name: level3_01004b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004b201902 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level3_01004s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
+
+
+--
+-- Name: level3_01004s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004s201902 ALTER COLUMN pair_id SET DEFAULT 4;
+
+
+--
+-- Name: level3_01004s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004s201902 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
 -- Name: level3_02001b201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1599,6 +1715,62 @@ ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ALTER COLUMN exchange_id S
 
 
 --
+-- Name: level3_bitfinex_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
+
+
+--
+-- Name: level3_bitfinex_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level3_bitfinex_xrpusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
+
+
+--
+-- Name: level3_bitfinex_xrpusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ALTER COLUMN pair_id SET DEFAULT 4;
+
+
+--
+-- Name: level3_bitfinex_xrpusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level3_bitfinex_xrpusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
+
+
+--
+-- Name: level3_bitfinex_xrpusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ALTER COLUMN pair_id SET DEFAULT 4;
+
+
+--
+-- Name: level3_bitfinex_xrpusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
 -- Name: level3_bitstamp exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1746,6 +1918,20 @@ ALTER TABLE ONLY obanalytics.matches_01003201903 ALTER COLUMN pair_id SET DEFAUL
 
 
 --
+-- Name: matches_01004201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01004201902 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: matches_01004201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01004201902 ALTER COLUMN pair_id SET DEFAULT 4;
+
+
+--
 -- Name: matches_02001201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1820,6 +2006,20 @@ ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ALTER COLUMN exchange_id SE
 --
 
 ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
+
+
+--
+-- Name: matches_bitfinex_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_bitfinex_xrpusd ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: matches_bitfinex_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_bitfinex_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
 
 
 --
@@ -1953,6 +2153,38 @@ ALTER TABLE ONLY obanalytics.level3_01003s201903
 
 ALTER TABLE ONLY obanalytics.level3_01003s201903
     ADD CONSTRAINT level3_01003s201903_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01004b201902 level3_01004b201902_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004b201902
+    ADD CONSTRAINT level3_01004b201902_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01004b201902 level3_01004b201902_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004b201902
+    ADD CONSTRAINT level3_01004b201902_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01004s201902 level3_01004s201902_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004s201902
+    ADD CONSTRAINT level3_01004s201902_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01004s201902 level3_01004s201902_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004s201902
+    ADD CONSTRAINT level3_01004s201902_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -2172,6 +2404,14 @@ ALTER TABLE ONLY obanalytics.matches_01003201903
 
 
 --
+-- Name: matches_01004201902 matches_01004201902_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01004201902
+    ADD CONSTRAINT matches_01004201902_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
 -- Name: matches_02001201901 matches_02001201901_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -2294,6 +2534,20 @@ CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_0200
 
 
 --
+-- Name: level3_01004b201902 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01004b201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01004s201902 ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01004s201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
 -- Name: level3_01001b201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -2406,6 +2660,55 @@ CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp O
 
 
 --
+-- Name: matches_01002201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01002201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_01002201903 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01002201903 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_01003201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01003201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_01003201903 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01003201903 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01004b201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01004b201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01004s201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01004s201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_01004201902 bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01004201902 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_01001b201903 level3_01001b201903_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -2499,6 +2802,38 @@ ALTER TABLE ONLY obanalytics.level3_01003s201903
 
 ALTER TABLE ONLY obanalytics.level3_01003s201903
     ADD CONSTRAINT level3_01003s201903_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01003s201903(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01004b201902 level3_01004b201902_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004b201902
+    ADD CONSTRAINT level3_01004b201902_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01004b201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01004b201902 level3_01004b201902_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004b201902
+    ADD CONSTRAINT level3_01004b201902_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01004b201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01004s201902 level3_01004s201902_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004s201902
+    ADD CONSTRAINT level3_01004s201902_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01004s201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01004s201902 level3_01004s201902_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01004s201902
+    ADD CONSTRAINT level3_01004s201902_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01004s201902(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -2787,6 +3122,22 @@ ALTER TABLE ONLY obanalytics.matches_01003201903
 
 ALTER TABLE ONLY obanalytics.matches_01003201903
     ADD CONSTRAINT matches_01003201903_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_01003s201903(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_01004201902 matches_01004201902_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01004201902
+    ADD CONSTRAINT matches_01004201902_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_01004b201902(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_01004201902 matches_01004201902_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01004201902
+    ADD CONSTRAINT matches_01004201902_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_01004s201902(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
