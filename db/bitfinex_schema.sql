@@ -1134,7 +1134,6 @@ begin
 						case when price = 0 then null else abs(amount) - abs(lag(amount) over oe) end as fill, 
 						case when price > 0 then coalesce(lead(episode_timestamp) over oe, 'infinity'::timestamptz) when price = 0 then '-infinity'::timestamptz end  as next_microtimestamp,
 						case when price > 0 then (coalesce(first_value(event_no) over oe, 1) )::integer + (row_number() over oe)::integer end as next_event_no,
-						null::bigint as trade_id,
 						pair_id,
 						local_timestamp,
 						reincarnation_no,
@@ -1153,7 +1152,7 @@ begin
 				window oe as (partition by order_id, reincarnation_no order by exchange_timestamp, local_timestamp)
 			)		
 			insert into obanalytics.level3_bitfinex (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
-													 trade_id, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp )
+													 pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp )
 			select microtimestamp, order_id, 
 					case when first_value(event_no) over o  > 1 and event_no = first_value(event_no) over o  and microtimestamp = first_value(microtimestamp) over o  then null 
 						else event_no end as event_no,	-- event_no MUST be set by BEFORE trigger in order to update the previous event 
@@ -1162,7 +1161,7 @@ begin
 						else fill end as fill,											-- see the comment for event_no
 					next_microtimestamp,
 					case when next_microtimestamp = 'infinity' then null else next_event_no end,
-					trade_id, pair_id, 
+					pair_id, 
 					-- null::smallint as exchange_id, 
 					local_timestamp,
 					case when first_value(event_no) over o  > 1 and event_no = first_value(event_no) over o  and microtimestamp = first_value(microtimestamp) over o  then null 							
@@ -1217,8 +1216,8 @@ with deleted as (
 	  and exchange_timestamp <= p_end_time
 	returning transient_trades.*
 )
-insert into obanalytics.matches_bitfinex (trade_id, amount, price, side, microtimestamp, local_timestamp, pair_id, exchange_trade_id)
-select 	trade_id, round(abs(qty), fmu), round(price, price_precision),  case when qty <0 then 's' else 'b' end, exchange_timestamp, local_timestamp, pair_id, id
+insert into obanalytics.matches_bitfinex (amount, price, side, microtimestamp, local_timestamp, pair_id, exchange_trade_id)
+select distinct on (exchange_timestamp, id) round(abs(qty), fmu), round(price, price_precision),  case when qty <0 then 's' else 'b' end, exchange_timestamp, local_timestamp, pair_id, id
 from deleted join bitfinex.latest_symbol_details using (pair_id) join obanalytics.pairs using (pair_id)
 order by exchange_timestamp, id
 returning matches_bitfinex.*;
