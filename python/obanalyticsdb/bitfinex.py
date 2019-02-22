@@ -134,49 +134,53 @@ class BitfinexTradeDataHandler:
 
 class BitfinexMessageHandler:
 
-    def __init__(self, ws, pair, pair_id, con, q):
+    def __init__(self, ws, pair, pair_id, pool, q):
         self.ws = ws
         self.pair = pair
         self.pair_id = pair_id
-        self.con = con
+        self.pool = pool
         self.channels = {}
         self.q = q
         self.logger = logging.getLogger(__name__ + ".messagehandler")
 
     async def process_messages(self):
-        lts, bl, message = await self.q.get()
-        MIN_MAX_QUEUE = 100
-        max_queue = MIN_MAX_QUEUE
-        while message is not None:
-            message = json.loads(message)
-            self.logger.debug(message)
-            if isinstance(message, dict):
-                await getattr(self, message['event'])(lts, message)
-            else:
-                await self.data(lts, message, bl)
+        async with self.pool.acquire() as con:
+            self.con = con
+            await con.execute(
+                f"set application_name to 'BITFINEX:{self.pair}'")
             lts, bl, message = await self.q.get()
-            if self.q.qsize() > max_queue:
-                self.logger.warning(
-                    'queue size: %i', self.q.qsize())
-                max_queue = self.q.qsize()*1.25
-            elif (self.q.qsize() >= MIN_MAX_QUEUE and
-                  self.q.qsize() < max_queue*0.75/1.25):
-                self.logger.warning(
-                    'queue size: %i (decreasing)', self.q.qsize())
-                max_queue = self.q.qsize()
-        await asyncio.shield(self.close())
+            MIN_MAX_QUEUE = 1024
+            max_queue = MIN_MAX_QUEUE
+            while message is not None:
+                message = json.loads(message)
+                self.logger.debug(message)
+                if isinstance(message, dict):
+                    await getattr(self, message['event'])(lts, message)
+                else:
+                    await self.data(lts, message, bl)
+                lts, bl, message = await self.q.get()
+                if self.q.qsize() > max_queue:
+                    self.logger.warning(
+                        'queue size: %i', self.q.qsize())
+                    max_queue = self.q.qsize()*1.25
+                elif (self.q.qsize() >= MIN_MAX_QUEUE and
+                      self.q.qsize() < max_queue*0.75/1.25):
+                    self.logger.warning(
+                        'queue size: %i (decreasing)', self.q.qsize())
+                    max_queue = self.q.qsize()
+            await asyncio.shield(self.close())
 
     async def info(self, lts, message):
         self.logger.info(message)
         if message.get("version", 0):
-            await self.ws.send(json.dumps({
-                "event": "subscribe",
-                "channel": "trades", "symbol": 't'+self.pair}))
             await self.ws.send(json.dumps({"event": "subscribe",
                                            "channel": "book",
                                            "prec": "R0",
                                            "len": 100,
                                            "symbol": 't'+self.pair}))
+            await self.ws.send(json.dumps({
+                "event": "subscribe",
+                "channel": "trades", "symbol": 't'+self.pair}))
 
     async def conf(self, lts, message):
         self.logger.info(message)
@@ -203,68 +207,72 @@ async def capture(pair, user, database):
     logger = logging.getLogger(__name__ + ".capture")
     logger.info(f'Started {pair}, {user}, {database}')
 
-    con = await asyncpg.connect(user=user, database=database)
-    pair_id = await con.fetchval(''' select pair_id from obanalytics.pairs
-                                where pair = $1 ''', pair)
-    await con.execute(f"set application_name to 'BITFINEX:{pair}'")
-    is_closing = False
-    MIN_MAX_QUEUE = 100
-    wait_list = list()
+    async with await asyncpg.create_pool(user=user, database=database,
+                                         min_size=1, max_size=1) as pool:
 
-    while True:
-        try:
-            if is_closing:
-                break
-            logger.info('Connecting to Bitfinex ...')
-            max_queue = MIN_MAX_QUEUE
-            async with websockets.connect("wss://api.bitfinex.com/ws/2",
-                                          max_queue=2**20) as ws:
-                q = asyncio.Queue()
-                handler = asyncio.ensure_future(
-                    BitfinexMessageHandler(ws, pair, pair_id, con,
-                                           q).process_messages())
-                await ws.send(json.dumps({'event': 'conf',
-                                          'flags': 32768}))
-                while True:
-                    try:
-                        message = await ws.recv()
-                        lts = datetime.now()
-                        bl = len(ws.messages)
-                        if handler.done():
-                            handler.result()
-                            raise asyncio.CancelledError
-                        else:
-                            q.put_nowait((lts, bl, message))
+        async with pool.acquire() as con:
+            pair_id = await con.fetchval('''
+                                         select pair_id from obanalytics.pairs
+                                         where pair = $1 ''', pair)
+        is_closing = False
+        MIN_MAX_QUEUE = 100
+        wait_list = list()
 
-                        if bl > max_queue or is_closing:
-                            logger.warning(
-                                'websockets internal queue size: %i', bl)
-                            if is_closing:
-                                logger.info(message)
-                            max_queue = bl*1.25
-                        elif bl >= MIN_MAX_QUEUE and bl < max_queue*0.75/1.25:
-                            logger.warning(
-                                'websockets internal queue size: %i '
-                                '(decreasing)', bl)
-                            max_queue = bl
-                    except asyncio.CancelledError:
-                        logger.info('Closing websocket ...')
-                        is_closing = True
-                        await ws.close()
-        except (websockets.InvalidHandshake, websockets.InvalidState,
-                websockets.PayloadTooBig, websockets.ConnectionClosed,
-                websockets.WebSocketProtocolError) as e:
-            logger.info(e)
-            q.put_nowait((datetime.now(), 0, None))
-            wait_list.append(handler)
-            # don't exit, re-connect
+        while True:
+            try:
+                if is_closing:
+                    break
+                logger.info('Connecting to Bitfinex ...')
+                max_queue = MIN_MAX_QUEUE
+                async with websockets.connect("wss://api.bitfinex.com/ws/2",
+                                              max_queue=2**20) as ws:
+                    q = asyncio.Queue()
+                    handler = asyncio.ensure_future(
+                        BitfinexMessageHandler(ws, pair, pair_id, pool,
+                                               q).process_messages())
+                    await ws.send(json.dumps({'event': 'conf',
+                                              'flags': 32768}))
+                    while True:
+                        try:
+                            message = await ws.recv()
+                            lts = datetime.now()
+                            bl = len(ws.messages)
+                            if handler.done():
+                                handler.result()
+                                raise asyncio.CancelledError
+                            else:
+                                q.put_nowait((lts, bl, message))
 
-        except Exception as e:
-            logger.exception(e)
-            raise
+                            if bl > max_queue or is_closing:
+                                logger.warning(
+                                    'websockets internal queue size: %i', bl)
+                                if is_closing:
+                                    logger.info(message)
+                                max_queue = bl*1.25
+                            elif (bl >= MIN_MAX_QUEUE and
+                                  bl < max_queue*0.75/1.25):
+                                logger.warning(
+                                    'websockets internal queue size: %i '
+                                    '(decreasing)', bl)
+                                max_queue = bl
+                        except asyncio.CancelledError:
+                            logger.info('Closing websocket ...')
+                            is_closing = True
+                            await ws.close()
+            except (websockets.InvalidHandshake, websockets.InvalidState,
+                    websockets.PayloadTooBig, websockets.ConnectionClosed,
+                    websockets.WebSocketProtocolError) as e:
+                logger.info(e)
+                q.put_nowait((datetime.now(), 0, None))
+                wait_list.append(handler)
+                # don't exit, re-connect
 
-    await asyncio.gather(*wait_list)
-    logger.info('Exiting ...')
+            except Exception as e:
+                logger.exception(e)
+                raise
+
+        await asyncio.gather(*wait_list)
+        logger.info('Exiting ...')
 
 
 async def monitor(user, database):
