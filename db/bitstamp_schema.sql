@@ -607,6 +607,14 @@ INSERT INTO bitstamp.live_trades (bitstamp_trade_id, amount, price, trade_type, 
 SELECT 	bitstamp_trade_id, amount, price, trade_type, trade_timestamp, buy_order_id, sell_order_id, local_timestamp, pair_id
 FROM deleted
 ORDER BY bitstamp_trade_id
+on conflict on constraint live_trades_unique_order_ids_combination 
+	do 	update 
+		set bitstamp_trade_id = excluded.bitstamp_trade_id, 
+			amount = excluded.amount,
+			price = excluded.price,
+			trade_type = excluded.trade_type, 
+			trade_timestamp = excluded.trade_timestamp,
+			local_timestamp = excluded.local_timestamp
 RETURNING live_trades.*;
 
 $$;
@@ -2302,7 +2310,7 @@ $$;
 ALTER FUNCTION bitstamp.pga_cleanse(p_pair text, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: pga_depth(text, interval, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: postgres
+-- Name: pga_depth(text, interval, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
 CREATE FUNCTION bitstamp.pga_depth(p_pair text DEFAULT 'BTCUSD'::text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS void
@@ -2363,7 +2371,7 @@ end;
 $$;
 
 
-ALTER FUNCTION bitstamp.pga_depth(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO postgres;
+ALTER FUNCTION bitstamp.pga_depth(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: pga_match(text, timestamp with time zone); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -3041,7 +3049,7 @@ ALTER TABLE ONLY bitstamp.live_trades
 --
 
 ALTER TABLE ONLY bitstamp.live_trades
-    ADD CONSTRAINT live_trades_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id) DEFERRABLE INITIALLY DEFERRED;
+    ADD CONSTRAINT live_trades_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
 
 
 --
