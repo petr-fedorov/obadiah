@@ -1075,7 +1075,7 @@ begin
 				
 				v_open_orders := null;	-- event_no will start from scratch
 			else
-				raise log 'Continue previous era for new channel % because interval % between % and % is less than threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
+				raise debug 'Continue previous era for new channel % because interval % between % and % is less than threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
 				with to_be_replaced as (
 					delete from bitfinex.transient_raw_book_events
 					where pair_id = v_pair_id
@@ -1096,7 +1096,7 @@ begin
 				;
 			end if;
 		else
-			raise log 'Continue previous era for old channel %', p.channel_id;
+			raise debug 'Continue previous era for old channel %', p.channel_id;
 		end if;
 		return query 
 			with deleted_transient_events as (

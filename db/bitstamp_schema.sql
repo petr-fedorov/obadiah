@@ -370,19 +370,31 @@ PARTITION BY LIST (order_type);
 ALTER TABLE bitstamp.live_orders OWNER TO "ob-analytics";
 
 --
--- Name: _order_book_after_event(bitstamp.order_book_record[], bitstamp.live_orders, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: _order_book_after_event(bitstamp.order_book_record[], bitstamp.live_orders[], boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp._order_book_after_event(p_ob bitstamp.order_book_record[], p_ev bitstamp.live_orders, p_strict boolean DEFAULT true) RETURNS bitstamp.order_book_record[]
+CREATE FUNCTION bitstamp._order_book_after_event(p_ob bitstamp.order_book_record[], p_ep bitstamp.live_orders[], p_strict boolean DEFAULT true) RETURNS bitstamp.order_book_record[]
     LANGUAGE plpgsql STABLE
     AS $$
 begin
 	if p_ob is null and not p_strict then
-		p_ob := array( select order_book from bitstamp.order_book(p_ev.microtimestamp, p_ev.pair_id, p_only_makers := false, p_before := true ));
+		p_ob := array( select order_book from bitstamp.order_book(p_ep[1].microtimestamp, p_ep[1].pair_id, p_only_makers := false, p_before := true ));
 	end if;
 	
-	return ( with orders as (
-					select  p_ev.microtimestamp AS ts, price, amount, direction, order_id,
+	return ( with mix as (
+						select ob.*, false as is_deleted
+						from unnest(p_ob) ob
+						union all
+						select microtimestamp, price,amount,order_type,order_id,microtimestamp,event_no,pair_id,TRUE, price_microtimestamp, event = 'order_deleted' 
+						from unnest(p_ep)
+					),
+					latest_events as (
+						select distinct on (order_id) *
+						from mix
+						order by order_id, event_no desc	-- just take the latest event_no for each order
+					),
+					orders as (
+					select p_ep[1].microtimestamp AS ts, price, amount, direction, order_id,
 							microtimestamp,event_no, pair_id,
 							coalesce(
 								case direction
@@ -393,22 +405,8 @@ begin
 							true) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
 							as is_maker,
 							datetime
-					from ( select * 
-							from unnest(p_ob) i
-							where ( p_ev.event = 'order_created' or i.order_id <> p_ev.order_id )
-							union all
-							select  p_ev.microtimestamp, 
-									 p_ev.price,
-									 p_ev.amount,
-									 p_ev.order_type,
-									 p_ev.order_id,
-									 p_ev.microtimestamp,
-									 p_ev.event_no,
-									 p_ev.pair_id,
-									 TRUE,
-									 p_ev.price_microtimestamp	-- 'datetime' is replaced by 'price_microtimestamp'
-							where p_ev.event <> 'order_deleted' 
-							) a
+					from latest_events
+					where not is_deleted
 				)
 				select array(
 					select orders::bitstamp.order_book_record
@@ -421,7 +419,7 @@ end;
 $$;
 
 
-ALTER FUNCTION bitstamp._order_book_after_event(p_ob bitstamp.order_book_record[], p_ev bitstamp.live_orders, p_strict boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp._order_book_after_event(p_ob bitstamp.order_book_record[], p_ep bitstamp.live_orders[], p_strict boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: spread; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
@@ -2129,15 +2127,15 @@ CREATE FUNCTION bitstamp.order_book_by_episode(p_start_time timestamp with time 
 --		These consistent snapshots are then used to calculate spread, depth and depth.summary. Note that the consitent order book may still be crossed.
 --		It is assumed that spread, depth and depth.summary will ignore the unprocessed agressors crossing the book. 
 --		
-select distinct on (microtimestamp) ob
+select bitstamp.order_book_agg(episode, p_strict) over (order by microtimestamp)  as ob
 from (
-	select microtimestamp, order_id, event, event_no, amount, bitstamp.order_book_agg(live_orders, p_strict) over w as ob
-	from bitstamp.live_orders join bitstamp.pairs using (pair_id)
+	select microtimestamp, array_agg(live_orders) as episode
+	from bitstamp.live_orders 
 	where microtimestamp between p_start_time and p_end_time
-	  and pairs.pair = p_pair
-	window w as (order by microtimestamp, order_id, event_no)
+	  and pair_id = (select pair_id from bitstamp.pairs where pair = p_pair )
+	group by microtimestamp  
 ) a
-order by microtimestamp, order_id desc, event_no desc
+order by microtimestamp
 
 $$;
 
@@ -2800,16 +2798,16 @@ CREATE AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, pric
 ALTER AGGREGATE bitstamp.draw_agg(microtimestamp timestamp with time zone, price numeric, pair_id smallint, minimal_draw numeric) OWNER TO "ob-analytics";
 
 --
--- Name: order_book_agg(bitstamp.live_orders, boolean); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
+-- Name: order_book_agg(bitstamp.live_orders[], boolean); Type: AGGREGATE; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE AGGREGATE bitstamp.order_book_agg(event bitstamp.live_orders, boolean) (
+CREATE AGGREGATE bitstamp.order_book_agg(event bitstamp.live_orders[], boolean) (
     SFUNC = bitstamp._order_book_after_event,
     STYPE = bitstamp.order_book_record[]
 );
 
 
-ALTER AGGREGATE bitstamp.order_book_agg(event bitstamp.live_orders, boolean) OWNER TO "ob-analytics";
+ALTER AGGREGATE bitstamp.order_book_agg(event bitstamp.live_orders[], boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: diff_order_book; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
