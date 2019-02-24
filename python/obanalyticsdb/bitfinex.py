@@ -181,6 +181,9 @@ class BitfinexMessageHandler:
             await self.ws.send(json.dumps({
                 "event": "subscribe",
                 "channel": "trades", "symbol": 't'+self.pair}))
+        elif message.get("code", 0) == 20051:
+            self.logger.info('Trying to reconnect as requested ...')
+            await self.ws.close()
 
     async def conf(self, lts, message):
         self.logger.info(message)
