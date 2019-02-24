@@ -217,8 +217,7 @@ begin
 	v_statements[i] := v_statement || '_unique_next unique (next_microtimestamp, order_id, next_event_no) deferrable initially deferred';
 	
 	i := i+1;
-	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_enabled = TRUE,  autovacuum_vacuum_scale_factor= 0.0 , '||
-		'autovacuum_analyze_scale_factor = 0.0 ,  autovacuum_analyze_threshold = 10000, autovacuum_vacuum_threshold = 10000)';
+	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
 	
 	i := i+1;
 	v_statements[i] := 'create trigger ba_incorporate_new_event before insert on '||V_SCHEMA||v_table_name||
@@ -337,11 +336,8 @@ begin
 	v_statements[i] := v_statement || '_fkey_level3_sells  foreign key (sell_event_no, microtimestamp, sell_order_id) references '||V_SCHEMA ||v_sell_orders_table ||
 							'(event_no, microtimestamp, order_id) match simple on update cascade on delete no action deferrable initially deferred';
 
-
-
 	i := i+1;
-	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_enabled = TRUE,  autovacuum_vacuum_scale_factor= 0.0 , '||
-		'autovacuum_analyze_scale_factor = 0.0 ,  autovacuum_analyze_threshold = 10000, autovacuum_vacuum_threshold = 10000)';
+	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
 	
 
 	foreach v_statement in array v_statements loop
@@ -359,6 +355,103 @@ $$;
 ALTER FUNCTION obanalytics._create_matches_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: _drop_leaf_level3_partition(text, character, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._drop_leaf_level3_partition(p_exchange text, p_side character, p_pair text, p_year integer, p_month integer, p_execute boolean DEFAULT false) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+
+declare
+	i integer;
+	v_exchange_id smallint;
+	v_pair_id smallint;
+	
+	v_table_name text;
+	v_statement text;
+	v_statements text[];
+	V_SCHEMA constant text default 'obanalytics.';
+begin 
+
+	if not lower(p_side) in ('b', 's') then 
+		raise exception 'Invalid p_side: % ', p_side;
+	end if;
+	
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs
+	where pair = upper(p_pair);
+	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges
+	where exchange = lower(p_exchange);
+
+	v_table_name :=  'level3_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0')|| p_side || p_year || lpad(p_month::text, 2, '0') ;
+	i := 1;
+	
+	v_statements[i] := 'drop table if exists '||V_SCHEMA ||v_table_name;
+							
+	foreach v_statement in array v_statements loop
+		raise debug '%', v_statement;
+		if p_execute then 
+			execute v_statement;
+		end if;		
+	end loop;		
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics._drop_leaf_level3_partition(p_exchange text, p_side character, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: _drop_leaf_matches_partition(text, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._drop_leaf_matches_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean DEFAULT false) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+
+declare
+	i integer;
+	v_exchange_id smallint;
+	v_pair_id smallint;
+	
+	
+	v_table_name text;
+	v_statement text;
+	v_statements text[];
+	V_SCHEMA constant text default 'obanalytics.';
+begin 
+
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs
+	where pair = upper(p_pair);
+	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges
+	where exchange = lower(p_exchange);
+	
+	v_table_name :=  'matches_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0') || p_year || lpad(p_month::text, 2, '0') ;
+	i := 1;
+	
+	v_statements[i] := 'drop table if exists '||V_SCHEMA ||v_table_name;
+							
+	foreach v_statement in array v_statements loop
+		raise debug '%', v_statement;
+		if p_execute then 
+			execute v_statement;
+		end if;		
+	end loop;		
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics._drop_leaf_matches_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
+
+--
 -- Name: create_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -374,6 +467,24 @@ $$;
 
 
 ALTER FUNCTION obanalytics.create_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
+
+--
+-- Name: drop_leaf_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+begin 
+	perform obanalytics._drop_leaf_matches_partition(p_exchange, p_pair, p_year, p_month, true);
+	perform obanalytics._drop_leaf_level3_partition(p_exchange, 'b', p_pair, p_year, p_month, true);
+	perform obanalytics._drop_leaf_level3_partition(p_exchange, 's', p_pair, p_year, p_month, true);
+	
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
 
 --
 -- Name: level3_incorporate_new_event(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -587,7 +698,7 @@ ALTER TABLE obanalytics.level3_bitfinex_btcusd_b OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01001b201902 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01001b201902 OWNER TO "ob-analytics";
@@ -620,7 +731,7 @@ ALTER TABLE obanalytics.level3_bitfinex_btcusd_s OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01001s201902 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01001s201902 OWNER TO "ob-analytics";
@@ -664,7 +775,7 @@ ALTER TABLE obanalytics.level3_bitfinex_ltcusd_b OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01002b201902 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01002b201902 OWNER TO "ob-analytics";
@@ -697,7 +808,7 @@ ALTER TABLE obanalytics.level3_bitfinex_ltcusd_s OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01002s201902 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01002s201902 OWNER TO "ob-analytics";
@@ -741,7 +852,7 @@ ALTER TABLE obanalytics.level3_bitfinex_ethusd_b OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01003b201902 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01003b201902 OWNER TO "ob-analytics";
@@ -774,7 +885,7 @@ ALTER TABLE obanalytics.level3_bitfinex_ethusd_s OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01003s201902 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01003s201902 OWNER TO "ob-analytics";
@@ -974,7 +1085,7 @@ ALTER TABLE obanalytics.matches_bitfinex_btcusd OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.matches_01001201902 PARTITION OF obanalytics.matches_bitfinex_btcusd
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.matches_01001201902 OWNER TO "ob-analytics";
@@ -1007,7 +1118,7 @@ ALTER TABLE obanalytics.matches_bitfinex_ltcusd OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.matches_01002201902 PARTITION OF obanalytics.matches_bitfinex_ltcusd
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.matches_01002201902 OWNER TO "ob-analytics";
@@ -1040,7 +1151,7 @@ ALTER TABLE obanalytics.matches_bitfinex_ethusd OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.matches_01003201902 PARTITION OF obanalytics.matches_bitfinex_ethusd
 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.matches_01003201902 OWNER TO "ob-analytics";
