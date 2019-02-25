@@ -625,7 +625,7 @@ ALTER FUNCTION bitstamp.capture_transient_trades(p_start_time timestamp with tim
 --
 
 CREATE FUNCTION bitstamp.depth_change_after_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT false) RETURNS SETOF bitstamp.depth
-    LANGUAGE sql STABLE
+    LANGUAGE plpgsql STABLE
     AS $$
 
 -- ARGUMENTS
@@ -633,43 +633,45 @@ CREATE FUNCTION bitstamp.depth_change_after_episode(p_start_time timestamp with 
 --		p_end_time	 - the end of the interval
 --		p_pair		 - the pair for which depths will be calculated
 --		p_strict		- whether to calculate the depth using events before p_start_time (false) or not (false). 
-
-with order_books as (
-	select ts, pair_id, ob, lag(ob) over (order by ts) as p_ob
-	from (
-		select ob[1].ts, ob[1].pair_id, ob
-		from bitstamp.order_book_by_episode(p_start_time, p_end_time, p_pair, p_strict) ob 
-	) a
-)
-select ts, pair_id, array_agg(d.d)
-from order_books  left join lateral (
-	select row(price, coalesce(af.amount, 0), direction)::bitstamp.depth_record as d
-	from (
-		select a.price, 
-				sum(a.amount) as amount,
-				case a.direction 
-					when 'buy' then 'bid'::bitstamp.side 
-					when 'sell' then 'ask'::bitstamp.side 
-				end as direction
-		from unnest(order_books.p_ob) a 
-		where a.is_maker 
-		group by a.price, a.direction, a.pair_id
-	) bf full join (
-		select a.price,
-				sum(a.amount) as amount,
-				case a.direction 
-					when 'buy' then 'bid'::bitstamp.side 
-					when 'sell' then 'ask'::bitstamp.side 
-				end as direction
-		from unnest(order_books.ob) a 
-		where a.is_maker 
-		group by a.price, a.direction, a.pair_id
-	) af using (price, direction)
-	where bf.amount is distinct from af.amount
-) d on true
-where p_ob is not null 
-group by ts, pair_id
-order by ts;
+declare
+	v_ob_before bitstamp.order_book_record[];
+	v_ob bitstamp.order_book_record[];
+begin
+	
+	for v_ob in select ob from bitstamp.order_book_by_episode(p_start_time, p_end_time, p_pair, p_strict) ob 
+	loop
+		if v_ob_before is not null then 
+			return query 
+				select v_ob[1].ts, v_ob[1].pair_id, array_agg(d.d)
+				from (
+					select row(price, coalesce(af.amount, 0), direction)::bitstamp.depth_record as d
+					from (
+						select a.price, 
+								sum(a.amount) as amount,
+								case a.direction 
+									when 'buy' then 'bid'::bitstamp.side 
+									when 'sell' then 'ask'::bitstamp.side 
+								end as direction
+						from unnest(v_ob_before) a 
+						where a.is_maker 
+						group by a.price, a.direction, a.pair_id
+					) bf full join (
+						select a.price,
+								sum(a.amount) as amount,
+								case a.direction 
+									when 'buy' then 'bid'::bitstamp.side 
+									when 'sell' then 'ask'::bitstamp.side 
+								end as direction
+						from unnest(v_ob) a 
+						where a.is_maker 
+						group by a.price, a.direction, a.pair_id
+					) af using (price, direction)
+					where bf.amount is distinct from af.amount
+				) d;
+		end if;
+		v_ob_before := v_ob;
+	end loop;			
+end;
 
 $$;
 
@@ -2358,7 +2360,7 @@ begin
 	raise debug 'pga_depth(): from: %  till: %', v_last_depth, v_end;
 	  
 	insert into bitstamp.depth (microtimestamp, pair_id, depth_change)
-	select microtimestamp, pair_id, depth_change
+	select microtimestamp, pair_id, coalesce(depth_change, '{}')
 	from bitstamp.depth_change_after_episode(v_last_depth, v_end, p_pair, p_strict := false);
 	
 	raise debug 'pga_depth() exec time: %', clock_timestamp() - v_current_timestamp;
