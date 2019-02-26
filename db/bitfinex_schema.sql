@@ -1236,14 +1236,15 @@ CREATE FUNCTION bitfinex.match_price_and_fill_exact(p_start_time timestamp with 
     SET work_mem TO '1GB'
     AS $$
 
-with level3 as (
-	select * 
+with level3_matcheable as (
+	select microtimestamp, order_id, event_no, price, coalesce(fill, -amount)  as fill, side
 	from obanalytics.level3_bitfinex
 	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
 	  and microtimestamp between p_start_time and p_end_time
+	  and fill is distinct from 0
 ),
 matches as (
-	select ctid, exchange_trade_id, price, -amount as fill, microtimestamp as trade_microtimestamp
+	select ctid, exchange_trade_id, price, -amount as fill, microtimestamp as trade_microtimestamp, side as origination
 	from obanalytics.matches_bitfinex
 	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
 	  and microtimestamp between p_start_time and p_end_time
@@ -1251,8 +1252,9 @@ matches as (
 ),
 joined as (
 	select * , row_number() over (partition by exchange_trade_id order by microtimestamp ) as r 
-	from level3 join matches using (price, fill)
+	from level3_matcheable join matches using (price, fill)
 	where microtimestamp between trade_microtimestamp  and trade_microtimestamp + p_max_delay
+	  and side <> origination
 ),
 for_update as (
 	select ctid, microtimestamp, order_id, event_no, side
@@ -1274,6 +1276,62 @@ $$;
 
 
 ALTER FUNCTION bitfinex.match_price_and_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_max_delay interval) OWNER TO "ob-analytics";
+
+--
+-- Name: match_price_and_sum_of_fill_exact(timestamp with time zone, timestamp with time zone, text, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_max_delay interval DEFAULT '00:00:01'::interval) RETURNS SETOF obanalytics.matches
+    LANGUAGE sql
+    SET work_mem TO '1GB'
+    AS $$
+
+with level3_matcheable as (
+	select microtimestamp, order_id, event_no, price, coalesce(fill, -amount)  as fill, side
+	from obanalytics.level3_bitfinex
+	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
+	  and microtimestamp between p_start_time and p_end_time
+	  and fill is distinct from 0
+),
+matches_gs as (
+	select ctid, (buy_order_id is null and sell_order_id is null and (lag(buy_order_id) over w is not null or lag(sell_order_id) over w is not null))::integer as gs, * 
+	from obanalytics.matches_bitfinex
+	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
+	  and microtimestamp between p_start_time and p_end_time																	  
+	window w as (order by microtimestamp)		
+	order by microtimestamp 
+	limit 1000),
+matches_gr as (
+	select sum(gs)  over (order by microtimestamp) as gr, *
+	from matches_gs
+	where buy_order_id is null and sell_order_id is null
+),
+matches as (
+	select max(microtimestamp) as trade_microtimestamp, -sum(amount) as fill, price, array_agg(ctid) as ctids, side as origination
+	from matches_gr	
+	group by gr, price, side
+),					 
+for_update as (
+	select *
+	from level3_matcheable join matches using (price, fill)
+	where microtimestamp between trade_microtimestamp  and trade_microtimestamp + p_max_delay
+	  and side <> origination
+)
+update obanalytics.matches_bitfinex
+set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
+    buy_event_no = case when for_update.side = 'b' then event_no else buy_order_id end,
+	sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
+	sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
+	microtimestamp = for_update.microtimestamp
+from for_update
+where matches_bitfinex.pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
+  and matches_bitfinex.ctid = any(ctids)
+returning matches_bitfinex.*;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_max_delay interval) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying, character); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
@@ -2268,12 +2326,10 @@ ALTER FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval) OWN
 -- Name: pga_match(text, interval, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.pga_match(p_pair text, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '01:00:00'::interval) RETURNS integer
+CREATE FUNCTION bitfinex.pga_match(p_pair text, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '08:00:00'::interval) RETURNS TABLE(o_start timestamp with time zone, o_end timestamp with time zone)
     LANGUAGE plpgsql
     AS $$
 declare
-	v_start timestamptz;
-	v_end timestamptz;
 	v_pair_id smallint;
 begin 
 	
@@ -2281,30 +2337,30 @@ begin
 	from obanalytics.pairs
 	where pair = upper(p_pair);
 
-	select max(microtimestamp) into v_start
+	select max(microtimestamp) into o_start
 	from obanalytics.matches_bitfinex 
 	where pair_id = v_pair_id
 	  and (buy_order_id is not null or sell_order_id is not null);
 	  
-	if v_start is not null then 
-		select coalesce(max(microtimestamp) - p_delay, 'infinity'::timestamptz) into v_end
+	if o_start is not null then 
+		select coalesce(max(microtimestamp) - p_delay, 'infinity'::timestamptz) into o_end
 		from obanalytics.matches_bitfinex
 		where pair_id = v_pair_id;
 		
-		if v_start + p_max_interval < v_end then
-			v_end := v_start + p_max_interval;
+		if o_start + p_max_interval < o_end then
+			o_end := o_start + p_max_interval;
 		end if;
 		
 	else
-		select min(microtimestamp) , min(microtimestamp) + p_max_interval into v_start, v_end
+		select min(microtimestamp) , min(microtimestamp) + p_max_interval into o_start, o_end
 		from obanalytics.matches_bitfinex 
 		where pair_id = v_pair_id;
 		
 	end if;	
-	raise debug 'v_start: %, v_end: %', v_start, v_end;
-	perform bitfinex.match_price_and_fill_exact(v_start, v_end, p_pair);
+	perform bitfinex.match_price_and_fill_exact(o_start, o_end, p_pair);
+	perform bitfinex.match_price_and_sum_of_fill_exact(o_start, o_end, p_pair);
 
-	return 0;											   
+	return next;
 end;
 $$;
 
