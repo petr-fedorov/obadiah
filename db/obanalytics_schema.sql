@@ -648,6 +648,72 @@ $$;
 ALTER FUNCTION obanalytics.save_exchange_microtimestamp() OWNER TO "ob-analytics";
 
 --
+-- Name: summary(text, text, timestamp with time zone, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.summary(p_exchange text DEFAULT NULL::text, p_pair text DEFAULT NULL::text, p_start_time timestamp with time zone DEFAULT (now() - '02:00:00'::interval), p_end_time timestamp with time zone DEFAULT 'infinity'::timestamp with time zone) RETURNS TABLE(pair text, e_first text, e_last text, e_total bigint, e_per_sec numeric, t_first text, t_last text, t_total bigint, t_per_sec numeric, t_matched bigint, t_exchange bigint, exchange text, era text)
+    LANGUAGE sql STABLE
+    AS $$
+		
+with periods as (
+	select exchange_id, pair_id, 
+			case when p_starts < p_start_time then p_start_time else p_starts end as period_starts, 
+			case when p_ends > p_end_time then p_end_time else p_ends end as period_ends, 	
+			era
+	from (
+		select exchange_id, pair_id, era as p_starts, 
+				coalesce(lead(era) over (partition by exchange_id, pair_id order by era) - '00:00:00.000001'::interval, 'infinity'::timestamptz) as p_ends, era
+		from obanalytics.level3_eras
+		where exchange_id in ( select exchange_id from obanalytics.exchanges where exchange = coalesce(lower(p_exchange), exchange) )
+		  and pair_id in ( select pair_id from obanalytics.pairs where pair = coalesce(upper(p_pair), pair))
+	) p 
+	where p_ends >= p_start_time
+   	  and p_starts <= p_end_time 
+),
+events as (		
+	select exchange_id,
+			pair_id,
+			period_starts,
+			period_ends,
+			min(microtimestamp) filter (where microtimestamp between period_starts and period_ends) as e_first, 
+			max(microtimestamp) filter (where microtimestamp between period_starts and period_ends) as e_last,
+			count(*) filter (where microtimestamp between period_starts and period_ends) as e_total
+	from periods join obanalytics.level3 using (exchange_id, pair_id)
+	where level3.microtimestamp between period_starts and period_ends
+	group by exchange_id, pair_id, period_starts, period_ends
+),
+trades as (		
+	select exchange_id,
+			pair_id,
+			period_starts,
+			period_ends,
+			min(microtimestamp) filter (where microtimestamp between period_starts and period_ends) as t_first, 
+			max(microtimestamp) filter (where microtimestamp between period_starts and period_ends) as t_last,
+			count(*) filter (where microtimestamp between period_starts and period_ends) as t_total,
+			count(*) filter (where microtimestamp between period_starts and period_ends and (buy_order_id is not null or sell_order_id is not null )) as t_matched,
+			count(*) filter (where microtimestamp between period_starts and period_ends and exchange_trade_id is not null) as t_exchange
+	from periods join obanalytics.matches using (exchange_id, pair_id)
+	where matches.microtimestamp between period_starts and period_ends
+	group by exchange_id, pair_id, period_starts, period_ends
+)		
+select pairs.pair, e_first::text, e_last::text, e_total, 
+		case  when extract( epoch from e_last - e_first ) > 0 then round((e_total/extract( epoch from e_last - e_first ))::numeric,2)
+	  		   else 0 
+		end as e_per_sec,		
+		t_first::text, t_last::text,
+		t_total, 
+		case  when extract( epoch from t_last - t_first ) > 0 then round((t_total/extract( epoch from t_last - t_first ))::numeric,2)
+	  		   else 0 
+		end as t_per_sec,		
+		t_matched, t_exchange, exchanges.exchange, periods.era::text
+from periods join obanalytics.pairs using (pair_id) join obanalytics.exchanges using (exchange_id) left join events using (exchange_id, pair_id, period_starts, period_ends)
+		left join trades using (exchange_id, pair_id, period_starts, period_ends)
+$$;
+
+
+ALTER FUNCTION obanalytics.summary(p_exchange text, p_pair text, p_start_time timestamp with time zone, p_end_time timestamp with time zone) OWNER TO "ob-analytics";
+
+--
 -- Name: exchanges; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
