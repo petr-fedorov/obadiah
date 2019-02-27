@@ -2715,7 +2715,6 @@ COMMENT ON FUNCTION bitstamp.spread_before_episode(p_start_time timestamp with t
 
 CREATE FUNCTION bitstamp.summary(p_limit integer DEFAULT 1, p_pair text DEFAULT NULL::text) RETURNS TABLE(era text, pair_id smallint, pair text, events bigint, e_last text, e_per_sec numeric, e_matched bigint, e_not_m bigint, trades bigint, t_matched bigint, t_not_m bigint, t_bitstamp bigint, spreads bigint, s_last text, depth bigint, d_last text)
     LANGUAGE sql STABLE
-    SET work_mem TO '4GB'
     AS $$
 
 with eras as (
@@ -2730,11 +2729,16 @@ with eras as (
 		where pairs.pair = coalesce(p_pair, pairs.pair)
 ),
 events_stat as (
-	select era_start, pair_id, count(*) as events, max(microtimestamp) as last_event, min(microtimestamp) as first_event,
-			count(*) filter (where trade_id is null and fill > 0 ) as unmatched_events,
-			count(*) filter (where trade_id is not null ) as matched_events	
-	from eras join bitstamp.live_orders on pair_id = era_pair_id and microtimestamp between era_start and era_end
-	group by pair_id, era_start 
+	select era_start, era_pair_id as pair_id, a.*
+	from eras join lateral (	-- lateral works better here than group by - no external sort!
+				select  count(*) as events,
+						 max(microtimestamp) as last_event,
+						 min(microtimestamp) as first_event,
+						 count(*) filter (where trade_id is null and fill > 0 ) as unmatched_events,
+						 count(*) filter (where trade_id is not null ) as matched_events	 
+				from bitstamp.live_orders 
+				where pair_id = era_pair_id 
+		  		  and microtimestamp between era_start and era_end ) a on true
 ),
 trades_stat as (
 	select era_start, pair_id, count(*) as trades, 
@@ -2768,7 +2772,7 @@ from eras
 		left join  trades_stat using (era_start, pair_id)
 		left join  spread_stat using (era_start, pair_id) 
 		left join  depth_stat using (era_start, pair_id) 
-order by pair, last_event desc;
+;
 
 $$;
 
