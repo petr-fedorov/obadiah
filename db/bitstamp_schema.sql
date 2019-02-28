@@ -313,7 +313,7 @@ COMMENT ON FUNCTION bitstamp._in_milliseconds(ts timestamp with time zone) IS 'S
 --
 
 CREATE FUNCTION bitstamp._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) RETURNS TABLE(event_id bigint, microtimestamp timestamp with time zone, order_id bigint, event_no smallint, event bitstamp.live_orders_event, order_type bitstamp.direction, price numeric, amount numeric, fill numeric, trade_id bigint, pair_id smallint, datetime timestamp with time zone)
-    LANGUAGE sql
+    LANGUAGE sql STABLE
     AS $$
 
 with active_events as (
@@ -1975,8 +1975,7 @@ COMMENT ON FUNCTION bitstamp.oba_spread(p_start_time timestamp with time zone, p
 --
 
 CREATE FUNCTION bitstamp.oba_trade(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text, p_strict boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, direction text, "maker.event.id" bigint, "taker.event.id" bigint, maker bigint, taker bigint, "real.trade.id" bigint)
-    LANGUAGE sql
-    SET work_mem TO '1GB'
+    LANGUAGE sql STABLE
     AS $$
 
  WITH trades AS (
