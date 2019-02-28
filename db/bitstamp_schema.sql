@@ -1599,11 +1599,10 @@ CREATE FUNCTION bitstamp.oba_depth(p_start_time timestamp with time zone, p_end_
     AS $$
 
 	with time_range as (
-		select pair_id, min(microtimestamp) as start_time
-		from bitstamp.depth join bitstamp.pairs using (pair_id)
+		select (select pair_id from bitstamp.pairs where pair = p_pair) as pair_id, min(microtimestamp) as start_time
+		from bitstamp.depth 
 		where microtimestamp >= p_start_time
-		  and pairs.pair = p_pair
-		group by pair_id
+		  and pair_id = (select pair_id from bitstamp.pairs where pair = p_pair)
 	)
 	select ts, price, amount, side
 	from time_range 
@@ -1621,10 +1620,11 @@ CREATE FUNCTION bitstamp.oba_depth(p_start_time timestamp with time zone, p_end_
 				group by ts, price, direction, pair_id
 		) a using (pair_id)
 	where not p_strict or (p_strict and ts >= p_start_time)
-	union all
+	union all 
 	select microtimestamp, price, volume, side::text
-	from time_range join bitstamp.depth using (pair_id) join lateral ( select price, volume, side from unnest(depth.depth_change) ) d on true
+	from bitstamp.depth join time_range using (pair_id) join lateral ( select price, volume, side from unnest(depth.depth_change) ) d on true
 	where microtimestamp between start_time and p_end_time 
+	  and depth.pair_id = (select pair_id from bitstamp.pairs where pair = p_pair )
 	  and microtimestamp >= p_start_time -- otherwise, the query optimizer produces a crazy plan!
 	  and price is not null;   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
 	  							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
