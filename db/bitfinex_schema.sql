@@ -1085,8 +1085,8 @@ begin
 				),
 				base_events as (
 					select exchange_timestamp, order_id, round( price, price_precision) as price,
-						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
-					from to_be_replaced join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
+						round(amount, price_precision) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from to_be_replaced join bitfinex.latest_symbol_details using (pair_id)
 					order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 				)
 				insert into bitfinex.transient_raw_book_events
@@ -1112,8 +1112,8 @@ begin
 						pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
 				from (
 					select exchange_timestamp, order_id, round( price, price_precision) as price,
-						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
-					from deleted_transient_events join obanalytics.pairs using (pair_id) join bitfinex.latest_symbol_details using (pair_id)
+						round(amount, price_precision) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from deleted_transient_events join bitfinex.latest_symbol_details using (pair_id)
 				) a
 				order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 			),
@@ -1210,15 +1210,13 @@ CREATE FUNCTION bitfinex.capture_transient_trades(p_end_time timestamp with time
     AS $$
 with deleted as (
 	delete from bitfinex.transient_trades
-	using obanalytics.pairs
-	where pairs.pair = upper(p_pair)
-	  and transient_trades.pair_id = pairs.pair_id
+	where transient_trades.pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
 	  and exchange_timestamp <= p_end_time
 	returning transient_trades.*
 )
 insert into obanalytics.matches_bitfinex (amount, price, side, microtimestamp, local_timestamp, pair_id, exchange_trade_id)
-select distinct on (exchange_timestamp, id) round(abs(qty), fmu), round(price, price_precision),  case when qty <0 then 's' else 'b' end, exchange_timestamp, local_timestamp, pair_id, id
-from deleted join bitfinex.latest_symbol_details using (pair_id) join obanalytics.pairs using (pair_id)
+select distinct on (exchange_timestamp, id) round(abs(qty), price_precision), round(price, price_precision),  case when qty <0 then 's' else 'b' end, exchange_timestamp, local_timestamp, pair_id, id
+from deleted join bitfinex.latest_symbol_details using (pair_id) 
 order by exchange_timestamp, id
 returning matches_bitfinex.*;
 
