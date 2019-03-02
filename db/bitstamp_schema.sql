@@ -1660,7 +1660,7 @@ ALTER FUNCTION bitstamp.oba_depth(p_start_time timestamp with time zone, p_end_t
 -- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, character varying, boolean, numeric); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair character varying DEFAULT 'BTCUSD'::character varying, p_strict boolean DEFAULT false, p_bps_step numeric DEFAULT 25) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text, bps_level integer)
+CREATE FUNCTION bitstamp.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair character varying DEFAULT 'BTCUSD'::character varying, p_strict boolean DEFAULT false, p_bps_step numeric DEFAULT 25) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text, bps_level bigint)
     LANGUAGE sql STABLE
     AS $$
 
@@ -1686,8 +1686,8 @@ depth_with_bps_levels as (
 			price,
 			side,
 			case side
-				when 'ask' then ceiling((price-best_ask_price)/best_ask_price/p_bps_step*10000)::integer
-				when 'bid' then ceiling((best_bid_price - price)/best_bid_price/p_bps_step*10000)::integer 
+				when 'ask' then ceiling((price-best_ask_price)/best_ask_price/p_bps_step*10000)::bigint
+				when 'bid' then ceiling((best_bid_price - price)/best_bid_price/p_bps_step*10000)::bigint
 			end as bps_level,
 			best_ask_price,
 			best_bid_price,
@@ -1710,7 +1710,7 @@ select ts,
 		price, 
 		sum(amount) as volume, 
 		side::text, 
-		bps_level*p_bps_step::integer
+		bps_level*p_bps_step::bigint
 from depth_with_price_adjusted
 where r = 1	-- if rounded to milliseconds ts are not unique, we'll take the LasT one and will drop the first silently
 			 -- this is a workaround for the inability of R to handle microseconds in POSIXct 
@@ -1938,8 +1938,8 @@ CREATE FUNCTION bitstamp.oba_spread(p_start_time timestamp with time zone, p_end
 	select *
 	from (
 		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_start_time
-		from bitstamp.spread join bitstamp.pairs using (pair_id)
-		where pairs.pair = p_pair
+		from bitstamp.spread 
+		where pair_id = (select pair_id from bitstamp.pairs where pair = p_pair)
 		  and microtimestamp < p_start_time
 		order by microtimestamp desc
 		limit 1
@@ -1948,16 +1948,13 @@ CREATE FUNCTION bitstamp.oba_spread(p_start_time timestamp with time zone, p_end
 	select *
 	from (
 		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_end_time
-		from bitstamp.spread join bitstamp.pairs using (pair_id)
-		where pairs.pair = p_pair
+		from bitstamp.spread
+		where pair_id = (select pair_id from bitstamp.pairs where pair = p_pair)
 		  and microtimestamp <= p_end_time
 		order by microtimestamp desc
 		limit 1
 	) a
 	
-
-	
-
 $$;
 
 
