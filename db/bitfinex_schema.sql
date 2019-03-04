@@ -1068,14 +1068,16 @@ begin
 				into v_open_orders
 		from unnest(v_last_order_book);
 		if p.is_channel_starts then	
-			if v_last_order_book is null or p.start_time - v_last_order_book[1].ts > p_new_era_start_threshold then
-				raise log 'Start new era for new channel % because interval % between % and % is greater than threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
+			if (v_last_order_book is null or p.start_time - v_last_order_book[1].ts > p_new_era_start_threshold ) or
+				(extract(month from v_last_order_book[1].ts) <> extract(month from p.start_time)) then	-- going over a partition boundary so need to start new era
+																											 -- next_microtimestamp and price_microtimestamp can't refer beyond partition
+				raise log 'Start new era for channel % interval % between % and %, threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, v_last_order_book[1].ts, p.start_time,  p_new_era_start_threshold;
 				insert into obanalytics.level3_eras (era, pair_id, exchange_id)
 				values (p.start_time, v_pair_id, v_exchange_id);
 				
 				v_open_orders := null;	-- event_no will start from scratch
 			else
-				raise debug 'Continue previous era for new channel % because interval % between % and % is less than threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
+				raise log 'Continue previous era for new channel %, interval % between % and % ,threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
 				with to_be_replaced as (
 					delete from bitfinex.transient_raw_book_events
 					where pair_id = v_pair_id
@@ -1085,8 +1087,8 @@ begin
 				),
 				base_events as (
 					select exchange_timestamp, order_id, round( price, price_precision) as price,
-						round(amount, price_precision) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
-					from to_be_replaced join bitfinex.latest_symbol_details using (pair_id)
+						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from to_be_replaced join bitfinex.latest_symbol_details using (pair_id) join obanalytics.pairs using (pair_id)
 					order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 				)
 				insert into bitfinex.transient_raw_book_events
@@ -1098,6 +1100,7 @@ begin
 		else
 			raise debug 'Continue previous era for old channel %', p.channel_id;
 		end if;
+		raise debug 'Starting processing of pair_id %, channel_id % from % till %', v_pair_id, p.channel_id, p.start_time, p.end_time;
 		return query 
 			with deleted_transient_events as (
 				delete from bitfinex.transient_raw_book_events
@@ -1112,8 +1115,8 @@ begin
 						pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
 				from (
 					select exchange_timestamp, order_id, round( price, price_precision) as price,
-						round(amount, price_precision) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
-					from deleted_transient_events join bitfinex.latest_symbol_details using (pair_id)
+						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from deleted_transient_events join bitfinex.latest_symbol_details using (pair_id) join obanalytics.pairs using (pair_id)
 				) a
 				order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 			),
@@ -1215,8 +1218,8 @@ with deleted as (
 	returning transient_trades.*
 )
 insert into obanalytics.matches_bitfinex (amount, price, side, microtimestamp, local_timestamp, pair_id, exchange_trade_id)
-select distinct on (exchange_timestamp, id) round(abs(qty), price_precision), round(price, price_precision),  case when qty <0 then 's' else 'b' end, exchange_timestamp, local_timestamp, pair_id, id
-from deleted join bitfinex.latest_symbol_details using (pair_id) 
+select distinct on (exchange_timestamp, id) round(abs(qty), fmu), round(price, price_precision),  case when qty <0 then 's' else 'b' end, exchange_timestamp, local_timestamp, pair_id, id
+from deleted join bitfinex.latest_symbol_details using (pair_id) join obanalytics.pairs using (pair_id)
 order by exchange_timestamp, id
 returning matches_bitfinex.*;
 
@@ -2294,31 +2297,97 @@ $$;
 ALTER FUNCTION bitfinex.oba_trades("start.time" timestamp with time zone, "end.time" timestamp with time zone, pair character varying, OUT "timestamp" timestamp with time zone, OUT price numeric, OUT volume numeric, OUT direction character varying, OUT snapshot_id integer, OUT episode_no integer, OUT event_no smallint, OUT id bigint) OWNER TO "ob-analytics";
 
 --
--- Name: pga_capture_transient(text, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+-- Name: pga_capture_transient(text, interval, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval DEFAULT '00:02:00'::interval) RETURNS integer
+CREATE FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '04:00:00'::interval) RETURNS integer
     LANGUAGE plpgsql
     AS $$
 declare
-	v_start timestamptz;
-	v_end timestamptz;
+	v_events_start timestamptz;
+	v_events_end timestamptz;
+	v_trades_end timestamptz;
+	
+	v_last_event timestamptz;
+	v_last_era timestamptz;
+	v_pair_id smallint;
+	v_exchange_id smallint;
+	v_channel_id integer;
+	
 begin 
-	perform bitfinex.capture_transient_trades( 
-		( select max(exchange_timestamp)  - p_delay
-		  from bitfinex.transient_trades join obanalytics.pairs using (pair_id)
-		  where pair = upper(p_pair)
-		 ),  p_pair);
-	select min(episode_timestamp), max(episode_timestamp) - p_delay into v_start, v_end
-	from bitfinex.transient_raw_book_events join obanalytics.pairs using (pair_id)
-	where pair = upper(p_pair);
-	perform bitfinex.capture_transient_raw_book_events(v_start, v_end, p_pair);
-	return 0;											   
+
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs where pair = upper(p_pair);
+	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges where exchange = 'bitfinex';
+ 
+	select max(exchange_timestamp)  - p_delay into v_trades_end
+	from bitfinex.transient_trades 
+	where pair_id = v_pair_id;
+																			  
+	perform bitfinex.capture_transient_trades(v_trades_end,  p_pair);
+	
+	select min(episode_timestamp), max(episode_timestamp) - p_delay into v_events_start, v_events_end
+	from bitfinex.transient_raw_book_events 
+	where pair_id = v_pair_id;
+																		 
+	if extract (month from v_events_start) <> extract (month from v_events_end) then 
+		v_events_end = date_trunc('month', v_events_end) - '00:00:00.000001'::interval;
+		raise debug 'updated v_events_end to %', v_events_end;
+	else
+	
+		select max(era) into strict v_last_era 
+		from obanalytics.level3_eras
+		where pair_id = v_pair_id
+		  and exchange_id = v_exchange_id;
+		  
+		select max(microtimestamp) into strict v_last_event
+		from obanalytics.level3_bitfinex
+		where pair_id = v_pair_id
+		  and microtimestamp >= v_last_era;	-- to avoid search over ALL partitions of level3 - the query optimizer is not smart enough yet unfortunately
+																				  
+		if extract(month from v_last_event) <> extract(month from v_events_start) then
+		
+			v_events_start := date_trunc('month', v_events_start);
+			
+			raise debug 'updated v_events_start to %', v_events_start;
+		
+			select channel_id into strict v_channel_id
+			from bitfinex.transient_raw_book_events
+			where pair_id = v_pair_id
+			order by episode_timestamp
+			limit 1;
+			
+			
+			insert into bitfinex.transient_raw_book_channels (episode_timestamp, pair_id, channel_id)
+			values (v_events_start, v_pair_id, v_channel_id);
+			
+			insert into bitfinex.transient_raw_book_events (exchange_timestamp, order_id, price, amount, pair_id, local_timestamp,
+															  channel_id, episode_timestamp, event_no, bl)
+			select v_events_start, order_id, price,
+					case side when 's' then -amount when 'b' then amount end, pair_id, null::timestamptz,
+					v_channel_id, v_events_start,null, null::integer
+			from obanalytics.level3_order_book(v_events_start, v_pair_id, v_exchange_id,
+										   p_only_makers := false,	-- since exchanges sometimes output crossed order books, we'll consider ALL active orders
+										   p_before := true);
+										   
+			raise debug 'Created snapshot for channel_id % at %', v_channel_id, v_events_start;
+		end if;
+		-- perform bitfinex.capture_transient_raw_book_events(v_events_start, v_events_end, p_pair);
+	end if;
+	
+	if v_events_start + p_max_interval < v_events_end then
+		v_events_end := v_events_start + p_max_interval;
+		raise debug 'updated v_events_end to % (p_max_interval is exceeded)', v_events_end;
+	end if;	
+	perform bitfinex.capture_transient_raw_book_events(v_events_start, v_events_end, p_pair);
+	return 0;
 end;
 $$;
 
 
-ALTER FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval, p_max_interval interval) OWNER TO "ob-analytics";
 
 --
 -- Name: pga_match(text, interval, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
@@ -2329,32 +2398,42 @@ CREATE FUNCTION bitfinex.pga_match(p_pair text, p_delay interval DEFAULT '00:02:
     AS $$
 declare
 	v_pair_id smallint;
+	v_last_era timestamptz;
 begin 
 	
-	select pair_id into v_pair_id
+	select pair_id into strict v_pair_id
 	from obanalytics.pairs
 	where pair = upper(p_pair);
+	
+	select max(era) into strict v_last_era
+	from obanalytics.level3_eras_bitfinex
+	where pair_id = v_pair_id;
 
 	select max(microtimestamp) into o_start
 	from obanalytics.matches_bitfinex 
 	where pair_id = v_pair_id
+	  and microtimestamp >= v_last_era
 	  and (buy_order_id is not null or sell_order_id is not null);
 	  
 	if o_start is not null then 
 		select coalesce(max(microtimestamp) - p_delay, 'infinity'::timestamptz) into o_end
 		from obanalytics.matches_bitfinex
-		where pair_id = v_pair_id;
-		
-		if o_start + p_max_interval < o_end then
-			o_end := o_start + p_max_interval;
-		end if;
+		where pair_id = v_pair_id
+		  and microtimestamp >= v_last_era;
 		
 	else
 		select min(microtimestamp) , min(microtimestamp) + p_max_interval into o_start, o_end
 		from obanalytics.matches_bitfinex 
-		where pair_id = v_pair_id;
+		where pair_id = v_pair_id
+		  and microtimestamp >= v_last_era;
 		
 	end if;	
+	
+	if o_start + p_max_interval < o_end then
+		o_end := o_start + p_max_interval;
+	end if;
+	
+	
 	perform bitfinex.match_price_and_fill_exact(o_start, o_end, p_pair);
 	perform bitfinex.match_price_and_sum_of_fill_exact(o_start, o_end, p_pair);
 

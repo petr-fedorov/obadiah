@@ -708,6 +708,7 @@ select pairs.pair, e_first::text, e_last::text, e_total,
 		t_matched, t_exchange, exchanges.exchange, periods.era::text
 from periods join obanalytics.pairs using (pair_id) join obanalytics.exchanges using (exchange_id) left join events using (exchange_id, pair_id, period_starts, period_ends)
 		left join trades using (exchange_id, pair_id, period_starts, period_ends)
+where e_first is not null							 
 $$;
 
 
@@ -1122,6 +1123,38 @@ CREATE TABLE obanalytics.level3_eras (
 
 
 ALTER TABLE obanalytics.level3_eras OWNER TO "ob-analytics";
+
+--
+-- Name: level3_eras_bitfinex; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE VIEW obanalytics.level3_eras_bitfinex AS
+ SELECT level3_eras.era,
+    level3_eras.pair_id,
+    level3_eras.exchange_id
+   FROM obanalytics.level3_eras
+  WHERE (level3_eras.exchange_id = ( SELECT exchanges.exchange_id
+           FROM obanalytics.exchanges
+          WHERE (exchanges.exchange = 'bitfinex'::text)));
+
+
+ALTER TABLE obanalytics.level3_eras_bitfinex OWNER TO "ob-analytics";
+
+--
+-- Name: level3_eras_bitstamp; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE VIEW obanalytics.level3_eras_bitstamp AS
+ SELECT level3_eras.era,
+    level3_eras.pair_id,
+    level3_eras.exchange_id
+   FROM obanalytics.level3_eras
+  WHERE (level3_eras.exchange_id = ( SELECT exchanges.exchange_id
+           FROM obanalytics.exchanges
+          WHERE (exchanges.exchange = 'bitstamp'::text)));
+
+
+ALTER TABLE obanalytics.level3_eras_bitstamp OWNER TO "ob-analytics";
 
 --
 -- Name: matches_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
