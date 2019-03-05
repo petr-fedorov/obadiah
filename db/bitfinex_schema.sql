@@ -1134,7 +1134,7 @@ begin
 						case when amount < 0 then 's' when amount > 0 then 'b' end as side,
 						case when price = 0 then abs(lag(price) over oe) else abs(price) end as  price, 
 						case when price = 0 then abs(lag(amount) over oe) else abs(amount) end as amount,
-						case when price = 0 then null else abs(amount) - abs(lag(amount) over oe) end as fill, 
+						case when price = 0 then null else abs(lag(amount) over oe) - abs(amount) end as fill, 
 						case when price > 0 then coalesce(lead(episode_timestamp) over oe, 'infinity'::timestamptz) when price = 0 then '-infinity'::timestamptz end  as next_microtimestamp,
 						case when price > 0 then (coalesce(first_value(event_no) over oe, 1) )::integer + (row_number() over oe)::integer end as next_event_no,
 						pair_id,
@@ -1238,29 +1238,29 @@ CREATE FUNCTION bitfinex.match_price_and_fill_exact(p_start_time timestamp with 
     AS $$
 
 with level3_matcheable as (
-	select microtimestamp, order_id, event_no, price, coalesce(fill, -amount)  as fill, side
+	select microtimestamp, order_id, event_no, price, coalesce(nullif(fill,0), amount)  as fill, side
 	from obanalytics.level3_bitfinex
 	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
 	  and microtimestamp between p_start_time and p_end_time
-	  and fill is distinct from 0
 ),
 matches as (
-	select ctid, exchange_trade_id, price, -amount as fill, microtimestamp as trade_microtimestamp, side as origination
+	select tableoid, ctid, exchange_trade_id, price, amount as fill, microtimestamp as trade_microtimestamp, side as origination
 	from obanalytics.matches_bitfinex
 	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
 	  and microtimestamp between p_start_time and p_end_time
 	  and buy_order_id is null and sell_order_id is null
 ),
 joined as (
-	select * , row_number() over (partition by exchange_trade_id order by microtimestamp ) as r 
+	select * , row_number() over (partition by exchange_trade_id order by microtimestamp ) as r,
+				row_number() over (partition by order_id, event_no order by trade_microtimestamp ) as r_l3
 	from level3_matcheable join matches using (price, fill)
 	where microtimestamp between trade_microtimestamp  and trade_microtimestamp + p_max_delay
 	  and side <> origination
 ),
 for_update as (
-	select ctid, microtimestamp, order_id, event_no, side
+	select tableoid, ctid, microtimestamp, order_id, event_no, side
 	from joined 
-	where r  = 1
+	where r  = 1 and r_l3 = 1
 )
 update obanalytics.matches_bitfinex
 set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
@@ -1271,6 +1271,7 @@ set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_
 from for_update
 where matches_bitfinex.pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
   and for_update.ctid = matches_bitfinex.ctid
+  and for_update.tableoid = matches_bitfinex.tableoid
 returning matches_bitfinex.*;
 
 $$;
@@ -1288,29 +1289,29 @@ CREATE FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestam
     AS $$
 
 with level3_matcheable as (
-	select microtimestamp, order_id, event_no, price, coalesce(fill, -amount)  as fill, side
+	select microtimestamp, order_id, event_no, price, coalesce(nullif(fill,0), amount)  as fill, side
 	from obanalytics.level3_bitfinex
 	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
 	  and microtimestamp between p_start_time and p_end_time
-	  and fill is distinct from 0
 ),
 matches_gs as (
-	select ctid, (buy_order_id is null and sell_order_id is null and (lag(buy_order_id) over w is not null or lag(sell_order_id) over w is not null))::integer as gs, * 
+	select tableoid, ctid, 
+		(buy_order_id is null and sell_order_id is null and (lag(buy_order_id) over w is not null or lag(sell_order_id) over w is not null))::integer as gs, * 
 	from obanalytics.matches_bitfinex
 	where pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
 	  and microtimestamp between p_start_time and p_end_time																	  
-	window w as (order by microtimestamp)		
-	order by microtimestamp 
-	limit 1000),
+	window w as (order by microtimestamp)
+),
 matches_gr as (
 	select sum(gs)  over (order by microtimestamp) as gr, *
 	from matches_gs
 	where buy_order_id is null and sell_order_id is null
 ),
 matches as (
-	select max(microtimestamp) as trade_microtimestamp, -sum(amount) as fill, price, array_agg(ctid) as ctids, side as origination
+	select max(microtimestamp) as trade_microtimestamp, sum(amount) as fill, price, array_agg(row(tableoid,ctid)) as ctids, side as origination
 	from matches_gr	
 	group by gr, price, side
+	having count(*) > 1
 ),					 
 for_update as (
 	select *
@@ -1324,9 +1325,10 @@ set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_
 	sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
 	sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
 	microtimestamp = for_update.microtimestamp
-from for_update
+from for_update join unnest(ctids) pks (tableoid oid, ctid tid) on true
 where matches_bitfinex.pair_id = (select pair_id from obanalytics.pairs where pair = upper(p_pair))
-  and matches_bitfinex.ctid = any(ctids)
+  and matches_bitfinex.ctid = pks.ctid 
+  and matches_bitfinex.tableoid = pks.tableoid
 returning matches_bitfinex.*;
 
 $$;
