@@ -452,6 +452,59 @@ $$;
 ALTER FUNCTION obanalytics._drop_leaf_matches_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: _order_book_after_event(obanalytics.level3_order_book_record[], obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._order_book_after_event(p_ob obanalytics.level3_order_book_record[], p_ep obanalytics.level3[]) RETURNS obanalytics.level3_order_book_record[]
+    LANGUAGE plpgsql STABLE
+    AS $$
+begin
+	if p_ob is null then
+		p_ob := array( select level3_order_book from obanalytics.level3_order_book(p_ep[1].microtimestamp, p_ep[1].pair_id, p_ep[1].exchange_id, p_only_makers := false, p_before := true ));
+	end if;
+	
+	return ( with mix as (
+						select ob.*, false as is_deleted
+						from unnest(p_ob) ob
+						union all
+						select microtimestamp, price,amount,side, null::boolean, microtimestamp,order_id, event_no,
+								price_microtimestamp, pair_id, exchange_id, next_microtimestamp = '-infinity'::timestamptz as is_deleted
+						from unnest(p_ep)
+					),
+					latest_events as (
+						select distinct on (order_id) *
+						from mix
+						order by order_id, event_no desc	-- just take the latest event_no for each order
+					),
+					orders as (
+					select p_ep[1].microtimestamp AS ts, price, amount, side, 
+							coalesce(
+								case side
+									-- below 'datetime' is actually 'price_microtimestamp'
+									when 'b' then price < min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+									when 's' then price > max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+								end,
+							true) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
+							as is_maker,
+							microtimestamp, order_id, event_no,
+							price_microtimestamp,  pair_id, exchange_id
+					from latest_events
+					where not is_deleted
+				)
+				select array(
+					select orders::obanalytics.level3_order_book_record
+					from orders
+					order by microtimestamp, order_id, event_no 
+				)
+		);
+end;   
+
+$$;
+
+
+ALTER FUNCTION obanalytics._order_book_after_event(p_ob obanalytics.level3_order_book_record[], p_ep obanalytics.level3[]) OWNER TO "ob-analytics";
+
+--
 -- Name: create_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -624,6 +677,46 @@ $$;
 ALTER FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id smallint, p_exchange_id smallint, p_only_makers boolean, p_before boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: order_book_by_episode(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3_order_book_record[]
+    LANGUAGE sql STABLE
+    AS $$
+
+-- ARGUMENTS
+--		p_start_time  - the start of the interval for the production of the order book snapshots
+--		p_end_time	  - the end of the interval
+--		p_pair_id	  - id of the pair for which order books will be calculated
+--		p_exchange_id - id of the exchange where order book is calculated
+
+-- DETAILS
+-- 		An episode is a moment in time when the order book, derived from obanalytics's data is in consistent state. 
+--		The state of the order book is consistent when:
+--			(a) all events that happened simultaneously (i.e. having the same microtimestamp) are reflected in the order book
+--			(b) both events that constitute a trade are reflected in the order book
+-- 		This function processes the order book events sequentially and returns consistent snapshots of the order book between
+--		p_start_time and p_end_time.
+--		These consistent snapshots are then used to calculate spread, depth and depth.summary. Note that the consitent order book may still be crossed.
+--		It is assumed that spread, depth and depth.summary will ignore the unprocessed agressors crossing the book. 
+--		
+select obanalytics.order_book_agg(episode) over (order by microtimestamp)  as ob
+from (
+	select microtimestamp, array_agg(level3) as episode
+	from obanalytics.level3
+	where microtimestamp between p_start_time and p_end_time
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	group by microtimestamp  
+) a
+order by microtimestamp
+
+$$;
+
+
+ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: save_exchange_microtimestamp(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -713,6 +806,18 @@ $$;
 
 
 ALTER FUNCTION obanalytics.summary(p_exchange text, p_pair text, p_start_time timestamp with time zone, p_end_time timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: order_book_agg(obanalytics.level3[]); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE AGGREGATE obanalytics.order_book_agg(event obanalytics.level3[]) (
+    SFUNC = obanalytics._order_book_after_event,
+    STYPE = obanalytics.level3_order_book_record[]
+);
+
+
+ALTER AGGREGATE obanalytics.order_book_agg(event obanalytics.level3[]) OWNER TO "ob-analytics";
 
 --
 -- Name: exchanges; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
