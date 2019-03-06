@@ -5,6 +5,7 @@ import websockets
 import logging
 import json
 from datetime import datetime
+from decimal import Decimal
 
 
 class BitfinexBookDataHandler:
@@ -12,7 +13,7 @@ class BitfinexBookDataHandler:
     MIN_SAVE_COUNT = 1000
 
     def __init__(self, con, pair_id, message):
-        self.chanId = message['chanId']
+        self.chanId = int(message['chanId'])
         self.logger = logging.getLogger(__name__ + ".bookdatahandler")
         #  self.logger.setLevel(logging.DEBUG)
         self.pair_id = pair_id
@@ -58,7 +59,8 @@ class BitfinexBookDataHandler:
             self.accumulated_data.append((data, rts, lts, bl))
 
         if is_episode_completed:
-            self.records = self.records + [(rts, d[0], d[1], d[2],
+            self.records = self.records + [(rts, int(d[0]), Decimal(d[1]),
+                                            Decimal(d[2]),
                                             self.pair_id, lts, self.chanId,
                                             self.episode_rts, bl)
                                            for d, rts, lts, bl in episode_data]
@@ -101,7 +103,7 @@ class BitfinexBookDataHandler:
 
 class BitfinexTradeDataHandler:
     def __init__(self, con, pair_id, message):
-        self.chanId = message['chanId']
+        self.chanId = int(message['chanId'])
         self.logger = logging.getLogger(__name__ + ".tradedatahandler")
         self.pair_id = pair_id
         self.con = con
@@ -122,8 +124,8 @@ class BitfinexTradeDataHandler:
                                    (id, qty, price, local_timestamp,
                                    exchange_timestamp, pair_id, channel_id)
                                    values ($1, $2, $3, $4, $5, $6, $7) ''',
-                                   d[0], d[2], d[3], lts,
-                                   datetime.fromtimestamp(d[1]/1000),
+                                   int(d[0]), Decimal(d[2]), Decimal(d[3]),
+                                   lts, datetime.fromtimestamp(d[1]/1000),
                                    self.pair_id, self.chanId)
 
             self.logger.debug(d)
@@ -234,7 +236,7 @@ async def capture(pair, user, database):
                         BitfinexMessageHandler(ws, pair, pair_id, pool,
                                                q).process_messages())
                     await ws.send(json.dumps({'event': 'conf',
-                                              'flags': 32768}))
+                                              'flags': 32768 + 8}))
                     while True:
                         try:
                             message = await ws.recv()
