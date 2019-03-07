@@ -25,6 +25,19 @@ CREATE SCHEMA obanalytics;
 ALTER SCHEMA obanalytics OWNER TO "ob-analytics";
 
 --
+-- Name: level2_depth_record; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TYPE obanalytics.level2_depth_record AS (
+	price numeric,
+	volume numeric,
+	side character(1)
+);
+
+
+ALTER TYPE obanalytics.level2_depth_record OWNER TO "ob-analytics";
+
+--
 -- Name: level3_order_book_record; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -208,6 +221,111 @@ $$;
 
 
 ALTER FUNCTION obanalytics._create_level1_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: _create_level2_partition(text, text, character, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._create_level2_partition(p_exchange text, p_pair text, p_precision character, p_year integer, p_month integer, p_execute boolean DEFAULT true) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+
+declare
+	i integer;
+	v_exchange_id smallint;
+	v_pair_id smallint;
+	v_from timestamptz;
+	v_to timestamptz;
+	
+	v_parent_table text;
+	
+	v_table_name text;
+	v_statement text;
+	v_statements text[];
+	V_SCHEMA constant text default 'obanalytics.';
+begin 
+
+	if not lower(p_precision) in ('p0', 'p1', 'p2', 'p3', 'p4') then 
+		raise exception 'Invalid p_precision: %. Valid values are p0, p1, p2, p3, p4', p_precision;
+	end if;
+	v_from := make_timestamptz(p_year, p_month, 1, 0, 0, 0);	-- will use the current timezone 
+	v_to := v_from + '1 month'::interval;
+	
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs
+	where pair = upper(p_pair);
+	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges
+	where exchange = lower(p_exchange);
+
+	
+	v_parent_table := 'level2';
+	v_table_name := v_parent_table || '_' || p_exchange;
+
+	i = 1;
+	v_statements[i] := 'create table if not exists ' || V_SCHEMA || v_table_name || ' partition of '|| V_SCHEMA ||v_parent_table||
+						' for values in ('|| v_exchange_id || ') partition by list ( pair_id )' ;
+
+	i := i+1;
+	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
+
+	v_parent_table := v_table_name;
+	v_table_name := v_parent_table || '_' || lower(p_pair);
+	
+	i := i + 1;
+	v_statements[i] := 'create table if not exists '||V_SCHEMA || v_table_name || ' partition of '|| V_SCHEMA ||v_parent_table||
+						' for values in ('|| v_pair_id || ') partition by list (precision)';
+	i := i+1;
+	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column pair_id set default ' || v_pair_id;
+
+	v_parent_table := v_table_name;
+	v_table_name := v_parent_table || '_' || lower(p_precision);
+	i := i + 1;
+	v_statements[i] := 'create table if not exists '||V_SCHEMA || v_table_name || ' partition of '|| V_SCHEMA ||v_parent_table||
+						' for values in ('|| quote_literal(p_precision) || ') partition by range (microtimestamp)';
+	i := i+1;
+	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column precision set default ' || quote_literal(p_precision);
+
+	v_parent_table := v_table_name;
+	-- We need a shorter name for the leafs - we are confined by max_identifier_length 
+	v_table_name :=  'level2_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0')|| p_precision || p_year || lpad(p_month::text, 2, '0') ;
+	i := i + 1;
+	
+	v_statements[i] := 'create table if not exists '||V_SCHEMA ||v_table_name||' partition of '||V_SCHEMA ||v_parent_table||
+							' for values from ('||quote_literal(v_from::timestamptz)||') to (' ||quote_literal(v_to::timestamptz) || ')';
+							
+	i := i+1;
+	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
+
+	i := i+1;
+	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column precision set default ' || quote_literal(p_precision);
+
+	i := i+1;
+	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column pair_id set default ' || v_pair_id;
+
+	v_statement := 	'alter table '|| V_SCHEMA || v_table_name || ' add constraint '  || v_table_name ;
+	
+	i := i + 1;
+	v_statements[i] := v_statement || '_pkey primary key (microtimestamp) ';  
+	
+	i := i+1;
+	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
+	
+							
+	foreach v_statement in array v_statements loop
+		raise debug '%', v_statement;
+		if p_execute then 
+			execute v_statement;
+		end if;		
+	end loop;		
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics._create_level2_partition(p_exchange text, p_pair text, p_precision character, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: _create_level3_partition(text, character, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -492,6 +610,56 @@ $$;
 ALTER FUNCTION obanalytics._drop_leaf_level1_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: _drop_leaf_level2_partition(text, text, character, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._drop_leaf_level2_partition(p_exchange text, p_pair text, p_precision character, p_year integer, p_month integer, p_execute boolean DEFAULT false) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+
+declare
+	i integer;
+	v_exchange_id smallint;
+	v_pair_id smallint;
+	
+	v_table_name text;
+	v_statement text;
+	v_statements text[];
+	V_SCHEMA constant text default 'obanalytics.';
+begin 
+
+	if not lower(p_precision) in ('p0', 'p1', 'p2', 'p3', 'p4') then 
+		raise exception 'Invalid p_precision: %. Valid values are p0, p1, p2, p3, p4', p_precision;
+	end if;
+
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs
+	where pair = upper(p_pair);
+	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges
+	where exchange = lower(p_exchange);
+
+	v_table_name :=  'level2_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0')|| p_precision || p_year || lpad(p_month::text, 2, '0') ;
+	i := 1;
+	
+	v_statements[i] := 'drop table if exists '||V_SCHEMA ||v_table_name;
+							
+	foreach v_statement in array v_statements loop
+		raise debug '%', v_statement;
+		if p_execute then 
+			execute v_statement;
+		end if;		
+	end loop;		
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics._drop_leaf_level2_partition(p_exchange text, p_pair text, p_precision character, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
+
+--
 -- Name: _drop_leaf_level3_partition(text, character, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -700,6 +868,7 @@ CREATE FUNCTION obanalytics.create_partitions(p_exchange text, p_pair text, p_ye
     AS $$
 begin 
 	perform obanalytics._create_level1_partition(p_exchange, p_pair, p_year, p_month);
+	perform obanalytics._create_level2_partition(p_exchange, p_pair, 'p0', p_year, p_month);
 	perform obanalytics._create_level3_partition(p_exchange, 'b', p_pair, p_year, p_month);
 	perform obanalytics._create_level3_partition(p_exchange, 's', p_pair, p_year, p_month);
 	perform obanalytics._create_matches_partition(p_exchange, p_pair, p_year, p_month);
@@ -708,6 +877,72 @@ $$;
 
 
 ALTER FUNCTION obanalytics.create_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
+
+--
+-- Name: level2; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_id smallint NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+PARTITION BY LIST (exchange_id);
+
+
+ALTER TABLE obanalytics.level2 OWNER TO "ob-analytics";
+
+--
+-- Name: depth_change_by_episode(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level2
+    LANGUAGE plpgsql STABLE
+    AS $$
+
+-- ARGUMENTS
+--		p_start_time - the start of the interval for the calculation of depths
+--		p_end_time	 - the end of the interval
+--		p_pair_id	 - the id of pair for which depths will be calculated
+--		p_exchange_id - the id of exchange where depths will be calculated
+-- NOTE
+--		Precision of depth is P0, i.e. not rounded prices are used
+declare
+	v_ob_before obanalytics.level3_order_book_record[];
+	v_ob obanalytics.level3_order_book_record[];
+begin
+	
+	for v_ob in select ob from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id) ob 
+	loop
+		if v_ob_before is not null then 
+			return query 
+				select v_ob[1].ts, v_ob[1].pair_id, v_ob[1].exchange_id, 'p0'::character(2), array_agg(d.d)
+				from (
+					select row(price, coalesce(af.amount, 0), side)::obanalytics.level2_depth_record as d
+					from (
+						select a.price, sum(a.amount) as amount,a.side
+						from unnest(v_ob_before) a 
+						where a.is_maker 
+						group by a.price, a.side, a.pair_id
+					) bf full join (
+						select a.price, sum(a.amount) as amount, a.side
+						from unnest(v_ob) a 
+						where a.is_maker 
+						group by a.price, a.side, a.pair_id
+					) af using (price, side)
+					where bf.amount is distinct from af.amount
+				) d;
+		end if;
+		v_ob_before := v_ob;
+	end loop;			
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: drop_leaf_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -720,6 +955,7 @@ begin
 	perform obanalytics._drop_leaf_matches_partition(p_exchange, p_pair, p_year, p_month, true);
 	perform obanalytics._drop_leaf_level3_partition(p_exchange, 'b', p_pair, p_year, p_month, true);
 	perform obanalytics._drop_leaf_level3_partition(p_exchange, 's', p_pair, p_year, p_month, true);
+	perform obanalytics._drop_leaf_level2_partition(p_exchange, p_pair, 'p0', p_year, p_month, true);	
 	perform obanalytics._drop_leaf_level1_partition(p_exchange, p_pair, p_year, p_month, true);
 	
 end;
@@ -904,6 +1140,85 @@ $$;
 
 
 ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: pga_depth(text, text, interval, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.pga_depth(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS void
+    LANGUAGE plpgsql
+    SET work_mem TO '4GB'
+    AS $$
+declare 
+	v_current_timestamp timestamptz;
+	v_start timestamptz;
+	v_end timestamptz;
+	v_last_depth timestamptz;
+	
+	v_pair_id obanalytics.pairs.pair_id%type;
+	v_exchange_id obanalytics.exchanges.exchange_id%type;
+	v_precision constant character(2) default 'p0';
+
+	
+begin 
+	v_current_timestamp := clock_timestamp();
+	
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs 
+	where pair = upper(p_pair);
+	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges 
+	where exchange = lower(p_exchange);
+	
+	select era_starts, era_ends into v_start, v_end
+	from (
+		select era as era_starts,
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
+		from obanalytics.level3_eras 
+		where pair_id = v_pair_id
+		  and exchange_id = v_exchange_id
+	) a
+	where coalesce(p_ts_within_era,  ( select max(era) 
+										 from obanalytics.level3_eras
+										 where pair_id = v_pair_id 
+									       and exchange_id = v_exchange_id
+									 ) ) between era_starts and era_ends;
+									 
+	select coalesce(max(microtimestamp), v_start) into v_last_depth
+	from obanalytics.level2 
+	where microtimestamp between v_start and v_end
+	  and pair_id = v_pair_id
+	  and precision = v_precision
+	  and exchange_id = v_exchange_id;
+	
+	-- delete the latest depth because it could be calculated using incomplete data
+	
+	delete from obanalytics.level2
+	where microtimestamp = v_last_depth
+	  and pair_id = v_pair_id
+	  and precision = v_precision
+	  and exchange_id = v_exchange_id;
+	  
+	if v_end > v_last_depth + p_max_interval then
+		v_end := v_last_depth + p_max_interval;
+	end if;
+	
+	raise debug 'pga_depth(): from: %  till: %', v_last_depth, v_end;
+	  
+	insert into obanalytics.level2 (microtimestamp, pair_id, exchange_id, precision, depth_change)
+	select microtimestamp, pair_id, exchange_id, precision, coalesce(depth_change, '{}')
+	from obanalytics.depth_change_by_episode(v_last_depth, v_end, v_pair_id, v_exchange_id);
+	
+	raise debug 'pga_depth() exec time: %', clock_timestamp() - v_current_timestamp;
+	
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics.pga_depth(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: pga_spread(text, text, interval, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1222,6 +1537,116 @@ WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000')
 
 
 ALTER TABLE obanalytics.level1_01003201903 OWNER TO "ob-analytics";
+
+--
+-- Name: level2_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_bitfinex PARTITION OF obanalytics.level2
+FOR VALUES IN ('1')
+PARTITION BY LIST (pair_id);
+
+
+ALTER TABLE obanalytics.level2_bitfinex OWNER TO "ob-analytics";
+
+--
+-- Name: level2_bitfinex_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_bitfinex_btcusd PARTITION OF obanalytics.level2_bitfinex
+FOR VALUES IN ('1')
+PARTITION BY LIST ("precision");
+
+
+ALTER TABLE obanalytics.level2_bitfinex_btcusd OWNER TO "ob-analytics";
+
+--
+-- Name: level2_bitfinex_btcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_bitfinex_btcusd_p0 PARTITION OF obanalytics.level2_bitfinex_btcusd
+FOR VALUES IN ('p0')
+PARTITION BY RANGE (microtimestamp);
+
+
+ALTER TABLE obanalytics.level2_bitfinex_btcusd_p0 OWNER TO "ob-analytics";
+
+--
+-- Name: level2_01001p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_01001p0201903 PARTITION OF obanalytics.level2_bitfinex_btcusd_p0
+FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+
+
+ALTER TABLE obanalytics.level2_01001p0201903 OWNER TO "ob-analytics";
+
+--
+-- Name: level2_bitfinex_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_bitfinex_ltcusd PARTITION OF obanalytics.level2_bitfinex
+FOR VALUES IN ('2')
+PARTITION BY LIST ("precision");
+
+
+ALTER TABLE obanalytics.level2_bitfinex_ltcusd OWNER TO "ob-analytics";
+
+--
+-- Name: level2_bitfinex_ltcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_bitfinex_ltcusd_p0 PARTITION OF obanalytics.level2_bitfinex_ltcusd
+FOR VALUES IN ('p0')
+PARTITION BY RANGE (microtimestamp);
+
+
+ALTER TABLE obanalytics.level2_bitfinex_ltcusd_p0 OWNER TO "ob-analytics";
+
+--
+-- Name: level2_01002p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_01002p0201903 PARTITION OF obanalytics.level2_bitfinex_ltcusd_p0
+FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+
+
+ALTER TABLE obanalytics.level2_01002p0201903 OWNER TO "ob-analytics";
+
+--
+-- Name: level2_bitfinex_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_bitfinex_ethusd PARTITION OF obanalytics.level2_bitfinex
+FOR VALUES IN ('3')
+PARTITION BY LIST ("precision");
+
+
+ALTER TABLE obanalytics.level2_bitfinex_ethusd OWNER TO "ob-analytics";
+
+--
+-- Name: level2_bitfinex_ethusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_bitfinex_ethusd_p0 PARTITION OF obanalytics.level2_bitfinex_ethusd
+FOR VALUES IN ('p0')
+PARTITION BY RANGE (microtimestamp);
+
+
+ALTER TABLE obanalytics.level2_bitfinex_ethusd_p0 OWNER TO "ob-analytics";
+
+--
+-- Name: level2_01003p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_01003p0201903 PARTITION OF obanalytics.level2_bitfinex_ethusd_p0
+FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+
+
+ALTER TABLE obanalytics.level2_01003p0201903 OWNER TO "ob-analytics";
 
 --
 -- Name: level3_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -1957,6 +2382,181 @@ ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ALTER COLUMN pair_id SET DEF
 --
 
 ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_01001p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01001p0201903 ALTER COLUMN pair_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_01001p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01001p0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_01001p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01001p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
+
+
+--
+-- Name: level2_01002p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01002p0201903 ALTER COLUMN pair_id SET DEFAULT 2;
+
+
+--
+-- Name: level2_01002p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01002p0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_01002p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01002p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
+
+
+--
+-- Name: level2_01003p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01003p0201903 ALTER COLUMN pair_id SET DEFAULT 3;
+
+
+--
+-- Name: level2_01003p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01003p0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_01003p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01003p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
+
+
+--
+-- Name: level2_bitfinex exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_btcusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_p0 ALTER COLUMN pair_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_btcusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_p0 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_btcusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
+
+
+--
+-- Name: level2_bitfinex_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
+
+
+--
+-- Name: level2_bitfinex_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_ethusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_p0 ALTER COLUMN pair_id SET DEFAULT 3;
+
+
+--
+-- Name: level2_bitfinex_ethusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_p0 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_ethusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
+
+
+--
+-- Name: level2_bitfinex_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
+
+
+--
+-- Name: level2_bitfinex_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_ltcusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_p0 ALTER COLUMN pair_id SET DEFAULT 2;
+
+
+--
+-- Name: level2_bitfinex_ltcusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_p0 ALTER COLUMN exchange_id SET DEFAULT 1;
+
+
+--
+-- Name: level2_bitfinex_ltcusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
 
 
 --
@@ -2879,6 +3479,30 @@ ALTER TABLE ONLY obanalytics.level1_01002201903
 
 ALTER TABLE ONLY obanalytics.level1_01003201903
     ADD CONSTRAINT level1_01003201903_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level2_01001p0201903 level2_01001p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01001p0201903
+    ADD CONSTRAINT level2_01001p0201903_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level2_01002p0201903 level2_01002p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01002p0201903
+    ADD CONSTRAINT level2_01002p0201903_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level2_01003p0201903 level2_01003p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01003p0201903
+    ADD CONSTRAINT level2_01003p0201903_pkey PRIMARY KEY (microtimestamp);
 
 
 --
