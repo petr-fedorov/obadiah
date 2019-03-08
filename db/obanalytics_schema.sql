@@ -1147,7 +1147,6 @@ ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with tim
 
 CREATE FUNCTION obanalytics.pga_depth(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS void
     LANGUAGE plpgsql
-    SET work_mem TO '4GB'
     AS $$
 declare 
 	v_current_timestamp timestamptz;
@@ -1226,7 +1225,6 @@ ALTER FUNCTION obanalytics.pga_depth(p_exchange text, p_pair text, p_max_interva
 
 CREATE FUNCTION obanalytics.pga_spread(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS TABLE(o_start timestamp with time zone, o_end timestamp with time zone)
     LANGUAGE plpgsql
-    SET work_mem TO '4GB'
     AS $$
 declare 
 	v_current_timestamp timestamptz;
