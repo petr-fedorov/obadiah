@@ -757,6 +757,27 @@ $$;
 ALTER FUNCTION obanalytics._drop_leaf_matches_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: _is_valid_taker_event(timestamp with time zone, bigint, integer, integer, integer, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._is_valid_taker_event(p_microtimestamp timestamp with time zone, p_order_id bigint, p_event_no integer, p_pair_id integer, p_exchange_id integer, p_next_microtimestamp timestamp with time zone) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+begin 
+	if p_next_microtimestamp = '-infinity' then
+		return true;
+	else
+		raise exception 'Invalid taker event: % % % % %', p_microtimestamp, p_order_id, p_event_no, 
+				(select pair from obanalytics.pairs where pair_id = p_pair_id),
+				(select exchange from obanalytics.exchanges where exchange_id = p_exchange_id);
+	end if;				
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics._is_valid_taker_event(p_microtimestamp timestamp with time zone, p_order_id bigint, p_event_no integer, p_pair_id integer, p_exchange_id integer, p_next_microtimestamp timestamp with time zone) OWNER TO "ob-analytics";
+
+--
 -- Name: _order_book_after_event(obanalytics.level3_order_book_record[], obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -769,11 +790,11 @@ begin
 	end if;
 	
 	return ( with mix as (
-						select ob.*, false as is_deleted
+						select ob.*, false as is_deleted, null as next_microtimestamp
 						from unnest(p_ob) ob
 						union all
 						select microtimestamp, price,amount,side, null::boolean, microtimestamp,order_id, event_no,
-								price_microtimestamp, pair_id, exchange_id, next_microtimestamp = '-infinity'::timestamptz as is_deleted
+								price_microtimestamp, pair_id, exchange_id, next_microtimestamp = '-infinity'::timestamptz as is_deleted, next_microtimestamp
 						from unnest(p_ep)
 					),
 					latest_events as (
@@ -792,13 +813,14 @@ begin
 							true) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
 							as is_maker,
 							microtimestamp, order_id, event_no,
-							price_microtimestamp,  pair_id, exchange_id
+							price_microtimestamp,  pair_id, exchange_id, next_microtimestamp
 					from latest_events
 					where not is_deleted
 				)
 				select array(
-					select orders::obanalytics.level3_order_book_record
+					select row(ts,price, amount, side, is_maker, microtimestamp, order_id, event_no, price_microtimestamp, pair_id, exchange_id)::obanalytics.level3_order_book_record
 					from orders
+					where is_maker or obanalytics._is_valid_taker_event(microtimestamp, order_id, event_no, pair_id, exchange_id, next_microtimestamp)
 					order by microtimestamp, order_id, event_no 
 				)
 		);
@@ -1049,10 +1071,10 @@ $$;
 ALTER FUNCTION obanalytics.level3_incorporate_new_event() OWNER TO "ob-analytics";
 
 --
--- Name: level3_order_book(timestamp with time zone, smallint, smallint, boolean, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: level3_order_book(timestamp with time zone, integer, integer, boolean, boolean, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id smallint, p_exchange_id smallint, p_only_makers boolean, p_before boolean) RETURNS SETOF obanalytics.level3_order_book_record
+CREATE FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_makers boolean, p_before boolean, p_check_takers boolean DEFAULT false) RETURNS SETOF obanalytics.level3_order_book_record
     LANGUAGE sql STABLE
     AS $$
 
@@ -1094,12 +1116,13 @@ CREATE FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_p
 			exchange_id
     from orders
 	where is_maker OR NOT p_only_makers
+	  and (not p_check_takers or (not is_maker and obanalytics._is_valid_taker_event(microtimestamp, order_id, event_no, pair_id, exchange_id, next_microtimestamp)))
 	order by microtimestamp, order_id, event_no;	-- order by must be the same as in spread_after_episode. Change both!
 
 $$;
 
 
-ALTER FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id smallint, p_exchange_id smallint, p_only_makers boolean, p_before boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_makers boolean, p_before boolean, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_exchange_id(text); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
