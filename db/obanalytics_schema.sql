@@ -1102,6 +1102,72 @@ $$;
 ALTER FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id smallint, p_exchange_id smallint, p_only_makers boolean, p_before boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: oba_exchange_id(text); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.oba_exchange_id(p_exchange text) RETURNS smallint
+    LANGUAGE sql STABLE SECURITY DEFINER
+    AS $$select exchange_id from obanalytics.exchanges where exchange = p_exchange$$;
+
+
+ALTER FUNCTION obanalytics.oba_exchange_id(p_exchange text) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_pair_id(text); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.oba_pair_id(p_pair text) RETURNS smallint
+    LANGUAGE sql STABLE SECURITY DEFINER
+    AS $$select pair_id from obanalytics.pairs where pair = p_pair$$;
+
+
+ALTER FUNCTION obanalytics.oba_pair_id(p_pair text) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_spread(timestamp with time zone, timestamp with time zone, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean DEFAULT true) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
+    LANGUAGE sql STABLE SECURITY DEFINER
+    AS $$
+
+-- ARGUMENTS
+--	See obanalytics.spread_by_episode()
+
+	select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+	from obanalytics.level1 
+	where pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and microtimestamp between p_start_time and p_end_time
+	union all
+	select *
+	from (
+		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_start_time
+		from obanalytics.level1 
+		where pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+		  and microtimestamp < p_start_time
+		order by microtimestamp desc
+		limit 1
+	) a
+	union all
+	select *
+	from (
+		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_end_time 
+		from obanalytics.level1 
+		where pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+		  and microtimestamp <= p_end_time
+		order by microtimestamp desc
+		limit 1
+	) a
+	
+$$;
+
+
+ALTER FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean) OWNER TO "ob-analytics";
+
+--
 -- Name: order_book_by_episode(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
