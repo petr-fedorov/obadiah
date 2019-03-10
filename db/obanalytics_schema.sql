@@ -1125,6 +1125,54 @@ $$;
 ALTER FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_makers boolean, p_before boolean, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: oba_depth(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
+    LANGUAGE sql STABLE
+    AS $$
+
+	with time_range as (
+		select p_pair_id as pair_id, p_exchange_id as exchange_id, min(microtimestamp) as start_time
+		from obanalytics.level2
+		where microtimestamp >= p_start_time
+		  and exchange_id = p_exchange_id
+		  and pair_id = p_pair_id
+	)
+	select ts, price, amount, side
+	from time_range 
+		join lateral (
+				select ts,
+						pair_id,
+						exchange_id,
+						price, 
+						sum(amount) as amount,
+						case side 
+							when 'b' then 'bid'::text
+							when 's' then 'ask'::text
+						end as side
+				from obanalytics.level3_order_book(start_time, p_pair_id, p_exchange_id, p_only_makers := false, p_before := true)
+				where is_maker 
+				group by ts, price, side, pair_id, exchange_id
+		) a using (pair_id, exchange_id)
+	union all 
+	select microtimestamp, price, volume, side::text
+	from obanalytics.level2 join time_range using (pair_id, exchange_id) join unnest(level2.depth_change) d on true
+	where microtimestamp between start_time and p_end_time 
+	  and level2.pair_id = p_pair_id
+	  and level2.exchange_id = p_exchange_id 
+	  and microtimestamp >= p_start_time -- otherwise, the query optimizer produces a crazy plan!
+	  and price is not null;   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
+	  							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
+								-- 'not null' constraint is to be added to price and depth_change columns of obanalytics.depth table. Then this check
+								-- will be redundant
+
+$$;
+
+
+ALTER FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: oba_exchange_id(text); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
