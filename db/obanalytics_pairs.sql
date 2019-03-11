@@ -20,13 +20,13 @@ SET row_security = off;
 --
 
 COPY obanalytics.pairs (pair_id, pair, "R0", "P0", "P1", "P2", "P3", fmu) FROM stdin;
-2	LTCUSD	2	\N	\N	\N	\N	8
-1	BTCUSD	2	\N	\N	\N	\N	8
-4	XRPUSD	2	\N	\N	\N	\N	12
-3	ETHUSD	2	\N	\N	\N	\N	18
-6	BTCEUR	2	\N	\N	\N	\N	8
-5	BCHUSD	2	\N	\N	\N	\N	8
-7	ETHBTC	8	\N	\N	\N	\N	18
+2	LTCUSD	2	1	\N	\N	\N	8
+3	ETHUSD	2	1	\N	\N	\N	18
+4	XRPUSD	2	1	\N	\N	\N	12
+5	BCHUSD	2	1	\N	\N	\N	8
+6	BTCEUR	2	1	\N	\N	\N	8
+7	ETHBTC	8	1	\N	\N	\N	18
+1	BTCUSD	2	1	0	-1	-2	8
 \.
 
 
