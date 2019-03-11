@@ -778,6 +778,44 @@ $$;
 ALTER FUNCTION obanalytics._is_valid_taker_event(p_microtimestamp timestamp with time zone, p_order_id bigint, p_event_no integer, p_pair_id integer, p_exchange_id integer, p_next_microtimestamp timestamp with time zone) OWNER TO "ob-analytics";
 
 --
+-- Name: _oba_events_with_id(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(event_id bigint, microtimestamp timestamp with time zone, order_id bigint, event_no integer, is_deleted boolean, side character, price numeric, amount numeric, fill numeric, pair_id smallint, exchange_id smallint, price_microtimestamp timestamp with time zone)
+    LANGUAGE sql STABLE
+    AS $$
+
+with active_events as (
+	select microtimestamp, order_id, event_no, next_microtimestamp = '-infinity' as is_deleted, side, price, amount, fill, pair_id, exchange_id, price_microtimestamp
+	from obanalytics.level3 
+	where microtimestamp between p_start_time and p_end_time
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	union -- not all since we want to eliminate duplicated events from the first level3 episode and level3_order_book
+	select microtimestamp, order_id, event_no, false as is_deleted, side, price, amount,
+			(select fill 
+		     from obanalytics.level3 
+			  where microtimestamp = ob.microtimestamp
+			    and order_id = ob.order_id
+			    and event_no = ob.event_no
+			    and pair_id = p_pair_id
+			    and exchange_id = p_exchange_id																						  
+		     ) as fill,
+			pair_id, exchange_id, price_microtimestamp
+	from obanalytics.level3_order_book(p_start_time, p_pair_id, p_exchange_id, p_only_makers := false, p_before := false) ob
+)
+select row_number() over (order by order_id, amount desc, event_no, microtimestamp ) as event_id,
+		microtimestamp, order_id, event_no, is_deleted, side,price, amount, fill, pair_id, exchange_id, 
+		price_microtimestamp
+from active_events
+where not (amount = 0 and event_no = 1 and not is_deleted)	
+
+$$;
+
+
+ALTER FUNCTION obanalytics._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: _order_book_after_event(obanalytics.level3_order_book_record[], obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1129,7 +1167,7 @@ ALTER FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_pa
 --
 
 CREATE FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
-    LANGUAGE sql STABLE
+    LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
 	with time_range as (
@@ -1171,6 +1209,154 @@ $$;
 
 
 ALTER FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: oba_events(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("event.id" bigint, id bigint, "timestamp" timestamp with time zone, "exchange.timestamp" timestamp with time zone, price numeric, volume numeric, action text, direction text, fill numeric, "matching.event" bigint, type text, "aggressiveness.bps" numeric, event_no integer, is_aggressor boolean, is_created boolean, is_ever_resting boolean, is_ever_aggressor boolean, is_ever_filled boolean, is_deleted boolean, is_price_ever_changed boolean, best_bid_price numeric, best_ask_price numeric)
+    LANGUAGE sql STABLE SECURITY DEFINER
+    AS $$
+
+ with trades as (
+		select * 
+		from obanalytics.matches 
+		where microtimestamp between p_start_time and p_end_time
+	 	  and exchange_id = p_exchange_id
+	      and pair_id = p_pair_id
+	   ),
+	  takers as (
+		  select distinct buy_order_id as order_id
+		  from trades
+		  where side = 'b'
+		  union	-- not all, unique
+		  select distinct sell_order_id as order_id
+		  from trades
+		  where side = 's'				
+		),
+	  makers as (
+		  select distinct buy_order_id as order_id
+		  from trades
+		  where side = 's'
+		  union -- not all, unique
+		  select distinct sell_order_id as order_id
+		  from trades
+		  where side = 'b'				
+		),
+	  spread_before as (
+		  select lead(microtimestamp) over (order by microtimestamp) as microtimestamp, 
+		  		  best_ask_price, best_bid_price
+		  from obanalytics.level1 
+		  where microtimestamp between p_start_time and p_end_time 
+		    and pair_id = p_pair_id
+		    and exchange_id = p_exchange_id
+		  ),
+	  base_events as (
+		  select event_id,
+		  		  microtimestamp,
+		  		  price,
+		  		  amount,
+		  		  side,
+		  		  order_id,
+		  		  is_deleted as is_deleted_event,
+		  		  price_microtimestamp,
+		  		  fill,
+		  		  -- the columns below require 'first-last-agg' from pgxn to be installed
+		  		  -- https://pgxn.org/dist/first_last_agg/doc/first_last_agg.html
+		  		  last(best_ask_price) over (order by microtimestamp) as best_ask_price,	
+		  		  last(best_bid_price) over (order by microtimestamp) as best_bid_price,	
+		  		  -- coalesce below on the right handles the case of one-sided order book ...
+		  		  case 
+		  			when not is_deleted then
+					  case side
+						when 's' then price <= coalesce(last(best_bid_price) over (order by microtimestamp), price - 1)
+						when 'b' then price >= coalesce(last(best_ask_price) over (order by microtimestamp) , price + 1 )
+		 			  end
+		  			else null
+		  		  end as is_aggressor,		  
+		  		  event_no
+		  from obanalytics._oba_events_with_id(p_start_time, p_end_time, p_pair_id, p_exchange_id) left join spread_before using(microtimestamp) 
+	  ),
+	  events as (
+		select base_events.*,
+		  		max(price) over o_all <> min(price) over o_all as is_price_ever_changed,
+				bool_or(not is_aggressor) over o_all as is_ever_resting,
+		  		bool_or(is_aggressor) over o_all as is_ever_aggressor, 	
+		  		bool_or(coalesce(fill, case when not is_deleted_event then 1.0 else null end ) > 0.0 ) over o_all as is_ever_filled, 	
+		  		first_value(is_deleted_event) over o_after as is_deleted,
+		  		first_value(event_no) over o_before = 1 and not first_value(is_deleted_event) over o_before as is_created
+		from base_events left join makers using (order_id) left join takers using (order_id) 
+  		
+		window o_all as (partition by order_id), 
+		  		o_after as (partition by order_id order by microtimestamp desc, event_no desc),
+		  		o_before as (partition by order_id order by microtimestamp, event_no)
+	  ),
+	  event_connection as (
+		  select trades.microtimestamp, 
+		   	      buy_event_no as event_no,
+		  		  buy_order_id as order_id, 
+		  		  events.event_id
+		  from trades join events on trades.microtimestamp = events.microtimestamp and sell_order_id = order_id and sell_event_no = event_no
+		  union all
+		  select trades.microtimestamp, 
+		  		  sell_event_no as event_no,
+		  		  sell_order_id as order_id, 
+		  		  events.event_id
+		  from trades join events on trades.microtimestamp = events.microtimestamp and buy_order_id = order_id and buy_event_no = event_no
+	  )
+  select events.event_id as "event.id",
+  		  order_id as id,
+		  microtimestamp as "timestamp",
+		  price_microtimestamp as "exchange.timestamp",
+		  price, 
+		  amount as volume,
+		  case 
+		  	when event_no = 1 and not is_deleted_event then 'created'::text
+			when event_no > 1 and not is_deleted_event then 'changed'::text
+			when is_deleted_event then 'deleted'::text
+		  end as action,
+		  case side
+		  	when 'b' then 'bid'::text
+			when 's' then 'ask'::text
+		  end as direction,
+		  case when fill > 0.0 then fill
+		  		else 0.0
+		  end as fill,
+		  event_connection.event_id as "matching.event",
+		  case when is_price_ever_changed then 'pacman'::text
+		  	    when is_ever_resting and not is_ever_aggressor and not is_ever_filled and is_deleted then 'flashed-limit'::text
+				when is_ever_resting and not is_ever_aggressor and not is_ever_filled and not is_deleted then 'resting-limit'::text
+				when is_ever_resting and not is_ever_aggressor and is_ever_filled then 'resting-limit'::text
+				when not is_ever_resting and is_ever_aggressor and is_deleted and is_ever_filled then 'market'::text
+				-- when two market orders have been placed simulltaneously, the first might take all liquidity 
+				-- so the second will not be executed and no change event will be generated for it so is_ever_resting will be 'false'.
+				-- in spite of this it will be resting the order book for some time so its type is 'flashed-limit'.
+				when not is_ever_resting and is_ever_aggressor and is_deleted and not is_ever_filled then 'flashed-limit'::text	
+				when is_ever_resting and is_ever_aggressor then 'market-limit'::text
+		  		else 'unknown'::text 
+		  end as "type",
+			case side
+		  		when 's' then round((best_ask_price - price)/best_ask_price*10000)
+		  		when 'b' then round((price - best_bid_price)/best_ask_price*10000)
+		  	end as "aggressiveness.bps",
+		event_no,
+		is_aggressor,
+		is_created,
+		is_ever_resting,
+		is_ever_aggressor,
+		is_ever_filled,
+		is_deleted,
+		is_price_ever_changed,
+		best_bid_price,
+		best_ask_price
+  from events left join event_connection using (microtimestamp, event_no, order_id) 
+
+  order by 1;
+
+$$;
+
+
+ALTER FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_exchange_id(text); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
