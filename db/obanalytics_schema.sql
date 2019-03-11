@@ -1425,6 +1425,55 @@ $$;
 ALTER FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: oba_trades(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.oba_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, direction text, "maker.event.id" bigint, "taker.event.id" bigint, maker bigint, taker bigint, "real.trade.id" bigint)
+    LANGUAGE sql STABLE SECURITY DEFINER
+    AS $$
+
+ with trades as (
+		select * 
+		from obanalytics.matches 
+		where microtimestamp between p_start_time and p_end_time
+	      and pair_id = p_pair_id
+	 	  and exchange_id = p_exchange_id
+	),
+ events as (
+	 select *
+	 from obanalytics._oba_events_with_id(p_start_time, p_end_time, p_pair_id, p_exchange_id) 
+ )
+  select trades.microtimestamp,
+  		  trades.price,
+		  trades.amount,
+		  case trades.side when 'b' then 'buy'::text when 's' then 'sell'::text end,
+		  case trades.side
+		  	when 'b' then s.event_id
+			when 's' then b.event_id
+		  end,
+		  case trades.side
+		  	when 'b' then b.event_id
+			when 's' then s.event_id
+		  end,
+		  case trades.side
+		  	when 'b' then sell_order_id
+			when 's' then buy_order_id
+		  end,
+		  case trades.side
+		  	when 'b' then buy_order_id
+			when 's' then sell_order_id
+		  end,
+		  trades.exchange_trade_id 
+  from trades left join events b on trades.microtimestamp = b.microtimestamp and buy_order_id = b.order_id and buy_event_no = b.event_no
+  		left join events s on trades.microtimestamp = s.microtimestamp and sell_order_id = s.order_id  and sell_event_no = s.event_no
+  order by 1
+
+$$;
+
+
+ALTER FUNCTION obanalytics.oba_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: order_book_by_episode(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
