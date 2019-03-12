@@ -1174,16 +1174,12 @@ CREATE FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_p
     LANGUAGE sql STABLE
     AS $$
 
-	with episode as (
-			select microtimestamp as e, pair_id, (select max(era) from obanalytics.level3_eras where era <= p_ts and pair_id = p_pair_id ) as s, exchange_id
-			from obanalytics.level3
-			where microtimestamp >= (select max(era) from obanalytics.level3_eras where era <= p_ts and pair_id = p_pair_id )
-			  and ( microtimestamp < p_ts or ( microtimestamp = p_ts and not p_before ) )
-		      and pair_id = p_pair_id
-			  and exchange_id = p_exchange_id
-			order by microtimestamp desc
-			limit 1
-		), 
+	with era as (select max(era) as s
+				 from obanalytics.level3_eras 
+				 where era <= p_ts 
+				   and pair_id = p_pair_id 
+				   and exchange_id = p_exchange_id 
+		),
 		orders as (
 			select *, 
 					coalesce(
@@ -1193,13 +1189,15 @@ CREATE FUNCTION obanalytics.level3_order_book(p_ts timestamp with time zone, p_p
 						end,
 					true )	-- if there are only 'b' or 's' orders in the order book at some moment in time, then all of them are makers
 					as is_maker
-			from obanalytics.level3 join episode using (exchange_id, pair_id)
-			where microtimestamp between episode.s and episode.e
-			  and pair_id = p_pair_id				-- redundant, but will help query optimizer with partition elimination
-			  and exchange_id = p_exchange_id		-- redundant, but will help query optimizer with partition elimination
-			  and next_microtimestamp > episode.e
+			from obanalytics.level3 join era on true
+			where microtimestamp >= s 
+			  and case when p_before then  microtimestamp < p_ts and next_microtimestamp >= p_ts 
+						when not p_before then microtimestamp <= p_ts and next_microtimestamp > p_ts 
+		  	      end
+			  and pair_id = p_pair_id
+			  and exchange_id = p_exchange_id		
 		)
-	select e,
+	select ( select max(microtimestamp) from orders ) as e,
 			price,
 			amount,
 			side,
@@ -1511,7 +1509,7 @@ ALTER FUNCTION obanalytics.oba_exchange_id(p_exchange text) OWNER TO "ob-analyti
 --
 
 CREATE FUNCTION obanalytics.oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(id bigint, "timestamp" text, "exchange.timestamp" text, price numeric, volume numeric, action text, direction text)
-    LANGUAGE sql
+    LANGUAGE sql STABLE
     AS $$
 select order_id,
 		obanalytics._in_milliseconds(microtimestamp),
@@ -2311,7 +2309,7 @@ ALTER TABLE obanalytics.level3_01001b201902 OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01001b201903 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01001b201903 OWNER TO "ob-analytics";
@@ -2344,7 +2342,7 @@ ALTER TABLE obanalytics.level3_01001s201902 OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01001s201903 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01001s201903 OWNER TO "ob-analytics";
@@ -2388,7 +2386,7 @@ ALTER TABLE obanalytics.level3_01002b201902 OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01002b201903 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01002b201903 OWNER TO "ob-analytics";
@@ -2421,7 +2419,7 @@ ALTER TABLE obanalytics.level3_01002s201902 OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01002s201903 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01002s201903 OWNER TO "ob-analytics";
@@ -2465,7 +2463,7 @@ ALTER TABLE obanalytics.level3_01003b201902 OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01003b201903 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01003b201903 OWNER TO "ob-analytics";
@@ -2498,7 +2496,7 @@ ALTER TABLE obanalytics.level3_01003s201902 OWNER TO "ob-analytics";
 
 CREATE TABLE obanalytics.level3_01003s201903 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 
 
 ALTER TABLE obanalytics.level3_01003s201903 OWNER TO "ob-analytics";

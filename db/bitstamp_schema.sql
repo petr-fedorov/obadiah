@@ -1896,7 +1896,7 @@ ALTER FUNCTION bitstamp.oba_event(p_start_time timestamp with time zone, p_end_t
 --
 
 CREATE FUNCTION bitstamp.oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS TABLE(id bigint, "timestamp" text, "exchange.timestamp" text, price numeric, volume numeric, action text, direction text)
-    LANGUAGE sql
+    LANGUAGE sql STABLE
     AS $$
 select order_id,
 		bitstamp._in_milliseconds(microtimestamp),
