@@ -1298,18 +1298,48 @@ for_update as (
 	select tableoid, ctid, microtimestamp, order_id, event_no, side
 	from joined 
 	where r  = 1 and r_l3 = 1
+),
+updated_matches as (
+	update obanalytics.matches_bitfinex
+	set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
+		buy_event_no = case when for_update.side = 'b' then event_no else buy_order_id end,
+		sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
+		sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
+		microtimestamp = for_update.microtimestamp
+	from for_update
+	where matches_bitfinex.pair_id = p_pair_id
+	  and for_update.ctid = matches_bitfinex.ctid
+	  and for_update.tableoid = matches_bitfinex.tableoid
+	returning matches_bitfinex.*
+),
+updated_buys as (
+	update obanalytics.level3_bitfinex
+	set amount = level3_bitfinex.amount - updated_matches.amount,
+		fill = updated_matches.amount
+	from updated_matches
+	where updated_matches.buy_order_id is not null 
+	  and level3_bitfinex.microtimestamp = updated_matches.microtimestamp
+	  and level3_bitfinex.order_id = buy_order_id 
+	  and level3_bitfinex.event_no = buy_event_no
+	  and level3_bitfinex.pair_id = p_pair_id
+	  and level3_bitfinex.side = 'b'
+	  and fill is null
+),
+updated_sells as (
+	update obanalytics.level3_bitfinex
+	set amount = level3_bitfinex.amount - updated_matches.amount,
+		fill = updated_matches.amount
+	from updated_matches
+	where updated_matches.sell_order_id is not null 
+	  and level3_bitfinex.microtimestamp = updated_matches.microtimestamp
+	  and level3_bitfinex.order_id = sell_order_id 
+	  and level3_bitfinex.event_no = sell_event_no
+	  and level3_bitfinex.pair_id = p_pair_id
+	  and level3_bitfinex.side = 's'	
+	  and fill is null
 )
-update obanalytics.matches_bitfinex
-set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
-    buy_event_no = case when for_update.side = 'b' then event_no else buy_order_id end,
-	sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
-	sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
-	microtimestamp = for_update.microtimestamp
-from for_update
-where matches_bitfinex.pair_id = p_pair_id
-  and for_update.ctid = matches_bitfinex.ctid
-  and for_update.tableoid = matches_bitfinex.tableoid
-returning matches_bitfinex.*;
+select *
+from updated_matches;
 
 $$;
 
@@ -1348,26 +1378,72 @@ matches as (
 									 and matches.origination = matches_gr.side
 	where matches.n < p_max_group_size
 ),					 
-for_update as (
+for_update_base as (
 	select distinct on (microtimestamp, order_id, event_no) *
 	from bitfinex._level3_matchable_events(p_start_time, p_end_time, p_pair_id ) 
 		  join (select * from matches where n > 1 ) a using (price, fill)
 	where microtimestamp between trade_microtimestamp  and trade_microtimestamp + p_max_delay
 	  and side <> origination
 	order by microtimestamp, order_id, event_no, trade_microtimestamp
+),
+-- we need to ensure that each match (i.e. trade) belongs to a single group only
+for_update as (
+	select l.*
+	from for_update_base l left join for_update_base r on l.ctids && r.ctids
+	where r.microtimestamp is null 
+	   or l.microtimestamp < r.microtimestamp 
+	   or ( l.microtimestamp = r.microtimestamp and l.trade_microtimestamp < r.trade_microtimestamp )
+	   or ( l.microtimestamp = r.microtimestamp and l.trade_microtimestamp = r.trade_microtimestamp and l.ctids < r.ctids)	-- choose one of them (arbitrarily)
+),
+updated_matches as (
+	update obanalytics.matches_bitfinex
+	set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
+		buy_event_no = case when for_update.side = 'b' then event_no else buy_order_id end,
+		sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
+		sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
+		microtimestamp = for_update.microtimestamp
+	from for_update join unnest(ctids) pks (tableoid oid, ctid tid) on true
+	where matches_bitfinex.pair_id = p_pair_id
+	  and matches_bitfinex.ctid = pks.ctid 
+	  and matches_bitfinex.tableoid = pks.tableoid
+	returning matches_bitfinex.*
+),
+updated_buys as (
+	update obanalytics.level3_bitfinex
+	set amount = level3_bitfinex.amount - updated_matches.amount,
+		fill = updated_matches.amount
+	from ( select microtimestamp, buy_order_id, buy_event_no, sum(amount) as amount
+			from updated_matches
+			where updated_matches.buy_order_id is not null 
+			group by 1,2,3
+		 ) updated_matches
+	where level3_bitfinex.microtimestamp = updated_matches.microtimestamp
+	  and level3_bitfinex.order_id = buy_order_id 
+	  and level3_bitfinex.event_no = buy_event_no
+	  and level3_bitfinex.pair_id = p_pair_id
+	  and level3_bitfinex.side = 'b'
+	  and fill is null
+),
+updated_sells as (
+	update obanalytics.level3_bitfinex
+	set amount = level3_bitfinex.amount - updated_matches.amount,
+		fill = updated_matches.amount
+	from ( select microtimestamp, sell_order_id, sell_event_no, sum(amount) as amount
+			from updated_matches
+			where updated_matches.sell_order_id is not null 
+			group by 1,2,3
+		 ) updated_matches
+	where level3_bitfinex.microtimestamp = updated_matches.microtimestamp
+	  and level3_bitfinex.order_id = sell_order_id 
+	  and level3_bitfinex.event_no = sell_event_no
+	  and level3_bitfinex.pair_id = p_pair_id
+	  and level3_bitfinex.side = 's'	
+	  and fill is null
 )
-update obanalytics.matches_bitfinex
-set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
-    buy_event_no = case when for_update.side = 'b' then event_no else buy_order_id end,
-	sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
-	sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
-	microtimestamp = for_update.microtimestamp
-from for_update join unnest(ctids) pks (tableoid oid, ctid tid) on true
-where matches_bitfinex.pair_id = p_pair_id
-  and matches_bitfinex.ctid = pks.ctid 
-  and matches_bitfinex.tableoid = pks.tableoid
-returning matches_bitfinex.*;
+select *
+from updated_matches;
 
+																																	 
 $$;
 
 
