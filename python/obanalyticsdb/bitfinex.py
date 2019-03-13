@@ -239,7 +239,8 @@ async def capture(pair, user, database):
                                               'flags': 32768 + 8}))
                     while True:
                         try:
-                            message = await ws.recv()
+                            message = await asyncio.wait_for(ws.recv(),
+                                                             timeout=2.0)
                             lts = datetime.now()
                             bl = len(ws.messages)
                             if handler.done():
@@ -260,6 +261,9 @@ async def capture(pair, user, database):
                                     'websockets internal queue size: %i '
                                     '(decreasing)', bl)
                                 max_queue = bl
+                        except asyncio.TimeoutError:
+                            logger.info('Websocket exhausted, re-connect ...')
+                            await ws.close()
                         except asyncio.CancelledError:
                             logger.info('Closing websocket ...')
                             is_closing = True
