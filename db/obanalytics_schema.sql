@@ -1499,7 +1499,7 @@ ALTER FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_e
 
 CREATE FUNCTION obanalytics.oba_exchange_id(p_exchange text) RETURNS smallint
     LANGUAGE sql STABLE SECURITY DEFINER
-    AS $$select exchange_id from obanalytics.exchanges where exchange = p_exchange$$;
+    AS $$select exchange_id from obanalytics.exchanges where exchange = lower(p_exchange)$$;
 
 
 ALTER FUNCTION obanalytics.oba_exchange_id(p_exchange text) OWNER TO "ob-analytics";
@@ -1538,7 +1538,7 @@ ALTER FUNCTION obanalytics.oba_export(p_start_time timestamp with time zone, p_e
 
 CREATE FUNCTION obanalytics.oba_pair_id(p_pair text) RETURNS smallint
     LANGUAGE sql STABLE SECURITY DEFINER
-    AS $$select pair_id from obanalytics.pairs where pair = p_pair$$;
+    AS $$select pair_id from obanalytics.pairs where pair = upper(p_pair)$$;
 
 
 ALTER FUNCTION obanalytics.oba_pair_id(p_pair text) OWNER TO "ob-analytics";
