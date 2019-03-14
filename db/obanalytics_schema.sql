@@ -1417,7 +1417,8 @@ CREATE FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_
 		  		max(price) over o_all <> min(price) over o_all as is_price_ever_changed,
 				bool_or(not is_aggressor) over o_all as is_ever_resting,
 		  		bool_or(is_aggressor) over o_all as is_ever_aggressor, 	
-		  		bool_or(coalesce(fill, case when not is_deleted_event then 1.0 else null end ) > 0.0 ) over o_all as is_ever_filled, 	
+		  		-- bool_or(coalesce(fill, case when not is_deleted_event then 1.0 else null end ) > 0.0 ) over o_all as is_ever_filled, 	-- BITSTAMP-specific version
+		  		bool_or(coalesce(fill,0.0) > 0.0 ) over o_all as is_ever_filled,	-- we should classify an order event as fill only when we know fill amount. TODO: check how it will work with Bitstamp 
 		  		first_value(is_deleted_event) over o_after as is_deleted,
 		  		first_value(event_no) over o_before = 1 and not first_value(is_deleted_event) over o_before as is_created
 		from base_events left join makers using (order_id) left join takers using (order_id) 
