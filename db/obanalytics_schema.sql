@@ -1333,7 +1333,7 @@ depth_with_price_adjusted as (
 select ts, 
 		price, 
 		sum(amount) as volume, 
-		side::text, 
+		case side when 's' then 'ask'::text when 'b' then 'bid'::text end, 
 		bps_level*p_bps_step::bigint
 from depth_with_price_adjusted
 where r = 1	-- if rounded to milliseconds ts are not unique, we'll take the LasT one and will drop the first silently
