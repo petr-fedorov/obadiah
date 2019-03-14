@@ -48,4 +48,27 @@ events <- function(conn, start.time, end.time, exchange, pair, debug.query = FAL
   events
 }
 
+#' @export
+trades <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
+  query <- paste0(" SELECT 	bitstamp._in_milliseconds(timestamp) AS timestamp,
+                  price, volume, direction,
+                  \"maker.event.id\"::integer,
+                  \"taker.event.id\"::integer,
+                  maker::numeric,
+                  taker::numeric,
+                  \"real.trade.id\" FROM obanalytics.oba_trades(",
+                  shQuote(start.time), ",",
+                  shQuote(end.time), ",",
+                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), ")",
+                  ") ORDER BY timestamp")
+  if(debug.query) cat(query)
+  trades <- DBI::dbGetQuery(conn, query)
+  trades$timestamp <- as.POSIXct(as.numeric(trades$timestamp)/1000, origin="1970-01-01")
+  trades$direction <- factor(trades$direction, c("buy", "sell"))
+
+  trades
+}
+
+
 
