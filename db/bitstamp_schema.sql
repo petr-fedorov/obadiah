@@ -3134,6 +3134,13 @@ CREATE UNIQUE INDEX live_buy_orders_fkey_live_trades_trade_id ON bitstamp.live_b
 
 
 --
+-- Name: live_buy_orders_idx_filled; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX live_buy_orders_idx_filled ON bitstamp.live_buy_orders USING btree (pair_id, microtimestamp) WHERE (fill > (0)::numeric);
+
+
+--
 -- Name: live_buy_orders_idx_order_created; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -3159,6 +3166,13 @@ CREATE INDEX live_sell_orders_fkey_live_sell_orders_price ON bitstamp.live_sell_
 --
 
 CREATE UNIQUE INDEX live_sell_orders_fkey_live_trades_trade_id ON bitstamp.live_sell_orders USING btree (trade_id);
+
+
+--
+-- Name: live_sell_orders_idx_filled; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX live_sell_orders_idx_filled ON bitstamp.live_sell_orders USING btree (pair_id, microtimestamp) WHERE (fill > (0)::numeric);
 
 
 --
