@@ -19,6 +19,28 @@ depth <- function(conn, start.time, end.time, exchange, pair, debug.query = FALS
 
 
 #' @export
+spread <- function(conn, start.time, end.time, exchange, pair, only.different = TRUE, debug.query = FALSE) {
+  query <- paste0(" SELECT 	obanalytics._in_milliseconds(timestamp) AS timestamp,
+                  \"best.bid.price\",
+                  \"best.bid.volume\",
+                  \"best.ask.price\",
+                  \"best.ask.volume\"
+                  FROM obanalytics.oba_spread(",
+                  shQuote(start.time), ",",
+                  shQuote(end.time), ",",
+                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
+                  only.different,
+                  " ) ORDER BY 1")
+  if(debug.query) cat(query)
+  spread <- DBI::dbGetQuery(conn, query)
+  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
+  spread
+}
+
+
+
+#' @export
 events <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
   query <- paste0(" SELECT 	\"event.id\"::integer,
                   \"id\"::numeric,
