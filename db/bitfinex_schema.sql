@@ -1071,7 +1071,7 @@ declare
 	p record;
 	v_pair_id smallint;
 	v_exchange_id smallint;
-	v_last_order_book obanalytics.level3_order_book_record[];
+	v_last_order_book record; -- obanalytics.level3_order_book_record[];
 	v_open_orders bitfinex.transient_raw_book_events[];	
 	v_era timestamptz;
 begin
@@ -1099,8 +1099,8 @@ begin
 				  and end_time >= p_start_time
 				order by 2	-- i.e. output's start_time
 				loop
-		select array_agg(level3_order_book) into v_last_order_book
-		from obanalytics.level3_order_book(p.start_time, 
+		select ts, ob into v_last_order_book
+		from obanalytics.order_book(p.start_time, 
 										   v_pair_id, v_exchange_id,
 										   p_only_makers := false,	-- since exchanges sometimes output crossed order books, we'll consider ALL active orders
 										   p_before := true);	
@@ -1109,18 +1109,18 @@ begin
 				case side when 's' then -amount when 'b' then amount end,
 				pair_id, null::timestamptz,-1, microtimestamp ,event_no,null::integer)::bitfinex.transient_raw_book_events) 
 				into v_open_orders
-		from unnest(v_last_order_book);
+		from unnest(v_last_order_book.ob);
 		if p.is_channel_starts then	
-			if (v_last_order_book is null or p.start_time - v_last_order_book[1].ts > p_new_era_start_threshold ) or
-				(extract(month from v_last_order_book[1].ts) <> extract(month from p.start_time)) then	-- going over a partition boundary so need to start new era
+			if (v_last_order_book is null or p.start_time - v_last_order_book.ts > p_new_era_start_threshold ) or
+				(extract(month from v_last_order_book.ts) <> extract(month from p.start_time)) then	-- going over a partition boundary so need to start new era
 																											 -- next_microtimestamp and price_microtimestamp can't refer beyond partition
-				raise log 'Start new era for channel % interval % between % and %, threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, v_last_order_book[1].ts, p.start_time,  p_new_era_start_threshold;
+				raise log 'Start new era for channel % interval % between % and %, threshold %', p.channel_id,  p.start_time -  v_last_order_book.ts, v_last_order_book.ts, p.start_time,  p_new_era_start_threshold;
 				insert into obanalytics.level3_eras (era, pair_id, exchange_id)
 				values (p.start_time, v_pair_id, v_exchange_id);
 				
 				v_open_orders := null;	-- event_no will start from scratch
 			else
-				raise log 'Continue previous era for new channel %, interval % between % and % ,threshold %', p.channel_id,  p.start_time -  v_last_order_book[1].ts, p.start_time,  v_last_order_book[1].ts, p_new_era_start_threshold;
+				raise log 'Continue previous era for new channel %, interval % between % and % ,threshold %', p.channel_id,  p.start_time -  v_last_order_book.ts, p.start_time,  v_last_order_book.ts, p_new_era_start_threshold;
 				with to_be_replaced as (
 					delete from bitfinex.transient_raw_book_events
 					where pair_id = v_pair_id
