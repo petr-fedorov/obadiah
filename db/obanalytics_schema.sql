@@ -1941,6 +1941,13 @@ with periods as (
 	where p_ends >= p_start_time
    	  and p_starts <= p_end_time 
 ),
+level3_base as (
+	select * 
+	from obanalytics.level3 
+	where exchange_id in ( select exchange_id from obanalytics.exchanges where exchange = coalesce(p_exchange, exchange))
+	  and pair_id in ( select pair_id from obanalytics.pairs where pair = coalesce(p_pair, pair))
+	  and microtimestamp  between p_start_time and p_end_time
+),
 events as (		
 	select exchange_id,
 			pair_id,
@@ -1949,9 +1956,17 @@ events as (
 			min(microtimestamp) filter (where microtimestamp between period_starts and period_ends) as e_first, 
 			max(microtimestamp) filter (where microtimestamp between period_starts and period_ends) as e_last,
 			count(*) filter (where microtimestamp between period_starts and period_ends) as e_total
-	from periods join obanalytics.level3 using (exchange_id, pair_id)
-	where level3.microtimestamp between period_starts and period_ends
+	from periods join level3_base using (exchange_id, pair_id)
+	where microtimestamp between period_starts and period_ends 	
+	  
 	group by exchange_id, pair_id, period_starts, period_ends
+),
+matches_base as (
+	select *
+	from obanalytics.matches
+	where exchange_id in ( select exchange_id from obanalytics.exchanges where exchange = coalesce(p_exchange, exchange))
+	  and pair_id in ( select pair_id from obanalytics.pairs where pair = coalesce(p_pair, pair))
+	  and microtimestamp  between p_start_time and p_end_time
 ),
 trades as (		
 	select exchange_id,
@@ -1963,8 +1978,8 @@ trades as (
 			count(*) filter (where microtimestamp between period_starts and period_ends) as t_total,
 			count(*) filter (where microtimestamp between period_starts and period_ends and (buy_order_id is not null or sell_order_id is not null )) as t_matched,
 			count(*) filter (where microtimestamp between period_starts and period_ends and exchange_trade_id is not null) as t_exchange
-	from periods join obanalytics.matches using (exchange_id, pair_id)
-	where matches.microtimestamp between period_starts and period_ends
+	from periods join matches_base using (exchange_id, pair_id)
+	where microtimestamp between period_starts and period_ends
 	group by exchange_id, pair_id, period_starts, period_ends
 )		
 select pairs.pair, e_first::text, e_last::text, e_total, 
