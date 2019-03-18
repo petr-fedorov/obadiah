@@ -846,59 +846,6 @@ $$;
 ALTER FUNCTION obanalytics._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: _order_book_after_episode(obanalytics.level3[], obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics._order_book_after_episode(p_ob obanalytics.level3[], p_ep obanalytics.level3[]) RETURNS obanalytics.level3[]
-    LANGUAGE plpgsql STABLE
-    AS $$
-begin
-	if p_ob is null then
-		select ob into p_ob
-		from obanalytics.order_book(p_ep[1].microtimestamp, p_ep[1].pair_id, p_ep[1].exchange_id, p_only_makers := false, p_before := true );
-	end if;
-	
-	return ( with mix as (
-						select ob.*, false as is_deleted
-						from unnest(p_ob) ob
-						union all
-						select ob.*, next_microtimestamp = '-infinity'::timestamptz as is_deleted
-						from unnest(p_ep) ob
-					),
-					latest_events as (
-						select distinct on (order_id) *
-						from mix
-						order by order_id, event_no desc	-- just take the latest event_no for each order
-					),
-					orders as (
-					select microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp,
-							price_microtimestamp, price_event_no, exchange_microtimestamp, 
-							coalesce(
-								case side
-									when 'b' then price < min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
-									when 's' then price > max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
-								end,
-							true) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
-							as is_maker
-					from latest_events
-					where not is_deleted
-				)
-				select array(
-					select orders::obanalytics.level3
-					from orders
-					where is_maker or obanalytics._is_valid_taker_event(microtimestamp, order_id, event_no, pair_id, exchange_id, next_microtimestamp)
-					order by microtimestamp, order_id, event_no 
-					-- order by must be the same as in obanalytics.order_book(). Change both!					
-				)
-		);
-end;   
-
-$$;
-
-
-ALTER FUNCTION obanalytics._order_book_after_episode(p_ob obanalytics.level3[], p_ep obanalytics.level3[]) OWNER TO "ob-analytics";
-
---
 -- Name: _order_book_after_episode(obanalytics.level3[], obanalytics.level3[], boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -928,8 +875,8 @@ begin
 							price_microtimestamp, price_event_no, exchange_microtimestamp, 
 							coalesce(
 								case side
-									when 'b' then price < min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
-									when 's' then price > max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+									when 'b' then price <= min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+									when 's' then price >= max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
 								end,
 							true) -- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
 							as is_maker
@@ -1622,8 +1569,8 @@ CREATE FUNCTION obanalytics.order_book(p_ts timestamp with time zone, p_pair_id 
 					price_microtimestamp, price_event_no, exchange_microtimestamp, 
 					coalesce(
 						case side 
-							when 'b' then price < min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
-							when 's' then price > max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+							when 'b' then price <= min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
+							when 's' then price >= max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp, microtimestamp)
 						end,
 					true )	-- if there are only 'b' or 's' orders in the order book at some moment in time, then all of them are makers
 					as is_maker
