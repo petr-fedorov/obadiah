@@ -1591,6 +1591,36 @@ $$;
 ALTER FUNCTION bitstamp.match_trades_to_sequential_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_tolerance_percentage numeric, p_offset integer) OWNER TO "ob-analytics";
 
 --
+-- Name: move_trades(timestamp with time zone, timestamp with time zone, integer); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.move_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer) RETURNS SETOF obanalytics.matches
+    LANGUAGE sql
+    AS $$
+with deleted as (
+	delete from bitstamp.live_trades
+	where pair_id = p_pair_id
+	  and buy_microtimestamp = sell_microtimestamp	-- incorrectly matched trades, if any,  will stay in bitstamp.live_trades
+	  and buy_microtimestamp between p_start_time and p_end_time
+	returning live_trades.*
+)
+insert into obanalytics.matches_bitstamp (amount, price, side, microtimestamp, buy_order_id, buy_event_no,
+										 sell_order_id, sell_event_no, buy_match_rule, sell_match_rule, 
+										 local_timestamp, pair_id, exchange_side, exchange_trade_id, 
+										 exchange_microtimestamp)
+select amount, price, case trade_type when 'buy' then 'b'::character(1) when 'sell' then 's' end, buy_microtimestamp, buy_order_id, buy_event_no,
+		sell_order_id, sell_event_no, buy_match_rule, sell_match_rule, local_timestamp, pair_id,
+		case trade_type when 'buy' then 'b'::character(1) when 'sell' then 's' else null end as exchange_side, bitstamp_trade_id,
+		case when bitstamp_trade_id is not null then trade_timestamp else null end
+from deleted
+order by buy_microtimestamp
+returning matches_bitstamp.*;
+$$;
+
+
+ALTER FUNCTION bitstamp.move_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: oba_depth(timestamp with time zone, timestamp with time zone, character varying, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
