@@ -4748,6 +4748,46 @@ ALTER TABLE ONLY obanalytics.level3_01003s201902
 
 
 --
+-- Name: level3_bitstamp level3_bitstamp_pair_id_side_microtimestamp_order_id_event__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitstamp
+    ADD CONSTRAINT level3_bitstamp_pair_id_side_microtimestamp_order_id_event__key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_bitstamp_btcusd level3_bitstamp_btcusd_pair_id_side_microtimestamp_order_id_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd
+    ADD CONSTRAINT level3_bitstamp_btcusd_pair_id_side_microtimestamp_order_id_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_bitstamp_btcusd_b level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b
+    ADD CONSTRAINT level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001b201901 level3_02001b201901_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201901
+    ADD CONSTRAINT level3_02001b201901_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001b201902 level3_02001b201902_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201902
+    ADD CONSTRAINT level3_02001b201902_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
 -- Name: level3_02001b201902 level3_02001b201902_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -4761,6 +4801,14 @@ ALTER TABLE ONLY obanalytics.level3_02001b201902
 
 ALTER TABLE ONLY obanalytics.level3_02001b201902
     ADD CONSTRAINT level3_02001b201902_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02001b201903 level3_02001b201903_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201903
+    ADD CONSTRAINT level3_02001b201903_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
 
 
 --
@@ -4780,6 +4828,30 @@ ALTER TABLE ONLY obanalytics.level3_02001b201903
 
 
 --
+-- Name: level3_bitstamp_btcusd_s level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s
+    ADD CONSTRAINT level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001s201901 level3_02001s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201901
+    ADD CONSTRAINT level3_02001s201901_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001s201902 level3_02001s201902_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201902
+    ADD CONSTRAINT level3_02001s201902_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
 -- Name: level3_02001s201902 level3_02001s201902_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -4793,6 +4865,14 @@ ALTER TABLE ONLY obanalytics.level3_02001s201902
 
 ALTER TABLE ONLY obanalytics.level3_02001s201902
     ADD CONSTRAINT level3_02001s201902_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02001s201903 level3_02001s201903_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201903
+    ADD CONSTRAINT level3_02001s201903_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
 
 
 --
@@ -4937,6 +5017,69 @@ ALTER TABLE ONLY obanalytics.matches_02001201903
 
 ALTER TABLE ONLY obanalytics.pairs
     ADD CONSTRAINT pairs_pkey PRIMARY KEY (pair_id);
+
+
+--
+-- Name: level3_02001b201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001b201901_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02001b201902_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001b201902_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02001b201903_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001b201903_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02001s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001s201901_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02001s201902_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001s201902_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02001s201903_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001s201903_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_pair_id_side_microtimestamp_order_id_key ATTACH PARTITION obanalytics.level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key;
+
+
+--
+-- Name: level3_bitstamp_btcusd_pair_id_side_microtimestamp_order_id_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_pair_id_side_microtimestamp_order_id_event__key ATTACH PARTITION obanalytics.level3_bitstamp_btcusd_pair_id_side_microtimestamp_order_id_key;
+
+
+--
+-- Name: level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_pair_id_side_microtimestamp_order_id_key ATTACH PARTITION obanalytics.level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key;
 
 
 --

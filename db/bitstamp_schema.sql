@@ -1591,6 +1591,46 @@ $$;
 ALTER FUNCTION bitstamp.match_trades_to_sequential_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text, p_tolerance_percentage numeric, p_offset integer) OWNER TO "ob-analytics";
 
 --
+-- Name: move_events(timestamp with time zone, timestamp with time zone, integer); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.move_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer) RETURNS SETOF obanalytics.level3
+    LANGUAGE sql
+    AS $$
+with deleted as (
+	delete from bitstamp.live_orders
+	where pair_id = p_pair_id
+	  and microtimestamp between p_start_time and p_end_time
+	  and next_microtimestamp <= p_end_time
+	returning live_orders.*
+),
+to_be_inserted as (
+	select *
+	from deleted
+	union all
+	select * 
+	from bitstamp.live_orders
+	where pair_id = p_pair_id
+	  and microtimestamp between p_start_time and p_end_time
+	  and next_microtimestamp > p_end_time	
+)
+insert into obanalytics.level3_bitstamp ( microtimestamp, order_id, event_no, side, price, amount, fill,
+										 	next_microtimestamp, next_event_no, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp)
+select microtimestamp, order_id, event_no, case order_type when 'buy' then 'b'::character(1) when 'sell' then 's' end, price, amount, fill, 
+		case when next_microtimestamp <= p_end_time then next_microtimestamp else 'infinity' end, 
+		case when next_microtimestamp <= p_end_time then next_event_no else null end, 
+		pair_id, local_timestamp, price_microtimestamp, price_event_no, orig_microtimestamp
+from to_be_inserted
+order by microtimestamp
+on conflict (pair_id, side, microtimestamp, order_id, event_no) do update set next_microtimestamp = excluded.next_microtimestamp, next_event_no = excluded.next_event_no
+returning level3_bitstamp.*;
+
+$$;
+
+
+ALTER FUNCTION bitstamp.move_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: move_trades(timestamp with time zone, timestamp with time zone, integer); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
