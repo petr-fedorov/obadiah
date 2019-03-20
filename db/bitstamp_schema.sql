@@ -1597,22 +1597,28 @@ ALTER FUNCTION bitstamp.match_trades_to_sequential_events(p_start_time timestamp
 CREATE FUNCTION bitstamp.move_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer) RETURNS SETOF obanalytics.level3
     LANGUAGE sql
     AS $$
-with deleted as (
-	delete from bitstamp.live_orders
+with chains as (
+	select *, first_value(next_microtimestamp) over (partition by order_id order by microtimestamp desc) < p_end_time as is_completed
+	from bitstamp.live_orders
 	where pair_id = p_pair_id
-	  and microtimestamp between p_start_time and p_end_time
-	  and next_microtimestamp <= p_end_time
-	returning live_orders.*
+	  and microtimestamp between p_start_time and p_end_time 
+),
+deleted as (
+	delete from bitstamp.live_orders o
+	using chains
+	where o.microtimestamp = chains.microtimestamp
+	  and o.order_id = chains.order_id
+	  and o.event_no = chains.event_no
+	  and is_completed
+	returning o.*, chains.is_completed
 ),
 to_be_inserted as (
 	select *
 	from deleted
 	union all
 	select * 
-	from bitstamp.live_orders
-	where pair_id = p_pair_id
-	  and microtimestamp between p_start_time and p_end_time
-	  and next_microtimestamp > p_end_time	
+	from chains
+	where not is_completed
 )
 insert into obanalytics.level3_bitstamp ( microtimestamp, order_id, event_no, side, price, amount, fill,
 										 	next_microtimestamp, next_event_no, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp)
@@ -1622,7 +1628,11 @@ select microtimestamp, order_id, event_no, case order_type when 'buy' then 'b'::
 		pair_id, local_timestamp, price_microtimestamp, price_event_no, orig_microtimestamp
 from to_be_inserted
 order by microtimestamp
-on conflict (pair_id, side, microtimestamp, order_id, event_no) do update set next_microtimestamp = excluded.next_microtimestamp, next_event_no = excluded.next_event_no
+on conflict (pair_id, side, microtimestamp, order_id, event_no) do update 
+																	 set next_microtimestamp = excluded.next_microtimestamp, 
+																		  next_event_no = excluded.next_event_no
+																	 where level3_bitstamp.next_event_no is null
+																	   and excluded.next_event_no is not null
 returning level3_bitstamp.*;
 
 $$;
@@ -2593,6 +2603,74 @@ $$;
 
 
 ALTER FUNCTION bitstamp.pga_spread(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: pga_transfer(text, timestamp with time zone, interval, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval, p_remove_era boolean DEFAULT NULL::boolean) RETURNS integer
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_start timestamptz;
+	v_end timestamptz;
+	
+	v_pair_id smallint;
+	
+begin 
+
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs where pair = upper(p_pair);
+	
+	with eras as (
+		select era, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity'::timestamptz) as next_era
+		from bitstamp.live_orders_eras
+	)
+	select era, next_era into strict v_start, v_end
+	from eras
+	where coalesce(p_ts_within_era, 'infinity'::timestamptz) between era and next_era;
+	
+	insert into obanalytics.level3_eras (era, pair_id, exchange_id)
+	select v_start, v_pair_id, exchange_id
+	from obanalytics.exchanges 
+	where exchange = 'bitstamp'
+	on conflict do nothing;
+	
+	if v_end = 'infinity'::timestamptz then	-- this is the last known era, so p_delay must be applied ...
+		if p_remove_era is null or not p_remove_era then 
+			select max(microtimestamp) - p_delay into strict v_end
+			from bitstamp.live_orders
+			where pair_id = v_pair_id
+			  and microtimestamp  >= v_start;
+
+			p_remove_era := false;
+		end if;
+	else
+		p_remove_era := true;
+	end if;
+	
+	raise debug 'v_start: %, v_end: %,  p_remove_era: %', v_start, v_end, p_remove_era;
+	
+	perform bitstamp.move_events(v_start, v_end, v_pair_id);
+	perform bitstamp.move_trades(v_start, v_end, v_pair_id);
+	 
+	if p_remove_era then
+		delete from bitstamp.live_orders_eras
+		where pair_id = v_pair_id
+		  and era = v_start;
+		  
+		delete from bitstamp.live_orders
+		where pair_id = v_pair_id
+		  and microtimestamp between v_start and v_end;
+		  
+	end if;
+ 
+	return 0;
+end;
+$$;
+
+
+ALTER FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone, p_delay interval, p_remove_era boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: protect_columns(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
