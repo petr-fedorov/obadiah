@@ -145,6 +145,9 @@ class BitfinexMessageHandler:
         self.q = q
         self.logger = logging.getLogger(__name__ + ".messagehandler")
 
+        # Wait for the book subscription up to 5 sec (then less -- see below)
+        self.timeout = 5
+
     async def process_messages(self):
         async with self.pool.acquire() as con:
             self.con = con
@@ -196,6 +199,7 @@ class BitfinexMessageHandler:
             self.logger.info('Channel %i, pair_id %i',
                              message['chanId'], self.pair_id)
             handler = BitfinexBookDataHandler(self.con, self.pair_id, message)
+            self.timeout = 2
         elif message['channel'] == 'trades':
             handler = BitfinexTradeDataHandler(self.con, self.pair_id, message)
         self.channels[message['chanId']] = handler
@@ -232,15 +236,14 @@ async def capture(pair, user, database):
                 async with websockets.connect("wss://api.bitfinex.com/ws/2",
                                               max_queue=2**20) as ws:
                     q = asyncio.Queue()
-                    handler = asyncio.ensure_future(
-                        BitfinexMessageHandler(ws, pair, pair_id, pool,
-                                               q).process_messages())
+                    mh = BitfinexMessageHandler(ws, pair, pair_id, pool, q)
+                    handler = asyncio.ensure_future(mh.process_messages())
                     await ws.send(json.dumps({'event': 'conf',
                                               'flags': 32768 + 8}))
                     while True:
                         try:
-                            message = await asyncio.wait_for(ws.recv(),
-                                                             timeout=2.0)
+                            message = await asyncio.wait_for(
+                                ws.recv(), timeout=mh.timeout)
                             lts = datetime.now()
                             bl = len(ws.messages)
                             if handler.done():
