@@ -1190,7 +1190,7 @@ ALTER FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_en
 --
 
 CREATE FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_precision character, p_bps_step numeric DEFAULT 25) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text, bps_level bigint)
-    LANGUAGE sql STABLE
+    LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
 with
@@ -1429,7 +1429,7 @@ ALTER FUNCTION obanalytics.oba_exchange_id(p_exchange text) OWNER TO "ob-analyti
 --
 
 CREATE FUNCTION obanalytics.oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(id bigint, "timestamp" text, "exchange.timestamp" text, price numeric, volume numeric, action text, direction text)
-    LANGUAGE sql STABLE
+    LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 select order_id,
 		obanalytics._in_milliseconds(microtimestamp),
@@ -5900,6 +5900,62 @@ ALTER TABLE ONLY obanalytics.matches_02001201903
 
 ALTER TABLE ONLY obanalytics.matches_02001201903
     ADD CONSTRAINT matches_02001201903_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02001s201903(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: SCHEMA obanalytics; Type: ACL; Schema: -; Owner: ob-analytics
+--
+
+GRANT USAGE ON SCHEMA obanalytics TO obauser;
+
+
+--
+-- Name: FUNCTION oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT ALL ON FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) TO obauser;
+
+
+--
+-- Name: FUNCTION oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_precision character, p_bps_step numeric); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT ALL ON FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_precision character, p_bps_step numeric) TO obauser;
+
+
+--
+-- Name: FUNCTION oba_exchange_id(p_exchange text); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT ALL ON FUNCTION obanalytics.oba_exchange_id(p_exchange text) TO obauser;
+
+
+--
+-- Name: FUNCTION oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT ALL ON FUNCTION obanalytics.oba_export(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) TO obauser;
+
+
+--
+-- Name: FUNCTION oba_pair_id(p_pair text); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT ALL ON FUNCTION obanalytics.oba_pair_id(p_pair text) TO obauser;
+
+
+--
+-- Name: FUNCTION oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT ALL ON FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean) TO obauser;
+
+
+--
+-- Name: FUNCTION oba_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT ALL ON FUNCTION obanalytics.oba_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) TO obauser;
 
 
 --
