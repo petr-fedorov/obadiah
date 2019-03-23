@@ -5959,6 +5959,20 @@ GRANT ALL ON FUNCTION obanalytics.oba_trades(p_start_time timestamp with time zo
 
 
 --
+-- Name: TABLE exchanges; Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT SELECT ON TABLE obanalytics.exchanges TO obauser;
+
+
+--
+-- Name: TABLE pairs; Type: ACL; Schema: obanalytics; Owner: ob-analytics
+--
+
+GRANT SELECT ON TABLE obanalytics.pairs TO obauser;
+
+
+--
 -- PostgreSQL database dump complete
 --
 
