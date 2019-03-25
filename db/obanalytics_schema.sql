@@ -1169,7 +1169,12 @@ CREATE FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_e
 				group by ts, price, side, pair_id, exchange_id
 		) a using (pair_id, exchange_id)
 	union all 
-	select microtimestamp, price, volume, side::text
+	select microtimestamp, price, volume, 						
+	case side 
+		when 'b' then 'bid'::text
+		when 's' then 'ask'::text
+	end as side
+
 	from obanalytics.level2 join time_range using (pair_id, exchange_id) join unnest(level2.depth_change) d on true
 	where microtimestamp between start_time and p_end_time 
 	  and level2.pair_id = p_pair_id
