@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 11.1
--- Dumped by pg_dump version 11.1
+-- Dumped from database version 11.2
+-- Dumped by pg_dump version 11.2
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -1030,6 +1030,41 @@ $$;
 
 
 ALTER FUNCTION bitstamp.fix_aggressor_creation_order(p_ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+
+--
+-- Name: fix_crossed_book(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.fix_crossed_book(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) RETURNS SETOF bitstamp.live_orders
+    LANGUAGE sql
+    AS $$
+
+with base_order_books as (
+	select ob[1].ts, ob[1].pair_id, exists (select * from unnest(ob) where not is_maker) as is_crossed
+	from bitstamp.order_book_by_episode(p_start_time,p_end_time, p_pair) ob 
+),
+order_books as (
+	select ts,  pair_id, is_crossed, 
+	max(ts) filter (where not is_crossed) over (order by ts) as previous_uncrossed,
+	min(ts) filter (where not is_crossed) over (order by ts desc) as next_uncrossed
+	from base_order_books 
+),
+crossed_order_books as (
+	select distinct previous_uncrossed, next_uncrossed, pair_id
+	from order_books
+	where is_crossed
+)
+update bitstamp.live_orders
+set	microtimestamp = next_uncrossed	-- just merge all 'crossed' order books into the next uncrossed one 
+from crossed_order_books
+where live_orders.pair_id = crossed_order_books.pair_id
+  and live_orders.microtimestamp > previous_uncrossed
+  and live_orders.microtimestamp < next_uncrossed
+returning live_orders.*;  
+$$;
+
+
+ALTER FUNCTION bitstamp.fix_crossed_book(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
 -- Name: inferred_trades(timestamp with time zone, timestamp with time zone, text, boolean, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -2376,7 +2411,10 @@ begin
 		where microtimestamp > min_microtimestamp 
 		) > 0 then
 		raise exception 'An inconsistent event orderding would be created for era %, exiting ...', v_start;
-	end if;																	   
+	end if;
+	
+	return query select * from bitstamp.fix_crossed_book(v_start, v_end, p_pair);
+	
 	return;
 end;
 
