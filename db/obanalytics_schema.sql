@@ -580,6 +580,34 @@ $_$;
 ALTER FUNCTION obanalytics._depth_after_depth_change(p_depth obanalytics.level2_depth_record[], p_depth_change obanalytics.level2_depth_record[], p_microtimestamp timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_precision character) OWNER TO "ob-analytics";
 
 --
+-- Name: _depth_change(obanalytics.level3[], obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._depth_change(p_ob_before obanalytics.level3[], p_ob_after obanalytics.level3[]) RETURNS obanalytics.level2_depth_record[]
+    LANGUAGE sql
+    AS $$
+
+select array_agg(row(price, coalesce(af.amount, 0), side)::obanalytics.level2_depth_record)
+from (
+	select a.price, sum(a.amount) as amount,a.side
+	from unnest(p_ob_before) a 
+	where a.is_maker 
+	group by a.price, a.side, a.pair_id
+) bf full join (
+	select a.price, sum(a.amount) as amount, a.side
+	from unnest(p_ob_after) a 
+	where a.is_maker 
+	group by a.price, a.side, a.pair_id
+) af using (price, side)
+where bf.amount is distinct from af.amount
+	
+
+$$;
+
+
+ALTER FUNCTION obanalytics._depth_change(p_ob_before obanalytics.level3[], p_ob_after obanalytics.level3[]) OWNER TO "ob-analytics";
+
+--
 -- Name: _drop_leaf_level1_partition(text, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1007,22 +1035,8 @@ begin
 	loop
 		if v_ob_before is not null then 
 			return query 
-				select v_ob.ts, p_pair_id::smallint, p_exchange_id::smallint, 'r0'::character(2), array_agg(d.d)
-				from (
-					select row(price, coalesce(af.amount, 0), side)::obanalytics.level2_depth_record as d
-					from (
-						select a.price, sum(a.amount) as amount,a.side
-						from unnest(v_ob_before.ob) a 
-						where a.is_maker 
-						group by a.price, a.side, a.pair_id
-					) bf full join (
-						select a.price, sum(a.amount) as amount, a.side
-						from unnest(v_ob.ob) a 
-						where a.is_maker 
-						group by a.price, a.side, a.pair_id
-					) af using (price, side)
-					where bf.amount is distinct from af.amount
-				) d;
+				select v_ob.ts, p_pair_id::smallint, p_exchange_id::smallint, 'r0'::character(2), d
+				from obanalytics._depth_change(v_ob_before.ob, v_ob.ob) d;
 		end if;
 		v_ob_before := v_ob;
 	end loop;			
@@ -1144,42 +1158,45 @@ ALTER FUNCTION obanalytics.level3_incorporate_new_event() OWNER TO "ob-analytics
 CREATE FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
-
-	with time_range as (
-		select p_pair_id as pair_id, p_exchange_id as exchange_id, min(microtimestamp) as start_time
-		from obanalytics.level2
-		where microtimestamp >= p_start_time
-		  and exchange_id = p_exchange_id
-		  and pair_id = p_pair_id
+	with periods as (
+		select period_start, period_end, lag(period_end) over (order by period_start) as previous_period_end
+		from (
+			select greatest(era_start, p_start_time) as period_start, least(era_end, p_end_time) as period_end
+			from (
+				select era as era_start, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity') as era_end
+				from obanalytics.level3_eras
+				where pair_id = p_pair_id
+				  and exchange_id = p_exchange_id
+			) e
+			where p_start_time <= era_end
+			  and p_end_time >= era_start
+		) p
+	),
+	starting_depth_change as (
+		select period_start, d.price, d.volume, d.side
+		from periods join obanalytics.order_book( previous_period_end, p_pair_id,p_exchange_id, true, false,false ) b on true 
+					 join obanalytics.order_book( period_start, p_pair_id,p_exchange_id, true, false,false ) a on true 
+		 			 join obanalytics._depth_change(b.ob, a.ob) c on true
+		  		     join unnest(c) d on true
 	)
-	select ts, price, amount, side
-	from time_range 
-		join lateral (
-				select ts,
-						pair_id,
-						exchange_id,
-						price, 
-						sum(amount) as amount,
-						case side 
-							when 'b' then 'bid'::text
-							when 's' then 'ask'::text
-						end as side
-				from obanalytics.order_book(start_time, p_pair_id, p_exchange_id, p_only_makers := false, p_before := true) join unnest(ob) on true
-				where is_maker 
-				group by ts, price, side, pair_id, exchange_id
-		) a using (pair_id, exchange_id)
+	select period_start, price, volume, 	case side 		
+									when 'b' then 'bid'::text
+									when 's' then 'ask'::text
+								end as side
+	from starting_depth_change
 	union all 
 	select microtimestamp, price, volume, 						
 	case side 
 		when 'b' then 'bid'::text
 		when 's' then 'ask'::text
 	end as side
-
-	from obanalytics.level2 join time_range using (pair_id, exchange_id) join unnest(level2.depth_change) d on true
-	where microtimestamp between start_time and p_end_time 
+	from periods join obanalytics.level2 on true join unnest(level2.depth_change) d on true
+	where microtimestamp > period_start
+	  and microtimestamp <= period_end
 	  and level2.pair_id = p_pair_id
 	  and level2.exchange_id = p_exchange_id 
-	  and microtimestamp >= p_start_time -- otherwise, the query optimizer produces a crazy plan!
+	  and level2.precision = 'r0'
+	  and microtimestamp > p_start_time and microtimestamp <= p_end_time -- otherwise, the query optimizer produces a crazy plan!
 	  and price is not null;   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
 	  							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
 								-- 'not null' constraint is to be added to price and depth_change columns of obanalytics.depth table. Then this check
