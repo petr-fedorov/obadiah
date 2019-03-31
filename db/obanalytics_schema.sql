@@ -845,21 +845,22 @@ ALTER FUNCTION obanalytics._is_valid_taker_event(p_microtimestamp timestamp with
 -- Name: _oba_events_with_id(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(event_id bigint, microtimestamp timestamp with time zone, order_id bigint, event_no integer, is_deleted boolean, side character, price numeric, amount numeric, fill numeric, pair_id smallint, exchange_id smallint, price_microtimestamp timestamp with time zone)
+CREATE FUNCTION obanalytics._oba_events_with_id(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(event_id uuid, microtimestamp timestamp with time zone, order_id bigint, event_no integer, is_deleted boolean, side character, price numeric, amount numeric, fill numeric, pair_id smallint, exchange_id smallint, price_microtimestamp timestamp with time zone)
     LANGUAGE sql STABLE
     AS $$
 
 with active_events as (
 	select microtimestamp, order_id, event_no, next_microtimestamp = '-infinity' as is_deleted, side, price, amount, fill, pair_id, exchange_id, price_microtimestamp
 	from obanalytics.level3 
-	where microtimestamp between p_start_time and p_end_time
+	where microtimestamp > p_start_time 
+	  and microtimestamp <= p_end_time
 	  and pair_id = p_pair_id
 	  and exchange_id = p_exchange_id
-	union -- not all since we want to eliminate duplicated events from the first level3 episode and obanalytics.order_book()
+	union all -- not all since we want to eliminate duplicated events from the first level3 episode and obanalytics.order_book()
 	select microtimestamp, order_id, event_no, false as is_deleted, side, price, amount, fill, pair_id, exchange_id, price_microtimestamp
 	from obanalytics.order_book(p_start_time, p_pair_id, p_exchange_id, p_only_makers := false, p_before := false) join unnest(ob) on true
 )
-select row_number() over (order by order_id, amount desc, event_no, microtimestamp ) as event_id,
+select md5(microtimestamp::text||'#'||order_id::text||'#'||event_no::text||'#'||exchange_id||'#'||pair_id)::uuid as event_id,
 		microtimestamp, order_id, event_no, is_deleted, side,price, amount, fill, pair_id, exchange_id, 
 		price_microtimestamp
 from active_events
@@ -1310,7 +1311,7 @@ ALTER FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zo
 -- Name: oba_events(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("event.id" bigint, id bigint, "timestamp" timestamp with time zone, "exchange.timestamp" timestamp with time zone, price numeric, volume numeric, action text, direction text, fill numeric, "matching.event" bigint, type text, "aggressiveness.bps" numeric, event_no integer, is_aggressor boolean, is_created boolean, is_ever_resting boolean, is_ever_aggressor boolean, is_ever_filled boolean, is_deleted boolean, is_price_ever_changed boolean, best_bid_price numeric, best_ask_price numeric)
+CREATE FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("event.id" uuid, id bigint, "timestamp" timestamp with time zone, "exchange.timestamp" timestamp with time zone, price numeric, volume numeric, action text, direction text, fill numeric, "matching.event" uuid, type text, "aggressiveness.bps" numeric, event_no integer, is_aggressor boolean, is_created boolean, is_ever_resting boolean, is_ever_aggressor boolean, is_ever_filled boolean, is_deleted boolean, is_price_ever_changed boolean, best_bid_price numeric, best_ask_price numeric)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
@@ -1593,7 +1594,7 @@ ALTER FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_e
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.oba_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, direction text, "maker.event.id" bigint, "taker.event.id" bigint, maker bigint, taker bigint, "real.trade.id" bigint)
+CREATE FUNCTION obanalytics.oba_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, direction text, "maker.event.id" uuid, "taker.event.id" uuid, maker bigint, taker bigint, "exchange.trade.id" bigint)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
