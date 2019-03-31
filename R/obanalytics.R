@@ -54,7 +54,7 @@ events <- function(conn, start.time, end.time, exchange, pair, debug.query = FAL
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
 
-  query <- paste0(" SELECT 	\"event.id\"::integer,
+  query <- paste0(" SELECT 	\"event.id\",
                   \"id\"::numeric,
                   obanalytics._in_milliseconds(timestamp) AS timestamp,
                   \"exchange.timestamp\",
@@ -63,7 +63,7 @@ events <- function(conn, start.time, end.time, exchange, pair, debug.query = FAL
                   action,
                   direction,
                   fill,
-                  \"matching.event\"::integer,
+                  \"matching.event\",
                   \"type\",
                   \"aggressiveness.bps\"
                   FROM obanalytics.oba_events(",
@@ -91,11 +91,11 @@ trades <- function(conn, start.time, end.time, exchange, pair, debug.query = FAL
 
   query <- paste0(" SELECT 	obanalytics._in_milliseconds(timestamp) AS timestamp,
                   price, volume, direction,
-                  \"maker.event.id\"::integer,
-                  \"taker.event.id\"::integer,
+                  \"maker.event.id\",
+                  \"taker.event.id\",
                   maker::numeric,
                   taker::numeric,
-                  \"real.trade.id\" FROM obanalytics.oba_trades(",
+                  \"exchange.trade.id\" FROM obanalytics.oba_trades(",
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
@@ -111,7 +111,7 @@ trades <- function(conn, start.time, end.time, exchange, pair, debug.query = FAL
 
 
 #' @export
-depth_summary <- function(conn, start.time, end.time, exchange, pair, precision='r0', debug.query = FALSE) {
+depth_summary <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
   tzone <- attr(end.time, "tzone")
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
@@ -121,8 +121,7 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, precision=
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
-                  shQuote(precision),
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
                   ") WHERE COALESCE(bps_level,0) <= 500")
   if(debug.query) cat(query)
   df <- DBI::dbGetQuery(conn, query)
