@@ -633,9 +633,9 @@ begin
 			select v_events_start, order_id, price,
 					case side when 's' then -amount when 'b' then amount end, pair_id, null::timestamptz,
 					v_channel_id, v_events_start,null, null::integer
-			from obanalytics.level3_order_book(v_events_start, v_pair_id, v_exchange_id,
+			from obanalytics.order_book(v_events_start, v_pair_id, v_exchange_id,
 										   p_only_makers := false,	-- since exchanges sometimes output crossed order books, we'll consider ALL active orders
-										   p_before := true);
+										   p_before := true) join unnest(ob) on true;
 										   
 			raise debug 'Created snapshot for channel_id % at %', v_channel_id, v_events_start;
 		end if;
