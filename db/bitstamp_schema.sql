@@ -2663,6 +2663,7 @@ begin
 	with eras as (
 		select era, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity'::timestamptz) as next_era
 		from bitstamp.live_orders_eras
+		where pair_id = v_pair_id
 	)
 	select era, next_era into strict v_start, v_end
 	from eras
