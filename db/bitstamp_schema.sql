@@ -634,7 +634,7 @@ with base_order_books as (
 ),
 order_books as (
 	select ts,  pair_id, is_crossed, 
-	max(ts) filter (where not is_crossed) over (order by ts) as previous_uncrossed,
+	coalesce(max(ts) filter (where not is_crossed) over (order by ts), p_start_time - '00:00:00.000001'::interval ) as previous_uncrossed,
 	min(ts) filter (where not is_crossed) over (order by ts desc) as next_uncrossed
 	from base_order_books 
 )
@@ -1071,7 +1071,7 @@ declare
 begin
 	v_execution_start_time := clock_timestamp();
 
-	for crossed_books in (select * from bitstamp.crossed_books(p_start_time, p_end_time, p_pair)) loop
+	for crossed_books in (select * from bitstamp.crossed_books(p_start_time, p_end_time, p_pair) where next_uncrossed is not null) loop
 		return query with updated as (
 						  update bitstamp.live_orders
 							 set	microtimestamp = crossed_books.next_uncrossed	-- just merge all 'crossed' order books into the next uncrossed one 

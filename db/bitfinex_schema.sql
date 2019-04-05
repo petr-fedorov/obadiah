@@ -655,6 +655,94 @@ $$;
 ALTER FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval, p_max_interval interval) OWNER TO "ob-analytics";
 
 --
+-- Name: pga_fix_crossed_books(text, interval, timestamp with time zone); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitfinex.pga_fix_crossed_books(p_pair text, p_max_interval interval DEFAULT '00:10:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+
+-- NOTE:
+--		This function is supposed to be doing something useful only after pga_spread() is failed due to crossed order book
+--		It is expected that Bitfinex produces rather few 'bad' events and rarely, so order book is crossed for relatively short
+-- 		period of time (i.e. 5 minutes). Otherwise one has to run this function manually, with higher p_max_interval
+
+declare 
+	v_current_timestamp timestamptz;
+	v_start timestamptz;
+	v_end timestamptz;
+	v_last_spread timestamptz;
+	
+	v_pair_id obanalytics.pairs.pair_id%type;
+	v_exchange_id obanalytics.exchanges.exchange_id%type;
+	
+begin 
+	v_current_timestamp := clock_timestamp();
+	
+	select pair_id into strict v_pair_id
+	from obanalytics.pairs 
+	where pair = upper(p_pair);
+	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges 
+	where exchange = 'bitfinex';
+
+	select era_starts, era_ends into v_start, v_end
+	from (
+		select era as era_starts,
+				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
+		from obanalytics.level3_eras 
+		where pair_id = v_pair_id
+		  and exchange_id = v_exchange_id
+	) a
+	where coalesce(p_ts_within_era,  ( select max(era) 
+										 from obanalytics.level3_eras 
+										 where pair_id = v_pair_id
+									       and exchange_id = v_exchange_id
+									 ) ) between era_starts and era_ends;
+
+	select coalesce(max(microtimestamp), v_start) into v_last_spread
+	from obanalytics.level1_bitfinex 
+	where microtimestamp between v_start and v_end
+	  and pair_id = v_pair_id;
+	  
+	if v_end > v_last_spread + p_max_interval then
+		v_end := v_last_spread + p_max_interval;
+	end if;	  
+	
+	raise debug 'v_last_spread: %, v_end: %, v_pair_id: % ', v_last_spread, v_end, v_pair_id;	  
+	
+	-- First remove eternal and crossed orders, which should have been removed by Bitfinex, but weren't for some reasons
+	return query 
+		insert into obanalytics.level3_bitfinex (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
+		select distinct on (microtimestamp, order_id)  ts, order_id, 
+				null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
+				side, price, amount, fill, '-infinity',
+				null as next_event_no,
+				pair_id, exchange_id, null as local_timestamp,
+				null as price_microtimestamp, 
+				null as price_event_no
+		from obanalytics.order_book_by_episode(v_last_spread, v_end, v_pair_id, v_exchange_id, p_check_takers :=false) 
+		join unnest(ob) ob on true 
+		where is_crossed and next_microtimestamp = 'infinity'
+		order by microtimestamp, order_id,
+				  ts	-- we need the earliest ts where order book became crossed
+		returning level3_bitfinex.*;
+	
+	if found then -- (i) there were some episodes producing crossed book and (ii) some of them may still be so - we can only merge them
+		return query select * from obanalytics.merge_crossed_books(v_last_spread, v_end, v_pair_id, v_exchange_id);
+	end if;
+	
+	raise debug 'pga_fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION bitfinex.pga_fix_crossed_books(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
 -- Name: pga_match(text, interval, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
