@@ -1659,7 +1659,9 @@ CREATE FUNCTION bitstamp.move_events(p_start_time timestamp with time zone, p_en
     AS $$
 with chains as (
 	select live_orders.*,
-			first_value(next_microtimestamp) over (partition by order_id order by microtimestamp desc) < p_end_time and
+			first_value(next_microtimestamp) over (partition by order_id 
+												   	 order by microtimestamp desc, event_no desc -- two events may have the same microtimestam => order by event_no is essential
+												  ) < p_end_time and
 	        not bool_or( buy_microtimestamp is distinct from sell_microtimestamp ) over (partition by order_id )
 			as is_completed
 	from bitstamp.live_orders left join bitstamp.live_trades on microtimestamp = buy_microtimestamp and order_id = buy_order_id and event_no = buy_event_no 
@@ -1668,7 +1670,9 @@ with chains as (
 	  and microtimestamp between p_start_time and p_end_time 
 	union all
 	select live_orders.*, 
-			first_value(next_microtimestamp) over (partition by order_id order by microtimestamp desc) < p_end_time and
+			first_value(next_microtimestamp) over (partition by order_id 
+												     order by microtimestamp desc, event_no desc -- two events may have the same microtimestam => order by event_no is essential
+												  ) < p_end_time and
 	        not bool_or( buy_microtimestamp is distinct from sell_microtimestamp ) over (partition by order_id ) as is_completed
 	from bitstamp.live_orders left join bitstamp.live_trades on microtimestamp = sell_microtimestamp and order_id = sell_order_id and event_no = sell_event_no 
 	where live_orders.pair_id = p_pair_id
