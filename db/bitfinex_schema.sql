@@ -309,9 +309,10 @@ begin
 				) a
 				window oe as (partition by order_id, reincarnation_no order by exchange_timestamp, local_timestamp)
 			)		
-			insert into obanalytics.level3_bitfinex (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
-													 pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp )
-			select microtimestamp, order_id, 
+			insert into obanalytics.level3 (exchange_id, microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
+											  pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp )
+			select 1::smallint, -- exchange_id of bitfinex - see obanalytics.exchanges
+					microtimestamp, order_id, 
 					case when first_value(event_no) over o  > 1 and event_no = first_value(event_no) over o  and microtimestamp = first_value(microtimestamp) over o  then null 
 						else event_no end as event_no,	-- event_no MUST be set by BEFORE trigger in order to update the previous event 
 					side::character(1), price, amount, 

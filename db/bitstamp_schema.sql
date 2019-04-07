@@ -1697,7 +1697,7 @@ to_be_inserted as (
 	where not is_completed
 )
 insert into obanalytics.level3_bitstamp ( microtimestamp, order_id, event_no, side, price, amount, fill,
-										 	next_microtimestamp, next_event_no, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp)
+								  next_microtimestamp, next_event_no, pair_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp)
 select microtimestamp, order_id, event_no, case order_type when 'buy' then 'b'::character(1) when 'sell' then 's' end, price, amount, fill, 
 		case when next_microtimestamp <= p_end_time then next_microtimestamp else 'infinity' end, 
 		case when next_microtimestamp <= p_end_time then next_event_no else null end, 
@@ -1709,7 +1709,7 @@ on conflict (pair_id, side, microtimestamp, order_id, event_no) do update
 																		  next_event_no = excluded.next_event_no
 																	 where level3_bitstamp.next_event_no is null
 																	   and excluded.next_event_no is not null
-returning level3_bitstamp.*;
+returning *;
 
 $$;
 

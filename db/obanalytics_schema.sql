@@ -1107,6 +1107,39 @@ $$;
 ALTER FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
 
 --
+-- Name: level1_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level1_update_level3_eras() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+begin 
+	with latest_events as (
+		select exchange_id, pair_id, max(microtimestamp) as latest
+		from inserted
+		group by exchange_id, pair_id
+	),
+	eras as (
+		select exchange_id, pair_id, latest, max(era) as era
+		from obanalytics.level3_eras join latest_events using (exchange_id, pair_id)
+		where era <= latest
+		group by exchange_id, pair_id, latest
+	)
+	update obanalytics.level3_eras
+	   set level1 = latest
+	from eras
+	where level3_eras.era = eras.era
+	  and level3_eras.exchange_id = eras.exchange_id
+	  and level3_eras.pair_id = eras.pair_id
+	  and (level1 is null or level1 < latest);
+	return null;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.level1_update_level3_eras() OWNER TO "ob-analytics";
+
+--
 -- Name: level2_continuous(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1158,6 +1191,39 @@ $$;
 
 
 ALTER FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: level2_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level2_update_level3_eras() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+begin 
+	with latest_events as (
+		select exchange_id, pair_id, max(microtimestamp) as latest
+		from inserted
+		group by exchange_id, pair_id
+	),
+	eras as (
+		select exchange_id, pair_id, latest, max(era) as era
+		from obanalytics.level3_eras join latest_events using (exchange_id, pair_id)
+		where era <= latest
+		group by exchange_id, pair_id, latest
+	)
+	update obanalytics.level3_eras
+	   set level2 = latest
+	from eras
+	where level3_eras.era = eras.era
+	  and level3_eras.exchange_id = eras.exchange_id
+	  and level3_eras.pair_id = eras.pair_id
+	  and (level2 is null or level2 < latest);
+	return null;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.level2_update_level3_eras() OWNER TO "ob-analytics";
 
 --
 -- Name: level3_incorporate_new_event(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1242,6 +1308,39 @@ $$;
 
 
 ALTER FUNCTION obanalytics.level3_incorporate_new_event() OWNER TO "ob-analytics";
+
+--
+-- Name: level3_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level3_update_level3_eras() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+begin 
+	with latest_events as (
+		select exchange_id, pair_id, max(microtimestamp) as latest
+		from inserted
+		group by exchange_id, pair_id
+	),
+	eras as (
+		select exchange_id, pair_id, latest, max(era) as era
+		from obanalytics.level3_eras join latest_events using (exchange_id, pair_id)
+		where era <= latest
+		group by exchange_id, pair_id, latest
+	)
+	update obanalytics.level3_eras
+	   set level3 = latest
+	from eras
+	where level3_eras.era = eras.era
+	  and level3_eras.exchange_id = eras.exchange_id
+	  and level3_eras.pair_id = eras.pair_id
+	  and (level3 is null or level3 < latest);
+	return null;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.level3_update_level3_eras() OWNER TO "ob-analytics";
 
 --
 -- Name: merge_crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -3779,11 +3878,21 @@ ALTER TABLE obanalytics.level3_02003s201904 OWNER TO "ob-analytics";
 CREATE TABLE obanalytics.level3_eras (
     era timestamp with time zone NOT NULL,
     pair_id smallint NOT NULL,
-    exchange_id smallint NOT NULL
+    exchange_id smallint NOT NULL,
+    level1 timestamp with time zone,
+    level2 timestamp with time zone,
+    level3 timestamp with time zone
 );
 
 
 ALTER TABLE obanalytics.level3_eras OWNER TO "ob-analytics";
+
+--
+-- Name: COLUMN level3_eras.level1; Type: COMMENT; Schema: obanalytics; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN obanalytics.level3_eras.level1 IS 'A microtimestamp of the latest calculated level1 event in this era ';
+
 
 --
 -- Name: level3_eras_bitfinex; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
@@ -8628,6 +8737,34 @@ CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp O
 --
 
 CREATE TRIGGER bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02003201904 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level1 update_level3_eras; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER update_level3_eras AFTER INSERT ON obanalytics.level1 REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE PROCEDURE obanalytics.level1_update_level3_eras();
+
+
+--
+-- Name: level2 update_level3_eras; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER update_level3_eras AFTER INSERT ON obanalytics.level2 REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE PROCEDURE obanalytics.level2_update_level3_eras();
+
+
+--
+-- Name: level3 update_level3_eras; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER update_level3_eras AFTER INSERT ON obanalytics.level3 REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE PROCEDURE obanalytics.level3_update_level3_eras();
+
+
+--
+-- Name: level3_bitstamp update_level3_eras; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER update_level3_eras AFTER INSERT ON obanalytics.level3_bitstamp REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE PROCEDURE obanalytics.level3_update_level3_eras();
 
 
 --
