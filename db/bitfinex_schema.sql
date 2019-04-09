@@ -659,7 +659,7 @@ ALTER FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval, p_m
 -- Name: pga_fix_crossed_books(text, interval, timestamp with time zone); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.pga_fix_crossed_books(p_pair text, p_max_interval interval DEFAULT '00:10:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS SETOF obanalytics.level3
+CREATE FUNCTION bitfinex.pga_fix_crossed_books(p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS SETOF obanalytics.level3
     LANGUAGE plpgsql
     AS $$
 
@@ -691,7 +691,7 @@ begin
 	select era_starts, era_ends into v_start, v_end
 	from (
 		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
+				coalesce(lead(era) over (order by era)  - '00:00:00.000001'::interval, 'infinity'::timestamptz) as era_ends
 		from obanalytics.level3_eras 
 		where pair_id = v_pair_id
 		  and exchange_id = v_exchange_id
@@ -701,6 +701,8 @@ begin
 										 where pair_id = v_pair_id
 									       and exchange_id = v_exchange_id
 									 ) ) between era_starts and era_ends;
+									 
+	raise debug 'v_start: %, v_end: %', v_start, v_end;
 
 	select coalesce(max(microtimestamp), v_start) into v_last_spread
 	from obanalytics.level1_bitfinex 
@@ -711,7 +713,7 @@ begin
 		v_end := v_last_spread + p_max_interval;
 	end if;	  
 	
-	raise debug 'v_last_spread: %, v_end: %, v_pair_id: % ', v_last_spread, v_end, v_pair_id;	  
+	raise debug 'v_last_spread: %, p_max_interval: %,  v_end: %, v_pair_id: % ', v_last_spread, p_max_interval, v_end, v_pair_id;	  
 	
 	-- First remove eternal and crossed orders, which should have been removed by Bitfinex, but weren't for some reasons
 	return query 
