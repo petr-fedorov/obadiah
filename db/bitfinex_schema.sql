@@ -183,17 +183,23 @@ declare
 	p record;
 	v_pair_id smallint;
 	v_exchange_id smallint;
+	v_price_precision smallint;
+	v_fmu smallint;
 	v_last_order_book record; -- obanalytics.level3_order_book_record[];
 	v_open_orders bitfinex.transient_raw_book_events[];	
 	v_era timestamptz;
 begin
-	select pair_id into strict v_pair_id
+	select pair_id, fmu into strict v_pair_id, v_fmu
 	from obanalytics.pairs
 	where pair = upper(p_pair);
 	
 	select exchange_id into strict v_exchange_id
 	from obanalytics.exchanges
 	where exchange = 'bitfinex';
+	
+	select price_precision into strict v_price_precision
+	from bitfinex.latest_symbol_details 
+	where pair_id = v_pair_id;
 
 	for p in with channels as (
 						select channel_id, episode_timestamp as start_time, 
@@ -241,9 +247,9 @@ begin
 					returning *
 				),
 				base_events as (
-					select exchange_timestamp, order_id, round( price, price_precision) as price,
-						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
-					from to_be_replaced join bitfinex.latest_symbol_details using (pair_id) join obanalytics.pairs using (pair_id)
+					select exchange_timestamp, order_id, round( price, v_price_precision) as price,
+						round(amount, v_fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from to_be_replaced 
 					order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 				)
 				insert into bitfinex.transient_raw_book_events
@@ -269,9 +275,9 @@ begin
 				select distinct on (episode_timestamp, order_id, channel_id, pair_id ) exchange_timestamp, order_id, price, amount,
 						pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
 				from (
-					select exchange_timestamp, order_id, round( price, price_precision) as price,
-						round(amount, fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
-					from deleted_transient_events join bitfinex.latest_symbol_details using (pair_id) join obanalytics.pairs using (pair_id)
+					select exchange_timestamp, order_id, round( price, v_price_precision) as price,
+						round(amount, v_fmu) as amount, pair_id, local_timestamp, channel_id, episode_timestamp, event_no, bl
+					from deleted_transient_events 
 				) a
 				order by episode_timestamp, order_id, channel_id, pair_id, exchange_timestamp desc, local_timestamp desc
 			),
