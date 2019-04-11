@@ -1070,9 +1070,14 @@ declare
 	v_ob record;
 begin
 	
+	select ts, ob 
+	from obanalytics.order_book(p_start_time, p_pair_id, p_exchange_id, p_only_makers := true, p_before := true) 
+	into v_ob_before;	-- so there will be a depth_change generated for the very first episode greater or equal to p_start_time
+	
 	for v_ob in select ts, ob from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id) 
 	loop
-		if v_ob_before is not null then 
+		if v_ob_before is not null then -- if p_start_time equals to an era start then v_ob_before will be null 
+										 -- so we don't generate depth_change for the era start
 			return query 
 				select v_ob.ts, p_pair_id::smallint, p_exchange_id::smallint, 'r0'::character(2), d
 				from obanalytics._depth_change(v_ob_before.ob, v_ob.ob) d;
@@ -2002,22 +2007,24 @@ $$;
 ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
--- Name: pga_depth(text, text, interval, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: pga_summarize(text, text, interval, timestamp with time zone, boolean); Type: PROCEDURE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.pga_depth(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS void
+CREATE PROCEDURE obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_commit_each_era boolean DEFAULT true)
     LANGUAGE plpgsql
     AS $$
 declare 
 	v_current_timestamp timestamptz;
+	
 	v_start timestamptz;
 	v_end timestamptz;
-	v_last_depth timestamptz;
+	
+	v_first timestamptz;
 	
 	v_pair_id obanalytics.pairs.pair_id%type;
 	v_exchange_id obanalytics.exchanges.exchange_id%type;
-	v_precision constant character(2) default 'r0';
-
+	
+	e record;
 	
 begin 
 	v_current_timestamp := clock_timestamp();
@@ -2027,133 +2034,93 @@ begin
 	where pair = upper(p_pair);
 	
 	select exchange_id into strict v_exchange_id
-	from obanalytics.exchanges 
+	from obanalytics.exchanges
 	where exchange = lower(p_exchange);
 	
-	select era_starts, era_ends into v_start, v_end
-	from (
-		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
+	if p_ts_within_era is null then	-- we start from the latest era where level1 and level2 have already been calculated.
+									 -- If a new era has started this start point will ensure that we'll calculate remaining 
+									 -- level1 and level2 for the old era(s) as well as the new one(s)
+		select max(era) into p_ts_within_era
 		from obanalytics.level3_eras 
 		where pair_id = v_pair_id
-		  and exchange_id = v_exchange_id
-	) a
-	where coalesce(p_ts_within_era,  ( select max(era) 
-										 from obanalytics.level3_eras
-										 where pair_id = v_pair_id 
-									       and exchange_id = v_exchange_id
-									 ) ) between era_starts and era_ends;
-									 
-	select coalesce(max(microtimestamp), v_start) into v_last_depth
-	from obanalytics.level2 
-	where microtimestamp between v_start and v_end
-	  and pair_id = v_pair_id
-	  and precision = v_precision
-	  and exchange_id = v_exchange_id;
-	
-	-- delete the latest depth because it could be calculated using incomplete data
-	
-	delete from obanalytics.level2
-	where microtimestamp = v_last_depth
-	  and pair_id = v_pair_id
-	  and precision = v_precision
-	  and exchange_id = v_exchange_id;
-	  
-	if v_end > v_last_depth + p_max_interval then
-		v_end := v_last_depth + p_max_interval;
+		   and exchange_id = v_exchange_id
+		   and level1 is not null and level2 is not null;
 	end if;
 	
-	raise debug 'pga_depth(): from: %  till: %', v_last_depth, v_end;
-	  
-	insert into obanalytics.level2 (microtimestamp, pair_id, exchange_id, precision, depth_change)
-	select microtimestamp, pair_id, exchange_id, precision, coalesce(depth_change, '{}')
-	from obanalytics.depth_change_by_episode(v_last_depth, v_end, v_pair_id, v_exchange_id);
+	select starts, ends into v_start, v_end
+	from (select era as starts, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity') as ends
+		   from obanalytics.level3_eras
+		   where pair_id = v_pair_id
+			 and exchange_id = v_exchange_id
+		 ) a
+	where p_ts_within_era between starts and ends;
 	
-	raise debug 'pga_depth() exec time: %', clock_timestamp() - v_current_timestamp;
+	raise debug 'p_ts_within_era: %, v_start: %, v_end: %', p_ts_within_era, v_start, v_end;
 	
-	return;
-end;
-
-$$;
-
-
-ALTER FUNCTION obanalytics.pga_depth(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
-
---
--- Name: pga_spread(text, text, interval, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.pga_spread(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS TABLE(o_start timestamp with time zone, o_end timestamp with time zone)
-    LANGUAGE plpgsql
-    AS $$
-declare 
-	v_current_timestamp timestamptz;
-	v_start timestamptz;
-	v_end timestamptz;
-	v_last_spread timestamptz;
-	
-	v_pair_id obanalytics.pairs.pair_id%type;
-	v_exchange_id obanalytics.exchanges.exchange_id%type;
-	
-begin 
-	v_current_timestamp := clock_timestamp();
-	
-	select pair_id into strict v_pair_id
-	from obanalytics.pairs 
-	where pair = upper(p_pair);
-	
-	select exchange_id into strict v_exchange_id
-	from obanalytics.exchanges 
-	where exchange = lower(p_exchange);
-
-	select era_starts, era_ends into v_start, v_end
-	from (
-		select era as era_starts,
-				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
-		from obanalytics.level3_eras 
-		where pair_id = v_pair_id
-		  and exchange_id = v_exchange_id
-	) a
-	where coalesce(p_ts_within_era,  ( select max(era) 
-										 from obanalytics.level3_eras 
-										 where pair_id = v_pair_id
-									       and exchange_id = v_exchange_id
-									 ) ) between era_starts and era_ends;
-
-	select coalesce(max(microtimestamp), v_start) into v_last_spread
+	select coalesce(max(microtimestamp) + '00:00:00.000001'::interval, v_start) into v_start
 	from obanalytics.level1 
 	where microtimestamp between v_start and v_end
 	  and exchange_id = v_exchange_id
 	  and pair_id = v_pair_id;
 	  
-	if v_end > v_last_spread + p_max_interval then
-		v_end := v_last_spread + p_max_interval;
-	end if;	  
+	raise debug 'start: %, end: %', v_start, v_start + p_max_interval;	  
+
+	for e in   select starts, least(ends, v_start + p_max_interval) as ends
+				from (
+					select era as starts,
+							coalesce(level3, 
+								coalesce(lead(era) over (order by era)  - '00:00:00.000001'::interval, 'infinity'::timestamptz)
+									) as ends
+					from obanalytics.level3_eras 
+					where pair_id = v_pair_id
+					  and exchange_id = v_exchange_id
+				) a
+				where a.ends >= v_start
+				  and starts <= v_start + p_max_interval
+				order by starts loop
+
+		-- theoretically the microtimestamp below should always be equal to level3_eras.level1
+		select coalesce(max(microtimestamp) + '00:00:00.000001'::interval, e.starts) into v_first
+		from obanalytics.level1 
+		where microtimestamp between e.starts and e.ends
+	  	  and exchange_id = v_exchange_id
+	  	  and pair_id = v_pair_id;
+		  
+		raise debug 'level1 (spread) e.starts: %, v_first: %, e.ends: %, v_pair_id: %, v_exchange_id: % ', e.starts, v_first, e.ends, v_pair_id, v_exchange_id;	  
+		
+		insert into obanalytics.level1 (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id)
+		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id
+		from obanalytics.spread_by_episode(v_first, e.ends, v_pair_id, v_exchange_id, p_with_order_book := false);
+		
+		-- theoretically the microtimestamp below should always be equal to level3_eras.level2
+		select coalesce(max(microtimestamp) + '00:00:00.000001'::interval, e.starts) into v_first
+		from obanalytics.level2
+		where microtimestamp between e.starts and e.ends
+		  and precision = 'r0'
+	  	  and exchange_id = v_exchange_id
+	  	  and pair_id = v_pair_id;
+		  
+		raise debug 'level2 (depth) e.starts: %, v_first: %, e.ends: %, v_pair_id: %, v_exchange_id: % ', e.starts, v_first, e.ends, v_pair_id, v_exchange_id;	  
+		
+		insert into obanalytics.level2 (microtimestamp, pair_id, exchange_id, precision, depth_change)
+		select microtimestamp, pair_id, exchange_id, precision, coalesce(depth_change, '{}')
+		from obanalytics.depth_change_by_episode(v_first, e.ends, v_pair_id, v_exchange_id);
+		
+		if p_commit_each_era then
+			commit;
+			raise debug 'era commited e.starts: %, e.ends: %, v_pair_id: %, v_exchange_id: % ', e.starts, e.ends, v_pair_id, v_exchange_id;	  
+		end if;
+		
+	end loop;
 	
-	-- delete the latest spread because it could be calculated using incomplete data
-	
-	delete from obanalytics.level1
-	where microtimestamp = v_last_spread
-	  and exchange_id = v_exchange_id
-	  and pair_id = v_pair_id;
-	  
-	raise debug 'v_last_spread: %, v_end: %, v_pair_id: %, v_exchange_id: % ', v_last_spread, v_end, v_pair_id, v_exchange_id;	  
-	  
-	insert into obanalytics.level1 (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id)
-    select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id
-	from obanalytics.spread_by_episode(v_last_spread, v_end, v_pair_id, v_exchange_id, p_with_order_book := false);
-	
-	raise debug 'pga_spread() exec time: %', clock_timestamp() - v_current_timestamp;
-	o_start := v_last_spread;
-	o_end := v_end;
-	return next;
+	raise debug 'pga_summarize() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
 end;
 
 $$;
 
 
-ALTER FUNCTION obanalytics.pga_spread(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+ALTER PROCEDURE obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone, p_commit_each_era boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: save_exchange_microtimestamp(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
