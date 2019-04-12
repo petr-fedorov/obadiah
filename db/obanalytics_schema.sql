@@ -1394,53 +1394,51 @@ COMMENT ON FUNCTION obanalytics.merge_crossed_books(p_start_time timestamp with 
 
 
 --
--- Name: oba_available_exchanges(timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: oba_available_exchanges(timestamp with time zone, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.oba_available_exchanges(p_ts timestamp with time zone) RETURNS SETOF text
+CREATE FUNCTION obanalytics.oba_available_exchanges(p_start_time timestamp with time zone, p_end_time timestamp with time zone) RETURNS SETOF text
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 with eras as (
-	select exchange_id, pair_id, era as era_start,
-			coalesce(lead(era) over (partition by exchange_id, pair_id order by era) - '00:00:00.000001'::interval, 'infinity' ) as era_end
+	select exchange_id, pair_id, tstzrange(era,coalesce(level3,era)) as era
 	from obanalytics.level3_eras
 ),
 has_data as (
 	select distinct exchange_id
 	from eras
-	where p_ts between era_start and era_end 
+	where tstzrange(p_start_time, p_end_time) && era
 )
 select exchange 
 from has_data join obanalytics.exchanges using (exchange_id)
 $$;
 
 
-ALTER FUNCTION obanalytics.oba_available_exchanges(p_ts timestamp with time zone) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.oba_available_exchanges(p_start_time timestamp with time zone, p_end_time timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: oba_available_pairs(timestamp with time zone, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: oba_available_pairs(timestamp with time zone, timestamp with time zone, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.oba_available_pairs(p_ts timestamp with time zone, p_exchange_id integer) RETURNS SETOF text
+CREATE FUNCTION obanalytics.oba_available_pairs(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer) RETURNS SETOF text
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 with eras as (
-	select exchange_id, pair_id, era as era_start,
-			coalesce(lead(era) over (partition by exchange_id, pair_id order by era) - '00:00:00.000001'::interval, 'infinity' ) as era_end
+	select exchange_id, pair_id, tstzrange(era, coalesce(level3,era)) as era
 	from obanalytics.level3_eras
 	where exchange_id = p_exchange_id
 ),
 has_data as (
 	select distinct pair_id
 	from eras
-	where p_ts between era_start and era_end 
+	where tstzrange(p_start_time, p_end_time) && era
 )
 select pair
 from has_data join obanalytics.pairs using (pair_id)
 $$;
 
 
-ALTER FUNCTION obanalytics.oba_available_pairs(p_ts timestamp with time zone, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.oba_available_pairs(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_depth(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1450,7 +1448,7 @@ CREATE FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_e
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 with starting_depth as (
-	select ts as microtimestamp, side, price, volume 
+	select greatest(ts, p_start_time) as microtimestamp, side, price, volume 
 	from obanalytics.order_book(p_start_time, 
 								p_pair_id,
 								p_exchange_id,
@@ -9542,17 +9540,17 @@ GRANT USAGE ON SCHEMA obanalytics TO obauser;
 
 
 --
--- Name: FUNCTION oba_available_exchanges(p_ts timestamp with time zone); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+-- Name: FUNCTION oba_available_exchanges(p_start_time timestamp with time zone, p_end_time timestamp with time zone); Type: ACL; Schema: obanalytics; Owner: ob-analytics
 --
 
-GRANT ALL ON FUNCTION obanalytics.oba_available_exchanges(p_ts timestamp with time zone) TO obauser;
+GRANT ALL ON FUNCTION obanalytics.oba_available_exchanges(p_start_time timestamp with time zone, p_end_time timestamp with time zone) TO obauser;
 
 
 --
--- Name: FUNCTION oba_available_pairs(p_ts timestamp with time zone, p_exchange_id integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+-- Name: FUNCTION oba_available_pairs(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
 --
 
-GRANT ALL ON FUNCTION obanalytics.oba_available_pairs(p_ts timestamp with time zone, p_exchange_id integer) TO obauser;
+GRANT ALL ON FUNCTION obanalytics.oba_available_pairs(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer) TO obauser;
 
 
 --
