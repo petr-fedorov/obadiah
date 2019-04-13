@@ -18,7 +18,8 @@ Imports:
     dplyr,
     plyr,
     reshape2,
-    zoo
+    zoo,
+    lubridate
 Suggests: testthat,
     knitr,
     rmarkdown

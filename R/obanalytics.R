@@ -1,5 +1,10 @@
 #' @export
-depth <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
+depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE) {
+  .depth(conn, start.time, end.time, exchange, pair, debug.query)
+}
+
+
+.depth <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE)   {
   tzone <- attr(end.time, "tzone")
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
@@ -17,6 +22,12 @@ depth <- function(conn, start.time, end.time, exchange, pair, debug.query = FALS
   depth$side <- factor(depth$side, c("bid", "ask"))
   attr(depth$timestamp, 'tzone') <- tzone
   depth
+}
+
+.cache_leaf_key <- function(start.time, end.time) {
+  stopifnot(inherits(start.time, "POSIXct"), inherits(end.time, "POSIXct"), attr(start.time, "tzone") != "",attr(end.time, "tzone") != "" )
+  fmt <- "%Y%m%d_%H%M%S%z"
+  paste0(".", format(start.time, format=fmt),"#", format(end.time, format=fmt), collapse="")
 }
 
 
