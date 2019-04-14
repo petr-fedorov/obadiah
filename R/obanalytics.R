@@ -1,6 +1,17 @@
 #' @export
 depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE) {
-  .depth(conn, start.time, end.time, exchange, pair, debug.query)
+  if(is.null(cache))
+    depth <- .depth(conn, start.time, end.time, exchange, pair, debug.query)
+  else {
+    depth <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .depth, .leaf_cache(cache, exchange, pair, "depth"))
+  }
+  depth
+}
+
+
+.load_cached <- function(conn, start.time, end.time, exchange, pair, debug.query, loader, cache) {
+  .update_cache(conn, start.time, end.time, exchange, pair, debug.query, loader, cache)
+  .load_from_cache(start.time, end.time, cache)
 }
 
 
@@ -22,12 +33,6 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
   depth$side <- factor(depth$side, c("bid", "ask"))
   attr(depth$timestamp, 'tzone') <- tzone
   depth
-}
-
-.cache_leaf_key <- function(start.time, end.time) {
-  stopifnot(inherits(start.time, "POSIXct"), inherits(end.time, "POSIXct"), attr(start.time, "tzone") != "",attr(end.time, "tzone") != "" )
-  fmt <- "%Y%m%d_%H%M%S%z"
-  paste0(".", format(start.time, format=fmt),"#", format(end.time, format=fmt), collapse="")
 }
 
 
