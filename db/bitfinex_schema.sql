@@ -737,10 +737,34 @@ begin
 		order by microtimestamp, order_id,
 				  ts	-- we need the earliest ts where order book became crossed
 		returning level3_bitfinex.*;
-	
-	if found then -- (i) there were some episodes producing crossed book and (ii) some of them may still be so - we can only merge them
-		return query select * from obanalytics.merge_crossed_books(v_last_spread, v_end, v_pair_id, v_exchange_id);
-	end if;
+		
+	-- Second remove crossed orders, which have been removed by Bitfinex, but for some reasons too late!
+	return query 		
+		with crossed as (
+			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
+			from obanalytics.order_book_by_episode(v_last_spread, v_end, v_pair_id, v_exchange_id, p_check_takers :=false) 
+			join unnest(ob) as ob on true
+			where is_crossed 
+		),
+		updated as (
+			update obanalytics.level3
+			  set microtimestamp = crossed.microtimestamp
+			from crossed
+			where exchange_id = v_exchange_id
+			  and pair_id = v_pair_id
+			  and level3.microtimestamp = crossed.next_microtimestamp
+			  and level3.order_id = crossed.order_id
+			  and level3.event_no = crossed.next_event_no
+			  and level3.next_microtimestamp = '-infinity'
+			  and level3.microtimestamp between v_last_spread and v_end
+			returning level3.*
+		)
+		select *
+		from updated;
+		
+			
+	-- Finally, try to merge remaining episodes producing crossed order books
+	return query select * from obanalytics.merge_crossed_books(v_last_spread, v_end, v_pair_id, v_exchange_id);
 	
 	raise debug 'pga_fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
