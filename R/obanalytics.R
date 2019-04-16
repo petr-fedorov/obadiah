@@ -1,3 +1,6 @@
+#' @importFrom lubridate floor_date ceiling_date
+
+
 #' @export
 depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE) {
   if(is.null(cache))
@@ -10,7 +13,8 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 
 .load_cached <- function(conn, start.time, end.time, exchange, pair, debug.query, loader, cache) {
-  .update_cache(conn, start.time, end.time, exchange, pair, debug.query, loader, cache)
+
+  .update_cache(conn, floor_date(start.time), ceiling_date(end.time), exchange, pair, debug.query, loader, cache)
   .load_from_cache(start.time, end.time, cache)
 }
 
