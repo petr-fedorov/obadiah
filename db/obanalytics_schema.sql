@@ -1441,14 +1441,15 @@ $$;
 ALTER FUNCTION obanalytics.oba_available_pairs(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: oba_depth(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: oba_depth(timestamp with time zone, timestamp with time zone, integer, integer, boolean, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
+CREATE FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_starting_depth boolean DEFAULT true, p_depth_changes boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
+
 with starting_depth as (
-	select greatest(ts, p_start_time) as microtimestamp, side, price, volume 
+	select p_start_time as microtimestamp, side, price, volume 
 	from obanalytics.order_book(p_start_time, 
 								p_pair_id,
 								p_exchange_id,
@@ -1457,6 +1458,7 @@ with starting_depth as (
 														-- then this order book will be null - see comment below
 								p_check_takers := false)
 	join lateral ( select price, side, sum(amount) as volume from unnest(ob) group by price, side ) d on true
+	where p_starting_depth 
 ),
 level2 as (
 	select microtimestamp, side, price, volume
@@ -1466,21 +1468,23 @@ level2 as (
 									    p_pair_id,
 									    p_exchange_id) level2
 		  join unnest(level2.depth_change) d on true
+	where p_depth_changes
 )
 select microtimestamp, price, volume, case side 	
 										when 'b' then 'bid'::text
 										when 's' then 'ask'::text
 									  end as side
-from ( select * from starting_depth union all select * from level2 ) d
-where price is not null;   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
+from ( select * from starting_depth union all select * from level2) d
+where price is not null   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
 							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
 							-- 'not null' constraint is to be added to price and depth_change columns of obanalytics.depth table. Then this check
 							-- will be redundant
+  and coalesce(microtimestamp < p_end_time, TRUE) -- for the convenience of client-side caching right, boundary must not be inclusive i.e. [p_staart_time, p_end_time)
 
 $$;
 
 
-ALTER FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_starting_depth boolean, p_depth_changes boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, integer, integer, numeric); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -9554,10 +9558,10 @@ GRANT ALL ON FUNCTION obanalytics.oba_available_pairs(p_start_time timestamp wit
 
 
 --
--- Name: FUNCTION oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+-- Name: FUNCTION oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_starting_depth boolean, p_depth_changes boolean); Type: ACL; Schema: obanalytics; Owner: ob-analytics
 --
 
-GRANT ALL ON FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) TO obauser;
+GRANT ALL ON FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_starting_depth boolean, p_depth_changes boolean) TO obauser;
 
 
 --
