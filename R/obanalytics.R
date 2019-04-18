@@ -3,12 +3,13 @@
 
 #' @export
 depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE) {
+  starting_depth <- .starting_depth(conn, start.time, exchange, pair, debug.query)
   if(is.null(cache))
-    depth <- .depth(conn, start.time, end.time, exchange, pair, debug.query)
+    depth_changes <- .depth_changes(conn, start.time, end.time, exchange, pair, debug.query)
   else {
-    depth <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .depth, .leaf_cache(cache, exchange, pair, "depth"))
+    depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .depth_changes, .leaf_cache(cache, exchange, pair, "depth"))
   }
-  depth
+  rbind(starting_depth, depth_changes)
 }
 
 
@@ -19,7 +20,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 }
 
 
-.depth <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE)   {
+.depth_changes <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE)   {
   tzone <- attr(end.time, "tzone")
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
@@ -29,8 +30,8 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
                   shQuote(start.time), ",",
                   shQuote(end.time), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ")",
-                  ") ORDER BY 1, 2 DESC")
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
+                  "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
   if(debug.query) cat(query)
   depth <- DBI::dbGetQuery(conn, query)
   depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
@@ -38,6 +39,26 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
   attr(depth$timestamp, 'tzone') <- tzone
   depth
 }
+
+
+.starting_depth <- function(conn, start.time, exchange, pair, debug.query = FALSE)   {
+  tzone <- attr(start.time, "tzone")
+  start.time <- format(start.time, usetz=T)
+
+  query <- paste0(" SELECT obanalytics._in_milliseconds(timestamp) AS timestamp,
+                  price, volume, side FROM obanalytics.oba_depth(",
+                  shQuote(start.time), ", NULL, ",
+                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
+                  "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
+  if(debug.query) cat(query)
+  depth <- DBI::dbGetQuery(conn, query)
+  depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
+  depth$side <- factor(depth$side, c("bid", "ask"))
+  attr(depth$timestamp, 'tzone') <- tzone
+  depth
+}
+
 
 
 #' @export
