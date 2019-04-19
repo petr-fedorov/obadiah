@@ -1,15 +1,35 @@
-#' @importFrom lubridate floor_date ceiling_date
+#' @import lubridate
 
 
 #' @export
 depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE) {
+
+
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+
+  flog.debug(paste0("depth(conn,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+
+  tzone <- tz(start.time)
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
   starting_depth <- .starting_depth(conn, start.time, exchange, pair, debug.query)
   if(is.null(cache))
     depth_changes <- .depth_changes(conn, start.time, end.time, exchange, pair, debug.query)
   else {
     depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .depth_changes, .leaf_cache(cache, exchange, pair, "depth"))
   }
-  rbind(starting_depth, depth_changes)
+  depth <- rbind(starting_depth, depth_changes)
+
+  # Assign timezone of start.time, if any, to timestamp column
+  depth$timestamp <- with_tz(depth$timestamp, tzone)
+  depth
+
 }
 
 
@@ -21,14 +41,11 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 
 .depth_changes <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE)   {
-  tzone <- attr(end.time, "tzone")
-  start.time <- format(start.time, usetz=T)
-  end.time <- format(end.time, usetz=T)
 
   query <- paste0(" SELECT obanalytics._in_milliseconds(timestamp) AS timestamp,
                   price, volume, side FROM obanalytics.oba_depth(",
-                  shQuote(start.time), ",",
-                  shQuote(end.time), ",",
+                  shQuote(format(start.time, usetz=T)), ",",
+                  shQuote(format(end.time, usetz=T)), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
                   "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
                   "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
@@ -36,18 +53,15 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
   depth <- DBI::dbGetQuery(conn, query)
   depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
   depth$side <- factor(depth$side, c("bid", "ask"))
-  attr(depth$timestamp, 'tzone') <- tzone
   depth
 }
 
 
 .starting_depth <- function(conn, start.time, exchange, pair, debug.query = FALSE)   {
-  tzone <- attr(start.time, "tzone")
-  start.time <- format(start.time, usetz=T)
 
   query <- paste0(" SELECT obanalytics._in_milliseconds(timestamp) AS timestamp,
                   price, volume, side FROM obanalytics.oba_depth(",
-                  shQuote(start.time), ", NULL, ",
+                  shQuote(format(start.time,usetz=T)), ", NULL, ",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
                   "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
                   "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
@@ -55,7 +69,6 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
   depth <- DBI::dbGetQuery(conn, query)
   depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
   depth$side <- factor(depth$side, c("bid", "ask"))
-  attr(depth$timestamp, 'tzone') <- tzone
   depth
 }
 

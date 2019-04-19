@@ -18,7 +18,9 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
 
 .cache_leaf_key <- function(start.time, end.time) {
-  stopifnot(inherits(start.time, "POSIXct"), inherits(end.time, "POSIXct"), attr(start.time, "tzone") != "",attr(end.time, "tzone") != "" )
+  stopifnot(inherits(start.time, "POSIXct"), inherits(end.time, "POSIXct"))
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
   fmt <- "%Y%m%d_%H%M%S%z"
   paste0(".", format(start.time, format=fmt),"#", format(end.time, format=fmt), collapse="")
 }
@@ -128,8 +130,9 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 }
 
 .load_from_cache <- function(start.time, end.time, cache) {
+
   flog.debug('.load_from_cache(%s, %s, %s)', format(start.time), format(end.time), cache$type, name="obanalyticsdb.cache")
-  cached_interval <-cache$periods %>% dplyr::filter( start.time>= s & start.time <= e & end.time >=s & end.time <= e )
+  cached_interval <-cache$periods %>% filter( start.time>= s & start.time <= e & end.time >=s & end.time <= e )
 
   if (plyr::empty(cached_interval)) {
     flog.error('requested data are not found in the cache: %s %s', format(start.time), format(end.time), name="obanalyticsdb.cache")
@@ -137,6 +140,6 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
   }
   cached_data <- cache[[.cache_leaf_key(head(cached_interval)$s, head(cached_interval)$e)]]
   flog.debug('requested data are found in the cache period %s %s', format(head(cached_interval)$s), format(head(cached_interval)$e), name="obanalyticsdb.cache")
-  cached_data %>%  filter(timestamp >= start.time & timestamp <= end.time) %>% arrange(timestamp, -price)
+  cached_data %>%  filter(timestamp >= start.time & timestamp < end.time) %>% arrange(timestamp, -price)
 
 }

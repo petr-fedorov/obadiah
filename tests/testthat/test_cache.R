@@ -1,222 +1,281 @@
-load(system.file("extdata/testdata.rda", package = "obAnalyticsDb"))
-flog.threshold(futile.logger::DEBUG, 'obanalyticsdb')
-flog.appender(appender.file('test.log'), name='obanalyticsdb')
+context("A depth cache")
 
 
+setup({
+   flog.threshold(futile.logger::DEBUG, 'obanalyticsdb')
+   flog.appender(appender.file('test_cache_depth.log'), name='obanalyticsdb')
+})
 
-context("Depth cache")
+teardown({
+  # flog.appender(NULL, name='obanalyticsdb')
+})
 
+# A common test fixture for all test_that functions below. To be evaluated by eval() within test_that()
 
-test_that('an empty cache',{
+fixture <- quote({
 
-  #skip('skip')
-  flog.debug('', name='obanalyticsdb')
-  flog.debug('an empty cache\n', name='obanalyticsdb')
-  cache <- new.env(parent=emptyenv())
+  load(system.file("extdata/testdata.rda", package = "obAnalyticsDb")) # gets 'bitstamp_btcusd_depth'
+
+  cache <- new.env(parent=emptyenv()) # is shared between tests below
   con <- NULL
-  start.time <- lubridate::ymd_hms("2019-04-13 01:00:00+0300") # we expect time to be rounded to seconds by cache functions
-  end.time <- lubridate::ymd_hms('2019-04-13 01:14:59+0300')
 
   exchange <- 'bitstamp'
   pair <- 'btcusd'
-  expected <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )
 
-  flog.debug("# Check that the depth is downloaded ...", name='obanalyticsdb')
+  queries <- data.frame()
+
+  # mock .depth_changes function that (i) logs queries to RDBMS into 'queries' data frame and (ii) returns data as from RDBMS
+
+  .depth_changes_mock <- function(con, start.time, end.time, exchange, pair, ...) {
+    queries <<- rbind(queries, data.frame(start.time=start.time, end.time = end.time, exchange=exchange, pair=pair))
+    bitstamp_btcusd_depth  %>% filter(timestamp >= start.time & timestamp < end.time) # [start.time, end.time)
+    }
+
+  })
+
+
+test_that('the depth is downloaded from RDBMS and timestamps are in UTC time zone',{
+
+  eval(fixture)
+
+  start.time <- with_tz(min(bitstamp_btcusd_depth$timestamp)) # no time zone!
+  end.time <- max(bitstamp_btcusd_depth$timestamp)
+
+  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp < end.time ) # timestamp >= end.time must not be returned, i.e. [start.time, end.time)
+  expected_data$timestamp <- with_tz(expected_data$timestamp, tz='UTC') # start.time is WITHOUT tzone, so 'UTC' must be returned
+
+  # All queries are supposed to be done in UTC time zone and start.time and end.time have to be rounded to seconds
+
+  expected_queries <- data.frame(start.time=floor_date(with_tz(start.time, tz='UTC')),
+                                 end.time = ceiling_date(with_tz(end.time, tz='UTC')),
+                                 exchange=exchange, pair=pair)
+
   with_mock(
     `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = function(con, start.time, end.time, exchange, pair, cache) { expected },
-      expect_equal( obAnalyticsDb::depth(con,start.time,end.time, exchange, pair, cache = cache),
-                    expected
-                    )
-  )
-
-  flog.debug(" #... and then served from cache whenever requested range is appropriate (i.e. cached)", name='obanalyticsdb')
-  with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = function(con, start.time, end.time, exchange, pair, cache) {
-      stop(paste('An unexpected query to RDBMS: depth',
-           start.time,
-           end.time,
-           exchange,
-           pair,
-           sep = " "
-           )
-           )
-      },
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
     {
-      expect_equal( obAnalyticsDb::depth(con,start.time,end.time, exchange, pair, cache = cache),
-                    expected, info=paste0(start.time, end.time, collapse=" ")
-                    )
-
-      start.time <- start.time + lubridate::minutes(1)
-      end.time <- end.time - lubridate::minutes(1)
-
-      expected <- expected %>% filter(timestamp >= start.time & timestamp <= end.time )
-
-      expect_equal( obAnalyticsDb::depth(con,start.time,end.time, exchange, pair, cache = cache),
-                    expected,
-                    info=paste0(start.time, end.time, collapse=" ")
-                    )
+      actual <- obAnalyticsDb::depth(con, start.time, end.time, exchange, pair, cache = cache)
     }
   )
 
-
-  start.time <- lubridate::ymd_hms("2019-04-13 01:15:00+0300")
-  end.time <- lubridate::ymd_hms('2019-04-13 01:25:10+0300')
-
-  expected <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )
-
-  flog.debug("# Non-overlapping depth is downloaded from RDBMS", name='obanalyticsdb')
-  with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = function(con, start.time, end.time, exchange, pair, cache) { expected },
-    expect_equal( obAnalyticsDb::depth(con,start.time,end.time, exchange, pair, cache = cache),
-                  expected
-    )
-  )
+  expect_equal(actual, expected_data, info="Data")
+  expect_equal(queries$start.time, expected_queries$start.time, info="Query: start.time")
+  expect_equal(queries$end.time, expected_queries$end.time, info="Query: end.time")
+  expect_equal(queries, expected_queries, info="Queries")
 
 })
 
 
+test_that('the depth is downloaded from RDBMS and timestamps are in Europe/Moscow time zone',{
 
-test_that('two queries to rdbms do not overlap',{
+  eval(fixture)
 
+  tzone <- "Europe/Moscow"
+
+  start.time <- ymd_hms("2019-04-13 01:00:00", tz=tzone)
+  end.time <- ymd_hms("2019-04-13 01:14:59", tz=tzone)
+
+  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )
+  expected_data$timestamp <- with_tz(expected_data$timestamp, tz=tzone) # start.time in Europe/Moscow, so returned data has to be in the same time zone
+
+  # All queries are supposed to be done in UTC time zone, no matter what is time zone of the parameters of depth()
+  expected_queries <- data.frame(start.time=with_tz(start.time, tz='UTC'),
+                                 end.time = with_tz(end.time, tz='UTC'),
+                                 exchange=exchange, pair=pair)
+
+  with_mock(
+    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    {
+      actual <- obAnalyticsDb::depth(con, start.time,end.time, exchange, pair, cache = cache)
+    }
+  )
+
+  expect_equal(actual, expected_data, info="Data")
+  expect_equal(queries, expected_queries, info="Query")
+
+})
+
+
+test_that('depth is served from cache whenever requested range is cached',  {
+
+
+  eval(fixture)
+
+  start.time <- ymd_hms("2019-04-13 01:00:00+0300")
+  end.time <- ymd_hms('2019-04-13 01:14:59+0300')
+
+  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time + minutes(1) & timestamp < end.time - minutes(1) )
+  expected_data$timestamp <- with_tz(expected_data$timestamp, tz='UTC')
+
+  # We cache [start.time, end.time) interval and then request [start.time + minutes(1), end.time - minutes(1)) from cache
+  # So there must be only one query for  [start.time, end.time) interval
+
+  expected_queries <- data.frame(start.time=with_tz(start.time, tz='UTC'),
+                                 end.time = with_tz(end.time, tz='UTC'),
+                                 exchange=exchange, pair=pair)
+
+
+  with_mock(
+    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    {
+      obAnalyticsDb::depth(con,start.time,end.time, exchange, pair, cache = cache)
+      actual <- obAnalyticsDb::depth(con,
+                                     start.time + minutes(1), # i.e. an interval within the one cached earlier
+                                     end.time - minutes(1),
+                                     exchange, pair, cache = cache)
+    }
+  )
+
+  expect_equal(actual, expected_data, info="Data")
+  expect_equal(queries$start.time, expected_queries$start.time, info="Query: start.time")
+  expect_equal(queries$end.time, expected_queries$end.time, info="Query: end.time")
+  expect_equal(queries, expected_queries, info="Queries")
+
+})
+
+test_that("non-overlapping depths are downloaded from RDBMS", {
+  eval(fixture)
+
+  tzone1 <- "Europe/London"
+  start.time1 <- ymd_hms("2019-04-13 01:00:00", tz=tzone1)
+  end.time1 <- ymd_hms('2019-04-13 01:14:59', tz=tzone1)
+
+  tzone2 <- "Europe/Moscow"
+  start.time2 <- ymd_hms("2019-04-13 01:00:00", tz=tzone2)
+  end.time2 <- ymd_hms('2019-04-13 01:14:59', tz=tzone2)
+
+
+  expected_data1 <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time1 & timestamp < end.time1 )
+  expected_data2 <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time2 & timestamp < end.time2 )
+
+  expected_data1$timestamp <- with_tz(expected_data1$timestamp, tz=tzone1)  # must be the same tzone as time zone of start.time1
+  expected_data2$timestamp <- with_tz(expected_data2$timestamp, tz=tzone2)  # must be the same tzone as time zone of start.time2
+
+  expected_queries <- data.frame(start.time=c(with_tz(start.time1, tz='UTC'),with_tz(start.time2, tz='UTC')),
+                                 end.time = c(with_tz(end.time1, tz='UTC'),with_tz(end.time2, tz='UTC')),
+                                 exchange=exchange, pair=pair)
+
+
+  with_mock(
+    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock, {
+    actual1 <- obAnalyticsDb::depth(con,start.time1, end.time1, exchange, pair, cache = cache)
+    actual2 <- obAnalyticsDb::depth(con,start.time2, end.time2, exchange, pair, cache = cache)
+    }
+    )
+  expect_equal(actual1, expected_data1)
+  expect_equal(actual2, expected_data2)
+  expect_equal(queries, expected_queries)
+  })
+
+
+test_that('two queries to RDBMS do not overlap when requested periods overlap',{
   # 1***
   #    2***
 
-  flog.debug('', name='obanalyticsdb')
-  flog.debug('two queries to rdbms do not overlap\n', name='obanalyticsdb')
-  cache <- new.env(parent=emptyenv())
-  con <- NULL
+  eval(fixture)
 
-  s1 <- lubridate::ymd_hms("2019-04-13 01:00:00+0300") # we expect time to be rounded to seconds by cache functions
-  e1 <- lubridate::ymd_hms('2019-04-13 01:15:00.1+0300')
 
-  s2 <- lubridate::ymd_hms('2019-04-13 01:14:59+0300')
-  e2 <- lubridate::ymd_hms('2019-04-13 01:15:59+0300')
+  s1 <- ymd_hms("2019-04-13 01:00:10", tz="Europe/Moscow")
+  e1 <- ymd_hms('2019-04-13 01:15:10.1', tz="Europe/Moscow")  # to test that celing_date() is actually used by cache
 
-  exchange <- 'bitstamp'
-  pair <- 'btcusd'
+  s2 <- ymd_hms('2019-04-13 01:14:59', tz="Europe/Moscow")
+  e2 <- ymd_hms('2019-04-13 01:15:59', tz="Europe/Moscow")
 
-  expected  <- data.frame(s = c(s1, lubridate::ceiling_date(e1)),
-                          e=c(lubridate::ceiling_date(e1), e2) )
 
-  actual <- data.frame()
 
-  .depth <- function(con, start.time, end.time, exchange, pair, cache) {
-    actual <<- rbind(actual, data.frame(s=start.time, e=end.time))
-    bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )
-    }
+  # internally all time objects have to be explicitly converted to UTC
+  expected_queries  <- data.frame(start.time = c(with_tz(s1, tz='UTC'), with_tz(ceiling_date(e1), tz='UTC')),
+                                  end.time=c(with_tz(ceiling_date(e1), tz='UTC'),with_tz(e2, tz='UTC')),
+                                  exchange = exchange,
+                                  pair=pair)
 
   with_mock(
     `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth,
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
     {
-      flog.debug("# adding to cache ...", name='obanalyticsdb')
       obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
       obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
-
-      flog.debug("# has to be served from cache (i.e. must not produce query)", name='obanalyticsdb')
-      obAnalyticsDb::depth(con,s1 + lubridate::seconds(1),e2, exchange, pair, cache = cache)
-
-      expect_equal(actual$s, expected$s)
-      expect_equal(actual$e, expected$e)
     }
   )
+
+  expect_equal(queries$start.time, expected_queries$start.time, info="Query: start.time")
+  expect_equal(queries$end.time, expected_queries$end.time, info="Query: end.time")
+
+  expect_equal(queries, expected_queries)
 
 })
 
 
-test_that('three queries to rdbms do not overlap',{
+test_that('three queries to RDBMS do not overlap when requested periods overlap',{
 
-  #skip('skip')
   #   1***   2***
   #   3**********
 
-  flog.debug('', name='obanalyticsdb')
-  flog.debug('three queries to rdbms do not overlap\n', name='obanalyticsdb')
+  eval(fixture)
 
-  cache <- new.env(parent=emptyenv())
-  con <- NULL
+  s1 <- ymd_hms("2019-04-13 01:00:00", tz="Europe/Moscow")
+  e1 <- ymd_hms('2019-04-13 01:15:00.1', tz="Europe/Moscow")
 
-  s1 <- lubridate::ymd_hms("2019-04-13 01:00:00+0300") # we expect time to be rounded to seconds by cache functions
-  e1 <- lubridate::ymd_hms('2019-04-13 01:15:00.1+0300')
-
-  s2 <- lubridate::ymd_hms('2019-04-13 01:16:59+0300')
-  e2 <- lubridate::ymd_hms('2019-04-13 01:17:59+0300')
+  s2 <- ymd_hms('2019-04-13 01:16:59', tz="Europe/Moscow")
+  e2 <- ymd_hms('2019-04-13 01:17:59', tz="Europe/Moscow")
 
 
-  exchange <- 'bitstamp'
-  pair <- 'btcusd'
-
-  expected  <- data.frame(s = c(s1, s2, lubridate::ceiling_date(e1)),
-                          e=c(lubridate::ceiling_date(e1), e2,  s2) )
-
-  actual <- data.frame()
-
-  .depth <- function(con, start.time, end.time, exchange, pair, cache) {
-    actual <<- rbind(actual, data.frame(s=start.time, e=end.time))
-    bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )
-  }
+  # internally all time objects have to be explicitly converted to UTC
+  expected_queries  <- data.frame(start.time = c(with_tz(s1, tz='UTC'),with_tz(s2, tz='UTC'), with_tz(ceiling_date(e1), tz='UTC')),
+                                  end.time=c(with_tz(ceiling_date(e1), tz='UTC'),with_tz(e2, tz='UTC'), with_tz(s2, tz='UTC')),
+                                  exchange = exchange,
+                                  pair=pair)
 
   with_mock(
     `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth,
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
     {
       obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
       obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
       obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
 
       # has to be served from cache (i.e. must not produce query)
-      obAnalyticsDb::depth(con,s1 + lubridate::seconds(1),e2, exchange, pair, cache = cache)
-
-      expect_equal(actual$s, expected$s)
-      expect_equal(actual$e, expected$e)
+      obAnalyticsDb::depth(con,s1 + seconds(1),e2, exchange, pair, cache = cache)
     }
   )
+  expect_equal(queries, expected_queries)
+
 
 })
 
 
-test_that('data returned from cache and from rdbms are the same',{
 
-  # 1***
-  #    2***
+test_that('data returned from the cache and from RDBMS are the same',{
 
-  flog.debug('', name='obanalyticsdb')
-  flog.debug('data returned from cache and from rdbms are the same\n', name='obanalyticsdb')
-  cache <- new.env(parent=emptyenv())
-  con <- NULL
+  #   1***   2***
+  #   3**********
 
-  s1 <- lubridate::ymd_hms("2019-04-13 01:14:55+0300") # we expect time to be rounded to seconds by cache functions
-  e1 <- lubridate::ymd_hms('2019-04-13 01:14:59+0300')
+  eval(fixture)
 
-  s2 <- lubridate::ymd_hms('2019-04-13 01:14:59+0300')
-  e2 <- lubridate::ymd_hms('2019-04-13 01:15:05+0300')
+  s1 <- ymd_hms("2019-04-13 01:00:00", tz="Europe/Moscow")
+  e1 <- ymd_hms('2019-04-13 01:15:00.1', tz="Europe/Moscow")
 
-  exchange <- 'bitstamp'
-  pair <- 'btcusd'
+  s2 <- ymd_hms('2019-04-13 01:16:59', tz="Europe/Moscow")
+  e2 <- ymd_hms('2019-04-13 01:17:59', tz="Europe/Moscow")
 
-  expected  <- bitstamp_btcusd_depth %>% filter(timestamp >= s1 & timestamp < e2 )  # [s1, s2)
 
-  .depth <- function(con, start.time, end.time, exchange, pair, cache) {
-    bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time ) # [start.time, end.time)
-  }
 
   with_mock(
     `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth,
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
     {
-      flog.debug("# adding to cache ...", name='obanalyticsdb')
       obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
       obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
+      obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
 
-      flog.debug("# data from cache ", name='obanalyticsdb')
-      actual <- obAnalyticsDb::depth(con,s1 ,e2, exchange, pair, cache = cache)
-
-      expect_equal(actual, expected)
+      from_cache <- obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
+      from_rdbms <- obAnalyticsDb::depth(con,s1,e2, exchange, pair)  # i.e. without cache
     }
   )
+  expect_equal(from_cache, from_rdbms)
 
 })
 
@@ -227,59 +286,40 @@ test_that('cached periods are reported properly',{
   #   1***   2***
   #   3**********
 
-  flog.debug('\n', name='obanalyticsdb')
-  flog.debug(paste0('cached periods are reported properly','\n'), name='obanalyticsdb')
+  eval(fixture)
 
-  cache <- new.env(parent=emptyenv())
-  con <- NULL
+  s1 <- ymd_hms("2019-04-13 01:00:00", tz="Europe/Moscow")
+  e1 <- ymd_hms('2019-04-13 01:15:00.1', tz="Europe/Moscow")
 
-  s1 <- lubridate::ymd_hms("2019-04-13 01:00:00+0300")
-  e1 <- lubridate::ymd_hms('2019-04-13 01:05:00+0300')
-
-  s2 <- lubridate::ymd_hms('2019-04-13 01:16:59+0300')
-  e2 <- lubridate::ymd_hms('2019-04-13 01:17:59+0300')
+  s2 <- ymd_hms('2019-04-13 01:16:59', tz="Europe/Moscow")
+  e2 <- ymd_hms('2019-04-13 01:17:59', tz="Europe/Moscow")
 
 
-  exchange <- 'bitstamp'
-  pair <- 'btcusd'
-
-
-  .depth <- function(con, start.time, end.time, exchange, pair, cache) {
-    bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )
-  }
 
   with_mock(
     `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth,
+    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
     {
       obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
-      actual <- getCachedPeriods(cache, exchange, pair, 'depth')
-      expected  <- data.frame(cached.period.start = c(s1),
-                              cached.period.end = c(e1),
-                              cached.period.rows= as.integer(1559)
-                              )
-
-      expect_equal(actual, expected)
-
+      actual1 <- getCachedPeriods(cache, exchange, pair, 'depth')
       obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
-
-      actual <- getCachedPeriods(cache, exchange, pair, 'depth')
-      expected  <- data.frame(cached.period.start = c(s1, s2),
-                              cached.period.end = c(e1, e2),
-                              cached.period.rows= as.integer(c(1559, 294)))
-      expect_equal(actual, expected)
-
+      actual2 <- getCachedPeriods(cache, exchange, pair, 'depth')
+      obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
+      actual3 <- getCachedPeriods(cache, exchange, pair, 'depth')
     }
+  )
+  expect_equal(actual1, data.frame(cached.period.start=c(with_tz(s1, tz='UTC')),
+                                    cached.period.end=c(with_tz(ceiling_date(e1), tz='UTC')),
+                                    cached.period.rows=as.integer(c(4872)))
+                )
+  expect_equal(actual2, data.frame(cached.period.start=c(with_tz(s1, tz='UTC'),with_tz(s2, tz='UTC')),
+                                   cached.period.end=c(with_tz(ceiling_date(e1), tz='UTC'), with_tz(ceiling_date(e2), tz='UTC')),
+                                   cached.period.rows=as.integer(c(4872, 294)))
+  )
+
+  expect_equal(actual3, data.frame(cached.period.start=c(with_tz(s1, tz='UTC')),
+                                   cached.period.end=c(with_tz(ceiling_date(e2), tz='UTC')),
+                                   cached.period.rows=as.integer(c(5999)))
   )
 
 })
-
-
-
-
-
-
-
-
-
-
