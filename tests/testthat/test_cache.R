@@ -147,10 +147,8 @@ test_that("non-overlapping depths are downloaded from RDBMS", {
   end.time2 <- ymd_hms('2019-04-13 01:14:59', tz=tzone2)
 
 
-  expected_data1 <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time1 & timestamp < end.time1 )
   expected_data2 <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time2 & timestamp < end.time2 )
 
-  expected_data1$timestamp <- with_tz(expected_data1$timestamp, tz=tzone1)  # must be the same tzone as time zone of start.time1
   expected_data2$timestamp <- with_tz(expected_data2$timestamp, tz=tzone2)  # must be the same tzone as time zone of start.time2
 
   expected_queries <- data.frame(start.time=c(with_tz(start.time1, tz='UTC'),with_tz(start.time2, tz='UTC')),
@@ -165,7 +163,7 @@ test_that("non-overlapping depths are downloaded from RDBMS", {
     actual2 <- obAnalyticsDb::depth(con,start.time2, end.time2, exchange, pair, cache = cache)
     }
     )
-  expect_equal(actual1, expected_data1)
+  expect_true(empty(actual1))
   expect_equal(actual2, expected_data2)
   expect_equal(queries, expected_queries)
   })

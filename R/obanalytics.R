@@ -26,10 +26,11 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
   }
   depth <- rbind(starting_depth, depth_changes)
 
-  # Assign timezone of start.time, if any, to timestamp column
-  depth$timestamp <- with_tz(depth$timestamp, tzone)
+  if(!empty(depth)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    depth$timestamp <- with_tz(depth$timestamp, tzone)
+  }
   depth
-
 }
 
 
