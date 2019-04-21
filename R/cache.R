@@ -157,7 +157,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
     if (!empty(cached_interval)) {
       cached_data <- cache[[.cache_leaf_key(head(cached_interval)$s, head(cached_interval)$e)]]
       flog.debug('requested data are found in the cache period %s %s', format(head(cached_interval)$s), format(head(cached_interval)$e), name="obanalyticsdb.cache")
-      data <- cached_data %>%  filter(timestamp >= start.time & timestamp < end.time) %>% arrange(timestamp, -price)
+      data <- cached_data %>%  filter(timestamp >= start.time & timestamp < end.time)
     }
     else
       data <- data.frame()

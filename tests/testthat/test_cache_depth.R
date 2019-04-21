@@ -1,5 +1,4 @@
-context("A depth cache")
-
+context("Generic cache functionality & depth")
 
 setup({
    flog.threshold(futile.logger::DEBUG, 'obanalyticsdb')

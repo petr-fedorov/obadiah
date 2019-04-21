@@ -2,7 +2,7 @@
 
 
 #' @export
-depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE) {
+depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
 
 
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
@@ -19,10 +19,15 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
   end.time <- with_tz(end.time, tz='UTC')
 
   starting_depth <- .starting_depth(conn, start.time, exchange, pair, debug.query)
-  if(is.null(cache))
+  if(is.null(cache) || start.time > cache.bound)
     depth_changes <- .depth_changes(conn, start.time, end.time, exchange, pair, debug.query)
   else {
-    depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .depth_changes, .leaf_cache(cache, exchange, pair, "depth"))
+    if(end.time <= cache.bound )
+      depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .depth_changes, .leaf_cache(cache, exchange, pair, "depth"))
+    else
+      depth_changes <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, .depth_changes, .leaf_cache(cache, exchange, pair, "depth") ),
+                             .depth_changes(conn, cache.bound, end.time, exchange, pair, debug.query)
+                            )
   }
   depth <- rbind(starting_depth, depth_changes)
 
@@ -30,7 +35,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
     # Assign timezone of start.time, if any, to timestamp column
     depth$timestamp <- with_tz(depth$timestamp, tzone)
   }
-  depth
+  depth %>% arrange(timestamp, -price)
 }
 
 
@@ -76,11 +81,39 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 
 #' @export
-spread <- function(conn, start.time, end.time, exchange, pair,  only.different = TRUE, debug.query = FALSE) {
-  tzone <- attr(end.time, "tzone")
+spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL,only.different = TRUE, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
-  start.time <- format(start.time, usetz=T)
-  end.time <- format(end.time, usetz=T)
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+
+  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+
+  tzone <- tz(start.time)
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+  if(is.null(cache) || start.time > cache.bound)
+    spread <- .spread(conn, start.time, end.time, exchange, pair, debug.query)
+  else
+    if(end.time <= cache.bound )
+      spread <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread"))
+  else
+    spread <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread") ),
+                    .spread(conn, cache.bound, end.time, exchange, pair, debug.query)
+    )
+
+  if(!empty(spread)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    spread$timestamp <- with_tz(spread$timestamp, tzone)
+  }
+  spread  %>% arrange(timestamp)
+
+}
+
+.spread <- function(conn, start.time, end.time, exchange, pair,  only.different = TRUE, debug.query = FALSE) {
 
   query <- paste0(" SELECT 	obanalytics._in_milliseconds(timestamp) AS timestamp,
                   \"best.bid.price\",
@@ -96,18 +129,51 @@ spread <- function(conn, start.time, end.time, exchange, pair,  only.different =
                   " ) ORDER BY 1")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
-  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01", tz=tzone)
+  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
   spread
 }
 
 
 
 #' @export
-events <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
-  tzone <- attr(end.time, "tzone")
+events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+
+  flog.debug(paste0("events(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+
+  tzone <- tz(start.time)
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+  if(is.null(cache) || start.time > cache.bound)
+    events <- .events(conn, start.time, end.time, exchange, pair, debug.query)
+  else
+    if(end.time <= cache.bound )
+      events <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .events, .leaf_cache(cache, exchange, pair, "events"))
+    else
+      events <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, .events, .leaf_cache(cache, exchange, pair, "events") ),
+                             .events(conn, cache.bound, end.time, exchange, pair, debug.query)
+      )
+
+  if(!empty(events)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    events$timestamp <- with_tz(events$timestamp, tzone)
+  }
+  events  %>% arrange(event.id)
+}
+
+
+
+.events <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
 
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
+
 
   query <- paste0(" SELECT 	\"event.id\",
                   \"id\"::numeric,
@@ -129,20 +195,49 @@ events <- function(conn, start.time, end.time, exchange, pair, debug.query = FAL
                   ")")
   if(debug.query) cat(query)
   events <- DBI::dbGetQuery(conn, query)
-  events$timestamp <- as.POSIXct(as.numeric(events$timestamp)/1000, origin="1970-01-01", tz=tzone)
   events$action <- factor(events$action, c("created", "changed", "deleted"))
   events$direction <- factor(events$direction, c("bid", "ask"))
   events$type <- factor(events$type, c("unknown", "flashed-limit",
                                        "resting-limit", "market-limit", "pacman", "market"))
+  events$timestamp <- as.POSIXct(as.numeric(events$timestamp)/1000, origin="1970-01-01")
   events
 }
 
 #' @export
-trades <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
-  tzone <- attr(end.time, "tzone")
+trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
 
-  start.time <- format(start.time, usetz=T)
-  end.time <- format(end.time, usetz=T)
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+
+  flog.debug(paste0("trades(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+
+  tzone <- tz(start.time)
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+  if(is.null(cache) || start.time > cache.bound)
+    trades <- .trades(conn, start.time, end.time, exchange, pair, debug.query)
+  else
+    if(end.time <= cache.bound )
+      trades <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .trades, .leaf_cache(cache, exchange, pair, "trades"))
+  else
+    trades <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, .trades, .leaf_cache(cache, exchange, pair, "trades") ),
+                    .trades(conn, cache.bound, end.time, exchange, pair, debug.query)
+    )
+
+  if(!empty(trades)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    trades$timestamp <- with_tz(trades$timestamp, tzone)
+  }
+  trades  %>% arrange(timestamp)
+}
+
+
+.trades <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
 
   query <- paste0(" SELECT 	obanalytics._in_milliseconds(timestamp) AS timestamp,
                   price, volume, direction,
@@ -158,7 +253,7 @@ trades <- function(conn, start.time, end.time, exchange, pair, debug.query = FAL
                   ") ORDER BY timestamp")
   if(debug.query) cat(query)
   trades <- DBI::dbGetQuery(conn, query)
-  trades$timestamp <- as.POSIXct(as.numeric(trades$timestamp)/1000, origin="1970-01-01", tz=tzone)
+  trades$timestamp <- as.POSIXct(as.numeric(trades$timestamp)/1000, origin="1970-01-01")
   trades$direction <- factor(trades$direction, c("buy", "sell"))
 
   trades
