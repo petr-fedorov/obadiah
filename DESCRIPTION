@@ -19,7 +19,8 @@ Imports:
     plyr,
     reshape2,
     zoo,
-    lubridate
+    lubridate,
+    futile.logger
 Suggests: testthat,
     knitr,
     rmarkdown
