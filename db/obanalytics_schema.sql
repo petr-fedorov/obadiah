@@ -31,7 +31,8 @@ ALTER SCHEMA obanalytics OWNER TO "ob-analytics";
 CREATE TYPE obanalytics.level2_depth_record AS (
 	price numeric,
 	volume numeric,
-	side character(1)
+	side character(1),
+	bps_level integer
 );
 
 
@@ -604,7 +605,7 @@ CREATE FUNCTION obanalytics._depth_change(p_ob_before obanalytics.level3[], p_ob
     LANGUAGE sql
     AS $$
 
-select array_agg(row(price, coalesce(af.amount, 0), side)::obanalytics.level2_depth_record  order by price desc)
+select array_agg(row(price, coalesce(af.amount, 0), side, null::integer)::obanalytics.level2_depth_record  order by price desc)
 from (
 	select a.price, sum(a.amount) as amount,a.side
 	from unnest(p_ob_before) a 
