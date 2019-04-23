@@ -266,13 +266,29 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, debug.quer
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
 
-  query <- paste0("SELECT obanalytics._in_milliseconds(timestamp) AS timestamp,
-                  side, bps_level, price, volume FROM obanalytics.oba_depth_summary(",
-                  shQuote(start.time), ",",
-                  shQuote(end.time), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
-                  ") WHERE COALESCE(bps_level,0) <= 500")
+  query <- paste0(" with depth_summary as (
+                  	        select timestamp,
+                                   price,
+                                   volume,
+                                   side,
+                                   bps_level,
+                                   rank() over (partition by obanalytics._in_milliseconds(timestamp) order by timestamp desc) as r
+                            from obanalytics.oba_depth_summary(",
+                                  shQuote(start.time), ",",
+                                  shQuote(end.time), ",",
+                                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
+                                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                          " ))
+                          select obanalytics._in_milliseconds(timestamp) as timestamp,
+                                 side,
+                                 bps_level,
+                                 price,
+                                 volume
+                          from depth_summary
+                          where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently
+                                    -- this is a workaround for the inability of R to handle microseconds in POSIXct
+
+                          order by 1, 2 desc")
   if(debug.query) cat(query)
   df <- DBI::dbGetQuery(conn, query)
   df$timestamp <- as.POSIXct(as.numeric(df$timestamp)/1000, origin="1970-01-01")

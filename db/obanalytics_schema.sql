@@ -38,6 +38,34 @@ CREATE TYPE obanalytics.level2_depth_record AS (
 
 ALTER TYPE obanalytics.level2_depth_record OWNER TO "ob-analytics";
 
+--
+-- Name: level2_depth_summary_internal_state; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TYPE obanalytics.level2_depth_summary_internal_state AS (
+	full_depth obanalytics.level2_depth_record[],
+	bps_step integer,
+	max_bps_level integer,
+	pair_id smallint
+);
+
+
+ALTER TYPE obanalytics.level2_depth_summary_internal_state OWNER TO "ob-analytics";
+
+--
+-- Name: level2_depth_summary_record; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TYPE obanalytics.level2_depth_summary_record AS (
+	price numeric,
+	volume numeric,
+	side character(1),
+	bps_level integer
+);
+
+
+ALTER TYPE obanalytics.level2_depth_summary_record OWNER TO "ob-analytics";
+
 SET default_tablespace = '';
 
 SET default_with_oids = false;
@@ -576,14 +604,15 @@ begin
 	if p_depth is null then
 		p_depth := array(	select row(price,  
 											sum(amount),
-									   		side
+									   		side,
+									   		null
 										 )::obanalytics.level2_depth_record
 								 from obanalytics.order_book( p_microtimestamp, p_pair_id, p_exchange_id,
 															p_only_makers := true,p_before := true) join unnest(ob) on true
 								 group by ts, price, side
 					  );
 	end if;
-	return array(  select row(price, volume, side)::obanalytics.level2_depth_record
+	return array(  select row(price, volume, side, null)::obanalytics.level2_depth_record
 					from (
 						select coalesce(d.price, c.price) as price, coalesce(c.volume, d.volume) as volume, coalesce(d.side, c.side) as side
 						from unnest(p_depth) d full join unnest(p_depth_change) c using (price, side)
@@ -624,6 +653,81 @@ $$;
 
 
 ALTER FUNCTION obanalytics._depth_change(p_ob_before obanalytics.level3[], p_ob_after obanalytics.level3[]) OWNER TO "ob-analytics";
+
+--
+-- Name: _depth_summary(obanalytics.level2_depth_summary_internal_state); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._depth_summary(p_depth obanalytics.level2_depth_summary_internal_state) RETURNS obanalytics.level2_depth_record[]
+    LANGUAGE sql STABLE
+    AS $$
+
+with depth as (
+	select price, volume, side
+	from unnest(p_depth.full_depth) d
+),	
+depth_with_best_prices as (
+	select min(price) filter(where side = 's') over () as best_ask_price, 
+			max(price) filter(where side = 'b') over () as best_bid_price, 
+			price,
+			volume as amount,
+			side
+	from depth
+),
+depth_with_bps_levels as (
+	select amount, 
+			price,
+			side,
+			case side
+				when 's' then ceiling((price-best_ask_price)/best_ask_price/p_depth.bps_step*10000)::numeric	
+				when 'b' then ceiling((best_bid_price-price)/best_bid_price/p_depth.bps_step*10000)::numeric	
+			end*p_depth.bps_step as bps_level,
+			best_ask_price,
+			best_bid_price
+	from depth_with_best_prices
+),
+depth_with_price_adjusted as (
+	select amount,
+			case side
+				when 's' then round(best_ask_price*(1 + bps_level/10000), (select "R0" from obanalytics.pairs where pair_id = p_depth.pair_id)) 
+				when 'b' then round(best_bid_price*(1 - bps_level/10000), (select "R0" from obanalytics.pairs where pair_id = p_depth.pair_id)) 
+			end as price,
+			side,
+			bps_level
+	from depth_with_bps_levels 
+	where bps_level <= p_depth.max_bps_level
+),
+depth_summary as (
+	select price, 
+			sum(amount), 
+			side, 
+			bps_level::bigint
+	from depth_with_price_adjusted
+	group by 1, 3, 4
+)
+select array_agg(depth_summary::obanalytics.level2_depth_record)
+from depth_summary
+
+$$;
+
+
+ALTER FUNCTION obanalytics._depth_summary(p_depth obanalytics.level2_depth_summary_internal_state) OWNER TO "ob-analytics";
+
+--
+-- Name: _depth_summary_after_depth_change(obanalytics.level2_depth_summary_internal_state, obanalytics.level2_depth_record[], timestamp with time zone, integer, integer, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._depth_summary_after_depth_change(p_internal_state obanalytics.level2_depth_summary_internal_state, p_depth_change obanalytics.level2_depth_record[], p_microtimestamp timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer) RETURNS obanalytics.level2_depth_summary_internal_state
+    LANGUAGE sql STABLE
+    AS $$
+select obanalytics._depth_after_depth_change(p_internal_state.full_depth, p_depth_change, p_microtimestamp, p_pair_id, p_exchange_id),
+		p_bps_step, 
+		p_max_bps_level,
+		p_pair_id::smallint;
+$$;
+
+
+ALTER FUNCTION obanalytics._depth_summary_after_depth_change(p_internal_state obanalytics.level2_depth_summary_internal_state, p_depth_change obanalytics.level2_depth_record[], p_microtimestamp timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer) OWNER TO "ob-analytics";
 
 --
 -- Name: _drop_leaf_level1_partition(text, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1488,67 +1592,31 @@ $$;
 ALTER FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_starting_depth boolean, p_depth_changes boolean) OWNER TO "ob-analytics";
 
 --
--- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, integer, integer, numeric); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: oba_depth_summary(timestamp with time zone, timestamp with time zone, integer, integer, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step numeric DEFAULT 25) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text, bps_level bigint)
+CREATE FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer DEFAULT 25, p_max_bps_level integer DEFAULT 500) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text, bps_level integer)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
-
-with
-depth as (
-	select microtimestamp as ts, pair_id, (unnest(d)).*
-	from (
-		select microtimestamp, pair_id, obanalytics.restore_depth_agg(depth_change, microtimestamp, pair_id, exchange_id ) over (order by microtimestamp) as d
-		from obanalytics.level2_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id)
-	) a 
-),
-depth_with_best_prices as (
-	select min(price) filter(where side = 's') over (partition by ts) as best_ask_price, 
-			max(price) filter(where side = 'b') over (partition by ts) as best_bid_price, 
-			ts, price, volume as amount, side, pair_id
-	from depth
-),
-depth_with_bps_levels as (
-	select ts, 
-			amount, 
-			price,
-			side,
-			case side
-				when 's' then ceiling((price-best_ask_price)/best_ask_price/p_bps_step*10000)::bigint
-				when 'b' then ceiling((best_bid_price - price)/best_bid_price/p_bps_step*10000)::bigint
-			end as bps_level,
-			best_ask_price,
-			best_bid_price,
-			pair_id
-	from depth_with_best_prices
-),
-depth_with_price_adjusted as (
-	select ts,
-			amount,
-			case side
-				when 's' then round(best_ask_price*(1 + bps_level*p_bps_step/10000), pairs."R0" )
-				when 'b' then round(best_bid_price*(1 - bps_level*p_bps_step/10000), pairs."R0" ) 
-			end as price,
-			side,
-			bps_level,
-			rank() over (partition by obanalytics._in_milliseconds(ts) order by ts desc) as r
-	from depth_with_bps_levels join obanalytics.pairs using (pair_id)
+with depth_summary as (
+	select microtimestamp, 
+			(unnest(obanalytics.depth_summary_agg(depth_change, microtimestamp, pair_id, exchange_id, p_bps_step, p_max_bps_level ) over (order by microtimestamp))).*,
+			rank() over (partition by obanalytics._in_milliseconds(microtimestamp) order by microtimestamp desc) as r
+	from obanalytics.level2_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id)
 )
-select ts, 
+select microtimestamp,
 		price, 
-		sum(amount) as volume, 
+		volume, 
 		case side when 's' then 'ask'::text when 'b' then 'bid'::text end, 
-		bps_level*p_bps_step::bigint
-from depth_with_price_adjusted
-where r = 1	-- if rounded to milliseconds ts are not unique, we'll take the LasT one and will drop the first silently
-			 -- this is a workaround for the inability of R to handle microseconds in POSIXct 
-group by 1, 2, 4, 5
+		bps_level
+from depth_summary
+where r = 1; -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently
+			  -- this is a workaround for the inability of R to handle microseconds in POSIXct 
 
 $$;
 
 
-ALTER FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step numeric) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_events(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2281,6 +2349,19 @@ $$;
 
 
 ALTER FUNCTION obanalytics.summary(p_exchange text, p_pair text, p_start_time timestamp with time zone, p_end_time timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: depth_summary_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer, integer, integer); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE AGGREGATE obanalytics.depth_summary_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer, integer, integer) (
+    SFUNC = obanalytics._depth_summary_after_depth_change,
+    STYPE = obanalytics.level2_depth_summary_internal_state,
+    FINALFUNC = obanalytics._depth_summary
+);
+
+
+ALTER AGGREGATE obanalytics.depth_summary_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer, integer, integer) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_agg(obanalytics.level3[], boolean); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
@@ -9566,10 +9647,10 @@ GRANT ALL ON FUNCTION obanalytics.oba_depth(p_start_time timestamp with time zon
 
 
 --
--- Name: FUNCTION oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step numeric); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+-- Name: FUNCTION oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
 --
 
-GRANT ALL ON FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step numeric) TO obauser;
+GRANT ALL ON FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer) TO obauser;
 
 
 --
