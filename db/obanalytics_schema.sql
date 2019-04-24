@@ -1600,8 +1600,7 @@ CREATE FUNCTION obanalytics.oba_depth_summary(p_start_time timestamp with time z
     AS $$
 with depth_summary as (
 	select microtimestamp, 
-			(unnest(obanalytics.depth_summary_agg(depth_change, microtimestamp, pair_id, exchange_id, p_bps_step, p_max_bps_level ) over (order by microtimestamp))).*,
-			rank() over (partition by obanalytics._in_milliseconds(microtimestamp) order by microtimestamp desc) as r
+			(unnest(obanalytics.depth_summary_agg(depth_change, microtimestamp, pair_id, exchange_id, p_bps_step, p_max_bps_level ) over (order by microtimestamp))).*
 	from obanalytics.level2_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id)
 )
 select microtimestamp,
@@ -1609,9 +1608,7 @@ select microtimestamp,
 		volume, 
 		case side when 's' then 'ask'::text when 'b' then 'bid'::text end, 
 		bps_level
-from depth_summary
-where r = 1; -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently
-			  -- this is a workaround for the inability of R to handle microseconds in POSIXct 
+from depth_summary;
 
 $$;
 

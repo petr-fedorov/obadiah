@@ -466,41 +466,63 @@ $$;
 ALTER FUNCTION bitfinex.match_price_and_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id smallint, p_max_delay interval) OWNER TO "ob-analytics";
 
 --
--- Name: match_price_and_sum_of_fill_exact(timestamp with time zone, timestamp with time zone, smallint, interval, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+-- Name: match_price_and_sum_of_fill_exact(timestamp with time zone, timestamp with time zone, smallint, interval, integer, integer); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id smallint, p_max_delay interval DEFAULT '00:00:01'::interval, p_max_group_size integer DEFAULT 3) RETURNS SETOF obanalytics.matches
+CREATE FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id smallint, p_max_delay interval DEFAULT '00:00:01'::interval, p_max_group_size integer DEFAULT 3, p_max_set_size integer DEFAULT 10) RETURNS SETOF obanalytics.matches
     LANGUAGE sql
     AS $$
 
-with recursive matches_gs as (
+with recursive matches_set_starts as (
 	select tableoid, ctid, 
-		(buy_order_id is null and sell_order_id is null and (lag(buy_order_id) over w is not null or lag(sell_order_id) over w is not null))::integer as gs, * 
+		(buy_order_id is null and sell_order_id is null 
+		 and ( (lag(buy_order_id) over w is not null or lag(sell_order_id) over w is not null ) 
+			    or (lag(side) over w <> side)
+			 	or (lag(price) over w <> price)
+			 )
+		)::integer as set_start, * 
 	from obanalytics.matches_bitfinex
 	where pair_id = p_pair_id
 	  and microtimestamp between p_start_time and p_end_time																	  
 	window w as (order by microtimestamp)
 ),
-matches_gr as (
-	select sum(gs)  over (order by microtimestamp) as gr, *
-	from matches_gs
-	where buy_order_id is null and sell_order_id is null
+matches_sets as (
+	select *, count(*) over (partition by set_id) as set_size
+	from (
+		select sum(set_start)  over (order by microtimestamp) as set_id, *
+		from matches_set_starts
+		where buy_order_id is null and sell_order_id is null
+	) m
 ),
-matches as (
-	select 1 as n, gr, microtimestamp as trade_microtimestamp, amount as fill, price, side as origination, array_append('{}', row(tableoid,ctid)) as ctids
-	from matches_gr																													  
+matches_by_groups as (
+	select 1 as group_size, set_id, microtimestamp as trade_microtimestamp, amount as fill, price, side as origination, array_append('{}', row(tableoid,ctid)) as ctids
+	from matches_sets
+	where set_size <= p_max_set_size
 	union all
-	select n+1, matches_gr.gr, matches_gr.microtimestamp, matches_gr.amount + fill, matches_gr.price, matches_gr.side,  array_append(ctids, row(tableoid,ctid))
-	from matches join matches_gr on matches_gr.microtimestamp > trade_microtimestamp 
-									 and matches.gr = matches_gr.gr
-									 and matches.price = matches_gr.price
-									 and matches.origination = matches_gr.side
-	where matches.n < p_max_group_size
-),					 
+	select group_size+1, matches_sets.set_id, matches_sets.microtimestamp, matches_sets.amount + fill, matches_sets.price, matches_sets.side,  array_append(ctids, row(tableoid,ctid))
+	from matches_by_groups join matches_sets on matches_sets.microtimestamp > trade_microtimestamp 
+								     and matches_sets.set_size <= p_max_set_size
+									 and matches_by_groups.set_id = matches_sets.set_id
+									 and matches_by_groups.price = matches_sets.price
+									 and matches_by_groups.origination = matches_sets.side
+	where matches_by_groups.group_size < p_max_group_size
+),
+matches_by_sets as (
+	select matches_sets.set_size, matches_sets.set_id, matches_sets.microtimestamp, sum(amount), matches_sets.price, matches_sets.side, 
+	array_agg(row(tableoid,ctid))
+	from matches_sets
+	where set_size > p_max_group_size
+	group by 1, 2, 3, 5, 6
+), 
+matches as (
+	select * from matches_by_groups
+	union all
+	select * from matches_by_sets
+),
 for_update_base as (
 	select distinct on (microtimestamp, order_id, event_no) *
 	from bitfinex._level3_matchable_events(p_start_time, p_end_time, p_pair_id ) 
-		  join (select * from matches where n > 1 ) a using (price, fill)
+		  join (select * from matches where group_size > 1 ) a using (price, fill)
 	where microtimestamp between trade_microtimestamp  and trade_microtimestamp + p_max_delay
 	  and side <> origination
 	order by microtimestamp, order_id, event_no, trade_microtimestamp
@@ -517,7 +539,7 @@ for_update as (
 updated_matches as (
 	update obanalytics.matches_bitfinex
 	set buy_order_id = case when for_update.side = 'b' then order_id else buy_order_id end,
-		buy_event_no = case when for_update.side = 'b' then event_no else buy_order_id end,
+		buy_event_no = case when for_update.side = 'b' then event_no else buy_event_no end,
 		sell_order_id = case when for_update.side = 's' then order_id else sell_order_id end,
 		sell_event_no = case when for_update.side = 's' then event_no else sell_event_no end,
 		microtimestamp = for_update.microtimestamp
@@ -566,7 +588,7 @@ from updated_matches;
 $$;
 
 
-ALTER FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id smallint, p_max_delay interval, p_max_group_size integer) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id smallint, p_max_delay interval, p_max_group_size integer, p_max_set_size integer) OWNER TO "ob-analytics";
 
 --
 -- Name: pga_capture_transient(text, interval, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
