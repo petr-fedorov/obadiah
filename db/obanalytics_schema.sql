@@ -1850,22 +1850,33 @@ with order_book as (
 		  join unnest(ob) d on true
 ),
 order_book_bps_lvl as (
-	select ts, order_id, microtimestamp, price_microtimestamp,  price, amount, sum(amount) over (order by price) as liquidity, 
-			round((price-best_ask_price)/best_ask_price*10000,2) as bps, side, row_number() over (order by price) as lvl
+	select ts, order_id, microtimestamp, price_microtimestamp,  price,
+			coalesce(amount,0) as amount,
+			sum(coalesce(amount,0)) over w as liquidity, 
+			round((price-best_ask_price)/best_ask_price*10000,2) as bps, side,
+			dense_rank() over (order by price) as lvl,
+			row_number() over w as o
 	from order_book
 	where side = 's'
+	window w as (order by price, microtimestamp, order_id)
 	union all
-	select ts, order_id,  microtimestamp, price_microtimestamp, price, amount, sum(amount) over (order by price desc) as liquidity,
-			round((best_bid_price-price)/best_bid_price*10000,2) as bps, side, row_number() over (order by price)
+	select ts, order_id,  microtimestamp, price_microtimestamp, price, 
+			coalesce(amount,0) as amount, sum(coalesce(amount,0)) over w as liquidity, 
+			round((best_bid_price-price)/best_bid_price*10000,2) as bps, side, 
+			dense_rank() over (order by price desc),
+			-row_number() over w as o
 	from order_book
 	where side = 'b'
-	order by side, price desc
+	window w as (order by price desc, microtimestamp, order_id)
 )
 select ts, order_id, microtimestamp, price_microtimestamp, price, amount, liquidity, bps, side 
 from order_book_bps_lvl
 where bps <= coalesce(p_bps_range, bps)
   and lvl <= coalesce(p_max_levels, lvl)
-  and ( (side = 'b' and price >= coalesce(p_min_bid, price)) or (side = 's' and price <= coalesce(p_max_ask, price)));
+  and ( (side = 'b' and price >= coalesce(p_min_bid, price)) or (side = 's' and price <= coalesce(p_max_ask, price)))
+order by o desc
+  
+  ;
 
 $$;
 
