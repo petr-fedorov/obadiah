@@ -117,18 +117,25 @@ sells_already_matched as (
 	  and sell_event_no is not null
 	group by 1, 2 ,3
 )
-select microtimestamp, order_id, event_no, price, coalesce(nullif(fill,0), amount) - coalesce(already_matched,0) as fill, side
+select microtimestamp, order_id, event_no, price,
+		case when next_microtimestamp = '-infinity' then coalesce(nullif(fill,0), amount) - coalesce(already_matched,0)
+			  when next_microtimestamp > '-infinity' then coalesce(fill,0) - coalesce(already_matched,0)
+	    end	as fill, 
+		side
 from obanalytics.level3_bitfinex left join buys_already_matched using (microtimestamp, order_id, event_no)
 where pair_id = p_pair_id
   and microtimestamp between p_start_time and p_end_time
   and side = 'b'																			  
 union all
-select microtimestamp, order_id, event_no, price, coalesce(nullif(fill,0), amount) - coalesce(already_matched,0)  as fill, side
+select microtimestamp, order_id, event_no, price, 
+		case when next_microtimestamp = '-infinity' then coalesce(nullif(fill,0), amount) - coalesce(already_matched,0)
+			  when next_microtimestamp > '-infinity' then coalesce(fill,0) - coalesce(already_matched,0)
+	    end	as fill, 
+		side
 from obanalytics.level3_bitfinex left join sells_already_matched using (microtimestamp, order_id, event_no)
 where pair_id = p_pair_id
   and side = 's'																			  
   and microtimestamp between p_start_time and p_end_time;
-
 
 $$;
 
