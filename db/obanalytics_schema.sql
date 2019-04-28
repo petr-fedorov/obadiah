@@ -2302,8 +2302,8 @@ with periods as (
 level3_base as (
 	select * 
 	from obanalytics.level3 
-	where exchange_id in ( select exchange_id from obanalytics.exchanges where exchange = coalesce(p_exchange, exchange))
-	  and pair_id in ( select pair_id from obanalytics.pairs where pair = coalesce(p_pair, pair))
+	where exchange_id in ( select exchange_id from obanalytics.exchanges where exchange = coalesce(lower(p_exchange), exchange))
+	  and pair_id in ( select pair_id from obanalytics.pairs where pair = coalesce(upper(p_pair), pair))
 	  and microtimestamp  between p_start_time and p_end_time
 ),
 events as (		
@@ -2322,8 +2322,8 @@ events as (
 matches_base as (
 	select *
 	from obanalytics.matches
-	where exchange_id in ( select exchange_id from obanalytics.exchanges where exchange = coalesce(p_exchange, exchange))
-	  and pair_id in ( select pair_id from obanalytics.pairs where pair = coalesce(p_pair, pair))
+	where exchange_id in ( select exchange_id from obanalytics.exchanges where exchange = coalesce(lower(p_exchange), exchange))
+	  and pair_id in ( select pair_id from obanalytics.pairs where pair = coalesce(upper(p_pair), pair))
 	  and microtimestamp  between p_start_time and p_end_time
 ),
 trades as (		
