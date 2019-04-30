@@ -1276,7 +1276,8 @@ BEGIN
 		update bitstamp.live_orders 
 		set microtimestamp = new.microtimestamp,
 			local_timestamp = new.local_timestamp
-		where microtimestamp >= v_era -- existing order_created's microtimestamp equals either v_era or datetime (in case ex-nihilo was received with datetime > v_era)
+		where microtimestamp between v_era and new.microtimestamp -- existing order_created's microtimestamp equals either v_era or datetime 
+																	-- (in case ex-nihilo was received with datetime > v_era) and is earlier than new.microtimestamp
 		  and  order_id = new.order_id 
 		  and order_type = new.order_type 
 		  and event = 'order_created'
@@ -1378,23 +1379,10 @@ CREATE FUNCTION bitstamp.live_orders_manage_orig_microtimestamp() RETURNS trigge
     LANGUAGE plpgsql
     AS $$ 
 BEGIN
-	CASE TG_OP
-		WHEN 'INSERT' THEN 
-			IF NEW.orig_microtimestamp <> NEW.microtimestamp THEN 	-- orig_microtimestamp can be either NULL or equal to NEW.microtimestamp
-				RAISE EXCEPTION 'Attempt to set orig_microtimestamp to % while microtimestamp is %', NEW.orig_microtimestamp, NEW.microtimestamp;
-			END IF;
-		WHEN 'UPDATE' THEN 
-			IF OLD.orig_microtimestamp IS NULL THEN
-				IF OLD.microtimestamp <> NEW.microtimestamp THEN
-					NEW.orig_microtimestamp := OLD.microtimestamp;
-				END IF;
-			ELSE
-				IF NEW.orig_microtimestamp IS DISTINCT FROM OLD.orig_microtimestamp THEN 
-					RAISE EXCEPTION 'Attempt to change orig_microtimestamp from % to %', OLD.orig_microtimestamp, NEW.orig_microtimestamp;
-				END IF;
-			END IF;
-	END CASE;
-	RETURN NEW;
+	if TG_OP =  'UPDATE' and old.orig_microtimestamp is null and  old.microtimestamp <> new.microtimestamp then 
+					new.orig_microtimestamp := old.microtimestamp;
+	end if;
+	return new;
 END;
 	
 
@@ -1701,9 +1689,12 @@ insert into obanalytics.level3_bitstamp ( microtimestamp, order_id, event_no, si
 select microtimestamp, order_id, event_no, case order_type when 'buy' then 'b'::character(1) when 'sell' then 's' end, price, amount, fill, 
 		case when next_microtimestamp <= p_end_time then next_microtimestamp else 'infinity' end, 
 		case when next_microtimestamp <= p_end_time then next_event_no else null end, 
-		pair_id, local_timestamp, price_microtimestamp, price_event_no, orig_microtimestamp
+		pair_id, local_timestamp,
+		price_microtimestamp,
+		price_event_no,
+		orig_microtimestamp
 from to_be_inserted
-order by microtimestamp
+order by microtimestamp, event_no
 on conflict (pair_id, side, microtimestamp, order_id, event_no) do update 
 																	 set next_microtimestamp = excluded.next_microtimestamp, 
 																		  next_event_no = excluded.next_event_no
@@ -2182,16 +2173,7 @@ CREATE FUNCTION bitstamp.order_book(p_ts timestamp with time zone, p_pair_id sma
     LANGUAGE sql STABLE
     AS $$
 
-	with episode as (
-			select microtimestamp as e, pair_id, (select max(era) from bitstamp.live_orders_eras where era <= p_ts and pair_id = p_pair_id ) as s
-			from bitstamp.live_orders
-			where microtimestamp >= (select max(era) from bitstamp.live_orders_eras where era <= p_ts and pair_id = p_pair_id )
-			  and ( microtimestamp < p_ts or ( microtimestamp = p_ts and not p_before ) )
-		      and pair_id = p_pair_id
-			order by microtimestamp desc
-			limit 1
-		), 
-		orders as (
+	with orders as (
 			select *, 
 					coalesce(
 						case order_type 
@@ -2200,12 +2182,15 @@ CREATE FUNCTION bitstamp.order_book(p_ts timestamp with time zone, p_pair_id sma
 						end,
 					true )	-- if there are only 'buy' or 'sell' orders in the order book at some moment in time, then all of them are makers
 					as is_maker
-			from bitstamp.live_orders join episode using (pair_id)
-			where microtimestamp between episode.s and episode.e
-			  and next_microtimestamp > episode.e
+			from bitstamp.live_orders 
+			where microtimestamp >= (select max(era) from bitstamp.live_orders_eras where era <= p_ts and pair_id = p_pair_id )
+			  and case when p_before then  microtimestamp < p_ts and next_microtimestamp >= p_ts 
+						when not p_before then microtimestamp <= p_ts and next_microtimestamp > p_ts 
+		  	      end
+			  and pair_id = p_pair_id
 			  and event <> 'order_deleted'
 		)
-	select e,
+	select (select max(microtimestamp) from orders ),
 			price,
 			amount,
 			order_type,
@@ -2684,73 +2669,194 @@ $$;
 ALTER FUNCTION bitstamp.pga_spread(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: pga_transfer(text, timestamp with time zone, interval, boolean); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+-- Name: pga_transfer(text, timestamp with time zone, interval, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval, p_remove_era boolean DEFAULT NULL::boolean) RETURNS integer
+CREATE FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '06:00:00'::interval) RETURNS integer
     LANGUAGE plpgsql
     AS $$
 declare
-	v_start timestamptz;
-	v_end timestamptz;
+	v_era_start timestamptz;
+	v_next_era_start timestamptz;
+	
+	v_period_start timestamptz;
+	v_period_end timestamptz;
+	
+	v_month_start timestamptz;
+	v_month_end timestamptz;
+	v_is_new_era boolean default false;
+	v_remove_era boolean;
 	
 	v_pair_id smallint;
+	v_exchange_id smallint;
 	
 begin 
 
 	select pair_id into strict v_pair_id
 	from obanalytics.pairs where pair = upper(p_pair);
 	
+	select exchange_id into strict v_exchange_id
+	from obanalytics.exchanges where exchange = 'bitstamp';
+
+	
 	with eras as (
 		select era, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity'::timestamptz) as next_era
 		from bitstamp.live_orders_eras
 		where pair_id = v_pair_id
 	)
-	select era, next_era into strict v_start, v_end
+	select era, next_era into strict v_era_start, v_next_era_start
 	from eras
 	where coalesce(p_ts_within_era, 'infinity'::timestamptz) between era and next_era;
 	
 	insert into obanalytics.level3_eras (era, pair_id, exchange_id)
-	select v_start, v_pair_id, exchange_id
-	from obanalytics.exchanges 
-	where exchange = 'bitstamp'
+	values (v_era_start, v_pair_id, v_exchange_id)
 	on conflict do nothing;
 	
-	if v_end = 'infinity'::timestamptz then	-- this is the last known era, so p_delay must be applied ...
-		if p_remove_era is null or not p_remove_era then 
-			select max(microtimestamp) - p_delay into strict v_end
-			from bitstamp.live_orders
-			where pair_id = v_pair_id
-			  and microtimestamp  >= v_start;
-
-			p_remove_era := false;
+	-- Europe/Moscow is essential for correct handling of level3 partition boundaries
+	v_period_start := v_era_start at time zone 'Europe/Moscow' at time zone 'Europe/Moscow';
+	
+	if v_next_era_start = 'infinity'::timestamptz then	-- this is the last known era, so p_delay must be applied ...
+		
+		select max(microtimestamp) - p_delay into strict v_period_end
+		from bitstamp.live_orders
+		where pair_id = v_pair_id
+		  and microtimestamp  >= v_era_start;
+		  
+		if v_period_start + p_max_interval < v_period_end then
+			v_period_end := v_period_start + p_max_interval;
 		end if;
+		
+		v_remove_era := false;
 	else
-		p_remove_era := true;
+		v_period_end := v_next_era_start - '00:00:00.000001'::interval;
+		
+		if v_period_start + p_max_interval < v_period_end then 
+			v_period_end := v_period_start + p_max_interval;
+			v_remove_era := false;
+		else
+			v_remove_era := true;
+		end if;
+
 	end if;
 	
-	raise debug 'v_start: %, v_end: %,  p_remove_era: %', v_start, v_end, p_remove_era;
+	v_period_end := v_period_end at time zone 'Europe/Moscow' at time zone 'Europe/Moscow';
 	
-	perform bitstamp.move_events(v_start, v_end, v_pair_id);
-	perform bitstamp.move_trades(v_start, v_end, v_pair_id);
-	 
-	if p_remove_era then
+	-- obanalytics.level3 partitions boundaries are set in Europe/Moscow time zone
+	if date_part('month', v_period_start) = date_part('month', v_period_end) then
+		raise debug 'v_period_start: %, v_period_end: %,  v_remove_era: %', v_period_start, v_period_end, v_remove_era;
+		perform bitstamp.move_events(v_period_start, v_period_end, v_pair_id);
+		perform bitstamp.move_trades(v_period_start, v_period_end, v_pair_id);
+	else
+		v_month_start := v_period_start;
+		v_month_end := date_trunc('month', v_period_start + '1 month'::interval)  - '00:00:00.000001'::interval;
+		
+		while v_month_start <= v_period_end loop
+			raise log 'Move by month: v_month_start: %, v_month_end: %,  pair: %', v_month_start, v_month_end, p_pair;
+			
+			perform bitstamp.move_events(v_month_start, v_month_end, v_pair_id);
+			perform bitstamp.move_trades(v_month_start, v_month_end, v_pair_id);
+			
+			if date_trunc('month', v_month_start + '1 month'::interval) <= v_period_end then 
+				-- there will be next month/next era, so prepare for it
+				
+				v_era_start := date_trunc('month', v_month_start + '1 month'::interval);
+			
+				insert into obanalytics.level3_eras (era, pair_id, exchange_id)
+				values (v_era_start, v_pair_id, v_exchange_id);
+				
+				insert into bitstamp.live_orders_eras (era, pair_id)
+				values (v_era_start, v_pair_id);
+
+				with active_orders as (
+					select *
+					from bitstamp.live_orders
+					where pair_id = v_pair_id
+					  and microtimestamp between v_month_start and v_month_end
+				)
+				insert into bitstamp.live_orders
+				select v_era_start,
+						o.order_id,
+						1,
+						'order_created', 
+						o.order_type,
+						o.price, 
+						o.amount,
+						o.fill,
+						o.next_microtimestamp,
+						case when isfinite(o.next_microtimestamp) then 2 else null end, 
+						o.trade_id,
+						o.orig_microtimestamp,
+						o.pair_id,
+						o.local_timestamp,
+						o.datetime,
+						v_era_start as price_microtimestamp,
+						1::smallint as price_event_no
+				from bitstamp.order_book(v_month_end, v_pair_id, false, false ) join active_orders o using (microtimestamp, order_id, event_no);
+				raise debug 'started new era';
+				
+				with recursive deleted as (
+					delete from bitstamp.live_orders
+					where pair_id = v_pair_id
+					  and microtimestamp between v_month_start and v_month_end
+					returning *
+				),
+				for_update as (
+					select *
+					from (
+						select distinct on (order_id) next_microtimestamp as microtimestamp, order_id, next_event_no as event_no, 2 as new_event_no 
+						from deleted
+						order by order_id, event_no desc
+					) last_deleted
+					union all
+					select next_microtimestamp as microtimestamp, order_id, next_event_no as event_no, new_event_no + 1 as new_event_no 
+					from for_update join bitstamp.live_orders using (microtimestamp, order_id, event_no)
+					where isfinite(next_microtimestamp)
+				)
+				update bitstamp.live_orders
+				   set event_no = new_event_no,
+						price_microtimestamp = case when price_microtimestamp <= v_era_start then v_era_start else price_microtimestamp end,
+						price_event_no = case when price_microtimestamp <= v_era_start then 1 else price_event_no end
+				from for_update
+				where live_orders.microtimestamp = for_update.microtimestamp
+				  and live_orders.order_id = for_update.order_id
+				  and live_orders.event_no = for_update.event_no;
+
+				delete from bitstamp.live_orders_eras
+				where pair_id = v_pair_id 
+				  and era = v_month_start;
+
+				raise debug 'updated';				  
+				set constraints all immediate;
+				set constraints all deferred;
+				raise debug 'enforced constraints';				  
+				  
+			end if;
+			v_month_start = date_trunc('month', v_month_start + '1 month'::interval);
+			v_month_end := date_trunc('month', v_month_start + '1 month'::interval) - '00:00:00.000001'::interval;
+
+			if v_month_end > v_period_end then
+				v_month_end = v_period_end;
+			end if;
+																					 
+		end loop;
+		
+	end if;
+
+	if v_remove_era then
 		delete from bitstamp.live_orders_eras
 		where pair_id = v_pair_id
-		  and era = v_start;
-		  
+		  and era = v_era_start;
+	
 		delete from bitstamp.live_orders
 		where pair_id = v_pair_id
-		  and microtimestamp between v_start and v_end;
-		  
+		  and microtimestamp between v_era_start and v_period_end;
 	end if;
- 
 	return 0;
 end;
 $$;
 
 
-ALTER FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone, p_delay interval, p_remove_era boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone, p_delay interval, p_max_interval interval) OWNER TO "ob-analytics";
 
 --
 -- Name: protect_columns(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
