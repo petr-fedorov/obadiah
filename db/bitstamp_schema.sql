@@ -2672,7 +2672,7 @@ ALTER FUNCTION bitstamp.pga_spread(p_pair text, p_max_interval interval, p_ts_wi
 -- Name: pga_transfer(text, timestamp with time zone, interval, interval); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '06:00:00'::interval) RETURNS integer
+CREATE FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT NULL::interval) RETURNS integer
     LANGUAGE plpgsql
     AS $$
 declare
@@ -2722,7 +2722,7 @@ begin
 		where pair_id = v_pair_id
 		  and microtimestamp  >= v_era_start;
 		  
-		if v_period_start + p_max_interval < v_period_end then
+		if p_max_interval is not null and v_period_start + p_max_interval < v_period_end then
 			v_period_end := v_period_start + p_max_interval;
 		end if;
 		
@@ -2730,7 +2730,7 @@ begin
 	else
 		v_period_end := v_next_era_start - '00:00:00.000001'::interval;
 		
-		if v_period_start + p_max_interval < v_period_end then 
+		if  p_max_interval is not null and v_period_start + p_max_interval < v_period_end then 
 			v_period_end := v_period_start + p_max_interval;
 			v_remove_era := false;
 		else
