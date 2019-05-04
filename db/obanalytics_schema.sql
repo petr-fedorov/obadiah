@@ -1909,45 +1909,7 @@ CREATE FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_
 	from obanalytics.level1 
 	where pair_id = p_pair_id
 	  and exchange_id = p_exchange_id
-	  and microtimestamp between p_start_time and p_end_time
-	union all
-	select *
-	from (
-		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_start_time
-		from obanalytics.level1 
-		where pair_id = p_pair_id
-		  and exchange_id = p_exchange_id
-		  and microtimestamp = (select max(microtimestamp) 
-								from obanalytics.level1 
-								where pair_id = p_pair_id
-								 and exchange_id = p_exchange_id
-								 and microtimestamp < p_start_time
-								 and microtimestamp >= ( select max(era)
-													   	  from obanalytics.level3_eras
-													      where pair_id = p_pair_id 
-													        and exchange_id = p_exchange_id
-													        and era < p_start_time )
-							    )
-	) a
-	union all
-	select *
-	from (
-		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, p_end_time 
-		from obanalytics.level1 
-		where pair_id = p_pair_id
-		  and exchange_id = p_exchange_id
-		  and microtimestamp = (select max(microtimestamp) 
-								from obanalytics.level1 
-								where pair_id = p_pair_id
-								 and exchange_id = p_exchange_id
-								 and microtimestamp <= p_end_time
-								 and microtimestamp >= ( select max(era)
-													   	  from obanalytics.level3_eras
-													      where pair_id = p_pair_id 
-													        and exchange_id = p_exchange_id
-													        and era <= p_end_time )								
-							    )
-	) a
+	  and microtimestamp between p_start_time and p_end_time;
 	
 $$;
 
