@@ -155,17 +155,17 @@ test_that('spread returned from the cache and from RDBMS are the same',{
 
 
   # internally all time objects have to be explicitly converted to UTC
-  expected_queries  <- data.frame(start.time = c(with_tz(s1, tz='UTC'),
-                                                 with_tz(s2, tz='UTC'),
+  expected_queries  <- data.frame(start.time = c(with_tz(s1, tz='UTC') - seconds(10),
+                                                 with_tz(s2, tz='UTC') - seconds(10),
                                                  with_tz(ceiling_date(e1), tz='UTC'),
-                                                 with_tz(s1, tz='UTC')
-  ),
-  end.time=c(with_tz(ceiling_date(e1), tz='UTC'),
-             with_tz(e2, tz='UTC'),
-             with_tz(s2, tz='UTC'),
-             with_tz(e2, tz='UTC')),
-  exchange = exchange,
-  pair=pair)
+                                                 with_tz(s1 - seconds(10), tz='UTC')
+                                                 ),
+                                  end.time=c(with_tz(ceiling_date(e1), tz='UTC'),
+                                               with_tz(e2, tz='UTC'),
+                                               with_tz(s2 - seconds(10), tz='UTC'),
+                                               with_tz(e2, tz='UTC')),
+                                  exchange = exchange,
+                                  pair=pair)
 
 
   with_mock(

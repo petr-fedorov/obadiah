@@ -1,4 +1,5 @@
 #' @import lubridate
+#' @importFrom dplyr lead if_else
 
 
 #' @export
@@ -81,7 +82,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 
 #' @export
-spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL,only.different = TRUE, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -95,13 +96,15 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL,only.d
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
 
+  before <- seconds(10)
+
   if(is.null(cache) || start.time > cache.bound)
-    spread <- .spread(conn, start.time, end.time, exchange, pair, debug.query)
+    spread <- .spread(conn, start.time - before, end.time, exchange, pair, debug.query)
   else
     if(end.time <= cache.bound )
-      spread <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread"))
+      spread <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread"))
   else
-    spread <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread") ),
+    spread <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread") ),
                     .spread(conn, cache.bound, end.time, exchange, pair, debug.query)
     )
 
@@ -109,24 +112,28 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL,only.d
     # Assign timezone of start.time, if any, to timestamp column
     spread$timestamp <- with_tz(spread$timestamp, tzone)
   }
-  spread  %>% arrange(timestamp)
-
+  spread<- spread  %>%
+    arrange(timestamp) %>%
+    filter(lead(timestamp) > start.time & timestamp <= end.time) %>%
+    mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time))
+  last_spread <- tail(spread, 1)
+  last_spread$timestamp <- end.time
+  rbind(spread,last_spread)
 }
 
-.spread <- function(conn, start.time, end.time, exchange, pair,  only.different = TRUE, debug.query = FALSE) {
+.spread <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
 
-  query <- paste0(" SELECT 	obanalytics._in_milliseconds(timestamp) AS timestamp,
+  query <- paste0(" SELECT distinct on (obanalytics._in_milliseconds(timestamp) )	obanalytics._in_milliseconds(timestamp) AS timestamp,
                   \"best.bid.price\",
                   \"best.bid.volume\",
                   \"best.ask.price\",
                   \"best.ask.volume\"
                   FROM obanalytics.oba_spread(",
-                  shQuote(start.time), ",",
-                  shQuote(end.time), ",",
+                  shQuote(format(start.time, usetz=T)), ",",
+                  shQuote(format(end.time, usetz=T)), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
-                  only.different,
-                  " ) ORDER BY 1")
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                  ") ORDER BY 1, timestamp desc ")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
   spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
