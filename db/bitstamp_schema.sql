@@ -2101,7 +2101,7 @@ CREATE FUNCTION bitstamp.oba_spread(p_start_time timestamp with time zone, p_end
 		order by microtimestamp desc
 		limit 1
 	) a
-	
+
 $$;
 
 

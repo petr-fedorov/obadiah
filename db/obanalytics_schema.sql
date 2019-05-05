@@ -1895,10 +1895,10 @@ CREATE FUNCTION obanalytics.oba_pair_id(p_pair text) RETURNS smallint
 ALTER FUNCTION obanalytics.oba_pair_id(p_pair text) OWNER TO "ob-analytics";
 
 --
--- Name: oba_spread(timestamp with time zone, timestamp with time zone, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: oba_spread(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean DEFAULT true) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
+CREATE FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
@@ -1914,7 +1914,7 @@ CREATE FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_
 $$;
 
 
-ALTER FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: oba_trades(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -10890,10 +10890,10 @@ GRANT ALL ON FUNCTION obanalytics.oba_pair_id(p_pair text) TO obauser;
 
 
 --
--- Name: FUNCTION oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean); Type: ACL; Schema: obanalytics; Owner: ob-analytics
+-- Name: FUNCTION oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer); Type: ACL; Schema: obanalytics; Owner: ob-analytics
 --
 
-GRANT ALL ON FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean) TO obauser;
+GRANT ALL ON FUNCTION obanalytics.oba_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) TO obauser;
 
 
 --
