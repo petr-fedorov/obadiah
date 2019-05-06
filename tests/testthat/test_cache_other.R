@@ -187,3 +187,57 @@ test_that('spread returned from the cache and from RDBMS are the same',{
 
 
 
+
+context("Depth summary cache")
+
+
+test_that('depth_summary returned from the cache and from RDBMS are the same',{
+
+  #   1***   2***
+  #   3**********
+
+  data <- 'bitstamp_btcusd_depth_summary'
+
+  eval(fixture)
+
+  s1 <- ymd_hms("2019-04-13 01:00:00", tz="Europe/Moscow")
+  e1 <- ymd_hms('2019-04-13 01:15:00.1', tz="Europe/Moscow")
+
+  s2 <- ymd_hms('2019-04-13 01:16:59', tz="Europe/Moscow")
+  e2 <- ymd_hms('2019-04-13 01:17:59', tz="Europe/Moscow")
+
+
+  # internally all time objects have to be explicitly converted to UTC
+  expected_queries  <- data.frame(start.time = c(with_tz(s1, tz='UTC'),
+                                                 with_tz(s2, tz='UTC'),
+                                                 with_tz(ceiling_date(e1), tz='UTC'),
+                                                 with_tz(s1, tz='UTC')
+  ),
+  end.time=c(with_tz(ceiling_date(e1), tz='UTC'),
+             with_tz(e2, tz='UTC'),
+             with_tz(s2, tz='UTC'),
+             with_tz(e2, tz='UTC')),
+  exchange = exchange,
+  pair=pair)
+
+
+  with_mock(
+    `obAnalyticsDb::.depth_summary` = .rdbms_query_mock,
+    {
+      obAnalyticsDb::depth_summary(con,s1,e1, exchange, pair, cache = cache)
+      obAnalyticsDb::depth_summary(con,s2,e2, exchange, pair, cache = cache)
+      obAnalyticsDb::depth_summary(con,s1,e2, exchange, pair, cache = cache)
+
+      from_cache <- obAnalyticsDb::depth_summary(con,s1,e2, exchange, pair, cache = cache)
+      from_rdbms <- obAnalyticsDb::depth_summary(con,s1,e2, exchange, pair)  # i.e. without cache
+    }
+  )
+  expect_equal(queries, expected_queries)
+  expect_equal(from_cache$timestamp, from_rdbms$timestamp)
+  expect_equal(from_cache, from_rdbms)
+
+})
+
+
+
+

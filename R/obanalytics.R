@@ -195,8 +195,8 @@ events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
                   \"type\",
                   \"aggressiveness.bps\"
                   FROM obanalytics.oba_events(",
-                  shQuote(start.time), ",",
-                  shQuote(end.time), ",",
+                  shQuote(format(start.time, usetz=T)), ",",
+                  shQuote(format(end.time, usetz=T)), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
                   "obanalytics.oba_exchange_id(", shQuote(exchange), ")",
                   ")")
@@ -253,8 +253,8 @@ trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debu
                   maker::numeric,
                   taker::numeric,
                   \"exchange.trade.id\" FROM obanalytics.oba_trades(",
-                  shQuote(start.time), ",",
-                  shQuote(end.time), ",",
+                  shQuote(format(start.time, usetz=T)), ",",
+                  shQuote(format(end.time, usetz=T)), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
                   "obanalytics.oba_exchange_id(", shQuote(exchange), ")",
                   ") ORDER BY timestamp")
@@ -268,11 +268,60 @@ trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debu
 
 
 #' @export
-depth_summary <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
-  tzone <- attr(end.time, "tzone")
-  start.time <- format(start.time, usetz=T)
-  end.time <- format(end.time, usetz=T)
+depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+
+  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+
+  tzone <- tz(start.time)
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+
+  if(is.null(cache) || start.time > cache.bound)
+    ds <- .depth_summary(conn, start.time, end.time, exchange, pair, debug.query)
+  else
+    if(end.time <= cache.bound )
+      ds <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, .depth_summary, .leaf_cache(cache, exchange, pair, "depth_summary"))
+  else
+    ds <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, .trades, .leaf_cache(cache, exchange, pair, "depth_summary") ),
+                    .depth_summary(conn, cache.bound, end.time, exchange, pair, debug.query)
+    )
+
+  ds <- ds %>%
+    filter(bps_level == 0) %>%
+    select(-volume) %>%
+    dcast(list(.(timestamp), .(paste0(side,'.price',bps_level, "bps"))), value.var="price")   %>%
+    full_join(ds %>%
+                select(-price) %>%
+                dcast(list(.(timestamp), .(paste0(side,'.vol',bps_level, "bps"))), value.var="volume")
+              , by="timestamp" ) %>%  rename(best.ask.price = ask.price0bps,
+                                             best.bid.price = bid.price0bps,
+                                             best.ask.vol = ask.vol0bps,
+                                             best.bid.vol = bid.vol0bps)
+
+  bid.names <- paste0("bid.vol", seq(from = 25, to = 500, by = 25),
+                      "bps")
+  ask.names <- paste0("ask.vol", seq(from = 25, to = 500, by = 25),
+                      "bps")
+  ds[setdiff(bid.names, colnames(ds))] <- 0
+  ds[setdiff(ask.names, colnames(ds))] <- 0
+  ds[is.na(ds)] <- 0
+
+  if(!empty(ds)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    ds$timestamp <- with_tz(ds$timestamp, tzone)
+  }
+  ds
+}
+
+
+.depth_summary <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
   query <- paste0(" with depth_summary as (
                   	        select timestamp,
                                    price,
@@ -281,11 +330,11 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, debug.quer
                                    bps_level,
                                    rank() over (partition by obanalytics._in_milliseconds(timestamp) order by timestamp desc) as r
                             from obanalytics.oba_depth_summary(",
-                                  shQuote(start.time), ",",
-                                  shQuote(end.time), ",",
-                                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
-                          " ))
+                  shQuote(format(start.time, usetz=T)), ",",
+                  shQuote(format(end.time, usetz=T)), ",",
+                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                  " ))
                           select obanalytics._in_milliseconds(timestamp) as timestamp,
                                  side,
                                  bps_level,
@@ -299,35 +348,22 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, debug.quer
   if(debug.query) cat(query)
   df <- DBI::dbGetQuery(conn, query)
   df$timestamp <- as.POSIXct(as.numeric(df$timestamp)/1000, origin="1970-01-01")
-  df <- df %>%
-    filter(bps_level == 0) %>%
-    select(-volume) %>%
-    dcast(list(.(timestamp), .(paste0(side,'.price',bps_level, "bps"))), value.var="price")   %>%
-    full_join(df %>%
-                select(-price) %>%
-                dcast(list(.(timestamp), .(paste0(side,'.vol',bps_level, "bps"))), value.var="volume")
-              , by="timestamp" ) %>%  rename(best.ask.price = ask.price0bps,
-                                             best.bid.price = bid.price0bps,
-                                             best.ask.vol = ask.vol0bps,
-                                             best.bid.vol = bid.vol0bps)
-
-  bid.names <- paste0("bid.vol", seq(from = 25, to = 500, by = 25),
-                      "bps")
-  ask.names <- paste0("ask.vol", seq(from = 25, to = 500, by = 25),
-                      "bps")
-  df[setdiff(bid.names, colnames(df))] <- 0
-  df[setdiff(ask.names, colnames(df))] <- 0
-  df[is.na(df)] <- 0
-  attr(df$timestamp, 'tzone') <- tzone
   df
+
 }
 
 
 #' @export
 order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA, min.bid = NA, max.ask = NA, debug.query = FALSE) {
 
-  tzone <- attr(tp, "tzone")
-  tp <- format(tp, usetz=T)
+  if(is.character(tp)) start.time <- ymd_hms(start.time)
+
+  stopifnot(inherits(tp, 'POSIXt'))
+
+  flog.debug(paste0("order_book(con,", format(tp, usetz=T), "," , exchange, ", ", pair,")" ), name="obanalyticsdb")
+
+  tzone <- tz(tp)
+
   if (is.na(max.levels)) max.levels <- "NULL"
   if (is.na(bps.range)) bps.range <- "NULL"
   if (is.na(min.bid)) min.bid <- "NULL"
@@ -336,7 +372,7 @@ order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA
 
   query <- paste0("select ts, \"timestamp\", id, price, volume, liquidity, bps, side, \"exchange.timestamp\"
                    from obanalytics.oba_order_book(",
-                  shQuote(tp), ",",
+                  shQuote(format(tp, usetz=T)), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
                   "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
                   max.levels,  ",",
@@ -349,7 +385,7 @@ order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA
   bids <- full_book[which(full_book$side == 'b'), cols ]
   asks <- full_book[which(full_book$side == 's'), cols ]
   ts <- full_book$ts[1]
-  attr(ts, "tzone") <- tzone
+  ts <- with_tz(ts, tzone)
   list(timestamp=ts, asks=asks, bids=bids)
 }
 
@@ -363,7 +399,7 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
 
   query <- paste0(" select * from obanalytics.oba_export(", shQuote(start.time),
                   ", ",
-                  shQuote(end.time), ", ",
+                  shQuote(format(end.time, usetz=T)), ",",
                   "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
                   "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
                   ") order by timestamp")
