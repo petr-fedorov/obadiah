@@ -2087,6 +2087,15 @@ begin
 		where pair_id = v_pair_id
 		   and exchange_id = v_exchange_id
 		   and level1 is not null and level2 is not null;
+		   
+		if p_ts_within_era is null then 
+			-- start from the very first era available
+			select min(era) into p_ts_within_era
+			from obanalytics.level3_eras 
+			where pair_id = v_pair_id
+			  and exchange_id = v_exchange_id;
+			  
+		end if;
 	end if;
 	
 	if p_max_interval is null then
