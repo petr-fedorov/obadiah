@@ -1,7 +1,7 @@
-Package: obAnalyticsDb
-Title: An interface to PostgreSQL-based database for obAnalytics package
+Package: obadiah
+Title: An interface to PostgreSQL database for obAnalytics package
 Version: 0.1.0
-Description: Loads data from the relational database in the format suitable for obAnalytics package 
+Description: Loads data from the relational database in the format suitable for visualization by obAnalytics package 
 Author: Petr Fedorov
 Maintainer: Petr Fedorov <petr.fedorov@phystech.edu>
 Date: 2018-01-01

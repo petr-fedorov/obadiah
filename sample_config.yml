@@ -1,0 +1,8 @@
+default:
+  sslrootcert: "./root.crt"
+  sslcert: "./postgresql.crt"
+  sslkey: "./postgresql.key"
+  user: "ob-analytics"
+  dbname: "ob-analytics"
+  host: "localhost"
+  port: 5432

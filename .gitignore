@@ -85,3 +85,12 @@ venv.bak/
 .mypy_cache/
 .Rproj.user
 inst/doc
+
+# PostgreSQL connection certificates & configuration
+postgresql.*
+*.crt
+config.yml
+
+#
+.RData
+.Rhistory
