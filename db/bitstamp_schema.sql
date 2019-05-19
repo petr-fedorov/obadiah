@@ -823,7 +823,8 @@ BEGIN
 						SELECT live_orders.*
 						FROM bitstamp.live_orders  join time_range using (pair_id)
 						WHERE microtimestamp BETWEEN "start.time" AND "end.time"
-						  AND fill > 0
+						  and fill > 0 
+						  and trade_id is not null
 					)
 					INSERT INTO bitstamp.live_orders (order_id, amount, event, order_type, datetime, microtimestamp,local_timestamp,pair_id,
 													 price, fill, next_microtimestamp)
@@ -861,6 +862,81 @@ $$;
 
 
 ALTER FUNCTION bitstamp.find_and_repair_eternal_orders(ts_within_era timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
+
+--
+-- Name: find_and_repair_eternal_orders_rollback(timestamp with time zone, integer); Type: FUNCTION; Schema: bitstamp; Owner: postgres
+--
+
+CREATE FUNCTION bitstamp.find_and_repair_eternal_orders_rollback(p_ts timestamp with time zone, p_pair_id integer) RETURNS SETOF bitstamp.live_orders
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_start_time timestamptz;
+	v_end_time timestamptz;
+begin
+	select era, era_end into v_start_time, v_end_time
+	from (
+		select era, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity') as era_end
+		from bitstamp.live_orders_eras
+		where pair_id = p_pair_id
+	) e
+	where p_ts between era and era_end;
+	raise debug 'v_start_time: %, v_end_time: %', v_start_time, v_end_time;
+
+	return query with order_ids as (
+		select distinct order_id
+		from bitstamp.live_orders
+		where microtimestamp = p_ts
+		  and pair_id = p_pair_id
+		  and local_timestamp is null
+		  -- and order_id = any('{3218345438, 3218550114}'::bigint[])
+	),
+	orders as (
+		select *, first_value(microtimestamp) over p as c_price_microtimestamp, first_value(event_no) over p as c_price_event_no, 
+				   coalesce(lead(microtimestamp) over o, case event when 'order_deleted' then '-infinity'::timestamptz else 'infinity'::timestamptz end ) as c_next_microtimestamp, lead(event_no) over o as c_next_event_no
+		from bitstamp.live_orders join order_ids using (order_id)
+		where microtimestamp between v_start_time and v_end_time
+		  and local_timestamp is not null
+		window p as (partition by order_id, price order by microtimestamp, event_no), o as (partition by order_id order by microtimestamp, event_no)
+	)
+	update bitstamp.live_orders
+	   set price_microtimestamp = c_price_microtimestamp,
+			price_event_no = c_price_event_no,
+			next_microtimestamp = c_next_microtimestamp,
+			next_event_no = c_next_event_no
+	from orders
+	where live_orders.microtimestamp = orders.microtimestamp
+	  and live_orders.order_id = orders.order_id 
+	  and live_orders.event_no = orders.event_no
+	  and live_orders.local_timestamp is not null
+	  and (	  orders.price_microtimestamp is distinct from orders.c_price_microtimestamp 
+		   or orders.price_event_no is distinct from orders.c_price_event_no 
+		   or orders.next_microtimestamp is distinct from orders.c_next_microtimestamp 
+		   or orders.next_event_no is distinct from orders.c_next_event_no 
+		  )
+	returning live_orders.*;
+	
+	raise debug 'Updated!';
+	
+	return query with order_ids as (
+		select distinct order_id
+		from bitstamp.live_orders
+		where microtimestamp = p_ts
+		  and pair_id = p_pair_id
+		  and local_timestamp is null
+		  -- and order_id = any('{3218345438, 3218550114}'::bigint[])
+	)
+	delete from bitstamp.live_orders
+	where microtimestamp between v_start_time and v_end_time
+	  and order_id in (select order_id from order_ids)
+	  and local_timestamp is null
+	returning live_orders.*;
+	
+end;
+$$;
+
+
+ALTER FUNCTION bitstamp.find_and_repair_eternal_orders_rollback(p_ts timestamp with time zone, p_pair_id integer) OWNER TO postgres;
 
 --
 -- Name: find_and_repair_missing_fill(timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
@@ -3166,8 +3242,7 @@ ALTER TABLE bitstamp.diff_order_book OWNER TO "ob-analytics";
 --
 
 CREATE TABLE bitstamp.live_buy_orders PARTITION OF bitstamp.live_orders
-FOR VALUES IN ('buy')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+FOR VALUES IN ('buy');
 
 
 ALTER TABLE bitstamp.live_buy_orders OWNER TO "ob-analytics";
@@ -3189,8 +3264,7 @@ ALTER TABLE bitstamp.live_orders_eras OWNER TO "ob-analytics";
 --
 
 CREATE TABLE bitstamp.live_sell_orders PARTITION OF bitstamp.live_orders
-FOR VALUES IN ('sell')
-WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+FOR VALUES IN ('sell');
 
 
 ALTER TABLE bitstamp.live_sell_orders OWNER TO "ob-analytics";
