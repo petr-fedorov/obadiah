@@ -2128,8 +2128,7 @@ begin
 					where pair_id = v_pair_id
 					  and exchange_id = v_exchange_id
 				) a
-				where a.ends >= v_start
-				  and starts <= v_start + p_max_interval
+				where a.ends >= v_start																																																																																
 				order by starts loop
 
 		-- theoretically the microtimestamp below should always be equal to level3_eras.level1
@@ -2150,7 +2149,7 @@ begin
 		e.ends := least(e.ends, least(v_first_level1, v_first_level2) + p_max_interval);
 		p_max_interval := greatest('00:00:00'::interval, p_max_interval - (e.ends - least(v_first_level1,  v_first_level2)));
 		
-		raise log 'pga_summarize(%, %) start: %, end: %, remaining interval: % ', p_exchange, p_pair, e.starts, e.ends, p_max_interval; 
+		raise debug 'pga_summarize(%, %) start: %, end: %, remaining interval: % ', p_exchange, p_pair, least(v_first_level1,  v_first_level2), e.ends, p_max_interval; 
 		
 		insert into obanalytics.level1 (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id)
 		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id
@@ -2163,7 +2162,7 @@ begin
 		
 		if p_commit_each_era then
 			commit;
-			raise log 'pga_summarize(%, %) era commited start: %, end: %, remaining interval: %', p_exchange, p_pair, e.starts, e.ends, p_max_interval;	 
+			raise debug 'pga_summarize(%, %) era commited start: %, end: %, remaining interval: %', p_exchange, p_pair, least(v_first_level1,  v_first_level2), e.ends, p_max_interval;	 
 		end if;
 		
 		if p_max_interval = '00:00:00'::interval then
