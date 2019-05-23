@@ -767,6 +767,7 @@ begin
 										 from obanalytics.level3_eras 
 										 where pair_id = v_pair_id
 									       and exchange_id = v_exchange_id
+									  	   and level1 is not null and level2 is not null
 									 ) ) between era_starts and era_ends;
 									 
 	raise debug 'v_start: %, v_end: %', v_start, v_end;
@@ -837,15 +838,16 @@ $$;
 ALTER FUNCTION bitfinex.pga_fix_crossed_books(p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
--- Name: pga_match(text, interval, interval); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
+-- Name: pga_match(text, interval, interval, timestamp with time zone); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
 --
 
-CREATE FUNCTION bitfinex.pga_match(p_pair text, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '02:00:00'::interval) RETURNS TABLE(o_start timestamp with time zone, o_end timestamp with time zone)
+CREATE FUNCTION bitfinex.pga_match(p_pair text, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '02:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS TABLE(o_start timestamp with time zone, o_end timestamp with time zone)
     LANGUAGE plpgsql
     AS $$
 declare
 	v_pair_id smallint;
-	v_last_era timestamptz;
+	v_frame_start timestamptz;	
+	v_frame_end timestamptz;
 	v_price_precision integer;
 	v_max_price_precision integer;
 begin 
@@ -858,33 +860,51 @@ begin
 	from bitfinex.latest_symbol_details
 	where pair_id = v_pair_id;
 	
-	select max(era) into strict v_last_era
-	from obanalytics.level3_eras_bitfinex
-	where pair_id = v_pair_id;
+	if p_ts_within_era is null then 
+	
+		select max(era) into strict v_frame_start
+		from obanalytics.level3_eras_bitfinex
+		where pair_id = v_pair_id
+		  and era <= now() - p_max_interval;
+		
+		v_frame_end := 'infinity';
+	else
+	
+		select era,  era_end into v_frame_start, v_frame_end
+		from (
+			select era, coalesce( lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity') as era_end
+			from obanalytics.level3_eras_bitfinex
+			where pair_id = v_pair_id
+		) a
+		where p_ts_within_era between era and era_end;
+		
+	end if;
 
 	select max(microtimestamp) into o_start
 	from obanalytics.matches_bitfinex 
 	where pair_id = v_pair_id
-	  and microtimestamp >= v_last_era
+	  and microtimestamp between v_frame_start and v_frame_end
 	  and (buy_order_id is not null or sell_order_id is not null);
 	  
 	if o_start is not null then 
 		select coalesce(max(microtimestamp) - p_delay, 'infinity'::timestamptz) into o_end
 		from obanalytics.matches_bitfinex
 		where pair_id = v_pair_id
-		  and microtimestamp >= v_last_era;
+		  and microtimestamp between v_frame_start and v_frame_end;
 		
 	else
-		select min(microtimestamp) , min(microtimestamp) + p_max_interval into o_start, o_end
+		select min(microtimestamp) , least(v_frame_end, min(microtimestamp) + p_max_interval) into o_start, o_end
 		from obanalytics.matches_bitfinex 
 		where pair_id = v_pair_id
-		  and microtimestamp >= v_last_era;
+		  and microtimestamp between v_frame_start and v_frame_end;
 		
 	end if;	
 	
 	if o_start + p_max_interval < o_end then
 		o_end := o_start + p_max_interval;
 	end if;
+	
+	raise debug 'o_start: %, o_end: %', o_start, o_end;
 	
 	v_price_precision := v_max_price_precision;
 	loop
@@ -915,7 +935,7 @@ end;
 $$;
 
 
-ALTER FUNCTION bitfinex.pga_match(p_pair text, p_delay interval, p_max_interval interval) OWNER TO "ob-analytics";
+ALTER FUNCTION bitfinex.pga_match(p_pair text, p_delay interval, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: update_symbol_details(text, smallint, numeric, numeric, numeric, numeric, text, boolean); Type: FUNCTION; Schema: bitfinex; Owner: ob-analytics
