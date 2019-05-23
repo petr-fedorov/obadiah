@@ -1683,14 +1683,10 @@ CREATE FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_
 		  		  last(best_ask_price) over (order by microtimestamp) as best_ask_price,	
 		  		  last(best_bid_price) over (order by microtimestamp) as best_bid_price,	
 		  		  -- coalesce below on the right handles the case of one-sided order book ...
-		  		  case 
-		  			when not is_deleted then
-					  case side
-						when 's' then price <= coalesce(last(best_bid_price) over (order by microtimestamp), price - 1)
-						when 'b' then price >= coalesce(last(best_ask_price) over (order by microtimestamp) , price + 1 )
-		 			  end
-		  			else null
-		  		  end as is_aggressor,		  
+				  case side
+					when 's' then price <= coalesce(last(best_bid_price) over (order by microtimestamp), price - 1)
+					when 'b' then price >= coalesce(last(best_ask_price) over (order by microtimestamp) , price + 1 )
+				  end as is_aggressor,		  
 		  		  event_no
 		  from active_events left join spread_before using(microtimestamp) 
 	  ),
@@ -1708,9 +1704,6 @@ CREATE FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_
 		from base_events left join makers using (order_id) left join takers using (order_id) 
   		
 		window o_all as (partition by order_id)
-		  		--, 
-		  		-- o_after as (partition by order_id order by microtimestamp desc, event_no desc),
-		  		--o_before as (partition by order_id order by microtimestamp, event_no)
 	  ),
 	  event_connection as (
 		  select trades.microtimestamp, 
@@ -1754,7 +1747,7 @@ CREATE FUNCTION obanalytics.oba_events(p_start_time timestamp with time zone, p_
 				-- so the second will not be executed and no change event will be generated for it so is_ever_resting will be 'false'.
 				-- in spite of this it will be resting the order book for some time so its type is 'flashed-limit'.
 				when not is_ever_resting and is_ever_aggressor and is_deleted and not is_ever_filled then 'flashed-limit'::text	
-				when is_ever_resting and is_ever_aggressor then 'market-limit'::text
+				when (is_ever_resting or not is_deleted) and is_ever_aggressor then 'market-limit'::text
 		  		else 'unknown'::text 
 		  end as "type",
 			case side
