@@ -3,7 +3,7 @@
 
 
 #' @export
-depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
 
 
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
@@ -13,7 +13,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
   flog.debug(paste0("depth(conn,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
 
-  tzone <- tz(start.time)
+  tzone <- tz
 
   # Convert to UTC, so internally only UTC is used
   start.time <- with_tz(start.time, tz='UTC')
@@ -82,7 +82,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 
 #' @export
-spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -90,7 +90,7 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
   flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
 
-  tzone <- tz(start.time)
+  tzone <- tz
 
   # Convert to UTC, so internally only UTC is used
   start.time <- with_tz(start.time, tz='UTC')
@@ -143,7 +143,7 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
 
 #' @export
-events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -151,7 +151,7 @@ events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
   flog.debug(paste0("events(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
 
-  tzone <- tz(start.time)
+  tzone <- tz
 
   # Convert to UTC, so internally only UTC is used
   start.time <- with_tz(start.time, tz='UTC')
@@ -204,14 +204,14 @@ events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
   events <- DBI::dbGetQuery(conn, query)
   events$action <- factor(events$action, c("created", "changed", "deleted"))
   events$direction <- factor(events$direction, c("bid", "ask"))
-  events$type <- factor(events$type, c("unknown", "flashed-limit",
-                                       "resting-limit", "market-limit", "pacman", "market"))
+  events$type <- factor(events$type, c("market", "market-limit", "pacman", "flashed-limit",
+                                       "resting-limit", "unknown"))
   events$timestamp <- as.POSIXct(as.numeric(events$timestamp)/1000, origin="1970-01-01")
   events
 }
 
 #' @export
-trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
 
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
@@ -220,7 +220,7 @@ trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debu
 
   flog.debug(paste0("trades(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
 
-  tzone <- tz(start.time)
+  tzone <- tz
 
   # Convert to UTC, so internally only UTC is used
   start.time <- with_tz(start.time, tz='UTC')
@@ -268,7 +268,7 @@ trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debu
 
 
 #' @export
-depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15)) {
+depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -276,7 +276,7 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL
 
   flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
 
-  tzone <- tz(start.time)
+  tzone <- tz
 
   # Convert to UTC, so internally only UTC is used
   start.time <- with_tz(start.time, tz='UTC')
@@ -354,7 +354,7 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL
 
 
 #' @export
-order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA, min.bid = NA, max.ask = NA, debug.query = FALSE) {
+order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA, min.bid = NA, max.ask = NA, debug.query = FALSE, tz='UTC') {
 
   if(is.character(tp)) start.time <- ymd_hms(start.time)
 
@@ -362,7 +362,7 @@ order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA
 
   flog.debug(paste0("order_book(con,", format(tp, usetz=T), "," , exchange, ", ", pair,")" ), name="obanalyticsdb")
 
-  tzone <- tz(tp)
+  tzone <- tz
 
   if (is.na(max.levels)) max.levels <- "NULL"
   if (is.na(bps.range)) bps.range <- "NULL"
