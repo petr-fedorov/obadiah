@@ -3,7 +3,7 @@
 --
 
 -- Dumped from database version 11.2
--- Dumped by pg_dump version 11.2
+-- Dumped by pg_dump version 11.3
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -12,6 +12,7 @@ SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SELECT pg_catalog.set_config('search_path', '', false);
 SET check_function_bodies = false;
+SET xmloption = content;
 SET client_min_messages = warning;
 SET row_security = off;
 
@@ -435,6 +436,7 @@ begin
 				from (
 					select *, sum(is_price_changed) over (partition by order_id, reincarnation_no order by microtimestamp) as price_group 			-- within an reincarnation of order_id
 					from  for_insert_level3
+					where price is not null -- when crossing a month boundary there can be deleted event with created in previous month. The record will have null price 
 				) a						
 				window op as (partition by order_id, reincarnation_no, price_group order by microtimestamp, event_no)
 			) a
