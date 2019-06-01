@@ -51,18 +51,18 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
 .update_cache <- function(conn, start.time, end.time, exchange, pair, debug.query, loader, cache) {
 
-  flog.debug(".update_cache(%s, %s, %s, %s, %s)", format(start.time), format(end.time), exchange, pair, cache$type, name="obanalyticsdb.cache")
+  flog.debug(".update_cache(%s, %s, %s, %s, %s)", format(start.time), format(end.time), exchange, pair, cache$type, name="obadiah.cache")
 
   if( empty(cache$periods) ) {
-    flog.debug('cache is empty, query: %s - %s ', format(start.time), format(end.time), name="obanalyticsdb.cache")
+    flog.debug('cache is empty, query: %s - %s ', format(start.time), format(end.time), name="obadiah.cache")
     data <- loader(conn, start.time, end.time, exchange, pair, debug.query)
     if(!empty(data)) {
-      flog.debug('added to cache: %s - %s ', format(start.time), format(end.time), name="obanalyticsdb.cache")
+      flog.debug('added to cache: %s - %s ', format(start.time), format(end.time), name="obadiah.cache")
       cache[[.cache_leaf_key(start.time, end.time)]] <- data
       cache$periods <- rbind(cache$periods, data.frame(s=start.time, e=end.time))
     }
     else
-      flog.debug('query %s - %s returned no data', format(start.time), format(end.time), name="obanalyticsdb.cache")
+      flog.debug('query %s - %s returned no data', format(start.time), format(end.time), name="obadiah.cache")
   }
   else {
 
@@ -78,7 +78,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
       new.cache.entry <- data.frame()
 
       while (current.time < end.time ) {
-        flog.debug('current.time = %s', format(current.time), name="obanalyticsdb.cache")
+        flog.debug('current.time = %s', format(current.time), name="obadiah.cache")
         key <- .cache_leaf_key(relevant[i, "s"],relevant[i, "e"])
 
         if (i > nrow(relevant)) {
@@ -86,15 +86,15 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
                                    loader(conn, current.time, end.time, exchange, pair, debug.query),
                                    cache[[.cache_leaf_key(current.time, end.time)]]
           )
-          flog.debug('nothing left in the cache, query, but not add to the cache yet %s - %s', format(current.time),format(end.time), name="obanalyticsdb.cache")
+          flog.debug('nothing left in the cache, query, but not add to the cache yet %s - %s', format(current.time),format(end.time), name="obadiah.cache")
           current.time <- end.time
           update.cache <- TRUE
 
         } else {
-          flog.debug('found relevant %s - %s', format(relevant[i, "s"]), format(relevant[i, "e"]), name="obanalyticsdb.cache")
+          flog.debug('found relevant %s - %s', format(relevant[i, "s"]), format(relevant[i, "e"]), name="obadiah.cache")
 
           if(current.time < relevant[i, "s"]) {
-            flog.debug('query, but not add to the cache yet: %s -%s', format(current.time), format(relevant[i, "s"]), name="obanalyticsdb.cache")
+            flog.debug('query, but not add to the cache yet: %s -%s', format(current.time), format(relevant[i, "s"]), name="obadiah.cache")
 
             new.cache.entry <- rbind(new.cache.entry,
                                      loader(conn, current.time, relevant[i, "s"], exchange, pair, debug.query),
@@ -116,7 +116,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
           cache$periods <- cache$periods %>% filter( !(s == relevant[i, "s"] & e == relevant[i, "e"]) )
           rm(list=key, envir = cache)
-          flog.debug('removed from the cache %s - %s %s', format(relevant[i, "s"]), format(relevant[i, "e"]), key, name="obanalyticsdb.cache")
+          flog.debug('removed from the cache %s - %s %s', format(relevant[i, "s"]), format(relevant[i, "e"]), key, name="obadiah.cache")
 
           current.time <- relevant[i, "e"]
           i <- i+1
@@ -126,29 +126,29 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
       if(!empty(new.cache.entry)) {
         cache[[.cache_leaf_key(start.time, end.time)]] <- new.cache.entry
         cache$periods <- rbind(cache$periods, data.frame(s=start.time, e=end.time))
-        flog.debug('added to cache %s - %s', format(start.time), format(end.time), name="obanalyticsdb.cache")
+        flog.debug('added to cache %s - %s', format(start.time), format(end.time), name="obadiah.cache")
       }
       else {
-        flog.debug('all queries returned no rows for %s - %s, cache not updated', format(start.time), format(end.time), name="obanalyticsdb.cache")
+        flog.debug('all queries returned no rows for %s - %s, cache not updated', format(start.time), format(end.time), name="obadiah.cache")
       }
 
     }
     else
-      flog.debug('the cache need not be updated', name="obanalyticsdb.cache")
+      flog.debug('the cache need not be updated', name="obadiah.cache")
   }
 
   if(!empty(cache$periods)) {
-    flog.debug('Cached periods: ', name="obanalyticsdb.cache")
+    flog.debug('Cached periods: ', name="obadiah.cache")
     plyr::a_ply(cache$periods, 1, function(x) {
-      flog.debug('   %s - %s # of rows %i', format(x$s), format(x$e), nrow(cache[[.cache_leaf_key(x$s, x$e)]]), name="obanalyticsdb.cache")
-      #flog.debug(ls(envir=cache, all.names=TRUE), name="obanalyticsdb.cache")
+      flog.debug('   %s - %s # of rows %i', format(x$s), format(x$e), nrow(cache[[.cache_leaf_key(x$s, x$e)]]), name="obadiah.cache")
+      #flog.debug(ls(envir=cache, all.names=TRUE), name="obadiah.cache")
       } )
   }
 }
 
 .load_from_cache <- function(start.time, end.time, cache) {
 
-  flog.debug('.load_from_cache(%s, %s, %s)', format(start.time), format(end.time), cache$type, name="obanalyticsdb.cache")
+  flog.debug('.load_from_cache(%s, %s, %s)', format(start.time), format(end.time), cache$type, name="obadiah.cache")
 
   if(!empty(cache$periods)) {
 
@@ -156,7 +156,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
     if (!empty(cached_interval)) {
       cached_data <- cache[[.cache_leaf_key(head(cached_interval)$s, head(cached_interval)$e)]]
-      flog.debug('requested data are found in the cache period %s %s', format(head(cached_interval)$s), format(head(cached_interval)$e), name="obanalyticsdb.cache")
+      flog.debug('requested data are found in the cache period %s %s', format(head(cached_interval)$s), format(head(cached_interval)$e), name="obadiah.cache")
       data <- cached_data %>%  filter(timestamp >= start.time & timestamp < end.time)
     }
     else
@@ -167,6 +167,6 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
     data <- data.frame()
 
   if(empty(data))
-    flog.debug('requested data are not found in the cache: %s %s', format(start.time), format(end.time), name="obanalyticsdb.cache")
+    flog.debug('requested data are not found in the cache: %s %s', format(start.time), format(end.time), name="obadiah.cache")
   data
 }

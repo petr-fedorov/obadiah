@@ -11,7 +11,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
 
-  flog.debug(paste0("depth(conn,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+  flog.debug(paste0("depth(conn,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
 
   tzone <- tz
 
@@ -88,7 +88,7 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
 
-  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
 
   tzone <- tz
 
@@ -149,7 +149,7 @@ events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
 
-  flog.debug(paste0("events(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+  flog.debug(paste0("events(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
 
   tzone <- tz
 
@@ -218,7 +218,7 @@ trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debu
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
 
-  flog.debug(paste0("trades(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+  flog.debug(paste0("trades(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
 
   tzone <- tz
 
@@ -274,7 +274,7 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
 
-  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obanalyticsdb")
+  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
 
   tzone <- tz
 
@@ -360,7 +360,7 @@ order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA
 
   stopifnot(inherits(tp, 'POSIXt'))
 
-  flog.debug(paste0("order_book(con,", format(tp, usetz=T), "," , exchange, ", ", pair,")" ), name="obanalyticsdb")
+  flog.debug(paste0("order_book(con,", format(tp, usetz=T), "," , exchange, ", ", pair,")" ), name="obadiah")
 
   tzone <- tz
 
@@ -406,6 +406,77 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
   if(debug.query) cat(query)
   events <- DBI::dbGetQuery(conn, query)
   write.csv(events, file = file, row.names = FALSE)
+}
+
+
+
+#' @export
+draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type='mid-price', cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+
+  flog.debug(paste0("draws(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
+
+  tzone <- tz
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+  before <- seconds(10)
+
+  if(is.null(cache) || start.time > cache.bound)
+    draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw, draw.type, debug.query)
+  else
+    if(end.time <= cache.bound )
+      draws <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query,
+                            function(conn, start.time, end.time, exchange, pair, debug.query) {
+                              .draws(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type, debug.query)
+                              },
+                            .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw)))
+  else
+    draws <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query,
+                                function(conn, start.time, end.time, exchange, pair, debug.query) {
+                                  .draws(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type,  debug.query)
+                                },
+                                .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw))),
+                    .draws(conn, cache.bound, end.time, exchange, pair,minimal.draw, draw.type, debug.query)
+    )
+
+  if(!empty(draws)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    draws$timestamp <- with_tz(draws$timestamp, tzone)
+    draws$draw.end <- with_tz(draws$draw.end, tzone)
+    draws<- draws  %>%
+       arrange(timestamp) %>%
+       filter((lead(timestamp) > start.time | is.na(lead(timestamp))) & timestamp <= end.time) %>%
+       mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time ))
+  }
+  draws
+}
+
+.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type, debug.query = FALSE) {
+
+  query <- paste0(" select obanalytics._in_milliseconds(\"timestamp\") AS \"timestamp\",
+                  obanalytics._in_milliseconds(\"draw.end\") AS \"draw.end\",
+                  \"start.price\",
+                  \"end.price\",
+                  \"draw.size\"
+                  FROM obanalytics.oba_draws(",
+                  shQuote(format(start.time, usetz=T)), ",",
+                  shQuote(format(end.time, usetz=T)), ",",
+                  shQuote(draw.type), ",",
+                  minimal.draw, ",",
+                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
+                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                  ") order by 1")
+  if(debug.query) cat(query)
+  draws <- DBI::dbGetQuery(conn, query)
+  draws$timestamp <- as.POSIXct(as.numeric(draws$timestamp)/1000, origin="1970-01-01")
+  draws$draw.end <- as.POSIXct(as.numeric(draws$draw.end)/1000, origin="1970-01-01")
+  draws
 }
 
 

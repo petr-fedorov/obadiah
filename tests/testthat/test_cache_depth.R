@@ -1,19 +1,20 @@
 context("Generic cache functionality & depth")
 
+
 setup({
-   flog.threshold(futile.logger::DEBUG, 'obanalyticsdb')
-   flog.appender(appender.file('test_cache_depth.log'), name='obanalyticsdb')
+   flog.threshold(futile.logger::DEBUG, 'obadiah')
+   flog.appender(appender.file('test_cache_depth.log'), name='obadiah')
 })
 
 teardown({
-  # flog.appender(NULL, name='obanalyticsdb')
+  # flog.appender(NULL, name='obadiah')
 })
 
 # A common test fixture for all test_that functions below. To be evaluated by eval() within test_that()
 
 fixture <- quote({
 
-  load(system.file("extdata/testdata.rda", package = "obAnalyticsDb")) # gets 'bitstamp_btcusd_depth'
+  load(system.file("extdata/testdata.rda", package = "obadiah")) # gets 'bitstamp_btcusd_depth'
 
   cache <- new.env(parent=emptyenv()) # is shared between tests below
   con <- NULL
@@ -50,10 +51,10 @@ test_that('the depth is downloaded from RDBMS and timestamps are in UTC time zon
                                  exchange=exchange, pair=pair)
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock,
     {
-      actual <- obAnalyticsDb::depth(con, start.time, end.time, exchange, pair, cache = cache)
+      actual <- obadiah::depth(con, start.time, end.time, exchange, pair, cache = cache)
     }
   )
 
@@ -83,10 +84,10 @@ test_that('the depth is downloaded from RDBMS and timestamps are in Europe/Mosco
                                  exchange=exchange, pair=pair)
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock,
     {
-      actual <- obAnalyticsDb::depth(con, start.time,end.time, exchange, pair, cache = cache)
+      actual <- obadiah::depth(con, start.time,end.time, exchange, pair, cache = cache, tz=tzone)
     }
   )
 
@@ -116,11 +117,11 @@ test_that('depth is served from cache whenever requested range is cached',  {
 
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock,
     {
-      obAnalyticsDb::depth(con,start.time,end.time, exchange, pair, cache = cache)
-      actual <- obAnalyticsDb::depth(con,
+      obadiah::depth(con,start.time,end.time, exchange, pair, cache = cache)
+      actual <- obadiah::depth(con,
                                      start.time + minutes(1), # i.e. an interval within the one cached earlier
                                      end.time - minutes(1),
                                      exchange, pair, cache = cache)
@@ -156,10 +157,10 @@ test_that("non-overlapping depths are downloaded from RDBMS", {
 
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock, {
-    actual1 <- obAnalyticsDb::depth(con,start.time1, end.time1, exchange, pair, cache = cache)
-    actual2 <- obAnalyticsDb::depth(con,start.time2, end.time2, exchange, pair, cache = cache)
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock, {
+    actual1 <- obadiah::depth(con,start.time1, end.time1, exchange, pair, cache = cache, tz=tzone1)
+    actual2 <- obadiah::depth(con,start.time2, end.time2, exchange, pair, cache = cache, tz=tzone2)
     }
     )
   expect_true(empty(actual1))
@@ -190,11 +191,11 @@ test_that('two queries to RDBMS do not overlap when requested periods overlap',{
                                   pair=pair)
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock,
     {
-      obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
-      obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s1,e1, exchange, pair, cache = cache)
+      obadiah::depth(con,s2,e2, exchange, pair, cache = cache)
     }
   )
 
@@ -227,15 +228,15 @@ test_that('three queries to RDBMS do not overlap when requested periods overlap'
                                   pair=pair)
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock,
     {
-      obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
-      obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
-      obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s1,e1, exchange, pair, cache = cache)
+      obadiah::depth(con,s2,e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s1,e2, exchange, pair, cache = cache)
 
       # has to be served from cache (i.e. must not produce query)
-      obAnalyticsDb::depth(con,s1 + seconds(1),e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s1 + seconds(1),e2, exchange, pair, cache = cache)
     }
   )
   expect_equal(queries, expected_queries)
@@ -261,15 +262,15 @@ test_that('data returned from the cache and from RDBMS are the same',{
 
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock,
     {
-      obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
-      obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
-      obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s1,e1, exchange, pair, cache = cache)
+      obadiah::depth(con,s2,e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s1,e2, exchange, pair, cache = cache)
 
-      from_cache <- obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
-      from_rdbms <- obAnalyticsDb::depth(con,s1,e2, exchange, pair)  # i.e. without cache
+      from_cache <- obadiah::depth(con,s1,e2, exchange, pair, cache = cache)
+      from_rdbms <- obadiah::depth(con,s1,e2, exchange, pair)  # i.e. without cache
     }
   )
   expect_equal(from_cache, from_rdbms)
@@ -294,14 +295,14 @@ test_that('cached periods are reported properly',{
 
 
   with_mock(
-    `obAnalyticsDb::.starting_depth` = function(...) { data.frame() },
-    `obAnalyticsDb::.depth_changes` = .depth_changes_mock,
+    `obadiah::.starting_depth` = function(...) { data.frame() },
+    `obadiah::.depth_changes` = .depth_changes_mock,
     {
-      obAnalyticsDb::depth(con,s1,e1, exchange, pair, cache = cache)
+      obadiah::depth(con,s1,e1, exchange, pair, cache = cache)
       actual1 <- getCachedPeriods(cache, exchange, pair, 'depth')
-      obAnalyticsDb::depth(con,s2,e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s2,e2, exchange, pair, cache = cache)
       actual2 <- getCachedPeriods(cache, exchange, pair, 'depth')
-      obAnalyticsDb::depth(con,s1,e2, exchange, pair, cache = cache)
+      obadiah::depth(con,s1,e2, exchange, pair, cache = cache)
       actual3 <- getCachedPeriods(cache, exchange, pair, 'depth')
     }
   )
