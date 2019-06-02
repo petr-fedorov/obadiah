@@ -94,3 +94,4 @@ config.yml
 #
 .RData
 .Rhistory
+docs/*_cache

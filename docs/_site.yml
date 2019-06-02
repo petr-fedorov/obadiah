@@ -1,0 +1,17 @@
+name: "Obadiah"
+output_dir: "."
+navbar:
+  title: "Obadiah"
+  left:
+    - text: "Home"
+      href: index.html
+    - text: "Explore"
+      href: explore.html      
+    - text: "Verify"
+      href: verify.html
+    - text: "Research"
+      href: research.html
+    - text: "Trade"
+      href: trade.html
+    - text: "About"
+      href: about.html

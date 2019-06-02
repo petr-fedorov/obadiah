@@ -1,0 +1,8 @@
+---
+title: "Verify"
+output: html_document
+---
+
+
+
+1. [A theory of power-law distributions in financial market fluctuations](power-law-distributions.html)

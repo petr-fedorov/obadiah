@@ -1,0 +1,19 @@
+---
+title: "Order Book Analytics Database"
+---
+
+
+**O**rder **B**ook **A**nalytics **D**atabase (OBADiah) contains the following high-freqency data from several cryptocurency exchanges:
+
+* An order book updates at various level of details, up to an individual order events where available
+* Matches (trades)
+* Level1 changes or spread
+* Level2 changes or depth
+
+Using these data someone can:
+
+* Explore their visual reprsentation 
+* Verify whether the claims made in a published research are valid for cryptocurrencies
+* Produce an original research
+* Develop and backtest trading strategies
+
