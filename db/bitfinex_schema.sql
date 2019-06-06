@@ -824,7 +824,32 @@ begin
 			returning level3.*
 		)
 		select *
-		from updated;
+		from updated;  
+		
+	-- Third remove takers, which have been removed by Bitfinex, but again for some reasons too late!
+	return query 		
+		with takers as (
+			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
+			from obanalytics.order_book_by_episode(v_last_spread, v_end, v_pair_id, v_exchange_id, p_check_takers :=false) 
+			join unnest(ob) as ob on true
+			where not is_maker
+		),
+		updated as (
+			update obanalytics.level3
+			  set microtimestamp = takers.microtimestamp
+			from takers
+			where exchange_id = v_exchange_id
+			  and pair_id = v_pair_id
+			  and level3.microtimestamp = takers.next_microtimestamp
+			  and level3.order_id = takers.order_id
+			  and level3.event_no = takers.next_event_no
+			  and level3.next_microtimestamp = '-infinity'
+			  and level3.microtimestamp between v_last_spread and v_end
+			returning level3.*
+		)
+		select *
+		from updated;  
+		
 		
 			
 	-- Finally, try to merge remaining episodes producing crossed order books
