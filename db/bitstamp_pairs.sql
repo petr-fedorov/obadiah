@@ -27,7 +27,6 @@ COPY bitstamp.pairs (pair_id, pair, "R0") FROM stdin;
 4	XRPUSD	2
 5	BCHUSD	2
 6	BTCEUR	2
-7	ETHBTC	8
 \.
 
 
