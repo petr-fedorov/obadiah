@@ -378,7 +378,7 @@ begin
 				select episode_timestamp as microtimestamp,
 						order_id,
 						(coalesce(first_value(event_no) over oe, 1) - 1)::integer + (row_number() over oe)::integer as event_no,
-						case when amount < 0 then 's' when amount > 0 then 'b' end as side,
+						side,
 						case when price = 0 then abs(lag(price) over oe) else abs(price) end as  price, 
 						case when price = 0 then abs(lag(amount) over oe) else abs(amount) end as amount,
 						case when price = 0 then null else abs(lag(amount) over oe) - abs(amount) end as fill, 
@@ -390,7 +390,9 @@ begin
 						coalesce((price <> lag(price) over oe and price > 0 )::integer, 1) as is_price_changed,
 						channel_id
 				from (
-					select *, sum(is_resurrected::integer) over o as reincarnation_no 
+					select *, sum(is_resurrected::integer) over o as reincarnation_no,
+							 -- BITFINEX sometimes changes order type (!). We consider it to be a bug and will infer the order type from  the first known event for the order_id.
+					         case when first_value(amount) over o < 0 then 's' when first_value(amount) over o > 0 then 'b' end as side
 					from (
 						select *, coalesce(lag(price) over o = 0, false) as is_resurrected
 						from base_for_insert_level3
