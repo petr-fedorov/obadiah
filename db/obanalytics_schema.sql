@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 11.2
--- Dumped by pg_dump version 11.3
+-- Dumped from database version 11.4
+-- Dumped by pg_dump version 11.4
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -135,6 +135,18 @@ ALTER TABLE obanalytics.level3 OWNER TO "ob-analytics";
 
 COMMENT ON COLUMN obanalytics.level3.exchange_microtimestamp IS 'An microtimestamp of an event as asigned by an exchange. Not null if different from ''microtimestamp''';
 
+
+--
+-- Name: pair_of_ob; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TYPE obanalytics.pair_of_ob AS (
+	ob1 obanalytics.level3[],
+	ob2 obanalytics.level3[]
+);
+
+
+ALTER TYPE obanalytics.pair_of_ob OWNER TO "ob-analytics";
 
 --
 -- Name: matches; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -699,6 +711,30 @@ $$;
 ALTER FUNCTION obanalytics._depth_after_depth_change(p_depth obanalytics.level2_depth_record[], p_depth_change obanalytics.level2_depth_record[], p_microtimestamp timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
+-- Name: _depth_change(obanalytics.pair_of_ob); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._depth_change(p_obs obanalytics.pair_of_ob) RETURNS obanalytics.level2_depth_record[]
+    LANGUAGE sql
+    AS $$
+select * from obanalytics._depth_change(
+	coalesce(p_obs.ob1,
+			 coalesce ( (   select ob 
+							from obanalytics.order_book( ( select max(microtimestamp) from unnest(p_obs.ob2)),	-- ob's ts is max(microtimestamp), see order_book() code
+														  ( select pair_id from unnest(p_obs.ob2) limit 1),
+														  ( select exchange_id from unnest(p_obs.ob2) limit 1),
+														  p_only_makers := true,
+														  p_before := true,	-- we need ob BEFORE here
+														  p_check_takers := true))),
+			 			p_obs.ob2 ),
+			  p_obs.ob2);
+
+$$;
+
+
+ALTER FUNCTION obanalytics._depth_change(p_obs obanalytics.pair_of_ob) OWNER TO "ob-analytics";
+
+--
 -- Name: _depth_change(obanalytics.level3[], obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -725,6 +761,20 @@ $$;
 
 
 ALTER FUNCTION obanalytics._depth_change(p_ob_before obanalytics.level3[], p_ob_after obanalytics.level3[]) OWNER TO "ob-analytics";
+
+--
+-- Name: _depth_change_sfunc(obanalytics.pair_of_ob, obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._depth_change_sfunc(p_obs obanalytics.pair_of_ob, p_ob obanalytics.level3[]) RETURNS obanalytics.pair_of_ob
+    LANGUAGE sql STABLE
+    AS $$
+	select (p_obs.ob2, p_ob)::obanalytics.pair_of_ob;
+
+$$;
+
+
+ALTER FUNCTION obanalytics._depth_change_sfunc(p_obs obanalytics.pair_of_ob, p_ob obanalytics.level3[]) OWNER TO "ob-analytics";
 
 --
 -- Name: _depth_summary(obanalytics.level2_depth_summary_internal_state); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2199,14 +2249,22 @@ ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with tim
 CREATE PROCEDURE obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_commit_each_era boolean DEFAULT true)
     LANGUAGE plpgsql
     AS $$
+
+-- PARAMETERS:
+--
+--	p_max_interval	interval 		If NULL, summarize using all available data, subject to limitations, enforced by the other parameters.
+-- 									If NOT NULL, then sum of all summarized intervals (for different eras, if more than one) will not exceed p_max_interval
+--	p_ts_within_era	timestamptz		If NULL, summarize starting from the most recent level1 or level2 data (which is earlier) for all eras if more than one
+--									If NOT NULL then summarize ONLY within the era p_ts_within_era belongs to
+
 declare 
 	v_current_timestamp timestamptz;
 	
+	v_first_era timestamptz;
+	v_last_era timestamptz;
+	
 	v_start timestamptz;
 	v_end timestamptz;
-	
-	v_first_level1 timestamptz;
-	v_first_level2 timestamptz;
 	
 	v_pair_id obanalytics.pairs.pair_id%type;
 	v_exchange_id obanalytics.exchanges.exchange_id%type;
@@ -2224,94 +2282,169 @@ begin
 	from obanalytics.exchanges
 	where exchange = lower(p_exchange);
 	
-	if p_ts_within_era is null then	-- we start from the latest era where level1 and level2 have already been calculated.
-									 -- If a new era has started this start point will ensure that we'll calculate remaining 
-									 -- level1 and level2 for the old era(s) as well as the new one(s)
-		select max(era) into p_ts_within_era
-		from obanalytics.level3_eras 
-		where pair_id = v_pair_id
-		   and exchange_id = v_exchange_id
-		   and level1 is not null and level2 is not null;
-		   
-		if p_ts_within_era is null then 
-			-- start from the very first era available
-			select min(era) into p_ts_within_era
+	begin
+
+		if p_ts_within_era is null then	-- we start from the latest era where level1 and level2 have already been calculated.
+										 -- If a new era has started this start point will ensure that we'll calculate remaining 
+										 -- level1 and level2 for the old era(s) as well as the new one(s)
+			select max(era) into v_first_era
 			from obanalytics.level3_eras 
 			where pair_id = v_pair_id
-			  and exchange_id = v_exchange_id;
-			  
+			   and exchange_id = v_exchange_id
+			   and level1 is not null and level2 is not null;
+			   
+			if v_first_era is null then 
+				-- start from the very first era available
+				select min(era) into v_first_era
+				from obanalytics.level3_eras 
+				where pair_id = v_pair_id
+				  and exchange_id = v_exchange_id;
+
+			end if;
+			
+			v_last_era := 'infinity';	-- i.e. we'll summarize all eras after the first one
+
+		else
+
+			select max(era) into v_first_era
+			from obanalytics.level3_eras 
+			where pair_id = v_pair_id
+			   and exchange_id = v_exchange_id
+			   and p_ts_within_era >= era;
+			   
+			v_last_era := v_first_era;			   
+			
 		end if;
-	end if;
+
+	end;
 	
-	if p_max_interval is null then
-		p_max_interval := '00:00:00'::interval;	-- do nothing
-	end if;
-	
-	select starts, ends into v_start, v_end
-	from (select era as starts, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity') as ends
-		   from obanalytics.level3_eras
-		   where pair_id = v_pair_id
-			 and exchange_id = v_exchange_id
-		 ) a
-	where p_ts_within_era between starts and ends;
+	create temp table if not exists level1 (like obanalytics.level1);
+	create temp table if not exists level2 (like obanalytics.level2);
 	
 	
-	
-	select coalesce(max(microtimestamp) + '00:00:00.000001'::interval, v_start) into v_start
-	from obanalytics.level1
-	where microtimestamp between v_start and v_end
-	  and exchange_id = v_exchange_id
-	  and pair_id = v_pair_id;
-	  
-	for e in   select starts, ends
+	for e in   select starts, ends, first_level1, first_level2
 				from (
 					select era as starts,
 							coalesce(level3, 
 								coalesce(lead(era) over (order by era)  - '00:00:00.000001'::interval, 'infinity'::timestamptz)
-									) as ends
+									) as ends,
+							coalesce(level1 + '00:00:00.000001'::interval, era) as first_level1,
+							coalesce(level2 + '00:00:00.000001'::interval, era) as first_level2
 					from obanalytics.level3_eras 
 					where pair_id = v_pair_id
 					  and exchange_id = v_exchange_id
 				) a
-				where a.ends >= v_start																																																																																
+				where a.starts between v_first_era and v_last_era
 				order by starts loop
+				
+		e.starts :=  least(e.first_level1, e.first_level2);
+		e.ends := least(e.ends, e.starts + p_max_interval);
+		
+		raise debug 'pga_summarize(%, %) start: %, end: %, remaining interval: % ', p_exchange, p_pair, e.starts, e.ends, p_max_interval; 
+		
+		
+/*		The SQL statement works slower than PL/PGSQL code. But may be improved in the future ... 
 
-		-- theoretically the microtimestamp below should always be equal to level3_eras.level1
-		select coalesce(max(microtimestamp) + '00:00:00.000001'::interval, e.starts) into v_first_level1
-		from obanalytics.level1 
-		where microtimestamp between e.starts and e.ends
-	  	  and exchange_id = v_exchange_id
-	  	  and pair_id = v_pair_id;
-		  
-		-- theoretically the microtimestamp below should always be equal to level3_eras.level2
-		select coalesce(max(microtimestamp) + '00:00:00.000001'::interval, e.starts) into v_first_level2
-		from obanalytics.level2
-		where microtimestamp between e.starts and e.ends
-		  and precision = 'r0'
-	  	  and exchange_id = v_exchange_id
-	  	  and pair_id = v_pair_id;
-		
-		e.ends := least(e.ends, least(v_first_level1, v_first_level2) + p_max_interval);
-		p_max_interval := greatest('00:00:00'::interval, p_max_interval - (e.ends - least(v_first_level1,  v_first_level2)));
-		
-		raise debug 'pga_summarize(%, %) start: %, end: %, remaining interval: % ', p_exchange, p_pair, least(v_first_level1,  v_first_level2), e.ends, p_max_interval; 
-		
+		with base as (
+			select (obanalytics._spread_from_order_book(ts, ob)).*, obanalytics.depth_change_agg(ob) over (order by ts) as depth_change 
+			from obanalytics.order_book_by_episode(e.starts, e.ends, v_pair_id, v_exchange_id)
+		),
+		insert_level2 as (
+			insert into obanalytics.level2 (microtimestamp, pair_id, exchange_id, precision,  depth_change)
+			select microtimestamp, pair_id, exchange_id, 'r0'::character(2), depth_change
+			from base
+			where depth_change is not null
+			  and microtimestamp > e.first_level2
+		)
 		insert into obanalytics.level1 (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id)
 		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id
-		from obanalytics.spread_by_episode(v_first_level1, e.ends, v_pair_id, v_exchange_id, p_with_order_book := false);
+		from (
+			select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id,
+					lag(best_bid_price) over w as p_best_bid_price, 
+					lag(best_bid_qty) over w as p_best_bid_qty,
+					lag(best_ask_price) over w as p_best_ask_price,
+					lag(best_ask_qty) over w as p_best_ask_qty
+			from base
+			window w as (order by microtimestamp)
+		) a
+		where microtimestamp > e.first_level1
+		  and (  best_bid_price is distinct from p_best_bid_price
+				 or best_bid_qty is distinct from p_best_bid_qty
+				 or best_ask_price is distinct from p_best_ask_price
+				 or best_ask_qty is distinct from p_best_ask_qty
+			   ); */
 		
-		
-		insert into obanalytics.level2 (microtimestamp, pair_id, exchange_id, precision, depth_change)
-		select microtimestamp, pair_id, exchange_id, precision, coalesce(depth_change, '{}')
-		from obanalytics.depth_change_by_episode(v_first_level2, e.ends, v_pair_id, v_exchange_id);
-		
+		declare
+			v_ob_before record;
+			v_ob record;
+			v_l1_before obanalytics.level1;
+			v_l1 obanalytics.level1;
+		begin
+
+				select ts, ob 
+				from obanalytics.order_book(e.starts, v_pair_id, v_exchange_id, p_only_makers := true, p_before := true) 
+				into v_ob_before;	-- so we are readyf for a depth_change generation for the very first episode greater or equal to e.starts
+				
+				select * into v_l1_before
+				from obanalytics.level1
+				where microtimestamp = e.first_level1
+				  and exchange_id = v_exchange_id
+				  and pair_id = v_pair_id;
+
+				for v_ob in select ts, ob from obanalytics.order_book_by_episode(e.starts, e.ends, v_pair_id, v_exchange_id) 
+				loop
+					if v_ob.ts > e.first_level1 then
+						select * into v_l1
+						from obanalytics._spread_from_order_book(v_ob.ts, v_ob.ob);
+						
+						if (v_l1_before.best_bid_price is distinct from v_l1.best_bid_price or
+						    v_l1_before.best_bid_qty  is distinct from v_l1.best_bid_qty or
+						    v_l1_before.best_ask_price is distinct from v_l1.best_ask_price or
+						    v_l1_before.best_ask_qty is distinct from v_l1.best_ask_qty )
+						then
+						
+							insert into level1
+							values (v_l1.*);
+							
+							v_l1_before := v_l1;
+							
+						end if;
+						
+					end if;
+					
+					if v_ob.ts > e.first_level2 then
+						if v_ob_before is not null then -- if e.starts equals to an era start then v_ob_before will be null 
+						
+							insert into level2
+							select v_ob.ts, v_pair_id::smallint, v_exchange_id::smallint, 'r0'::character(2), d 
+							from obanalytics._depth_change(v_ob_before.ob, v_ob.ob) d
+							where d is not null;
+							
+						end if;
+						
+					end if;
+					v_ob_before := v_ob;
+				end loop;			
+				
+				insert into obanalytics.level1
+				select * from level1;
+				
+				insert into obanalytics.level2
+				select * from level2;
+		end;
+
 		if p_commit_each_era then
 			commit;
-			raise debug 'pga_summarize(%, %) era commited start: %, end: %, remaining interval: %', p_exchange, p_pair, least(v_first_level1,  v_first_level2), e.ends, p_max_interval;	 
+			raise debug 'pga_summarize(%, %) era commited start: %, end: %, remaining interval: %', p_exchange, p_pair, least(e.first_level1,  e.first_level2), e.ends, p_max_interval;	 
 		end if;
-		
-		if p_max_interval = '00:00:00'::interval then
-			exit;
+
+		if p_max_interval is not null then 
+			p_max_interval := greatest('00:00:00'::interval, p_max_interval - (e.ends - least(e.first_level1,  e.first_level2)));
+			
+			if p_max_interval = '00:00:00'::interval then
+				exit;
+			end if;
+			
 		end if;
 		
 	end loop;
@@ -2483,6 +2616,19 @@ $$;
 ALTER FUNCTION obanalytics.summary(p_exchange text, p_pair text, p_start_time timestamp with time zone, p_end_time timestamp with time zone) OWNER TO "ob-analytics";
 
 --
+-- Name: depth_change_agg(obanalytics.level3[]); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE AGGREGATE obanalytics.depth_change_agg(obanalytics.level3[]) (
+    SFUNC = obanalytics._depth_change_sfunc,
+    STYPE = obanalytics.pair_of_ob,
+    FINALFUNC = obanalytics._depth_change
+);
+
+
+ALTER AGGREGATE obanalytics.depth_change_agg(obanalytics.level3[]) OWNER TO "ob-analytics";
+
+--
 -- Name: depth_summary_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer, integer, integer); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -2547,9 +2693,17 @@ ALTER TABLE obanalytics.exchanges OWNER TO "ob-analytics";
 -- Name: level1_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitfinex PARTITION OF obanalytics.level1
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level1_bitfinex (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.level1 ATTACH PARTITION obanalytics.level1_bitfinex FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.level1_bitfinex OWNER TO "ob-analytics";
@@ -2558,9 +2712,17 @@ ALTER TABLE obanalytics.level1_bitfinex OWNER TO "ob-analytics";
 -- Name: level1_bitfinex_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitfinex_btcusd PARTITION OF obanalytics.level1_bitfinex
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level1_bitfinex_btcusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitfinex ATTACH PARTITION obanalytics.level1_bitfinex_btcusd FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.level1_bitfinex_btcusd OWNER TO "ob-analytics";
@@ -2569,9 +2731,17 @@ ALTER TABLE obanalytics.level1_bitfinex_btcusd OWNER TO "ob-analytics";
 -- Name: level1_01001201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01001201903 PARTITION OF obanalytics.level1_bitfinex_btcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01001201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ATTACH PARTITION obanalytics.level1_01001201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01001201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2581,9 +2751,17 @@ ALTER TABLE obanalytics.level1_01001201903 OWNER TO "ob-analytics";
 -- Name: level1_01001201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01001201904 PARTITION OF obanalytics.level1_bitfinex_btcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01001201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ATTACH PARTITION obanalytics.level1_01001201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01001201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2593,9 +2771,17 @@ ALTER TABLE obanalytics.level1_01001201904 OWNER TO "ob-analytics";
 -- Name: level1_01001201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01001201905 PARTITION OF obanalytics.level1_bitfinex_btcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01001201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ATTACH PARTITION obanalytics.level1_01001201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01001201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2605,9 +2791,17 @@ ALTER TABLE obanalytics.level1_01001201905 OWNER TO "ob-analytics";
 -- Name: level1_01001201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01001201906 PARTITION OF obanalytics.level1_bitfinex_btcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01001201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ATTACH PARTITION obanalytics.level1_01001201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01001201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2617,21 +2811,57 @@ ALTER TABLE obanalytics.level1_01001201906 OWNER TO "ob-analytics";
 -- Name: level1_01001201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01001201907 PARTITION OF obanalytics.level1_bitfinex_btcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01001201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ATTACH PARTITION obanalytics.level1_01001201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01001201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_01001201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_01001201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_01001201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ATTACH PARTITION obanalytics.level1_01001201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_01001201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_01001201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitfinex_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitfinex_ltcusd PARTITION OF obanalytics.level1_bitfinex
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level1_bitfinex_ltcusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitfinex ATTACH PARTITION obanalytics.level1_bitfinex_ltcusd FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.level1_bitfinex_ltcusd OWNER TO "ob-analytics";
@@ -2640,9 +2870,17 @@ ALTER TABLE obanalytics.level1_bitfinex_ltcusd OWNER TO "ob-analytics";
 -- Name: level1_01002201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01002201903 PARTITION OF obanalytics.level1_bitfinex_ltcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01002201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ATTACH PARTITION obanalytics.level1_01002201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01002201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2652,9 +2890,17 @@ ALTER TABLE obanalytics.level1_01002201903 OWNER TO "ob-analytics";
 -- Name: level1_01002201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01002201904 PARTITION OF obanalytics.level1_bitfinex_ltcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01002201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ATTACH PARTITION obanalytics.level1_01002201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01002201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2664,9 +2910,17 @@ ALTER TABLE obanalytics.level1_01002201904 OWNER TO "ob-analytics";
 -- Name: level1_01002201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01002201905 PARTITION OF obanalytics.level1_bitfinex_ltcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01002201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ATTACH PARTITION obanalytics.level1_01002201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01002201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2676,9 +2930,17 @@ ALTER TABLE obanalytics.level1_01002201905 OWNER TO "ob-analytics";
 -- Name: level1_01002201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01002201906 PARTITION OF obanalytics.level1_bitfinex_ltcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01002201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ATTACH PARTITION obanalytics.level1_01002201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01002201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2688,21 +2950,57 @@ ALTER TABLE obanalytics.level1_01002201906 OWNER TO "ob-analytics";
 -- Name: level1_01002201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01002201907 PARTITION OF obanalytics.level1_bitfinex_ltcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01002201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ATTACH PARTITION obanalytics.level1_01002201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01002201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_01002201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_01002201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_01002201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ATTACH PARTITION obanalytics.level1_01002201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_01002201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_01002201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitfinex_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitfinex_ethusd PARTITION OF obanalytics.level1_bitfinex
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.level1_bitfinex_ethusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitfinex ATTACH PARTITION obanalytics.level1_bitfinex_ethusd FOR VALUES IN ('3');
 
 
 ALTER TABLE obanalytics.level1_bitfinex_ethusd OWNER TO "ob-analytics";
@@ -2711,9 +3009,17 @@ ALTER TABLE obanalytics.level1_bitfinex_ethusd OWNER TO "ob-analytics";
 -- Name: level1_01003201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01003201903 PARTITION OF obanalytics.level1_bitfinex_ethusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01003201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ATTACH PARTITION obanalytics.level1_01003201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01003201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2723,9 +3029,17 @@ ALTER TABLE obanalytics.level1_01003201903 OWNER TO "ob-analytics";
 -- Name: level1_01003201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01003201904 PARTITION OF obanalytics.level1_bitfinex_ethusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01003201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ATTACH PARTITION obanalytics.level1_01003201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01003201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2735,9 +3049,17 @@ ALTER TABLE obanalytics.level1_01003201904 OWNER TO "ob-analytics";
 -- Name: level1_01003201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01003201905 PARTITION OF obanalytics.level1_bitfinex_ethusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01003201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ATTACH PARTITION obanalytics.level1_01003201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01003201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2747,9 +3069,17 @@ ALTER TABLE obanalytics.level1_01003201905 OWNER TO "ob-analytics";
 -- Name: level1_01003201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01003201906 PARTITION OF obanalytics.level1_bitfinex_ethusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01003201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ATTACH PARTITION obanalytics.level1_01003201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01003201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2759,21 +3089,57 @@ ALTER TABLE obanalytics.level1_01003201906 OWNER TO "ob-analytics";
 -- Name: level1_01003201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_01003201907 PARTITION OF obanalytics.level1_bitfinex_ethusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_01003201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ATTACH PARTITION obanalytics.level1_01003201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_01003201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_01003201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_01003201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_01003201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ATTACH PARTITION obanalytics.level1_01003201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_01003201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_01003201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp PARTITION OF obanalytics.level1
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level1_bitstamp (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.level1 ATTACH PARTITION obanalytics.level1_bitstamp FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.level1_bitstamp OWNER TO "ob-analytics";
@@ -2782,9 +3148,17 @@ ALTER TABLE obanalytics.level1_bitstamp OWNER TO "ob-analytics";
 -- Name: level1_bitstamp_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp_btcusd PARTITION OF obanalytics.level1_bitstamp
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level1_bitstamp_btcusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_btcusd FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.level1_bitstamp_btcusd OWNER TO "ob-analytics";
@@ -2793,9 +3167,17 @@ ALTER TABLE obanalytics.level1_bitstamp_btcusd OWNER TO "ob-analytics";
 -- Name: level1_02001201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02001201901 PARTITION OF obanalytics.level1_bitstamp_btcusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02001201901 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02001201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2805,9 +3187,17 @@ ALTER TABLE obanalytics.level1_02001201901 OWNER TO "ob-analytics";
 -- Name: level1_02001201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02001201902 PARTITION OF obanalytics.level1_bitstamp_btcusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02001201902 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02001201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2817,9 +3207,17 @@ ALTER TABLE obanalytics.level1_02001201902 OWNER TO "ob-analytics";
 -- Name: level1_02001201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02001201903 PARTITION OF obanalytics.level1_bitstamp_btcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02001201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02001201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2829,9 +3227,17 @@ ALTER TABLE obanalytics.level1_02001201903 OWNER TO "ob-analytics";
 -- Name: level1_02001201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02001201904 PARTITION OF obanalytics.level1_bitstamp_btcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02001201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02001201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2841,9 +3247,17 @@ ALTER TABLE obanalytics.level1_02001201904 OWNER TO "ob-analytics";
 -- Name: level1_02001201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02001201905 PARTITION OF obanalytics.level1_bitstamp_btcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02001201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02001201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2853,9 +3267,17 @@ ALTER TABLE obanalytics.level1_02001201905 OWNER TO "ob-analytics";
 -- Name: level1_02001201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02001201906 PARTITION OF obanalytics.level1_bitstamp_btcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02001201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02001201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2865,21 +3287,57 @@ ALTER TABLE obanalytics.level1_02001201906 OWNER TO "ob-analytics";
 -- Name: level1_02001201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02001201907 PARTITION OF obanalytics.level1_bitstamp_btcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02001201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02001201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_02001201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_02001201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_02001201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ATTACH PARTITION obanalytics.level1_02001201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_02001201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_02001201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitstamp_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp_ltcusd PARTITION OF obanalytics.level1_bitstamp
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level1_bitstamp_ltcusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_ltcusd FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.level1_bitstamp_ltcusd OWNER TO "ob-analytics";
@@ -2888,9 +3346,17 @@ ALTER TABLE obanalytics.level1_bitstamp_ltcusd OWNER TO "ob-analytics";
 -- Name: level1_02002201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02002201901 PARTITION OF obanalytics.level1_bitstamp_ltcusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02002201901 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02002201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2900,9 +3366,17 @@ ALTER TABLE obanalytics.level1_02002201901 OWNER TO "ob-analytics";
 -- Name: level1_02002201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02002201902 PARTITION OF obanalytics.level1_bitstamp_ltcusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02002201902 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02002201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2912,9 +3386,17 @@ ALTER TABLE obanalytics.level1_02002201902 OWNER TO "ob-analytics";
 -- Name: level1_02002201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02002201903 PARTITION OF obanalytics.level1_bitstamp_ltcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02002201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02002201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2924,9 +3406,17 @@ ALTER TABLE obanalytics.level1_02002201903 OWNER TO "ob-analytics";
 -- Name: level1_02002201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02002201904 PARTITION OF obanalytics.level1_bitstamp_ltcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02002201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02002201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2936,9 +3426,17 @@ ALTER TABLE obanalytics.level1_02002201904 OWNER TO "ob-analytics";
 -- Name: level1_02002201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02002201905 PARTITION OF obanalytics.level1_bitstamp_ltcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02002201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02002201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2948,9 +3446,17 @@ ALTER TABLE obanalytics.level1_02002201905 OWNER TO "ob-analytics";
 -- Name: level1_02002201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02002201906 PARTITION OF obanalytics.level1_bitstamp_ltcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02002201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02002201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2960,21 +3466,57 @@ ALTER TABLE obanalytics.level1_02002201906 OWNER TO "ob-analytics";
 -- Name: level1_02002201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02002201907 PARTITION OF obanalytics.level1_bitstamp_ltcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02002201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02002201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_02002201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_02002201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_02002201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ATTACH PARTITION obanalytics.level1_02002201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_02002201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_02002201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitstamp_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp_ethusd PARTITION OF obanalytics.level1_bitstamp
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.level1_bitstamp_ethusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_ethusd FOR VALUES IN ('3');
 
 
 ALTER TABLE obanalytics.level1_bitstamp_ethusd OWNER TO "ob-analytics";
@@ -2983,9 +3525,17 @@ ALTER TABLE obanalytics.level1_bitstamp_ethusd OWNER TO "ob-analytics";
 -- Name: level1_02003201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02003201901 PARTITION OF obanalytics.level1_bitstamp_ethusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02003201901 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02003201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -2995,9 +3545,17 @@ ALTER TABLE obanalytics.level1_02003201901 OWNER TO "ob-analytics";
 -- Name: level1_02003201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02003201902 PARTITION OF obanalytics.level1_bitstamp_ethusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02003201902 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02003201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3007,9 +3565,17 @@ ALTER TABLE obanalytics.level1_02003201902 OWNER TO "ob-analytics";
 -- Name: level1_02003201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02003201903 PARTITION OF obanalytics.level1_bitstamp_ethusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02003201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02003201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3019,9 +3585,17 @@ ALTER TABLE obanalytics.level1_02003201903 OWNER TO "ob-analytics";
 -- Name: level1_02003201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02003201904 PARTITION OF obanalytics.level1_bitstamp_ethusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02003201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02003201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3031,9 +3605,17 @@ ALTER TABLE obanalytics.level1_02003201904 OWNER TO "ob-analytics";
 -- Name: level1_02003201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02003201905 PARTITION OF obanalytics.level1_bitstamp_ethusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02003201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02003201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3043,9 +3625,17 @@ ALTER TABLE obanalytics.level1_02003201905 OWNER TO "ob-analytics";
 -- Name: level1_02003201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02003201906 PARTITION OF obanalytics.level1_bitstamp_ethusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02003201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02003201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3055,21 +3645,57 @@ ALTER TABLE obanalytics.level1_02003201906 OWNER TO "ob-analytics";
 -- Name: level1_02003201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02003201907 PARTITION OF obanalytics.level1_bitstamp_ethusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02003201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02003201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_02003201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_02003201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_02003201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ATTACH PARTITION obanalytics.level1_02003201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_02003201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_02003201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitstamp_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp_xrpusd PARTITION OF obanalytics.level1_bitstamp
-FOR VALUES IN ('4')
+CREATE TABLE obanalytics.level1_bitstamp_xrpusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_xrpusd FOR VALUES IN ('4');
 
 
 ALTER TABLE obanalytics.level1_bitstamp_xrpusd OWNER TO "ob-analytics";
@@ -3078,9 +3704,17 @@ ALTER TABLE obanalytics.level1_bitstamp_xrpusd OWNER TO "ob-analytics";
 -- Name: level1_02004201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02004201901 PARTITION OF obanalytics.level1_bitstamp_xrpusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02004201901 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02004201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3090,9 +3724,17 @@ ALTER TABLE obanalytics.level1_02004201901 OWNER TO "ob-analytics";
 -- Name: level1_02004201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02004201902 PARTITION OF obanalytics.level1_bitstamp_xrpusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02004201902 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02004201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3102,9 +3744,17 @@ ALTER TABLE obanalytics.level1_02004201902 OWNER TO "ob-analytics";
 -- Name: level1_02004201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02004201903 PARTITION OF obanalytics.level1_bitstamp_xrpusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02004201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02004201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3114,9 +3764,17 @@ ALTER TABLE obanalytics.level1_02004201903 OWNER TO "ob-analytics";
 -- Name: level1_02004201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02004201904 PARTITION OF obanalytics.level1_bitstamp_xrpusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02004201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02004201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3126,9 +3784,17 @@ ALTER TABLE obanalytics.level1_02004201904 OWNER TO "ob-analytics";
 -- Name: level1_02004201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02004201905 PARTITION OF obanalytics.level1_bitstamp_xrpusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02004201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02004201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3138,9 +3804,17 @@ ALTER TABLE obanalytics.level1_02004201905 OWNER TO "ob-analytics";
 -- Name: level1_02004201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02004201906 PARTITION OF obanalytics.level1_bitstamp_xrpusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02004201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02004201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3150,21 +3824,57 @@ ALTER TABLE obanalytics.level1_02004201906 OWNER TO "ob-analytics";
 -- Name: level1_02004201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02004201907 PARTITION OF obanalytics.level1_bitstamp_xrpusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02004201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02004201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_02004201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_02004201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_02004201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ATTACH PARTITION obanalytics.level1_02004201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_02004201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_02004201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitstamp_bchusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp_bchusd PARTITION OF obanalytics.level1_bitstamp
-FOR VALUES IN ('5')
+CREATE TABLE obanalytics.level1_bitstamp_bchusd (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_bchusd FOR VALUES IN ('5');
 
 
 ALTER TABLE obanalytics.level1_bitstamp_bchusd OWNER TO "ob-analytics";
@@ -3173,9 +3883,17 @@ ALTER TABLE obanalytics.level1_bitstamp_bchusd OWNER TO "ob-analytics";
 -- Name: level1_02005201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02005201901 PARTITION OF obanalytics.level1_bitstamp_bchusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02005201901 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02005201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3185,9 +3903,17 @@ ALTER TABLE obanalytics.level1_02005201901 OWNER TO "ob-analytics";
 -- Name: level1_02005201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02005201902 PARTITION OF obanalytics.level1_bitstamp_bchusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02005201902 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02005201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3197,9 +3923,17 @@ ALTER TABLE obanalytics.level1_02005201902 OWNER TO "ob-analytics";
 -- Name: level1_02005201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02005201903 PARTITION OF obanalytics.level1_bitstamp_bchusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02005201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02005201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3209,9 +3943,17 @@ ALTER TABLE obanalytics.level1_02005201903 OWNER TO "ob-analytics";
 -- Name: level1_02005201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02005201904 PARTITION OF obanalytics.level1_bitstamp_bchusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02005201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02005201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3221,9 +3963,17 @@ ALTER TABLE obanalytics.level1_02005201904 OWNER TO "ob-analytics";
 -- Name: level1_02005201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02005201905 PARTITION OF obanalytics.level1_bitstamp_bchusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02005201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02005201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3233,9 +3983,17 @@ ALTER TABLE obanalytics.level1_02005201905 OWNER TO "ob-analytics";
 -- Name: level1_02005201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02005201906 PARTITION OF obanalytics.level1_bitstamp_bchusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02005201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02005201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3245,21 +4003,57 @@ ALTER TABLE obanalytics.level1_02005201906 OWNER TO "ob-analytics";
 -- Name: level1_02005201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02005201907 PARTITION OF obanalytics.level1_bitstamp_bchusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02005201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02005201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_02005201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_02005201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_02005201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ATTACH PARTITION obanalytics.level1_02005201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_02005201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_02005201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitstamp_btceur; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp_btceur PARTITION OF obanalytics.level1_bitstamp
-FOR VALUES IN ('6')
+CREATE TABLE obanalytics.level1_bitstamp_btceur (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_btceur FOR VALUES IN ('6');
 
 
 ALTER TABLE obanalytics.level1_bitstamp_btceur OWNER TO "ob-analytics";
@@ -3268,9 +4062,17 @@ ALTER TABLE obanalytics.level1_bitstamp_btceur OWNER TO "ob-analytics";
 -- Name: level1_02006201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02006201901 PARTITION OF obanalytics.level1_bitstamp_btceur
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02006201901 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02006201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3280,9 +4082,17 @@ ALTER TABLE obanalytics.level1_02006201901 OWNER TO "ob-analytics";
 -- Name: level1_02006201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02006201902 PARTITION OF obanalytics.level1_bitstamp_btceur
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02006201902 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02006201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3292,9 +4102,17 @@ ALTER TABLE obanalytics.level1_02006201902 OWNER TO "ob-analytics";
 -- Name: level1_02006201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02006201903 PARTITION OF obanalytics.level1_bitstamp_btceur
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02006201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02006201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3304,9 +4122,17 @@ ALTER TABLE obanalytics.level1_02006201903 OWNER TO "ob-analytics";
 -- Name: level1_02006201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02006201904 PARTITION OF obanalytics.level1_bitstamp_btceur
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02006201904 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02006201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3316,9 +4142,17 @@ ALTER TABLE obanalytics.level1_02006201904 OWNER TO "ob-analytics";
 -- Name: level1_02006201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02006201905 PARTITION OF obanalytics.level1_bitstamp_btceur
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02006201905 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02006201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3328,9 +4162,17 @@ ALTER TABLE obanalytics.level1_02006201905 OWNER TO "ob-analytics";
 -- Name: level1_02006201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02006201906 PARTITION OF obanalytics.level1_bitstamp_btceur
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02006201906 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02006201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3340,21 +4182,57 @@ ALTER TABLE obanalytics.level1_02006201906 OWNER TO "ob-analytics";
 -- Name: level1_02006201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02006201907 PARTITION OF obanalytics.level1_bitstamp_btceur
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02006201907 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02006201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level1_02006201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level1_02006201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level1_02006201908 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ATTACH PARTITION obanalytics.level1_02006201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level1_02006201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level1_02006201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level1_bitstamp_ethbtc; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_bitstamp_ethbtc PARTITION OF obanalytics.level1_bitstamp
-FOR VALUES IN ('7')
+CREATE TABLE obanalytics.level1_bitstamp_ethbtc (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 7 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_ethbtc FOR VALUES IN ('7');
 
 
 ALTER TABLE obanalytics.level1_bitstamp_ethbtc OWNER TO "ob-analytics";
@@ -3363,9 +4241,17 @@ ALTER TABLE obanalytics.level1_bitstamp_ethbtc OWNER TO "ob-analytics";
 -- Name: level1_02007201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level1_02007201903 PARTITION OF obanalytics.level1_bitstamp_ethbtc
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level1_02007201903 (
+    best_bid_price numeric,
+    best_bid_qty numeric,
+    best_ask_price numeric,
+    best_ask_qty numeric,
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 7 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level1_bitstamp_ethbtc ATTACH PARTITION obanalytics.level1_02007201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level1_02007201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3375,9 +4261,15 @@ ALTER TABLE obanalytics.level1_02007201903 OWNER TO "ob-analytics";
 -- Name: level2_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex PARTITION OF obanalytics.level2
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level2_bitfinex (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.level2 ATTACH PARTITION obanalytics.level2_bitfinex FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.level2_bitfinex OWNER TO "ob-analytics";
@@ -3386,9 +4278,15 @@ ALTER TABLE obanalytics.level2_bitfinex OWNER TO "ob-analytics";
 -- Name: level2_bitfinex_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_btcusd PARTITION OF obanalytics.level2_bitfinex
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level2_bitfinex_btcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitfinex ATTACH PARTITION obanalytics.level2_bitfinex_btcusd FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.level2_bitfinex_btcusd OWNER TO "ob-analytics";
@@ -3397,9 +4295,15 @@ ALTER TABLE obanalytics.level2_bitfinex_btcusd OWNER TO "ob-analytics";
 -- Name: level2_bitfinex_btcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_btcusd_p0 PARTITION OF obanalytics.level2_bitfinex_btcusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitfinex_btcusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ATTACH PARTITION obanalytics.level2_bitfinex_btcusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitfinex_btcusd_p0 OWNER TO "ob-analytics";
@@ -3408,9 +4312,15 @@ ALTER TABLE obanalytics.level2_bitfinex_btcusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_01001p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01001p0201903 PARTITION OF obanalytics.level2_bitfinex_btcusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01001p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_p0 ATTACH PARTITION obanalytics.level2_01001p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01001p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3420,9 +4330,15 @@ ALTER TABLE obanalytics.level2_01001p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitfinex_btcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_btcusd_r0 PARTITION OF obanalytics.level2_bitfinex_btcusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitfinex_btcusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ATTACH PARTITION obanalytics.level2_bitfinex_btcusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3432,9 +4348,15 @@ ALTER TABLE obanalytics.level2_bitfinex_btcusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_01001r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01001r0201903 PARTITION OF obanalytics.level2_bitfinex_btcusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01001r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ATTACH PARTITION obanalytics.level2_01001r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01001r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3444,9 +4366,15 @@ ALTER TABLE obanalytics.level2_01001r0201903 OWNER TO "ob-analytics";
 -- Name: level2_01001r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01001r0201904 PARTITION OF obanalytics.level2_bitfinex_btcusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01001r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ATTACH PARTITION obanalytics.level2_01001r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01001r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3456,9 +4384,15 @@ ALTER TABLE obanalytics.level2_01001r0201904 OWNER TO "ob-analytics";
 -- Name: level2_01001r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01001r0201905 PARTITION OF obanalytics.level2_bitfinex_btcusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01001r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ATTACH PARTITION obanalytics.level2_01001r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01001r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3468,9 +4402,15 @@ ALTER TABLE obanalytics.level2_01001r0201905 OWNER TO "ob-analytics";
 -- Name: level2_01001r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01001r0201906 PARTITION OF obanalytics.level2_bitfinex_btcusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01001r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ATTACH PARTITION obanalytics.level2_01001r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01001r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3480,20 +4420,50 @@ ALTER TABLE obanalytics.level2_01001r0201906 OWNER TO "ob-analytics";
 -- Name: level2_01001r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01001r0201907 PARTITION OF obanalytics.level2_bitfinex_btcusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01001r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ATTACH PARTITION obanalytics.level2_01001r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_01001r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_01001r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_01001r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_01001r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ATTACH PARTITION obanalytics.level2_01001r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_01001r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitfinex_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_ltcusd PARTITION OF obanalytics.level2_bitfinex
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level2_bitfinex_ltcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitfinex ATTACH PARTITION obanalytics.level2_bitfinex_ltcusd FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.level2_bitfinex_ltcusd OWNER TO "ob-analytics";
@@ -3502,9 +4472,15 @@ ALTER TABLE obanalytics.level2_bitfinex_ltcusd OWNER TO "ob-analytics";
 -- Name: level2_bitfinex_ltcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_ltcusd_p0 PARTITION OF obanalytics.level2_bitfinex_ltcusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitfinex_ltcusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ATTACH PARTITION obanalytics.level2_bitfinex_ltcusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitfinex_ltcusd_p0 OWNER TO "ob-analytics";
@@ -3513,9 +4489,15 @@ ALTER TABLE obanalytics.level2_bitfinex_ltcusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_01002p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01002p0201903 PARTITION OF obanalytics.level2_bitfinex_ltcusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01002p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_p0 ATTACH PARTITION obanalytics.level2_01002p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01002p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3525,9 +4507,15 @@ ALTER TABLE obanalytics.level2_01002p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitfinex_ltcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_ltcusd_r0 PARTITION OF obanalytics.level2_bitfinex_ltcusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitfinex_ltcusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ATTACH PARTITION obanalytics.level2_bitfinex_ltcusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3537,9 +4525,15 @@ ALTER TABLE obanalytics.level2_bitfinex_ltcusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_01002r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01002r0201903 PARTITION OF obanalytics.level2_bitfinex_ltcusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01002r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ATTACH PARTITION obanalytics.level2_01002r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01002r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3549,9 +4543,15 @@ ALTER TABLE obanalytics.level2_01002r0201903 OWNER TO "ob-analytics";
 -- Name: level2_01002r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01002r0201904 PARTITION OF obanalytics.level2_bitfinex_ltcusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01002r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ATTACH PARTITION obanalytics.level2_01002r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01002r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3561,9 +4561,15 @@ ALTER TABLE obanalytics.level2_01002r0201904 OWNER TO "ob-analytics";
 -- Name: level2_01002r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01002r0201905 PARTITION OF obanalytics.level2_bitfinex_ltcusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01002r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ATTACH PARTITION obanalytics.level2_01002r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01002r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3573,9 +4579,15 @@ ALTER TABLE obanalytics.level2_01002r0201905 OWNER TO "ob-analytics";
 -- Name: level2_01002r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01002r0201906 PARTITION OF obanalytics.level2_bitfinex_ltcusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01002r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ATTACH PARTITION obanalytics.level2_01002r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01002r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3585,20 +4597,50 @@ ALTER TABLE obanalytics.level2_01002r0201906 OWNER TO "ob-analytics";
 -- Name: level2_01002r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01002r0201907 PARTITION OF obanalytics.level2_bitfinex_ltcusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01002r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ATTACH PARTITION obanalytics.level2_01002r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_01002r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_01002r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_01002r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_01002r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ATTACH PARTITION obanalytics.level2_01002r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_01002r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitfinex_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_ethusd PARTITION OF obanalytics.level2_bitfinex
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.level2_bitfinex_ethusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitfinex ATTACH PARTITION obanalytics.level2_bitfinex_ethusd FOR VALUES IN ('3');
 
 
 ALTER TABLE obanalytics.level2_bitfinex_ethusd OWNER TO "ob-analytics";
@@ -3607,9 +4649,15 @@ ALTER TABLE obanalytics.level2_bitfinex_ethusd OWNER TO "ob-analytics";
 -- Name: level2_bitfinex_ethusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_ethusd_p0 PARTITION OF obanalytics.level2_bitfinex_ethusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitfinex_ethusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ATTACH PARTITION obanalytics.level2_bitfinex_ethusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitfinex_ethusd_p0 OWNER TO "ob-analytics";
@@ -3618,9 +4666,15 @@ ALTER TABLE obanalytics.level2_bitfinex_ethusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_01003p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01003p0201903 PARTITION OF obanalytics.level2_bitfinex_ethusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01003p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_p0 ATTACH PARTITION obanalytics.level2_01003p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01003p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3630,9 +4684,15 @@ ALTER TABLE obanalytics.level2_01003p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitfinex_ethusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitfinex_ethusd_r0 PARTITION OF obanalytics.level2_bitfinex_ethusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitfinex_ethusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ATTACH PARTITION obanalytics.level2_bitfinex_ethusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3642,9 +4702,15 @@ ALTER TABLE obanalytics.level2_bitfinex_ethusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_01003r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01003r0201903 PARTITION OF obanalytics.level2_bitfinex_ethusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01003r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ATTACH PARTITION obanalytics.level2_01003r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01003r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3654,9 +4720,15 @@ ALTER TABLE obanalytics.level2_01003r0201903 OWNER TO "ob-analytics";
 -- Name: level2_01003r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01003r0201904 PARTITION OF obanalytics.level2_bitfinex_ethusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01003r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ATTACH PARTITION obanalytics.level2_01003r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01003r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3666,9 +4738,15 @@ ALTER TABLE obanalytics.level2_01003r0201904 OWNER TO "ob-analytics";
 -- Name: level2_01003r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01003r0201905 PARTITION OF obanalytics.level2_bitfinex_ethusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01003r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ATTACH PARTITION obanalytics.level2_01003r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01003r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3678,9 +4756,15 @@ ALTER TABLE obanalytics.level2_01003r0201905 OWNER TO "ob-analytics";
 -- Name: level2_01003r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01003r0201906 PARTITION OF obanalytics.level2_bitfinex_ethusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01003r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ATTACH PARTITION obanalytics.level2_01003r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_01003r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3690,20 +4774,50 @@ ALTER TABLE obanalytics.level2_01003r0201906 OWNER TO "ob-analytics";
 -- Name: level2_01003r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_01003r0201907 PARTITION OF obanalytics.level2_bitfinex_ethusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_01003r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ATTACH PARTITION obanalytics.level2_01003r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_01003r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_01003r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_01003r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_01003r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ATTACH PARTITION obanalytics.level2_01003r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_01003r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp PARTITION OF obanalytics.level2
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level2_bitstamp (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.level2 ATTACH PARTITION obanalytics.level2_bitstamp FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.level2_bitstamp OWNER TO "ob-analytics";
@@ -3712,9 +4826,15 @@ ALTER TABLE obanalytics.level2_bitstamp OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_btcusd PARTITION OF obanalytics.level2_bitstamp
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level2_bitstamp_btcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_btcusd FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_btcusd OWNER TO "ob-analytics";
@@ -3723,9 +4843,15 @@ ALTER TABLE obanalytics.level2_bitstamp_btcusd OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_btcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_btcusd_p0 PARTITION OF obanalytics.level2_bitstamp_btcusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitstamp_btcusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd ATTACH PARTITION obanalytics.level2_bitstamp_btcusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_btcusd_p0 OWNER TO "ob-analytics";
@@ -3734,9 +4860,15 @@ ALTER TABLE obanalytics.level2_bitstamp_btcusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_02001p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001p0201903 PARTITION OF obanalytics.level2_bitstamp_btcusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_p0 ATTACH PARTITION obanalytics.level2_02001p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3746,9 +4878,15 @@ ALTER TABLE obanalytics.level2_02001p0201903 OWNER TO "ob-analytics";
 -- Name: level2_02001p0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001p0201904 PARTITION OF obanalytics.level2_bitstamp_btcusd_p0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001p0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_p0 ATTACH PARTITION obanalytics.level2_02001p0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001p0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3758,9 +4896,15 @@ ALTER TABLE obanalytics.level2_02001p0201904 OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_btcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_btcusd_r0 PARTITION OF obanalytics.level2_bitstamp_btcusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitstamp_btcusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd ATTACH PARTITION obanalytics.level2_bitstamp_btcusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3770,9 +4914,15 @@ ALTER TABLE obanalytics.level2_bitstamp_btcusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_02001r0201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001r0201901 PARTITION OF obanalytics.level2_bitstamp_btcusd_r0
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001r0201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001r0201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3782,9 +4932,15 @@ ALTER TABLE obanalytics.level2_02001r0201901 OWNER TO "ob-analytics";
 -- Name: level2_02001r0201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001r0201902 PARTITION OF obanalytics.level2_bitstamp_btcusd_r0
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001r0201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001r0201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3794,9 +4950,15 @@ ALTER TABLE obanalytics.level2_02001r0201902 OWNER TO "ob-analytics";
 -- Name: level2_02001r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001r0201903 PARTITION OF obanalytics.level2_bitstamp_btcusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3806,9 +4968,15 @@ ALTER TABLE obanalytics.level2_02001r0201903 OWNER TO "ob-analytics";
 -- Name: level2_02001r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001r0201904 PARTITION OF obanalytics.level2_bitstamp_btcusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3818,9 +4986,15 @@ ALTER TABLE obanalytics.level2_02001r0201904 OWNER TO "ob-analytics";
 -- Name: level2_02001r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001r0201905 PARTITION OF obanalytics.level2_bitstamp_btcusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3830,9 +5004,15 @@ ALTER TABLE obanalytics.level2_02001r0201905 OWNER TO "ob-analytics";
 -- Name: level2_02001r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001r0201906 PARTITION OF obanalytics.level2_bitstamp_btcusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02001r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3842,20 +5022,50 @@ ALTER TABLE obanalytics.level2_02001r0201906 OWNER TO "ob-analytics";
 -- Name: level2_02001r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02001r0201907 PARTITION OF obanalytics.level2_bitstamp_btcusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02001r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_02001r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_02001r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_02001r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_02001r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ATTACH PARTITION obanalytics.level2_02001r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_02001r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitstamp_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ltcusd PARTITION OF obanalytics.level2_bitstamp
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level2_bitstamp_ltcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_ltcusd FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_ltcusd OWNER TO "ob-analytics";
@@ -3864,9 +5074,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ltcusd OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_ltcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ltcusd_p0 PARTITION OF obanalytics.level2_bitstamp_ltcusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitstamp_ltcusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd ATTACH PARTITION obanalytics.level2_bitstamp_ltcusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_ltcusd_p0 OWNER TO "ob-analytics";
@@ -3875,9 +5091,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ltcusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_02002p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002p0201903 PARTITION OF obanalytics.level2_bitstamp_ltcusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_p0 ATTACH PARTITION obanalytics.level2_02002p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02002p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3887,9 +5109,15 @@ ALTER TABLE obanalytics.level2_02002p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_ltcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ltcusd_r0 PARTITION OF obanalytics.level2_bitstamp_ltcusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitstamp_ltcusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd ATTACH PARTITION obanalytics.level2_bitstamp_ltcusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3899,9 +5127,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ltcusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_02002r0201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002r0201901 PARTITION OF obanalytics.level2_bitstamp_ltcusd_r0
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002r0201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02002r0201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3911,9 +5145,15 @@ ALTER TABLE obanalytics.level2_02002r0201901 OWNER TO "ob-analytics";
 -- Name: level2_02002r0201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002r0201902 PARTITION OF obanalytics.level2_bitstamp_ltcusd_r0
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002r0201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02002r0201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3923,9 +5163,15 @@ ALTER TABLE obanalytics.level2_02002r0201902 OWNER TO "ob-analytics";
 -- Name: level2_02002r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002r0201903 PARTITION OF obanalytics.level2_bitstamp_ltcusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02002r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3935,9 +5181,15 @@ ALTER TABLE obanalytics.level2_02002r0201903 OWNER TO "ob-analytics";
 -- Name: level2_02002r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002r0201904 PARTITION OF obanalytics.level2_bitstamp_ltcusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02002r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3947,9 +5199,15 @@ ALTER TABLE obanalytics.level2_02002r0201904 OWNER TO "ob-analytics";
 -- Name: level2_02002r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002r0201905 PARTITION OF obanalytics.level2_bitstamp_ltcusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02002r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3959,9 +5217,15 @@ ALTER TABLE obanalytics.level2_02002r0201905 OWNER TO "ob-analytics";
 -- Name: level2_02002r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002r0201906 PARTITION OF obanalytics.level2_bitstamp_ltcusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02002r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -3971,20 +5235,50 @@ ALTER TABLE obanalytics.level2_02002r0201906 OWNER TO "ob-analytics";
 -- Name: level2_02002r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02002r0201907 PARTITION OF obanalytics.level2_bitstamp_ltcusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02002r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_02002r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_02002r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_02002r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_02002r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ATTACH PARTITION obanalytics.level2_02002r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_02002r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitstamp_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ethusd PARTITION OF obanalytics.level2_bitstamp
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.level2_bitstamp_ethusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_ethusd FOR VALUES IN ('3');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_ethusd OWNER TO "ob-analytics";
@@ -3993,9 +5287,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ethusd OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_ethusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ethusd_p0 PARTITION OF obanalytics.level2_bitstamp_ethusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitstamp_ethusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd ATTACH PARTITION obanalytics.level2_bitstamp_ethusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_ethusd_p0 OWNER TO "ob-analytics";
@@ -4004,9 +5304,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ethusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_02003p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003p0201903 PARTITION OF obanalytics.level2_bitstamp_ethusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_p0 ATTACH PARTITION obanalytics.level2_02003p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02003p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4016,9 +5322,15 @@ ALTER TABLE obanalytics.level2_02003p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_ethusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ethusd_r0 PARTITION OF obanalytics.level2_bitstamp_ethusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitstamp_ethusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd ATTACH PARTITION obanalytics.level2_bitstamp_ethusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4028,9 +5340,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ethusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_02003r0201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003r0201901 PARTITION OF obanalytics.level2_bitstamp_ethusd_r0
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003r0201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02003r0201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4040,9 +5358,15 @@ ALTER TABLE obanalytics.level2_02003r0201901 OWNER TO "ob-analytics";
 -- Name: level2_02003r0201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003r0201902 PARTITION OF obanalytics.level2_bitstamp_ethusd_r0
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003r0201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02003r0201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4052,9 +5376,15 @@ ALTER TABLE obanalytics.level2_02003r0201902 OWNER TO "ob-analytics";
 -- Name: level2_02003r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003r0201903 PARTITION OF obanalytics.level2_bitstamp_ethusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02003r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4064,9 +5394,15 @@ ALTER TABLE obanalytics.level2_02003r0201903 OWNER TO "ob-analytics";
 -- Name: level2_02003r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003r0201904 PARTITION OF obanalytics.level2_bitstamp_ethusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02003r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4076,9 +5412,15 @@ ALTER TABLE obanalytics.level2_02003r0201904 OWNER TO "ob-analytics";
 -- Name: level2_02003r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003r0201905 PARTITION OF obanalytics.level2_bitstamp_ethusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02003r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4088,9 +5430,15 @@ ALTER TABLE obanalytics.level2_02003r0201905 OWNER TO "ob-analytics";
 -- Name: level2_02003r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003r0201906 PARTITION OF obanalytics.level2_bitstamp_ethusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02003r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4100,20 +5448,50 @@ ALTER TABLE obanalytics.level2_02003r0201906 OWNER TO "ob-analytics";
 -- Name: level2_02003r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02003r0201907 PARTITION OF obanalytics.level2_bitstamp_ethusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02003r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_02003r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_02003r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_02003r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_02003r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ATTACH PARTITION obanalytics.level2_02003r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_02003r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitstamp_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_xrpusd PARTITION OF obanalytics.level2_bitstamp
-FOR VALUES IN ('4')
+CREATE TABLE obanalytics.level2_bitstamp_xrpusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_xrpusd FOR VALUES IN ('4');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_xrpusd OWNER TO "ob-analytics";
@@ -4122,9 +5500,15 @@ ALTER TABLE obanalytics.level2_bitstamp_xrpusd OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_xrpusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_xrpusd_p0 PARTITION OF obanalytics.level2_bitstamp_xrpusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitstamp_xrpusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd ATTACH PARTITION obanalytics.level2_bitstamp_xrpusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_xrpusd_p0 OWNER TO "ob-analytics";
@@ -4133,9 +5517,15 @@ ALTER TABLE obanalytics.level2_bitstamp_xrpusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_02004p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004p0201903 PARTITION OF obanalytics.level2_bitstamp_xrpusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_p0 ATTACH PARTITION obanalytics.level2_02004p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02004p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4145,9 +5535,15 @@ ALTER TABLE obanalytics.level2_02004p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_xrpusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_xrpusd_r0 PARTITION OF obanalytics.level2_bitstamp_xrpusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitstamp_xrpusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd ATTACH PARTITION obanalytics.level2_bitstamp_xrpusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4157,9 +5553,15 @@ ALTER TABLE obanalytics.level2_bitstamp_xrpusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_02004r0201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004r0201901 PARTITION OF obanalytics.level2_bitstamp_xrpusd_r0
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004r0201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02004r0201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4169,9 +5571,15 @@ ALTER TABLE obanalytics.level2_02004r0201901 OWNER TO "ob-analytics";
 -- Name: level2_02004r0201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004r0201902 PARTITION OF obanalytics.level2_bitstamp_xrpusd_r0
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004r0201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02004r0201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4181,9 +5589,15 @@ ALTER TABLE obanalytics.level2_02004r0201902 OWNER TO "ob-analytics";
 -- Name: level2_02004r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004r0201903 PARTITION OF obanalytics.level2_bitstamp_xrpusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02004r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4193,9 +5607,15 @@ ALTER TABLE obanalytics.level2_02004r0201903 OWNER TO "ob-analytics";
 -- Name: level2_02004r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004r0201904 PARTITION OF obanalytics.level2_bitstamp_xrpusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02004r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4205,9 +5625,15 @@ ALTER TABLE obanalytics.level2_02004r0201904 OWNER TO "ob-analytics";
 -- Name: level2_02004r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004r0201905 PARTITION OF obanalytics.level2_bitstamp_xrpusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02004r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4217,9 +5643,15 @@ ALTER TABLE obanalytics.level2_02004r0201905 OWNER TO "ob-analytics";
 -- Name: level2_02004r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004r0201906 PARTITION OF obanalytics.level2_bitstamp_xrpusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02004r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4229,20 +5661,50 @@ ALTER TABLE obanalytics.level2_02004r0201906 OWNER TO "ob-analytics";
 -- Name: level2_02004r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02004r0201907 PARTITION OF obanalytics.level2_bitstamp_xrpusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02004r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_02004r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_02004r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_02004r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_02004r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ATTACH PARTITION obanalytics.level2_02004r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_02004r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitstamp_bchusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_bchusd PARTITION OF obanalytics.level2_bitstamp
-FOR VALUES IN ('5')
+CREATE TABLE obanalytics.level2_bitstamp_bchusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_bchusd FOR VALUES IN ('5');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_bchusd OWNER TO "ob-analytics";
@@ -4251,9 +5713,15 @@ ALTER TABLE obanalytics.level2_bitstamp_bchusd OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_bchusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_bchusd_p0 PARTITION OF obanalytics.level2_bitstamp_bchusd
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitstamp_bchusd_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd ATTACH PARTITION obanalytics.level2_bitstamp_bchusd_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_bchusd_p0 OWNER TO "ob-analytics";
@@ -4262,9 +5730,15 @@ ALTER TABLE obanalytics.level2_bitstamp_bchusd_p0 OWNER TO "ob-analytics";
 -- Name: level2_02005p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005p0201903 PARTITION OF obanalytics.level2_bitstamp_bchusd_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_p0 ATTACH PARTITION obanalytics.level2_02005p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02005p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4274,9 +5748,15 @@ ALTER TABLE obanalytics.level2_02005p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_bchusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_bchusd_r0 PARTITION OF obanalytics.level2_bitstamp_bchusd
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitstamp_bchusd_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd ATTACH PARTITION obanalytics.level2_bitstamp_bchusd_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4286,9 +5766,15 @@ ALTER TABLE obanalytics.level2_bitstamp_bchusd_r0 OWNER TO "ob-analytics";
 -- Name: level2_02005r0201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005r0201901 PARTITION OF obanalytics.level2_bitstamp_bchusd_r0
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005r0201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02005r0201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4298,9 +5784,15 @@ ALTER TABLE obanalytics.level2_02005r0201901 OWNER TO "ob-analytics";
 -- Name: level2_02005r0201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005r0201902 PARTITION OF obanalytics.level2_bitstamp_bchusd_r0
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005r0201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02005r0201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4310,9 +5802,15 @@ ALTER TABLE obanalytics.level2_02005r0201902 OWNER TO "ob-analytics";
 -- Name: level2_02005r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005r0201903 PARTITION OF obanalytics.level2_bitstamp_bchusd_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02005r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4322,9 +5820,15 @@ ALTER TABLE obanalytics.level2_02005r0201903 OWNER TO "ob-analytics";
 -- Name: level2_02005r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005r0201904 PARTITION OF obanalytics.level2_bitstamp_bchusd_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02005r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4334,9 +5838,15 @@ ALTER TABLE obanalytics.level2_02005r0201904 OWNER TO "ob-analytics";
 -- Name: level2_02005r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005r0201905 PARTITION OF obanalytics.level2_bitstamp_bchusd_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02005r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4346,9 +5856,15 @@ ALTER TABLE obanalytics.level2_02005r0201905 OWNER TO "ob-analytics";
 -- Name: level2_02005r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005r0201906 PARTITION OF obanalytics.level2_bitstamp_bchusd_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02005r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4358,20 +5874,50 @@ ALTER TABLE obanalytics.level2_02005r0201906 OWNER TO "ob-analytics";
 -- Name: level2_02005r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02005r0201907 PARTITION OF obanalytics.level2_bitstamp_bchusd_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02005r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_02005r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_02005r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_02005r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_02005r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ATTACH PARTITION obanalytics.level2_02005r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_02005r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitstamp_btceur; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_btceur PARTITION OF obanalytics.level2_bitstamp
-FOR VALUES IN ('6')
+CREATE TABLE obanalytics.level2_bitstamp_btceur (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_btceur FOR VALUES IN ('6');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_btceur OWNER TO "ob-analytics";
@@ -4380,9 +5926,15 @@ ALTER TABLE obanalytics.level2_bitstamp_btceur OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_btceur_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_btceur_p0 PARTITION OF obanalytics.level2_bitstamp_btceur
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitstamp_btceur_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur ATTACH PARTITION obanalytics.level2_bitstamp_btceur_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_btceur_p0 OWNER TO "ob-analytics";
@@ -4391,9 +5943,15 @@ ALTER TABLE obanalytics.level2_bitstamp_btceur_p0 OWNER TO "ob-analytics";
 -- Name: level2_02006p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006p0201903 PARTITION OF obanalytics.level2_bitstamp_btceur_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_p0 ATTACH PARTITION obanalytics.level2_02006p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02006p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4403,9 +5961,15 @@ ALTER TABLE obanalytics.level2_02006p0201903 OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_btceur_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_btceur_r0 PARTITION OF obanalytics.level2_bitstamp_btceur
-FOR VALUES IN ('r0')
+CREATE TABLE obanalytics.level2_bitstamp_btceur_r0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur ATTACH PARTITION obanalytics.level2_bitstamp_btceur_r0 FOR VALUES IN ('r0');
 ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4415,9 +5979,15 @@ ALTER TABLE obanalytics.level2_bitstamp_btceur_r0 OWNER TO "ob-analytics";
 -- Name: level2_02006r0201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006r0201901 PARTITION OF obanalytics.level2_bitstamp_btceur_r0
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006r0201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02006r0201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4427,9 +5997,15 @@ ALTER TABLE obanalytics.level2_02006r0201901 OWNER TO "ob-analytics";
 -- Name: level2_02006r0201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006r0201902 PARTITION OF obanalytics.level2_bitstamp_btceur_r0
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006r0201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02006r0201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4439,9 +6015,15 @@ ALTER TABLE obanalytics.level2_02006r0201902 OWNER TO "ob-analytics";
 -- Name: level2_02006r0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006r0201903 PARTITION OF obanalytics.level2_bitstamp_btceur_r0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006r0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02006r0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4451,9 +6033,15 @@ ALTER TABLE obanalytics.level2_02006r0201903 OWNER TO "ob-analytics";
 -- Name: level2_02006r0201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006r0201904 PARTITION OF obanalytics.level2_bitstamp_btceur_r0
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006r0201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02006r0201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4463,9 +6051,15 @@ ALTER TABLE obanalytics.level2_02006r0201904 OWNER TO "ob-analytics";
 -- Name: level2_02006r0201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006r0201905 PARTITION OF obanalytics.level2_bitstamp_btceur_r0
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006r0201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02006r0201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4475,9 +6069,15 @@ ALTER TABLE obanalytics.level2_02006r0201905 OWNER TO "ob-analytics";
 -- Name: level2_02006r0201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006r0201906 PARTITION OF obanalytics.level2_bitstamp_btceur_r0
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006r0201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02006r0201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4487,20 +6087,50 @@ ALTER TABLE obanalytics.level2_02006r0201906 OWNER TO "ob-analytics";
 -- Name: level2_02006r0201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02006r0201907 PARTITION OF obanalytics.level2_bitstamp_btceur_r0
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02006r0201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level2_02006r0201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level2_02006r0201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level2_02006r0201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level2_02006r0201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ATTACH PARTITION obanalytics.level2_02006r0201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level2_02006r0201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_bitstamp_ethbtc; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ethbtc PARTITION OF obanalytics.level2_bitstamp
-FOR VALUES IN ('7')
+CREATE TABLE obanalytics.level2_bitstamp_ethbtc (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 7 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY LIST ("precision");
+ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_ethbtc FOR VALUES IN ('7');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_ethbtc OWNER TO "ob-analytics";
@@ -4509,9 +6139,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ethbtc OWNER TO "ob-analytics";
 -- Name: level2_bitstamp_ethbtc_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_bitstamp_ethbtc_p0 PARTITION OF obanalytics.level2_bitstamp_ethbtc
-FOR VALUES IN ('p0')
+CREATE TABLE obanalytics.level2_bitstamp_ethbtc_p0 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 7 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc ATTACH PARTITION obanalytics.level2_bitstamp_ethbtc_p0 FOR VALUES IN ('p0');
 
 
 ALTER TABLE obanalytics.level2_bitstamp_ethbtc_p0 OWNER TO "ob-analytics";
@@ -4520,9 +6156,15 @@ ALTER TABLE obanalytics.level2_bitstamp_ethbtc_p0 OWNER TO "ob-analytics";
 -- Name: level2_02007p0201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2_02007p0201903 PARTITION OF obanalytics.level2_bitstamp_ethbtc_p0
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level2_02007p0201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    pair_id smallint DEFAULT 7 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
+    depth_change obanalytics.level2_depth_record[] NOT NULL
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc_p0 ATTACH PARTITION obanalytics.level2_02007p0201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level2_02007p0201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4532,9 +6174,32 @@ ALTER TABLE obanalytics.level2_02007p0201903 OWNER TO "ob-analytics";
 -- Name: level3_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex PARTITION OF obanalytics.level3
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level3_bitfinex (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.level3 ATTACH PARTITION obanalytics.level3_bitfinex FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.level3_bitfinex OWNER TO "ob-analytics";
@@ -4543,9 +6208,32 @@ ALTER TABLE obanalytics.level3_bitfinex OWNER TO "ob-analytics";
 -- Name: level3_bitfinex_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_btcusd PARTITION OF obanalytics.level3_bitfinex
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level3_bitfinex_btcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_btcusd FOR VALUES IN ('1');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4555,9 +6243,32 @@ ALTER TABLE obanalytics.level3_bitfinex_btcusd OWNER TO "ob-analytics";
 -- Name: level3_bitfinex_btcusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_btcusd_b PARTITION OF obanalytics.level3_bitfinex_btcusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitfinex_btcusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd ATTACH PARTITION obanalytics.level3_bitfinex_btcusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4567,9 +6278,32 @@ ALTER TABLE obanalytics.level3_bitfinex_btcusd_b OWNER TO "ob-analytics";
 -- Name: level3_01001b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001b201902 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4579,9 +6313,32 @@ ALTER TABLE obanalytics.level3_01001b201902 OWNER TO "ob-analytics";
 -- Name: level3_01001b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001b201903 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4591,9 +6348,32 @@ ALTER TABLE obanalytics.level3_01001b201903 OWNER TO "ob-analytics";
 -- Name: level3_01001b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001b201904 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4603,9 +6383,32 @@ ALTER TABLE obanalytics.level3_01001b201904 OWNER TO "ob-analytics";
 -- Name: level3_01001b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001b201905 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4615,9 +6418,32 @@ ALTER TABLE obanalytics.level3_01001b201905 OWNER TO "ob-analytics";
 -- Name: level3_01001b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001b201906 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4627,20 +6453,101 @@ ALTER TABLE obanalytics.level3_01001b201906 OWNER TO "ob-analytics";
 -- Name: level3_01001b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001b201907 PARTITION OF obanalytics.level3_bitfinex_btcusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_01001b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_01001b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_01001b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01001b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_01001b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitfinex_btcusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_btcusd_s PARTITION OF obanalytics.level3_bitfinex_btcusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitfinex_btcusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd ATTACH PARTITION obanalytics.level3_bitfinex_btcusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4650,9 +6557,32 @@ ALTER TABLE obanalytics.level3_bitfinex_btcusd_s OWNER TO "ob-analytics";
 -- Name: level3_01001s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001s201902 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4662,9 +6592,32 @@ ALTER TABLE obanalytics.level3_01001s201902 OWNER TO "ob-analytics";
 -- Name: level3_01001s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001s201903 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4674,9 +6627,32 @@ ALTER TABLE obanalytics.level3_01001s201903 OWNER TO "ob-analytics";
 -- Name: level3_01001s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001s201904 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4686,9 +6662,32 @@ ALTER TABLE obanalytics.level3_01001s201904 OWNER TO "ob-analytics";
 -- Name: level3_01001s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001s201905 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4698,9 +6697,32 @@ ALTER TABLE obanalytics.level3_01001s201905 OWNER TO "ob-analytics";
 -- Name: level3_01001s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001s201906 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4710,21 +6732,102 @@ ALTER TABLE obanalytics.level3_01001s201906 OWNER TO "ob-analytics";
 -- Name: level3_01001s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01001s201907 PARTITION OF obanalytics.level3_bitfinex_btcusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01001s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01001s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_01001s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_01001s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01001s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_01001s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_01001s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitfinex_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_ltcusd PARTITION OF obanalytics.level3_bitfinex
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level3_bitfinex_ltcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_ltcusd FOR VALUES IN ('2');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4734,9 +6837,32 @@ ALTER TABLE obanalytics.level3_bitfinex_ltcusd OWNER TO "ob-analytics";
 -- Name: level3_bitfinex_ltcusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_ltcusd_b PARTITION OF obanalytics.level3_bitfinex_ltcusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitfinex_ltcusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd ATTACH PARTITION obanalytics.level3_bitfinex_ltcusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4746,9 +6872,32 @@ ALTER TABLE obanalytics.level3_bitfinex_ltcusd_b OWNER TO "ob-analytics";
 -- Name: level3_01002b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002b201902 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4758,9 +6907,32 @@ ALTER TABLE obanalytics.level3_01002b201902 OWNER TO "ob-analytics";
 -- Name: level3_01002b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002b201903 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4770,9 +6942,32 @@ ALTER TABLE obanalytics.level3_01002b201903 OWNER TO "ob-analytics";
 -- Name: level3_01002b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002b201904 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4782,9 +6977,32 @@ ALTER TABLE obanalytics.level3_01002b201904 OWNER TO "ob-analytics";
 -- Name: level3_01002b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002b201905 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4794,9 +7012,32 @@ ALTER TABLE obanalytics.level3_01002b201905 OWNER TO "ob-analytics";
 -- Name: level3_01002b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002b201906 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4806,20 +7047,101 @@ ALTER TABLE obanalytics.level3_01002b201906 OWNER TO "ob-analytics";
 -- Name: level3_01002b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002b201907 PARTITION OF obanalytics.level3_bitfinex_ltcusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_01002b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_01002b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_01002b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01002b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_01002b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitfinex_ltcusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_ltcusd_s PARTITION OF obanalytics.level3_bitfinex_ltcusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitfinex_ltcusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd ATTACH PARTITION obanalytics.level3_bitfinex_ltcusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4829,9 +7151,32 @@ ALTER TABLE obanalytics.level3_bitfinex_ltcusd_s OWNER TO "ob-analytics";
 -- Name: level3_01002s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002s201902 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4841,9 +7186,32 @@ ALTER TABLE obanalytics.level3_01002s201902 OWNER TO "ob-analytics";
 -- Name: level3_01002s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002s201903 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4853,9 +7221,32 @@ ALTER TABLE obanalytics.level3_01002s201903 OWNER TO "ob-analytics";
 -- Name: level3_01002s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002s201904 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4865,9 +7256,32 @@ ALTER TABLE obanalytics.level3_01002s201904 OWNER TO "ob-analytics";
 -- Name: level3_01002s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002s201905 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4877,9 +7291,32 @@ ALTER TABLE obanalytics.level3_01002s201905 OWNER TO "ob-analytics";
 -- Name: level3_01002s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002s201906 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4889,21 +7326,102 @@ ALTER TABLE obanalytics.level3_01002s201906 OWNER TO "ob-analytics";
 -- Name: level3_01002s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01002s201907 PARTITION OF obanalytics.level3_bitfinex_ltcusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01002s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01002s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_01002s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_01002s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01002s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_01002s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_01002s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitfinex_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_ethusd PARTITION OF obanalytics.level3_bitfinex
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.level3_bitfinex_ethusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_ethusd FOR VALUES IN ('3');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4913,9 +7431,32 @@ ALTER TABLE obanalytics.level3_bitfinex_ethusd OWNER TO "ob-analytics";
 -- Name: level3_bitfinex_ethusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_ethusd_b PARTITION OF obanalytics.level3_bitfinex_ethusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitfinex_ethusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd ATTACH PARTITION obanalytics.level3_bitfinex_ethusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4925,9 +7466,32 @@ ALTER TABLE obanalytics.level3_bitfinex_ethusd_b OWNER TO "ob-analytics";
 -- Name: level3_01003b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003b201902 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4937,9 +7501,32 @@ ALTER TABLE obanalytics.level3_01003b201902 OWNER TO "ob-analytics";
 -- Name: level3_01003b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003b201903 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4949,9 +7536,32 @@ ALTER TABLE obanalytics.level3_01003b201903 OWNER TO "ob-analytics";
 -- Name: level3_01003b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003b201904 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4961,9 +7571,32 @@ ALTER TABLE obanalytics.level3_01003b201904 OWNER TO "ob-analytics";
 -- Name: level3_01003b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003b201905 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4973,9 +7606,32 @@ ALTER TABLE obanalytics.level3_01003b201905 OWNER TO "ob-analytics";
 -- Name: level3_01003b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003b201906 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -4985,20 +7641,101 @@ ALTER TABLE obanalytics.level3_01003b201906 OWNER TO "ob-analytics";
 -- Name: level3_01003b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003b201907 PARTITION OF obanalytics.level3_bitfinex_ethusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_01003b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_01003b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_01003b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01003b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_01003b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitfinex_ethusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_ethusd_s PARTITION OF obanalytics.level3_bitfinex_ethusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitfinex_ethusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd ATTACH PARTITION obanalytics.level3_bitfinex_ethusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5008,9 +7745,32 @@ ALTER TABLE obanalytics.level3_bitfinex_ethusd_s OWNER TO "ob-analytics";
 -- Name: level3_01003s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003s201902 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5020,9 +7780,32 @@ ALTER TABLE obanalytics.level3_01003s201902 OWNER TO "ob-analytics";
 -- Name: level3_01003s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003s201903 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5032,9 +7815,32 @@ ALTER TABLE obanalytics.level3_01003s201903 OWNER TO "ob-analytics";
 -- Name: level3_01003s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003s201904 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5044,9 +7850,32 @@ ALTER TABLE obanalytics.level3_01003s201904 OWNER TO "ob-analytics";
 -- Name: level3_01003s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003s201905 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5056,9 +7885,32 @@ ALTER TABLE obanalytics.level3_01003s201905 OWNER TO "ob-analytics";
 -- Name: level3_01003s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003s201906 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5068,21 +7920,102 @@ ALTER TABLE obanalytics.level3_01003s201906 OWNER TO "ob-analytics";
 -- Name: level3_01003s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01003s201907 PARTITION OF obanalytics.level3_bitfinex_ethusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01003s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01003s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_01003s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_01003s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_01003s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_01003s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_01003s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitfinex_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_xrpusd PARTITION OF obanalytics.level3_bitfinex
-FOR VALUES IN ('4')
+CREATE TABLE obanalytics.level3_bitfinex_xrpusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_xrpusd FOR VALUES IN ('4');
 
 
 ALTER TABLE obanalytics.level3_bitfinex_xrpusd OWNER TO "ob-analytics";
@@ -5091,9 +8024,32 @@ ALTER TABLE obanalytics.level3_bitfinex_xrpusd OWNER TO "ob-analytics";
 -- Name: level3_bitfinex_xrpusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_xrpusd_b PARTITION OF obanalytics.level3_bitfinex_xrpusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitfinex_xrpusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ATTACH PARTITION obanalytics.level3_bitfinex_xrpusd_b FOR VALUES IN ('b');
 
 
 ALTER TABLE obanalytics.level3_bitfinex_xrpusd_b OWNER TO "ob-analytics";
@@ -5102,9 +8058,32 @@ ALTER TABLE obanalytics.level3_bitfinex_xrpusd_b OWNER TO "ob-analytics";
 -- Name: level3_01004b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01004b201902 PARTITION OF obanalytics.level3_bitfinex_xrpusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01004b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ATTACH PARTITION obanalytics.level3_01004b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01004b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5114,9 +8093,32 @@ ALTER TABLE obanalytics.level3_01004b201902 OWNER TO "ob-analytics";
 -- Name: level3_bitfinex_xrpusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitfinex_xrpusd_s PARTITION OF obanalytics.level3_bitfinex_xrpusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitfinex_xrpusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ATTACH PARTITION obanalytics.level3_bitfinex_xrpusd_s FOR VALUES IN ('s');
 
 
 ALTER TABLE obanalytics.level3_bitfinex_xrpusd_s OWNER TO "ob-analytics";
@@ -5125,9 +8127,32 @@ ALTER TABLE obanalytics.level3_bitfinex_xrpusd_s OWNER TO "ob-analytics";
 -- Name: level3_01004s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_01004s201902 PARTITION OF obanalytics.level3_bitfinex_xrpusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_01004s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ATTACH PARTITION obanalytics.level3_01004s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_01004s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5137,9 +8162,32 @@ ALTER TABLE obanalytics.level3_01004s201902 OWNER TO "ob-analytics";
 -- Name: level3_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp PARTITION OF obanalytics.level3
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level3_bitstamp (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.level3 ATTACH PARTITION obanalytics.level3_bitstamp FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.level3_bitstamp OWNER TO "ob-analytics";
@@ -5148,9 +8196,32 @@ ALTER TABLE obanalytics.level3_bitstamp OWNER TO "ob-analytics";
 -- Name: level3_bitstamp_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_btcusd PARTITION OF obanalytics.level3_bitstamp
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.level3_bitstamp_btcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_btcusd FOR VALUES IN ('1');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5160,9 +8231,32 @@ ALTER TABLE obanalytics.level3_bitstamp_btcusd OWNER TO "ob-analytics";
 -- Name: level3_bitstamp_btcusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_btcusd_b PARTITION OF obanalytics.level3_bitstamp_btcusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitstamp_btcusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd ATTACH PARTITION obanalytics.level3_bitstamp_btcusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5172,9 +8266,32 @@ ALTER TABLE obanalytics.level3_bitstamp_btcusd_b OWNER TO "ob-analytics";
 -- Name: level3_02001b201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001b201901 PARTITION OF obanalytics.level3_bitstamp_btcusd_b
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001b201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001b201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5184,9 +8301,32 @@ ALTER TABLE obanalytics.level3_02001b201901 OWNER TO "ob-analytics";
 -- Name: level3_02001b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001b201902 PARTITION OF obanalytics.level3_bitstamp_btcusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5196,9 +8336,32 @@ ALTER TABLE obanalytics.level3_02001b201902 OWNER TO "ob-analytics";
 -- Name: level3_02001b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001b201903 PARTITION OF obanalytics.level3_bitstamp_btcusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5208,9 +8371,32 @@ ALTER TABLE obanalytics.level3_02001b201903 OWNER TO "ob-analytics";
 -- Name: level3_02001b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001b201904 PARTITION OF obanalytics.level3_bitstamp_btcusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5220,9 +8406,32 @@ ALTER TABLE obanalytics.level3_02001b201904 OWNER TO "ob-analytics";
 -- Name: level3_02001b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001b201905 PARTITION OF obanalytics.level3_bitstamp_btcusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5232,9 +8441,32 @@ ALTER TABLE obanalytics.level3_02001b201905 OWNER TO "ob-analytics";
 -- Name: level3_02001b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001b201906 PARTITION OF obanalytics.level3_bitstamp_btcusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5244,20 +8476,101 @@ ALTER TABLE obanalytics.level3_02001b201906 OWNER TO "ob-analytics";
 -- Name: level3_02001b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001b201907 PARTITION OF obanalytics.level3_bitstamp_btcusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02001b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02001b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02001b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02001b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_02001b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_btcusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_btcusd_s PARTITION OF obanalytics.level3_bitstamp_btcusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitstamp_btcusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd ATTACH PARTITION obanalytics.level3_bitstamp_btcusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5267,9 +8580,32 @@ ALTER TABLE obanalytics.level3_bitstamp_btcusd_s OWNER TO "ob-analytics";
 -- Name: level3_02001s201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001s201901 PARTITION OF obanalytics.level3_bitstamp_btcusd_s
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001s201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001s201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5279,9 +8615,32 @@ ALTER TABLE obanalytics.level3_02001s201901 OWNER TO "ob-analytics";
 -- Name: level3_02001s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001s201902 PARTITION OF obanalytics.level3_bitstamp_btcusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5291,9 +8650,32 @@ ALTER TABLE obanalytics.level3_02001s201902 OWNER TO "ob-analytics";
 -- Name: level3_02001s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001s201903 PARTITION OF obanalytics.level3_bitstamp_btcusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5303,9 +8685,32 @@ ALTER TABLE obanalytics.level3_02001s201903 OWNER TO "ob-analytics";
 -- Name: level3_02001s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001s201904 PARTITION OF obanalytics.level3_bitstamp_btcusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5315,9 +8720,32 @@ ALTER TABLE obanalytics.level3_02001s201904 OWNER TO "ob-analytics";
 -- Name: level3_02001s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001s201905 PARTITION OF obanalytics.level3_bitstamp_btcusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5327,9 +8755,32 @@ ALTER TABLE obanalytics.level3_02001s201905 OWNER TO "ob-analytics";
 -- Name: level3_02001s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001s201906 PARTITION OF obanalytics.level3_bitstamp_btcusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5339,21 +8790,102 @@ ALTER TABLE obanalytics.level3_02001s201906 OWNER TO "ob-analytics";
 -- Name: level3_02001s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02001s201907 PARTITION OF obanalytics.level3_bitstamp_btcusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02001s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02001s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02001s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02001s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02001s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02001s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_02001s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_ltcusd PARTITION OF obanalytics.level3_bitstamp
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.level3_bitstamp_ltcusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_ltcusd FOR VALUES IN ('2');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5363,9 +8895,32 @@ ALTER TABLE obanalytics.level3_bitstamp_ltcusd OWNER TO "ob-analytics";
 -- Name: level3_bitstamp_ltcusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_ltcusd_b PARTITION OF obanalytics.level3_bitstamp_ltcusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitstamp_ltcusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd ATTACH PARTITION obanalytics.level3_bitstamp_ltcusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5375,9 +8930,32 @@ ALTER TABLE obanalytics.level3_bitstamp_ltcusd_b OWNER TO "ob-analytics";
 -- Name: level3_02002b201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002b201901 PARTITION OF obanalytics.level3_bitstamp_ltcusd_b
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002b201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002b201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5387,9 +8965,32 @@ ALTER TABLE obanalytics.level3_02002b201901 OWNER TO "ob-analytics";
 -- Name: level3_02002b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002b201902 PARTITION OF obanalytics.level3_bitstamp_ltcusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5399,9 +9000,32 @@ ALTER TABLE obanalytics.level3_02002b201902 OWNER TO "ob-analytics";
 -- Name: level3_02002b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002b201903 PARTITION OF obanalytics.level3_bitstamp_ltcusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5411,9 +9035,32 @@ ALTER TABLE obanalytics.level3_02002b201903 OWNER TO "ob-analytics";
 -- Name: level3_02002b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002b201904 PARTITION OF obanalytics.level3_bitstamp_ltcusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5423,9 +9070,32 @@ ALTER TABLE obanalytics.level3_02002b201904 OWNER TO "ob-analytics";
 -- Name: level3_02002b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002b201905 PARTITION OF obanalytics.level3_bitstamp_ltcusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5435,9 +9105,32 @@ ALTER TABLE obanalytics.level3_02002b201905 OWNER TO "ob-analytics";
 -- Name: level3_02002b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002b201906 PARTITION OF obanalytics.level3_bitstamp_ltcusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5447,20 +9140,101 @@ ALTER TABLE obanalytics.level3_02002b201906 OWNER TO "ob-analytics";
 -- Name: level3_02002b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002b201907 PARTITION OF obanalytics.level3_bitstamp_ltcusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02002b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02002b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02002b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02002b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_02002b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_ltcusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_ltcusd_s PARTITION OF obanalytics.level3_bitstamp_ltcusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitstamp_ltcusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd ATTACH PARTITION obanalytics.level3_bitstamp_ltcusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5470,9 +9244,32 @@ ALTER TABLE obanalytics.level3_bitstamp_ltcusd_s OWNER TO "ob-analytics";
 -- Name: level3_02002s201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002s201901 PARTITION OF obanalytics.level3_bitstamp_ltcusd_s
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002s201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002s201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5482,9 +9279,32 @@ ALTER TABLE obanalytics.level3_02002s201901 OWNER TO "ob-analytics";
 -- Name: level3_02002s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002s201902 PARTITION OF obanalytics.level3_bitstamp_ltcusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5494,9 +9314,32 @@ ALTER TABLE obanalytics.level3_02002s201902 OWNER TO "ob-analytics";
 -- Name: level3_02002s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002s201903 PARTITION OF obanalytics.level3_bitstamp_ltcusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5506,9 +9349,32 @@ ALTER TABLE obanalytics.level3_02002s201903 OWNER TO "ob-analytics";
 -- Name: level3_02002s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002s201904 PARTITION OF obanalytics.level3_bitstamp_ltcusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5518,9 +9384,32 @@ ALTER TABLE obanalytics.level3_02002s201904 OWNER TO "ob-analytics";
 -- Name: level3_02002s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002s201905 PARTITION OF obanalytics.level3_bitstamp_ltcusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5530,9 +9419,32 @@ ALTER TABLE obanalytics.level3_02002s201905 OWNER TO "ob-analytics";
 -- Name: level3_02002s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002s201906 PARTITION OF obanalytics.level3_bitstamp_ltcusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5542,21 +9454,102 @@ ALTER TABLE obanalytics.level3_02002s201906 OWNER TO "ob-analytics";
 -- Name: level3_02002s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02002s201907 PARTITION OF obanalytics.level3_bitstamp_ltcusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02002s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02002s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02002s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02002s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02002s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02002s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_02002s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_ethusd PARTITION OF obanalytics.level3_bitstamp
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.level3_bitstamp_ethusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_ethusd FOR VALUES IN ('3');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5566,9 +9559,32 @@ ALTER TABLE obanalytics.level3_bitstamp_ethusd OWNER TO "ob-analytics";
 -- Name: level3_bitstamp_ethusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_ethusd_b PARTITION OF obanalytics.level3_bitstamp_ethusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitstamp_ethusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd ATTACH PARTITION obanalytics.level3_bitstamp_ethusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5578,9 +9594,32 @@ ALTER TABLE obanalytics.level3_bitstamp_ethusd_b OWNER TO "ob-analytics";
 -- Name: level3_02003b201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003b201901 PARTITION OF obanalytics.level3_bitstamp_ethusd_b
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003b201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003b201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5590,9 +9629,32 @@ ALTER TABLE obanalytics.level3_02003b201901 OWNER TO "ob-analytics";
 -- Name: level3_02003b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003b201902 PARTITION OF obanalytics.level3_bitstamp_ethusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5602,9 +9664,32 @@ ALTER TABLE obanalytics.level3_02003b201902 OWNER TO "ob-analytics";
 -- Name: level3_02003b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003b201903 PARTITION OF obanalytics.level3_bitstamp_ethusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5614,9 +9699,32 @@ ALTER TABLE obanalytics.level3_02003b201903 OWNER TO "ob-analytics";
 -- Name: level3_02003b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003b201904 PARTITION OF obanalytics.level3_bitstamp_ethusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5626,9 +9734,32 @@ ALTER TABLE obanalytics.level3_02003b201904 OWNER TO "ob-analytics";
 -- Name: level3_02003b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003b201905 PARTITION OF obanalytics.level3_bitstamp_ethusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5638,9 +9769,32 @@ ALTER TABLE obanalytics.level3_02003b201905 OWNER TO "ob-analytics";
 -- Name: level3_02003b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003b201906 PARTITION OF obanalytics.level3_bitstamp_ethusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5650,20 +9804,101 @@ ALTER TABLE obanalytics.level3_02003b201906 OWNER TO "ob-analytics";
 -- Name: level3_02003b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003b201907 PARTITION OF obanalytics.level3_bitstamp_ethusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02003b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02003b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02003b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02003b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_02003b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_ethusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_ethusd_s PARTITION OF obanalytics.level3_bitstamp_ethusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitstamp_ethusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd ATTACH PARTITION obanalytics.level3_bitstamp_ethusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5673,9 +9908,32 @@ ALTER TABLE obanalytics.level3_bitstamp_ethusd_s OWNER TO "ob-analytics";
 -- Name: level3_02003s201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003s201901 PARTITION OF obanalytics.level3_bitstamp_ethusd_s
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003s201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003s201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5685,9 +9943,32 @@ ALTER TABLE obanalytics.level3_02003s201901 OWNER TO "ob-analytics";
 -- Name: level3_02003s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003s201902 PARTITION OF obanalytics.level3_bitstamp_ethusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5697,9 +9978,32 @@ ALTER TABLE obanalytics.level3_02003s201902 OWNER TO "ob-analytics";
 -- Name: level3_02003s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003s201903 PARTITION OF obanalytics.level3_bitstamp_ethusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5709,9 +10013,32 @@ ALTER TABLE obanalytics.level3_02003s201903 OWNER TO "ob-analytics";
 -- Name: level3_02003s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003s201904 PARTITION OF obanalytics.level3_bitstamp_ethusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5721,9 +10048,32 @@ ALTER TABLE obanalytics.level3_02003s201904 OWNER TO "ob-analytics";
 -- Name: level3_02003s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003s201905 PARTITION OF obanalytics.level3_bitstamp_ethusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5733,9 +10083,32 @@ ALTER TABLE obanalytics.level3_02003s201905 OWNER TO "ob-analytics";
 -- Name: level3_02003s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003s201906 PARTITION OF obanalytics.level3_bitstamp_ethusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5745,21 +10118,102 @@ ALTER TABLE obanalytics.level3_02003s201906 OWNER TO "ob-analytics";
 -- Name: level3_02003s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02003s201907 PARTITION OF obanalytics.level3_bitstamp_ethusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02003s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02003s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02003s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02003s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02003s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02003s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_02003s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_xrpusd PARTITION OF obanalytics.level3_bitstamp
-FOR VALUES IN ('4')
+CREATE TABLE obanalytics.level3_bitstamp_xrpusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd FOR VALUES IN ('4');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5769,9 +10223,32 @@ ALTER TABLE obanalytics.level3_bitstamp_xrpusd OWNER TO "ob-analytics";
 -- Name: level3_bitstamp_xrpusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_xrpusd_b PARTITION OF obanalytics.level3_bitstamp_xrpusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitstamp_xrpusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5781,9 +10258,32 @@ ALTER TABLE obanalytics.level3_bitstamp_xrpusd_b OWNER TO "ob-analytics";
 -- Name: level3_02004b201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004b201901 PARTITION OF obanalytics.level3_bitstamp_xrpusd_b
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004b201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004b201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5793,9 +10293,32 @@ ALTER TABLE obanalytics.level3_02004b201901 OWNER TO "ob-analytics";
 -- Name: level3_02004b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004b201902 PARTITION OF obanalytics.level3_bitstamp_xrpusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5805,9 +10328,32 @@ ALTER TABLE obanalytics.level3_02004b201902 OWNER TO "ob-analytics";
 -- Name: level3_02004b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004b201903 PARTITION OF obanalytics.level3_bitstamp_xrpusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5817,9 +10363,32 @@ ALTER TABLE obanalytics.level3_02004b201903 OWNER TO "ob-analytics";
 -- Name: level3_02004b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004b201904 PARTITION OF obanalytics.level3_bitstamp_xrpusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5829,9 +10398,32 @@ ALTER TABLE obanalytics.level3_02004b201904 OWNER TO "ob-analytics";
 -- Name: level3_02004b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004b201905 PARTITION OF obanalytics.level3_bitstamp_xrpusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5841,9 +10433,32 @@ ALTER TABLE obanalytics.level3_02004b201905 OWNER TO "ob-analytics";
 -- Name: level3_02004b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004b201906 PARTITION OF obanalytics.level3_bitstamp_xrpusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5853,20 +10468,101 @@ ALTER TABLE obanalytics.level3_02004b201906 OWNER TO "ob-analytics";
 -- Name: level3_02004b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004b201907 PARTITION OF obanalytics.level3_bitstamp_xrpusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02004b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02004b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02004b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02004b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_02004b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_xrpusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_xrpusd_s PARTITION OF obanalytics.level3_bitstamp_xrpusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitstamp_xrpusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5876,9 +10572,32 @@ ALTER TABLE obanalytics.level3_bitstamp_xrpusd_s OWNER TO "ob-analytics";
 -- Name: level3_02004s201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004s201901 PARTITION OF obanalytics.level3_bitstamp_xrpusd_s
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004s201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004s201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5888,9 +10607,32 @@ ALTER TABLE obanalytics.level3_02004s201901 OWNER TO "ob-analytics";
 -- Name: level3_02004s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004s201902 PARTITION OF obanalytics.level3_bitstamp_xrpusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5900,9 +10642,32 @@ ALTER TABLE obanalytics.level3_02004s201902 OWNER TO "ob-analytics";
 -- Name: level3_02004s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004s201903 PARTITION OF obanalytics.level3_bitstamp_xrpusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5912,9 +10677,32 @@ ALTER TABLE obanalytics.level3_02004s201903 OWNER TO "ob-analytics";
 -- Name: level3_02004s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004s201904 PARTITION OF obanalytics.level3_bitstamp_xrpusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5924,9 +10712,32 @@ ALTER TABLE obanalytics.level3_02004s201904 OWNER TO "ob-analytics";
 -- Name: level3_02004s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004s201905 PARTITION OF obanalytics.level3_bitstamp_xrpusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5936,9 +10747,32 @@ ALTER TABLE obanalytics.level3_02004s201905 OWNER TO "ob-analytics";
 -- Name: level3_02004s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004s201906 PARTITION OF obanalytics.level3_bitstamp_xrpusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5948,21 +10782,102 @@ ALTER TABLE obanalytics.level3_02004s201906 OWNER TO "ob-analytics";
 -- Name: level3_02004s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02004s201907 PARTITION OF obanalytics.level3_bitstamp_xrpusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02004s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02004s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02004s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02004s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02004s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02004s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_02004s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_bchusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_bchusd PARTITION OF obanalytics.level3_bitstamp
-FOR VALUES IN ('5')
+CREATE TABLE obanalytics.level3_bitstamp_bchusd (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_bchusd FOR VALUES IN ('5');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5972,9 +10887,32 @@ ALTER TABLE obanalytics.level3_bitstamp_bchusd OWNER TO "ob-analytics";
 -- Name: level3_bitstamp_bchusd_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_bchusd_b PARTITION OF obanalytics.level3_bitstamp_bchusd
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitstamp_bchusd_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd ATTACH PARTITION obanalytics.level3_bitstamp_bchusd_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5984,9 +10922,32 @@ ALTER TABLE obanalytics.level3_bitstamp_bchusd_b OWNER TO "ob-analytics";
 -- Name: level3_02005b201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005b201901 PARTITION OF obanalytics.level3_bitstamp_bchusd_b
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005b201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005b201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -5996,9 +10957,32 @@ ALTER TABLE obanalytics.level3_02005b201901 OWNER TO "ob-analytics";
 -- Name: level3_02005b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005b201902 PARTITION OF obanalytics.level3_bitstamp_bchusd_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6008,9 +10992,32 @@ ALTER TABLE obanalytics.level3_02005b201902 OWNER TO "ob-analytics";
 -- Name: level3_02005b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005b201903 PARTITION OF obanalytics.level3_bitstamp_bchusd_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6020,9 +11027,32 @@ ALTER TABLE obanalytics.level3_02005b201903 OWNER TO "ob-analytics";
 -- Name: level3_02005b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005b201904 PARTITION OF obanalytics.level3_bitstamp_bchusd_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6032,9 +11062,32 @@ ALTER TABLE obanalytics.level3_02005b201904 OWNER TO "ob-analytics";
 -- Name: level3_02005b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005b201905 PARTITION OF obanalytics.level3_bitstamp_bchusd_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6044,9 +11097,32 @@ ALTER TABLE obanalytics.level3_02005b201905 OWNER TO "ob-analytics";
 -- Name: level3_02005b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005b201906 PARTITION OF obanalytics.level3_bitstamp_bchusd_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6056,20 +11132,101 @@ ALTER TABLE obanalytics.level3_02005b201906 OWNER TO "ob-analytics";
 -- Name: level3_02005b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005b201907 PARTITION OF obanalytics.level3_bitstamp_bchusd_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02005b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02005b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02005b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02005b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_02005b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_bchusd_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_bchusd_s PARTITION OF obanalytics.level3_bitstamp_bchusd
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitstamp_bchusd_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd ATTACH PARTITION obanalytics.level3_bitstamp_bchusd_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6079,9 +11236,32 @@ ALTER TABLE obanalytics.level3_bitstamp_bchusd_s OWNER TO "ob-analytics";
 -- Name: level3_02005s201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005s201901 PARTITION OF obanalytics.level3_bitstamp_bchusd_s
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005s201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005s201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6091,9 +11271,32 @@ ALTER TABLE obanalytics.level3_02005s201901 OWNER TO "ob-analytics";
 -- Name: level3_02005s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005s201902 PARTITION OF obanalytics.level3_bitstamp_bchusd_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6103,9 +11306,32 @@ ALTER TABLE obanalytics.level3_02005s201902 OWNER TO "ob-analytics";
 -- Name: level3_02005s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005s201903 PARTITION OF obanalytics.level3_bitstamp_bchusd_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6115,9 +11341,32 @@ ALTER TABLE obanalytics.level3_02005s201903 OWNER TO "ob-analytics";
 -- Name: level3_02005s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005s201904 PARTITION OF obanalytics.level3_bitstamp_bchusd_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6127,9 +11376,32 @@ ALTER TABLE obanalytics.level3_02005s201904 OWNER TO "ob-analytics";
 -- Name: level3_02005s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005s201905 PARTITION OF obanalytics.level3_bitstamp_bchusd_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6139,9 +11411,32 @@ ALTER TABLE obanalytics.level3_02005s201905 OWNER TO "ob-analytics";
 -- Name: level3_02005s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005s201906 PARTITION OF obanalytics.level3_bitstamp_bchusd_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6151,21 +11446,102 @@ ALTER TABLE obanalytics.level3_02005s201906 OWNER TO "ob-analytics";
 -- Name: level3_02005s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02005s201907 PARTITION OF obanalytics.level3_bitstamp_bchusd_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02005s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02005s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02005s201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02005s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02005s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02005s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_02005s201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_btceur; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_btceur PARTITION OF obanalytics.level3_bitstamp
-FOR VALUES IN ('6')
+CREATE TABLE obanalytics.level3_bitstamp_btceur (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_btceur FOR VALUES IN ('6');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6175,9 +11551,32 @@ ALTER TABLE obanalytics.level3_bitstamp_btceur OWNER TO "ob-analytics";
 -- Name: level3_bitstamp_btceur_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_btceur_b PARTITION OF obanalytics.level3_bitstamp_btceur
-FOR VALUES IN ('b')
+CREATE TABLE obanalytics.level3_bitstamp_btceur_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur ATTACH PARTITION obanalytics.level3_bitstamp_btceur_b FOR VALUES IN ('b');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6187,9 +11586,32 @@ ALTER TABLE obanalytics.level3_bitstamp_btceur_b OWNER TO "ob-analytics";
 -- Name: level3_02006b201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006b201901 PARTITION OF obanalytics.level3_bitstamp_btceur_b
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006b201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006b201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6199,9 +11621,32 @@ ALTER TABLE obanalytics.level3_02006b201901 OWNER TO "ob-analytics";
 -- Name: level3_02006b201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006b201902 PARTITION OF obanalytics.level3_bitstamp_btceur_b
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006b201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006b201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6211,9 +11656,32 @@ ALTER TABLE obanalytics.level3_02006b201902 OWNER TO "ob-analytics";
 -- Name: level3_02006b201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006b201903 PARTITION OF obanalytics.level3_bitstamp_btceur_b
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006b201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006b201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6223,9 +11691,32 @@ ALTER TABLE obanalytics.level3_02006b201903 OWNER TO "ob-analytics";
 -- Name: level3_02006b201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006b201904 PARTITION OF obanalytics.level3_bitstamp_btceur_b
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006b201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006b201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6235,9 +11726,32 @@ ALTER TABLE obanalytics.level3_02006b201904 OWNER TO "ob-analytics";
 -- Name: level3_02006b201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006b201905 PARTITION OF obanalytics.level3_bitstamp_btceur_b
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006b201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006b201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6247,9 +11761,32 @@ ALTER TABLE obanalytics.level3_02006b201905 OWNER TO "ob-analytics";
 -- Name: level3_02006b201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006b201906 PARTITION OF obanalytics.level3_bitstamp_btceur_b
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006b201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006b201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6259,20 +11796,101 @@ ALTER TABLE obanalytics.level3_02006b201906 OWNER TO "ob-analytics";
 -- Name: level3_02006b201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006b201907 PARTITION OF obanalytics.level3_bitstamp_btceur_b
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006b201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02006b201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02006b201907 OWNER TO "ob-analytics";
 
 --
+-- Name: level3_02006b201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02006b201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.level3_02006b201908 OWNER TO "ob-analytics";
+
+--
 -- Name: level3_bitstamp_btceur_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_bitstamp_btceur_s PARTITION OF obanalytics.level3_bitstamp_btceur
-FOR VALUES IN ('s')
+CREATE TABLE obanalytics.level3_bitstamp_btceur_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur ATTACH PARTITION obanalytics.level3_bitstamp_btceur_s FOR VALUES IN ('s');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6282,9 +11900,32 @@ ALTER TABLE obanalytics.level3_bitstamp_btceur_s OWNER TO "ob-analytics";
 -- Name: level3_02006s201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006s201901 PARTITION OF obanalytics.level3_bitstamp_btceur_s
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006s201901 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006s201901 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6294,9 +11935,32 @@ ALTER TABLE obanalytics.level3_02006s201901 OWNER TO "ob-analytics";
 -- Name: level3_02006s201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006s201902 PARTITION OF obanalytics.level3_bitstamp_btceur_s
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006s201902 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006s201902 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6306,9 +11970,32 @@ ALTER TABLE obanalytics.level3_02006s201902 OWNER TO "ob-analytics";
 -- Name: level3_02006s201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006s201903 PARTITION OF obanalytics.level3_bitstamp_btceur_s
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006s201903 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006s201903 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6318,9 +12005,32 @@ ALTER TABLE obanalytics.level3_02006s201903 OWNER TO "ob-analytics";
 -- Name: level3_02006s201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006s201904 PARTITION OF obanalytics.level3_bitstamp_btceur_s
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006s201904 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006s201904 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6330,9 +12040,32 @@ ALTER TABLE obanalytics.level3_02006s201904 OWNER TO "ob-analytics";
 -- Name: level3_02006s201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006s201905 PARTITION OF obanalytics.level3_bitstamp_btceur_s
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006s201905 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006s201905 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6342,9 +12075,32 @@ ALTER TABLE obanalytics.level3_02006s201905 OWNER TO "ob-analytics";
 -- Name: level3_02006s201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006s201906 PARTITION OF obanalytics.level3_bitstamp_btceur_s
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006s201906 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006s201906 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
@@ -6354,13 +12110,71 @@ ALTER TABLE obanalytics.level3_02006s201906 OWNER TO "ob-analytics";
 -- Name: level3_02006s201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level3_02006s201907 PARTITION OF obanalytics.level3_bitstamp_btceur_s
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.level3_02006s201907 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 ALTER TABLE ONLY obanalytics.level3_02006s201907 ALTER COLUMN microtimestamp SET STATISTICS 1000;
 
 
 ALTER TABLE obanalytics.level3_02006s201907 OWNER TO "ob-analytics";
+
+--
+-- Name: level3_02006s201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_02006s201908 (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+ALTER TABLE ONLY obanalytics.level3_02006s201908 ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_02006s201908 OWNER TO "ob-analytics";
 
 --
 -- Name: level3_eras; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -6421,9 +12235,26 @@ ALTER TABLE obanalytics.level3_eras_bitstamp OWNER TO "ob-analytics";
 -- Name: matches_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitfinex PARTITION OF obanalytics.matches
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.matches_bitfinex (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.matches ATTACH PARTITION obanalytics.matches_bitfinex FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.matches_bitfinex OWNER TO "ob-analytics";
@@ -6432,9 +12263,26 @@ ALTER TABLE obanalytics.matches_bitfinex OWNER TO "ob-analytics";
 -- Name: matches_bitfinex_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitfinex_btcusd PARTITION OF obanalytics.matches_bitfinex
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.matches_bitfinex_btcusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitfinex ATTACH PARTITION obanalytics.matches_bitfinex_btcusd FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.matches_bitfinex_btcusd OWNER TO "ob-analytics";
@@ -6443,9 +12291,26 @@ ALTER TABLE obanalytics.matches_bitfinex_btcusd OWNER TO "ob-analytics";
 -- Name: matches_01001201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01001201902 PARTITION OF obanalytics.matches_bitfinex_btcusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01001201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ATTACH PARTITION obanalytics.matches_01001201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01001201902 OWNER TO "ob-analytics";
@@ -6454,9 +12319,26 @@ ALTER TABLE obanalytics.matches_01001201902 OWNER TO "ob-analytics";
 -- Name: matches_01001201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01001201903 PARTITION OF obanalytics.matches_bitfinex_btcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01001201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ATTACH PARTITION obanalytics.matches_01001201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01001201903 OWNER TO "ob-analytics";
@@ -6465,9 +12347,26 @@ ALTER TABLE obanalytics.matches_01001201903 OWNER TO "ob-analytics";
 -- Name: matches_01001201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01001201904 PARTITION OF obanalytics.matches_bitfinex_btcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01001201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ATTACH PARTITION obanalytics.matches_01001201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01001201904 OWNER TO "ob-analytics";
@@ -6476,9 +12375,26 @@ ALTER TABLE obanalytics.matches_01001201904 OWNER TO "ob-analytics";
 -- Name: matches_01001201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01001201905 PARTITION OF obanalytics.matches_bitfinex_btcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01001201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ATTACH PARTITION obanalytics.matches_01001201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01001201905 OWNER TO "ob-analytics";
@@ -6487,9 +12403,26 @@ ALTER TABLE obanalytics.matches_01001201905 OWNER TO "ob-analytics";
 -- Name: matches_01001201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01001201906 PARTITION OF obanalytics.matches_bitfinex_btcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01001201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ATTACH PARTITION obanalytics.matches_01001201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01001201906 OWNER TO "ob-analytics";
@@ -6498,20 +12431,82 @@ ALTER TABLE obanalytics.matches_01001201906 OWNER TO "ob-analytics";
 -- Name: matches_01001201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01001201907 PARTITION OF obanalytics.matches_bitfinex_btcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01001201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ATTACH PARTITION obanalytics.matches_01001201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01001201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_01001201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_01001201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ATTACH PARTITION obanalytics.matches_01001201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_01001201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitfinex_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitfinex_ltcusd PARTITION OF obanalytics.matches_bitfinex
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.matches_bitfinex_ltcusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitfinex ATTACH PARTITION obanalytics.matches_bitfinex_ltcusd FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.matches_bitfinex_ltcusd OWNER TO "ob-analytics";
@@ -6520,9 +12515,26 @@ ALTER TABLE obanalytics.matches_bitfinex_ltcusd OWNER TO "ob-analytics";
 -- Name: matches_01002201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01002201902 PARTITION OF obanalytics.matches_bitfinex_ltcusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01002201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ATTACH PARTITION obanalytics.matches_01002201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01002201902 OWNER TO "ob-analytics";
@@ -6531,9 +12543,26 @@ ALTER TABLE obanalytics.matches_01002201902 OWNER TO "ob-analytics";
 -- Name: matches_01002201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01002201903 PARTITION OF obanalytics.matches_bitfinex_ltcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01002201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ATTACH PARTITION obanalytics.matches_01002201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01002201903 OWNER TO "ob-analytics";
@@ -6542,9 +12571,26 @@ ALTER TABLE obanalytics.matches_01002201903 OWNER TO "ob-analytics";
 -- Name: matches_01002201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01002201904 PARTITION OF obanalytics.matches_bitfinex_ltcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01002201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ATTACH PARTITION obanalytics.matches_01002201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01002201904 OWNER TO "ob-analytics";
@@ -6553,9 +12599,26 @@ ALTER TABLE obanalytics.matches_01002201904 OWNER TO "ob-analytics";
 -- Name: matches_01002201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01002201905 PARTITION OF obanalytics.matches_bitfinex_ltcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01002201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ATTACH PARTITION obanalytics.matches_01002201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01002201905 OWNER TO "ob-analytics";
@@ -6564,9 +12627,26 @@ ALTER TABLE obanalytics.matches_01002201905 OWNER TO "ob-analytics";
 -- Name: matches_01002201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01002201906 PARTITION OF obanalytics.matches_bitfinex_ltcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01002201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ATTACH PARTITION obanalytics.matches_01002201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01002201906 OWNER TO "ob-analytics";
@@ -6575,20 +12655,82 @@ ALTER TABLE obanalytics.matches_01002201906 OWNER TO "ob-analytics";
 -- Name: matches_01002201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01002201907 PARTITION OF obanalytics.matches_bitfinex_ltcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01002201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ATTACH PARTITION obanalytics.matches_01002201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01002201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_01002201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_01002201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ATTACH PARTITION obanalytics.matches_01002201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_01002201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitfinex_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitfinex_ethusd PARTITION OF obanalytics.matches_bitfinex
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.matches_bitfinex_ethusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitfinex ATTACH PARTITION obanalytics.matches_bitfinex_ethusd FOR VALUES IN ('3');
 
 
 ALTER TABLE obanalytics.matches_bitfinex_ethusd OWNER TO "ob-analytics";
@@ -6597,9 +12739,26 @@ ALTER TABLE obanalytics.matches_bitfinex_ethusd OWNER TO "ob-analytics";
 -- Name: matches_01003201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01003201902 PARTITION OF obanalytics.matches_bitfinex_ethusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01003201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ATTACH PARTITION obanalytics.matches_01003201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01003201902 OWNER TO "ob-analytics";
@@ -6608,9 +12767,26 @@ ALTER TABLE obanalytics.matches_01003201902 OWNER TO "ob-analytics";
 -- Name: matches_01003201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01003201903 PARTITION OF obanalytics.matches_bitfinex_ethusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01003201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ATTACH PARTITION obanalytics.matches_01003201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01003201903 OWNER TO "ob-analytics";
@@ -6619,9 +12795,26 @@ ALTER TABLE obanalytics.matches_01003201903 OWNER TO "ob-analytics";
 -- Name: matches_01003201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01003201904 PARTITION OF obanalytics.matches_bitfinex_ethusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01003201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ATTACH PARTITION obanalytics.matches_01003201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01003201904 OWNER TO "ob-analytics";
@@ -6630,9 +12823,26 @@ ALTER TABLE obanalytics.matches_01003201904 OWNER TO "ob-analytics";
 -- Name: matches_01003201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01003201905 PARTITION OF obanalytics.matches_bitfinex_ethusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01003201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ATTACH PARTITION obanalytics.matches_01003201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01003201905 OWNER TO "ob-analytics";
@@ -6641,9 +12851,26 @@ ALTER TABLE obanalytics.matches_01003201905 OWNER TO "ob-analytics";
 -- Name: matches_01003201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01003201906 PARTITION OF obanalytics.matches_bitfinex_ethusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01003201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ATTACH PARTITION obanalytics.matches_01003201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01003201906 OWNER TO "ob-analytics";
@@ -6652,20 +12879,82 @@ ALTER TABLE obanalytics.matches_01003201906 OWNER TO "ob-analytics";
 -- Name: matches_01003201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01003201907 PARTITION OF obanalytics.matches_bitfinex_ethusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01003201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ATTACH PARTITION obanalytics.matches_01003201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01003201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_01003201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_01003201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ATTACH PARTITION obanalytics.matches_01003201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_01003201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitfinex_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitfinex_xrpusd PARTITION OF obanalytics.matches_bitfinex
-FOR VALUES IN ('4')
+CREATE TABLE obanalytics.matches_bitfinex_xrpusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitfinex ATTACH PARTITION obanalytics.matches_bitfinex_xrpusd FOR VALUES IN ('4');
 
 
 ALTER TABLE obanalytics.matches_bitfinex_xrpusd OWNER TO "ob-analytics";
@@ -6674,9 +12963,26 @@ ALTER TABLE obanalytics.matches_bitfinex_xrpusd OWNER TO "ob-analytics";
 -- Name: matches_01004201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_01004201902 PARTITION OF obanalytics.matches_bitfinex_xrpusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_01004201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 1 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitfinex_xrpusd ATTACH PARTITION obanalytics.matches_01004201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_01004201902 OWNER TO "ob-analytics";
@@ -6685,9 +12991,26 @@ ALTER TABLE obanalytics.matches_01004201902 OWNER TO "ob-analytics";
 -- Name: matches_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitstamp PARTITION OF obanalytics.matches
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.matches_bitstamp (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.matches ATTACH PARTITION obanalytics.matches_bitstamp FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.matches_bitstamp OWNER TO "ob-analytics";
@@ -6696,9 +13019,26 @@ ALTER TABLE obanalytics.matches_bitstamp OWNER TO "ob-analytics";
 -- Name: matches_bitstamp_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitstamp_btcusd PARTITION OF obanalytics.matches_bitstamp
-FOR VALUES IN ('1')
+CREATE TABLE obanalytics.matches_bitstamp_btcusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.matches_bitstamp_btcusd FOR VALUES IN ('1');
 
 
 ALTER TABLE obanalytics.matches_bitstamp_btcusd OWNER TO "ob-analytics";
@@ -6707,9 +13047,26 @@ ALTER TABLE obanalytics.matches_bitstamp_btcusd OWNER TO "ob-analytics";
 -- Name: matches_02001201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02001201901 PARTITION OF obanalytics.matches_bitstamp_btcusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02001201901 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02001201901 OWNER TO "ob-analytics";
@@ -6718,9 +13075,26 @@ ALTER TABLE obanalytics.matches_02001201901 OWNER TO "ob-analytics";
 -- Name: matches_02001201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02001201902 PARTITION OF obanalytics.matches_bitstamp_btcusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02001201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02001201902 OWNER TO "ob-analytics";
@@ -6729,9 +13103,26 @@ ALTER TABLE obanalytics.matches_02001201902 OWNER TO "ob-analytics";
 -- Name: matches_02001201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02001201903 PARTITION OF obanalytics.matches_bitstamp_btcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02001201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02001201903 OWNER TO "ob-analytics";
@@ -6740,9 +13131,26 @@ ALTER TABLE obanalytics.matches_02001201903 OWNER TO "ob-analytics";
 -- Name: matches_02001201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02001201904 PARTITION OF obanalytics.matches_bitstamp_btcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02001201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02001201904 OWNER TO "ob-analytics";
@@ -6751,9 +13159,26 @@ ALTER TABLE obanalytics.matches_02001201904 OWNER TO "ob-analytics";
 -- Name: matches_02001201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02001201905 PARTITION OF obanalytics.matches_bitstamp_btcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02001201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02001201905 OWNER TO "ob-analytics";
@@ -6762,9 +13187,26 @@ ALTER TABLE obanalytics.matches_02001201905 OWNER TO "ob-analytics";
 -- Name: matches_02001201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02001201906 PARTITION OF obanalytics.matches_bitstamp_btcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02001201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02001201906 OWNER TO "ob-analytics";
@@ -6773,20 +13215,82 @@ ALTER TABLE obanalytics.matches_02001201906 OWNER TO "ob-analytics";
 -- Name: matches_02001201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02001201907 PARTITION OF obanalytics.matches_bitstamp_btcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02001201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02001201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_02001201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_02001201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 1 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ATTACH PARTITION obanalytics.matches_02001201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_02001201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitstamp_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitstamp_ltcusd PARTITION OF obanalytics.matches_bitstamp
-FOR VALUES IN ('2')
+CREATE TABLE obanalytics.matches_bitstamp_ltcusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.matches_bitstamp_ltcusd FOR VALUES IN ('2');
 
 
 ALTER TABLE obanalytics.matches_bitstamp_ltcusd OWNER TO "ob-analytics";
@@ -6795,9 +13299,26 @@ ALTER TABLE obanalytics.matches_bitstamp_ltcusd OWNER TO "ob-analytics";
 -- Name: matches_02002201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02002201901 PARTITION OF obanalytics.matches_bitstamp_ltcusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02002201901 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02002201901 OWNER TO "ob-analytics";
@@ -6806,9 +13327,26 @@ ALTER TABLE obanalytics.matches_02002201901 OWNER TO "ob-analytics";
 -- Name: matches_02002201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02002201902 PARTITION OF obanalytics.matches_bitstamp_ltcusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02002201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02002201902 OWNER TO "ob-analytics";
@@ -6817,9 +13355,26 @@ ALTER TABLE obanalytics.matches_02002201902 OWNER TO "ob-analytics";
 -- Name: matches_02002201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02002201903 PARTITION OF obanalytics.matches_bitstamp_ltcusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02002201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02002201903 OWNER TO "ob-analytics";
@@ -6828,9 +13383,26 @@ ALTER TABLE obanalytics.matches_02002201903 OWNER TO "ob-analytics";
 -- Name: matches_02002201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02002201904 PARTITION OF obanalytics.matches_bitstamp_ltcusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02002201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02002201904 OWNER TO "ob-analytics";
@@ -6839,9 +13411,26 @@ ALTER TABLE obanalytics.matches_02002201904 OWNER TO "ob-analytics";
 -- Name: matches_02002201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02002201905 PARTITION OF obanalytics.matches_bitstamp_ltcusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02002201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02002201905 OWNER TO "ob-analytics";
@@ -6850,9 +13439,26 @@ ALTER TABLE obanalytics.matches_02002201905 OWNER TO "ob-analytics";
 -- Name: matches_02002201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02002201906 PARTITION OF obanalytics.matches_bitstamp_ltcusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02002201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02002201906 OWNER TO "ob-analytics";
@@ -6861,20 +13467,82 @@ ALTER TABLE obanalytics.matches_02002201906 OWNER TO "ob-analytics";
 -- Name: matches_02002201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02002201907 PARTITION OF obanalytics.matches_bitstamp_ltcusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02002201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02002201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_02002201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_02002201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 2 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ATTACH PARTITION obanalytics.matches_02002201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_02002201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitstamp_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitstamp_ethusd PARTITION OF obanalytics.matches_bitstamp
-FOR VALUES IN ('3')
+CREATE TABLE obanalytics.matches_bitstamp_ethusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.matches_bitstamp_ethusd FOR VALUES IN ('3');
 
 
 ALTER TABLE obanalytics.matches_bitstamp_ethusd OWNER TO "ob-analytics";
@@ -6883,9 +13551,26 @@ ALTER TABLE obanalytics.matches_bitstamp_ethusd OWNER TO "ob-analytics";
 -- Name: matches_02003201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02003201901 PARTITION OF obanalytics.matches_bitstamp_ethusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02003201901 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02003201901 OWNER TO "ob-analytics";
@@ -6894,9 +13579,26 @@ ALTER TABLE obanalytics.matches_02003201901 OWNER TO "ob-analytics";
 -- Name: matches_02003201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02003201902 PARTITION OF obanalytics.matches_bitstamp_ethusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02003201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02003201902 OWNER TO "ob-analytics";
@@ -6905,9 +13607,26 @@ ALTER TABLE obanalytics.matches_02003201902 OWNER TO "ob-analytics";
 -- Name: matches_02003201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02003201903 PARTITION OF obanalytics.matches_bitstamp_ethusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02003201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02003201903 OWNER TO "ob-analytics";
@@ -6916,9 +13635,26 @@ ALTER TABLE obanalytics.matches_02003201903 OWNER TO "ob-analytics";
 -- Name: matches_02003201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02003201904 PARTITION OF obanalytics.matches_bitstamp_ethusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02003201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02003201904 OWNER TO "ob-analytics";
@@ -6927,9 +13663,26 @@ ALTER TABLE obanalytics.matches_02003201904 OWNER TO "ob-analytics";
 -- Name: matches_02003201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02003201905 PARTITION OF obanalytics.matches_bitstamp_ethusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02003201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02003201905 OWNER TO "ob-analytics";
@@ -6938,9 +13691,26 @@ ALTER TABLE obanalytics.matches_02003201905 OWNER TO "ob-analytics";
 -- Name: matches_02003201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02003201906 PARTITION OF obanalytics.matches_bitstamp_ethusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02003201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02003201906 OWNER TO "ob-analytics";
@@ -6949,20 +13719,82 @@ ALTER TABLE obanalytics.matches_02003201906 OWNER TO "ob-analytics";
 -- Name: matches_02003201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02003201907 PARTITION OF obanalytics.matches_bitstamp_ethusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02003201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02003201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_02003201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_02003201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 3 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ATTACH PARTITION obanalytics.matches_02003201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_02003201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitstamp_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitstamp_xrpusd PARTITION OF obanalytics.matches_bitstamp
-FOR VALUES IN ('4')
+CREATE TABLE obanalytics.matches_bitstamp_xrpusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.matches_bitstamp_xrpusd FOR VALUES IN ('4');
 
 
 ALTER TABLE obanalytics.matches_bitstamp_xrpusd OWNER TO "ob-analytics";
@@ -6971,9 +13803,26 @@ ALTER TABLE obanalytics.matches_bitstamp_xrpusd OWNER TO "ob-analytics";
 -- Name: matches_02004201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02004201901 PARTITION OF obanalytics.matches_bitstamp_xrpusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02004201901 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02004201901 OWNER TO "ob-analytics";
@@ -6982,9 +13831,26 @@ ALTER TABLE obanalytics.matches_02004201901 OWNER TO "ob-analytics";
 -- Name: matches_02004201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02004201902 PARTITION OF obanalytics.matches_bitstamp_xrpusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02004201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02004201902 OWNER TO "ob-analytics";
@@ -6993,9 +13859,26 @@ ALTER TABLE obanalytics.matches_02004201902 OWNER TO "ob-analytics";
 -- Name: matches_02004201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02004201903 PARTITION OF obanalytics.matches_bitstamp_xrpusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02004201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02004201903 OWNER TO "ob-analytics";
@@ -7004,9 +13887,26 @@ ALTER TABLE obanalytics.matches_02004201903 OWNER TO "ob-analytics";
 -- Name: matches_02004201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02004201904 PARTITION OF obanalytics.matches_bitstamp_xrpusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02004201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02004201904 OWNER TO "ob-analytics";
@@ -7015,9 +13915,26 @@ ALTER TABLE obanalytics.matches_02004201904 OWNER TO "ob-analytics";
 -- Name: matches_02004201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02004201905 PARTITION OF obanalytics.matches_bitstamp_xrpusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02004201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02004201905 OWNER TO "ob-analytics";
@@ -7026,9 +13943,26 @@ ALTER TABLE obanalytics.matches_02004201905 OWNER TO "ob-analytics";
 -- Name: matches_02004201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02004201906 PARTITION OF obanalytics.matches_bitstamp_xrpusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02004201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02004201906 OWNER TO "ob-analytics";
@@ -7037,20 +13971,82 @@ ALTER TABLE obanalytics.matches_02004201906 OWNER TO "ob-analytics";
 -- Name: matches_02004201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02004201907 PARTITION OF obanalytics.matches_bitstamp_xrpusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02004201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02004201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_02004201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_02004201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 4 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ATTACH PARTITION obanalytics.matches_02004201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_02004201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitstamp_bchusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitstamp_bchusd PARTITION OF obanalytics.matches_bitstamp
-FOR VALUES IN ('5')
+CREATE TABLE obanalytics.matches_bitstamp_bchusd (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.matches_bitstamp_bchusd FOR VALUES IN ('5');
 
 
 ALTER TABLE obanalytics.matches_bitstamp_bchusd OWNER TO "ob-analytics";
@@ -7059,9 +14055,26 @@ ALTER TABLE obanalytics.matches_bitstamp_bchusd OWNER TO "ob-analytics";
 -- Name: matches_02005201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02005201901 PARTITION OF obanalytics.matches_bitstamp_bchusd
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02005201901 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02005201901 OWNER TO "ob-analytics";
@@ -7070,9 +14083,26 @@ ALTER TABLE obanalytics.matches_02005201901 OWNER TO "ob-analytics";
 -- Name: matches_02005201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02005201902 PARTITION OF obanalytics.matches_bitstamp_bchusd
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02005201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02005201902 OWNER TO "ob-analytics";
@@ -7081,9 +14111,26 @@ ALTER TABLE obanalytics.matches_02005201902 OWNER TO "ob-analytics";
 -- Name: matches_02005201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02005201903 PARTITION OF obanalytics.matches_bitstamp_bchusd
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02005201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02005201903 OWNER TO "ob-analytics";
@@ -7092,9 +14139,26 @@ ALTER TABLE obanalytics.matches_02005201903 OWNER TO "ob-analytics";
 -- Name: matches_02005201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02005201904 PARTITION OF obanalytics.matches_bitstamp_bchusd
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02005201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02005201904 OWNER TO "ob-analytics";
@@ -7103,9 +14167,26 @@ ALTER TABLE obanalytics.matches_02005201904 OWNER TO "ob-analytics";
 -- Name: matches_02005201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02005201905 PARTITION OF obanalytics.matches_bitstamp_bchusd
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02005201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02005201905 OWNER TO "ob-analytics";
@@ -7114,9 +14195,26 @@ ALTER TABLE obanalytics.matches_02005201905 OWNER TO "ob-analytics";
 -- Name: matches_02005201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02005201906 PARTITION OF obanalytics.matches_bitstamp_bchusd
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02005201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02005201906 OWNER TO "ob-analytics";
@@ -7125,20 +14223,82 @@ ALTER TABLE obanalytics.matches_02005201906 OWNER TO "ob-analytics";
 -- Name: matches_02005201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02005201907 PARTITION OF obanalytics.matches_bitstamp_bchusd
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02005201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02005201907 OWNER TO "ob-analytics";
 
 --
+-- Name: matches_02005201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_02005201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 5 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ATTACH PARTITION obanalytics.matches_02005201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_02005201908 OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitstamp_btceur; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_bitstamp_btceur PARTITION OF obanalytics.matches_bitstamp
-FOR VALUES IN ('6')
+CREATE TABLE obanalytics.matches_bitstamp_btceur (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.matches_bitstamp_btceur FOR VALUES IN ('6');
 
 
 ALTER TABLE obanalytics.matches_bitstamp_btceur OWNER TO "ob-analytics";
@@ -7147,9 +14307,26 @@ ALTER TABLE obanalytics.matches_bitstamp_btceur OWNER TO "ob-analytics";
 -- Name: matches_02006201901; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02006201901 PARTITION OF obanalytics.matches_bitstamp_btceur
-FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02006201901 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02006201901 OWNER TO "ob-analytics";
@@ -7158,9 +14335,26 @@ ALTER TABLE obanalytics.matches_02006201901 OWNER TO "ob-analytics";
 -- Name: matches_02006201902; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02006201902 PARTITION OF obanalytics.matches_bitstamp_btceur
-FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02006201902 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02006201902 OWNER TO "ob-analytics";
@@ -7169,9 +14363,26 @@ ALTER TABLE obanalytics.matches_02006201902 OWNER TO "ob-analytics";
 -- Name: matches_02006201903; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02006201903 PARTITION OF obanalytics.matches_bitstamp_btceur
-FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02006201903 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02006201903 OWNER TO "ob-analytics";
@@ -7180,9 +14391,26 @@ ALTER TABLE obanalytics.matches_02006201903 OWNER TO "ob-analytics";
 -- Name: matches_02006201904; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02006201904 PARTITION OF obanalytics.matches_bitstamp_btceur
-FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02006201904 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02006201904 OWNER TO "ob-analytics";
@@ -7191,9 +14419,26 @@ ALTER TABLE obanalytics.matches_02006201904 OWNER TO "ob-analytics";
 -- Name: matches_02006201905; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02006201905 PARTITION OF obanalytics.matches_bitstamp_btceur
-FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02006201905 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02006201905 OWNER TO "ob-analytics";
@@ -7202,9 +14447,26 @@ ALTER TABLE obanalytics.matches_02006201905 OWNER TO "ob-analytics";
 -- Name: matches_02006201906; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02006201906 PARTITION OF obanalytics.matches_bitstamp_btceur
-FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02006201906 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02006201906 OWNER TO "ob-analytics";
@@ -7213,12 +14475,57 @@ ALTER TABLE obanalytics.matches_02006201906 OWNER TO "ob-analytics";
 -- Name: matches_02006201907; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.matches_02006201907 PARTITION OF obanalytics.matches_bitstamp_btceur
-FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03')
+CREATE TABLE obanalytics.matches_02006201907 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
 
 
 ALTER TABLE obanalytics.matches_02006201907 OWNER TO "ob-analytics";
+
+--
+-- Name: matches_02006201908; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_02006201908 (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 2 NOT NULL,
+    pair_id smallint DEFAULT 6 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
+ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ATTACH PARTITION obanalytics.matches_02006201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
+
+
+ALTER TABLE obanalytics.matches_02006201908 OWNER TO "ob-analytics";
 
 --
 -- Name: pairs; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -7257,7097 +14564,6 @@ COMMENT ON COLUMN obanalytics.pairs."R0" IS '-log10 of Fractional Monetary Unit 
 --
 
 COMMENT ON COLUMN obanalytics.pairs.fmu IS '-log10 of Fractional Monetary Unit (i.e. 2 for 0.01 of USD or 8 for 0.00000001 of Bitcoin) for the first currency in the pair (i.e. BTC in BTCUSD). To be used for rounding of floating-point quantities ';
-
-
---
--- Name: level1_01001201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_01001201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01001201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01002201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_01002201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01002201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_01002201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01002201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_01002201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01002201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_01002201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01002201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_01002201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01002201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01003201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_01003201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01003201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_01003201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01003201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_01003201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01003201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_01003201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_01003201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_01003201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_01003201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201901 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02001201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02001201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02001201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02001201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02001201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02001201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_02001201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02001201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201901 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_02002201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02002201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02003201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201901 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_02003201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02003201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_02003201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02003201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_02003201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02003201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_02003201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02003201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_02003201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02003201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_02003201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02003201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_02003201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02003201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02004201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201901 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_02004201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02004201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_02004201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02004201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201903 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_02004201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02004201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201904 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_02004201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02004201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201905 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_02004201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02004201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201906 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_02004201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02004201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201907 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_02004201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02004201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02005201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201901 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_02005201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02005201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201902 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_02005201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02005201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201903 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_02005201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02005201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201904 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_02005201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02005201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201905 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_02005201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02005201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201906 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_02005201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02005201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201907 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_02005201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02005201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02006201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201901 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_02006201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02006201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201902 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_02006201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02006201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201903 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_02006201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02006201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201904 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_02006201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02006201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201905 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_02006201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02006201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201906 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_02006201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02006201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201907 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_02006201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02006201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_02007201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02007201903 ALTER COLUMN pair_id SET DEFAULT 7;
-
-
---
--- Name: level1_02007201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_02007201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitfinex exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitfinex ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_bitfinex_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_bitfinex_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitfinex_btcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_bitfinex_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_bitfinex_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitfinex_ethusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_bitfinex_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitfinex_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitfinex_ltcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level1_bitstamp exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_bchusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level1_bitstamp_bchusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_bchusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_btceur pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level1_bitstamp_btceur exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_btceur ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level1_bitstamp_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_btcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_ethbtc pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_ethbtc ALTER COLUMN pair_id SET DEFAULT 7;
-
-
---
--- Name: level1_bitstamp_ethbtc exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_ethbtc ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level1_bitstamp_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_ethusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_ltcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level1_bitstamp_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level1_bitstamp_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level1_bitstamp_xrpusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_01001p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001p0201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001p0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_01001r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01001r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01001r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01001r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01001r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01001r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01001r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01002p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002p0201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_01002p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002p0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01002p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_01002r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_01002r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01002r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01002r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_01002r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01002r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01002r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_01002r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01002r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01002r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_01002r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01002r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01002r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_01002r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01002r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01002r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01003p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003p0201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_01003p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003p0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01003p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_01003r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_01003r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01003r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01003r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_01003r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01003r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01003r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_01003r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01003r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01003r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_01003r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01003r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_01003r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_01003r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_01003r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_01003r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02001p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001p0201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001p0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_02001p0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001p0201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001p0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001p0201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001p0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001p0201904 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_02001r0201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201901 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001r0201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001r0201901 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201901 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02001r0201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001r0201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001r0201902 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201902 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02001r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02001r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02001r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02001r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02001r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_02001r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02001r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02001r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02002p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002p0201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002p0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_02002r0201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201901 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201901 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201901 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02002r0201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201902 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201902 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02002r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02002r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02002r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02002r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02002r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02002r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02002r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02003p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003p0201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003p0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_02003r0201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201901 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003r0201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003r0201901 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201901 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02003r0201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003r0201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003r0201902 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201902 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02003r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02003r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02003r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02003r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02003r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_02003r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02003r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02003r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02004p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004p0201903 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004p0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_02004r0201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201901 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004r0201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004r0201901 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201901 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02004r0201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004r0201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004r0201902 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201902 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02004r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201903 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02004r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201904 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02004r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201905 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02004r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201906 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02004r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201907 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_02004r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02004r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02004r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02005p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005p0201903 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005p0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_02005r0201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201901 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005r0201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005r0201901 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201901 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02005r0201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201902 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005r0201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005r0201902 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201902 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02005r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201903 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02005r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201904 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02005r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201905 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02005r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201906 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02005r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201907 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_02005r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02005r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02005r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02006p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006p0201903 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006p0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_02006r0201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201901 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006r0201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006r0201901 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201901 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02006r0201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201902 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006r0201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006r0201902 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201902 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02006r0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201903 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006r0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006r0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201903 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02006r0201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201904 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006r0201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006r0201904 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201904 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02006r0201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201905 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006r0201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006r0201905 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201905 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02006r0201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201906 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006r0201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006r0201906 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201906 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02006r0201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201907 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_02006r0201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02006r0201907 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02006r0201907 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_02007p0201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02007p0201903 ALTER COLUMN pair_id SET DEFAULT 7;
-
-
---
--- Name: level2_02007p0201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02007p0201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_02007p0201903 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_02007p0201903 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitfinex exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_btcusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_p0 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_btcusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_p0 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_btcusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitfinex_btcusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_btcusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_btcusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitfinex_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_bitfinex_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_ethusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_p0 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_bitfinex_ethusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_p0 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_ethusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitfinex_ethusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_bitfinex_ethusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_ethusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitfinex_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitfinex_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_ltcusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_p0 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitfinex_ltcusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_p0 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_ltcusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitfinex_ltcusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitfinex_ltcusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitfinex_ltcusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitstamp exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_bchusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_bitstamp_bchusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_bchusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_p0 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_bitstamp_bchusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_p0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_bchusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitstamp_bchusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level2_bitstamp_bchusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_bchusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitstamp_btceur pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_bitstamp_btceur exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_btceur_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_p0 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_bitstamp_btceur_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_p0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_btceur_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitstamp_btceur_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level2_bitstamp_btceur_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_btceur_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitstamp_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitstamp_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_btcusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_p0 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitstamp_btcusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_p0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_btcusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitstamp_btcusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level2_bitstamp_btcusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_btcusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitstamp_ethbtc pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc ALTER COLUMN pair_id SET DEFAULT 7;
-
-
---
--- Name: level2_bitstamp_ethbtc exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ethbtc_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc_p0 ALTER COLUMN pair_id SET DEFAULT 7;
-
-
---
--- Name: level2_bitstamp_ethbtc_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc_p0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ethbtc_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitstamp_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_bitstamp_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ethusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_p0 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_bitstamp_ethusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_p0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ethusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitstamp_ethusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level2_bitstamp_ethusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ethusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitstamp_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ltcusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_p0 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ltcusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_p0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ltcusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitstamp_ltcusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ltcusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_ltcusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level2_bitstamp_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_bitstamp_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_xrpusd_p0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_p0 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_bitstamp_xrpusd_p0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_p0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_xrpusd_p0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_p0 ALTER COLUMN "precision" SET DEFAULT 'p0'::bpchar;
-
-
---
--- Name: level2_bitstamp_xrpusd_r0 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level2_bitstamp_xrpusd_r0 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level2_bitstamp_xrpusd_r0 precision; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ALTER COLUMN "precision" SET DEFAULT 'r0'::bpchar;
-
-
---
--- Name: level3_01001b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01001b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01001b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01001b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01001b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01001b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01001b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001b201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01001s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01001s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01001s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01001s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01001s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01001s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_01001s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01001s201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01002b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01002b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01002b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01002b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01002b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01002b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002b201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01002s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01002s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01002s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01002s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01002s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01002s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01002s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_01002s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01002s201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01003b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01003b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01003b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01003b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01003b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01003b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003b201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01003s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01003s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01003s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01003s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01003s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01003s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01003s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_01003s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01003s201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01004b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01004b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_01004b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01004b201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_01004b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01004b201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_01004s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01004s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_01004s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01004s201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_01004s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_01004s201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201901 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02001b201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201901 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02001b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02001b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02001b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02001b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02001b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02001b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001b201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001s201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201901 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02001s201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201901 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001s201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02001s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02001s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02001s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02001s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02001s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02001s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02001s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_02001s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02001s201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201901 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02002b201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201901 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02002b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02002b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02002b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02002b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02002b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02002b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002b201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201901 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02002s201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201901 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02002s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02002s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02002s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02002s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02002s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02002s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_02002s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02002s201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003b201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201901 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02003b201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201901 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003b201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02003b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02003b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02003b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02003b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02003b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02003b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003b201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003s201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201901 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02003s201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201901 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003s201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02003s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02003s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02003s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02003s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02003s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02003s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02003s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_02003s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02003s201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004b201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201901 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02004b201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201901 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004b201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02004b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02004b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201903 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02004b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201904 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02004b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201905 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02004b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201906 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02004b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201907 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004b201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004s201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201901 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02004s201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201901 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004s201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02004s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02004s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201903 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02004s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201904 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02004s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201905 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02004s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201906 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02004s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02004s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201907 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_02004s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02004s201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005b201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201901 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02005b201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201901 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005b201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02005b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201902 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02005b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201903 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02005b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201904 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02005b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201905 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02005b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201906 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02005b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201907 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005b201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005s201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201901 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02005s201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201901 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005s201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02005s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201902 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02005s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201903 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02005s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201904 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02005s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201905 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02005s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201906 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02005s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02005s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201907 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_02005s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02005s201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006b201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201901 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02006b201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201901 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006b201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006b201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201902 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02006b201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201902 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006b201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006b201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201903 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02006b201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201903 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006b201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006b201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201904 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02006b201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201904 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006b201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006b201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201905 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02006b201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201905 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006b201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006b201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201906 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02006b201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201906 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006b201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006b201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201907 ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_02006b201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201907 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006b201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006b201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006s201901 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201901 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02006s201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201901 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006s201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006s201902 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201902 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02006s201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201902 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006s201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006s201903 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201903 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02006s201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201903 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006s201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006s201904 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201904 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02006s201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201904 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006s201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006s201905 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201905 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02006s201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201905 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006s201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006s201906 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201906 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02006s201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201906 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006s201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_02006s201907 side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201907 ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_02006s201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201907 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_02006s201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_02006s201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitfinex exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_btcusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitfinex_btcusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_btcusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_btcusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitfinex_btcusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_btcusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_bitfinex_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_ethusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitfinex_ethusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_bitfinex_ethusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_ethusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitfinex_ethusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_bitfinex_ethusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitfinex_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_ltcusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitfinex_ltcusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitfinex_ltcusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_ltcusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitfinex_ltcusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitfinex_ltcusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_bitfinex_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_xrpusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitfinex_xrpusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_bitfinex_xrpusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitfinex_xrpusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitfinex_xrpusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_bitfinex_xrpusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitstamp exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_bchusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_bitstamp_bchusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_bchusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitstamp_bchusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_bitstamp_bchusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_bchusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitstamp_bchusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: level3_bitstamp_bchusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_btceur pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_bitstamp_btceur exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_btceur_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitstamp_btceur_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_bitstamp_btceur_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_btceur_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitstamp_btceur_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: level3_bitstamp_btceur_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitstamp_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_btcusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitstamp_btcusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitstamp_btcusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_btcusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitstamp_btcusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: level3_bitstamp_btcusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_bitstamp_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ethusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitstamp_ethusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_bitstamp_ethusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ethusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitstamp_ethusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: level3_bitstamp_ethusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ltcusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitstamp_ltcusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ltcusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ltcusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitstamp_ltcusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_ltcusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_bitstamp_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_xrpusd_b side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ALTER COLUMN side SET DEFAULT 'b'::bpchar;
-
-
---
--- Name: level3_bitstamp_xrpusd_b pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_bitstamp_xrpusd_b exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: level3_bitstamp_xrpusd_s side; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ALTER COLUMN side SET DEFAULT 's'::bpchar;
-
-
---
--- Name: level3_bitstamp_xrpusd_s pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: level3_bitstamp_xrpusd_s exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_01001201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01001201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01001201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_01002201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01002201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_01002201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01002201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_01002201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01002201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_01002201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01002201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_01002201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01002201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_01002201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01002201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01002201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_01003201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01003201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_01003201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201903 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01003201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_01003201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201904 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01003201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_01003201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201905 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01003201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_01003201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201906 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01003201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_01003201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201907 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01003201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01003201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_01004201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01004201902 ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_01004201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_01004201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02001201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02001201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201901 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_02001201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02001201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201902 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_02001201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02001201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201903 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_02001201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02001201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201904 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_02001201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02001201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201905 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_02001201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02001201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201906 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_02001201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02001201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02001201907 ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_02002201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201901 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201902 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201903 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201904 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201905 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201906 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02002201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02002201907 ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201901 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_02003201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201902 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_02003201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201903 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_02003201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201904 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_02003201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201905 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_02003201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201906 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_02003201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02003201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02003201907 ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_02004201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02004201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201901 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02004201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02004201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201902 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02004201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02004201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201903 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02004201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02004201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201904 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02004201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02004201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201905 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02004201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02004201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201906 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02004201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02004201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02004201907 ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_02005201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02005201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201901 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_02005201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02005201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201902 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_02005201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02005201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201903 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_02005201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02005201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201904 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_02005201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02005201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201905 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_02005201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02005201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201906 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_02005201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02005201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02005201907 ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_02006201901 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201901 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02006201901 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201901 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_02006201902 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201902 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02006201902 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201902 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_02006201903 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201903 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02006201903 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201903 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_02006201904 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201904 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02006201904 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201904 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_02006201905 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201905 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02006201905 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201905 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_02006201906 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201906 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02006201906 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201906 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_02006201907 exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201907 ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_02006201907 pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_02006201907 ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_bitfinex exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_bitfinex_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_bitfinex_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_bitfinex_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_bitfinex_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_bitfinex_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_bitfinex_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitfinex_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_xrpusd ALTER COLUMN exchange_id SET DEFAULT 1;
-
-
---
--- Name: matches_bitfinex_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitfinex_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
-
-
---
--- Name: matches_bitstamp exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_bchusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_bchusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_bchusd ALTER COLUMN pair_id SET DEFAULT 5;
-
-
---
--- Name: matches_bitstamp_btceur exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_btceur pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_btceur ALTER COLUMN pair_id SET DEFAULT 6;
-
-
---
--- Name: matches_bitstamp_btcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_btcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_btcusd ALTER COLUMN pair_id SET DEFAULT 1;
-
-
---
--- Name: matches_bitstamp_ethusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_ethusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_ethusd ALTER COLUMN pair_id SET DEFAULT 3;
-
-
---
--- Name: matches_bitstamp_ltcusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_ltcusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_ltcusd ALTER COLUMN pair_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_xrpusd exchange_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ALTER COLUMN exchange_id SET DEFAULT 2;
-
-
---
--- Name: matches_bitstamp_xrpusd pair_id; Type: DEFAULT; Schema: obanalytics; Owner: ob-analytics
---
-
-ALTER TABLE ONLY obanalytics.matches_bitstamp_xrpusd ALTER COLUMN pair_id SET DEFAULT 4;
 
 
 --
@@ -14407,6 +14623,14 @@ ALTER TABLE ONLY obanalytics.level1_01001201907
 
 
 --
+-- Name: level1_01001201908 level1_01001201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_01001201908
+    ADD CONSTRAINT level1_01001201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level1_01002201903 level1_01002201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -14447,6 +14671,14 @@ ALTER TABLE ONLY obanalytics.level1_01002201907
 
 
 --
+-- Name: level1_01002201908 level1_01002201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_01002201908
+    ADD CONSTRAINT level1_01002201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level1_01003201903 level1_01003201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -14484,6 +14716,14 @@ ALTER TABLE ONLY obanalytics.level1_01003201906
 
 ALTER TABLE ONLY obanalytics.level1_01003201907
     ADD CONSTRAINT level1_01003201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level1_01003201908 level1_01003201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_01003201908
+    ADD CONSTRAINT level1_01003201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -14543,6 +14783,14 @@ ALTER TABLE ONLY obanalytics.level1_02001201907
 
 
 --
+-- Name: level1_02001201908 level1_02001201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_02001201908
+    ADD CONSTRAINT level1_02001201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level1_02002201901 level1_02002201901_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -14596,6 +14844,14 @@ ALTER TABLE ONLY obanalytics.level1_02002201906
 
 ALTER TABLE ONLY obanalytics.level1_02002201907
     ADD CONSTRAINT level1_02002201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level1_02002201908 level1_02002201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_02002201908
+    ADD CONSTRAINT level1_02002201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -14655,6 +14911,14 @@ ALTER TABLE ONLY obanalytics.level1_02003201907
 
 
 --
+-- Name: level1_02003201908 level1_02003201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_02003201908
+    ADD CONSTRAINT level1_02003201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level1_02004201901 level1_02004201901_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -14708,6 +14972,14 @@ ALTER TABLE ONLY obanalytics.level1_02004201906
 
 ALTER TABLE ONLY obanalytics.level1_02004201907
     ADD CONSTRAINT level1_02004201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level1_02004201908 level1_02004201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_02004201908
+    ADD CONSTRAINT level1_02004201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -14767,6 +15039,14 @@ ALTER TABLE ONLY obanalytics.level1_02005201907
 
 
 --
+-- Name: level1_02005201908 level1_02005201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_02005201908
+    ADD CONSTRAINT level1_02005201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level1_02006201901 level1_02006201901_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -14820,6 +15100,14 @@ ALTER TABLE ONLY obanalytics.level1_02006201906
 
 ALTER TABLE ONLY obanalytics.level1_02006201907
     ADD CONSTRAINT level1_02006201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level1_02006201908 level1_02006201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level1_02006201908
+    ADD CONSTRAINT level1_02006201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -14879,6 +15167,14 @@ ALTER TABLE ONLY obanalytics.level2_01001r0201907
 
 
 --
+-- Name: level2_01001r0201908 level2_01001r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01001r0201908
+    ADD CONSTRAINT level2_01001r0201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level2_01002p0201903 level2_01002p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -14927,6 +15223,14 @@ ALTER TABLE ONLY obanalytics.level2_01002r0201907
 
 
 --
+-- Name: level2_01002r0201908 level2_01002r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01002r0201908
+    ADD CONSTRAINT level2_01002r0201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level2_01003p0201903 level2_01003p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -14972,6 +15276,14 @@ ALTER TABLE ONLY obanalytics.level2_01003r0201906
 
 ALTER TABLE ONLY obanalytics.level2_01003r0201907
     ADD CONSTRAINT level2_01003r0201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level2_01003r0201908 level2_01003r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_01003r0201908
+    ADD CONSTRAINT level2_01003r0201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -15047,6 +15359,14 @@ ALTER TABLE ONLY obanalytics.level2_02001r0201907
 
 
 --
+-- Name: level2_02001r0201908 level2_02001r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_02001r0201908
+    ADD CONSTRAINT level2_02001r0201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level2_02002p0201903 level2_02002p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -15108,6 +15428,14 @@ ALTER TABLE ONLY obanalytics.level2_02002r0201906
 
 ALTER TABLE ONLY obanalytics.level2_02002r0201907
     ADD CONSTRAINT level2_02002r0201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level2_02002r0201908 level2_02002r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_02002r0201908
+    ADD CONSTRAINT level2_02002r0201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -15175,6 +15503,14 @@ ALTER TABLE ONLY obanalytics.level2_02003r0201907
 
 
 --
+-- Name: level2_02003r0201908 level2_02003r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_02003r0201908
+    ADD CONSTRAINT level2_02003r0201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level2_02004p0201903 level2_02004p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -15236,6 +15572,14 @@ ALTER TABLE ONLY obanalytics.level2_02004r0201906
 
 ALTER TABLE ONLY obanalytics.level2_02004r0201907
     ADD CONSTRAINT level2_02004r0201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level2_02004r0201908 level2_02004r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_02004r0201908
+    ADD CONSTRAINT level2_02004r0201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -15303,6 +15647,14 @@ ALTER TABLE ONLY obanalytics.level2_02005r0201907
 
 
 --
+-- Name: level2_02005r0201908 level2_02005r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_02005r0201908
+    ADD CONSTRAINT level2_02005r0201908_pkey PRIMARY KEY (microtimestamp);
+
+
+--
 -- Name: level2_02006p0201903 level2_02006p0201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -15364,6 +15716,14 @@ ALTER TABLE ONLY obanalytics.level2_02006r0201906
 
 ALTER TABLE ONLY obanalytics.level2_02006r0201907
     ADD CONSTRAINT level2_02006r0201907_pkey PRIMARY KEY (microtimestamp);
+
+
+--
+-- Name: level2_02006r0201908 level2_02006r0201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level2_02006r0201908
+    ADD CONSTRAINT level2_02006r0201908_pkey PRIMARY KEY (microtimestamp);
 
 
 --
@@ -15455,6 +15815,22 @@ ALTER TABLE ONLY obanalytics.level3_01001b201907
 
 
 --
+-- Name: level3_01001b201908 level3_01001b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001b201908
+    ADD CONSTRAINT level3_01001b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01001b201908 level3_01001b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001b201908
+    ADD CONSTRAINT level3_01001b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_01001s201903 level3_01001s201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -15532,6 +15908,22 @@ ALTER TABLE ONLY obanalytics.level3_01001s201907
 
 ALTER TABLE ONLY obanalytics.level3_01001s201907
     ADD CONSTRAINT level3_01001s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01001s201908 level3_01001s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001s201908
+    ADD CONSTRAINT level3_01001s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01001s201908 level3_01001s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001s201908
+    ADD CONSTRAINT level3_01001s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -15615,6 +16007,22 @@ ALTER TABLE ONLY obanalytics.level3_01002b201907
 
 
 --
+-- Name: level3_01002b201908 level3_01002b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002b201908
+    ADD CONSTRAINT level3_01002b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01002b201908 level3_01002b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002b201908
+    ADD CONSTRAINT level3_01002b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_01002s201903 level3_01002s201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -15692,6 +16100,22 @@ ALTER TABLE ONLY obanalytics.level3_01002s201907
 
 ALTER TABLE ONLY obanalytics.level3_01002s201907
     ADD CONSTRAINT level3_01002s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01002s201908 level3_01002s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002s201908
+    ADD CONSTRAINT level3_01002s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01002s201908 level3_01002s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002s201908
+    ADD CONSTRAINT level3_01002s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -15775,6 +16199,22 @@ ALTER TABLE ONLY obanalytics.level3_01003b201907
 
 
 --
+-- Name: level3_01003b201908 level3_01003b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003b201908
+    ADD CONSTRAINT level3_01003b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01003b201908 level3_01003b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003b201908
+    ADD CONSTRAINT level3_01003b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_01003s201903 level3_01003s201903_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -15852,6 +16292,22 @@ ALTER TABLE ONLY obanalytics.level3_01003s201907
 
 ALTER TABLE ONLY obanalytics.level3_01003s201907
     ADD CONSTRAINT level3_01003s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01003s201908 level3_01003s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003s201908
+    ADD CONSTRAINT level3_01003s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_01003s201908 level3_01003s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003s201908
+    ADD CONSTRAINT level3_01003s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -16159,6 +16615,30 @@ ALTER TABLE ONLY obanalytics.level3_02001b201907
 
 
 --
+-- Name: level3_02001b201908 level3_02001b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201908
+    ADD CONSTRAINT level3_02001b201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001b201908 level3_02001b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201908
+    ADD CONSTRAINT level3_02001b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001b201908 level3_02001b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201908
+    ADD CONSTRAINT level3_02001b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_bitstamp_btcusd_s level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -16316,6 +16796,30 @@ ALTER TABLE ONLY obanalytics.level3_02001s201907
 
 ALTER TABLE ONLY obanalytics.level3_02001s201907
     ADD CONSTRAINT level3_02001s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02001s201908 level3_02001s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201908
+    ADD CONSTRAINT level3_02001s201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001s201908 level3_02001s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201908
+    ADD CONSTRAINT level3_02001s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02001s201908 level3_02001s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201908
+    ADD CONSTRAINT level3_02001s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -16503,6 +17007,30 @@ ALTER TABLE ONLY obanalytics.level3_02002b201907
 
 
 --
+-- Name: level3_02002b201908 level3_02002b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002b201908
+    ADD CONSTRAINT level3_02002b201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02002b201908 level3_02002b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002b201908
+    ADD CONSTRAINT level3_02002b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02002b201908 level3_02002b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002b201908
+    ADD CONSTRAINT level3_02002b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_bitstamp_ltcusd_s level3_bitstamp_ltcusd_s_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -16676,6 +17204,30 @@ ALTER TABLE ONLY obanalytics.level3_02002s201907
 
 ALTER TABLE ONLY obanalytics.level3_02002s201907
     ADD CONSTRAINT level3_02002s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02002s201908 level3_02002s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002s201908
+    ADD CONSTRAINT level3_02002s201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02002s201908 level3_02002s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002s201908
+    ADD CONSTRAINT level3_02002s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02002s201908 level3_02002s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002s201908
+    ADD CONSTRAINT level3_02002s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -16863,6 +17415,30 @@ ALTER TABLE ONLY obanalytics.level3_02003b201907
 
 
 --
+-- Name: level3_02003b201908 level3_02003b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003b201908
+    ADD CONSTRAINT level3_02003b201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02003b201908 level3_02003b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003b201908
+    ADD CONSTRAINT level3_02003b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02003b201908 level3_02003b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003b201908
+    ADD CONSTRAINT level3_02003b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_bitstamp_ethusd_s level3_bitstamp_ethusd_s_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -17036,6 +17612,30 @@ ALTER TABLE ONLY obanalytics.level3_02003s201907
 
 ALTER TABLE ONLY obanalytics.level3_02003s201907
     ADD CONSTRAINT level3_02003s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02003s201908 level3_02003s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003s201908
+    ADD CONSTRAINT level3_02003s201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02003s201908 level3_02003s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003s201908
+    ADD CONSTRAINT level3_02003s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02003s201908 level3_02003s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003s201908
+    ADD CONSTRAINT level3_02003s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -17223,6 +17823,30 @@ ALTER TABLE ONLY obanalytics.level3_02004b201907
 
 
 --
+-- Name: level3_02004b201908 level3_02004b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004b201908
+    ADD CONSTRAINT level3_02004b201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02004b201908 level3_02004b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004b201908
+    ADD CONSTRAINT level3_02004b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02004b201908 level3_02004b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004b201908
+    ADD CONSTRAINT level3_02004b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_bitstamp_xrpusd_s level3_bitstamp_xrpusd_s_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -17396,6 +18020,30 @@ ALTER TABLE ONLY obanalytics.level3_02004s201907
 
 ALTER TABLE ONLY obanalytics.level3_02004s201907
     ADD CONSTRAINT level3_02004s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02004s201908 level3_02004s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004s201908
+    ADD CONSTRAINT level3_02004s201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02004s201908 level3_02004s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004s201908
+    ADD CONSTRAINT level3_02004s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02004s201908 level3_02004s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004s201908
+    ADD CONSTRAINT level3_02004s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -17583,6 +18231,30 @@ ALTER TABLE ONLY obanalytics.level3_02005b201907
 
 
 --
+-- Name: level3_02005b201908 level3_02005b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005b201908
+    ADD CONSTRAINT level3_02005b201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02005b201908 level3_02005b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005b201908
+    ADD CONSTRAINT level3_02005b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02005b201908 level3_02005b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005b201908
+    ADD CONSTRAINT level3_02005b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_bitstamp_bchusd_s level3_bitstamp_bchusd_s_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -17756,6 +18428,30 @@ ALTER TABLE ONLY obanalytics.level3_02005s201907
 
 ALTER TABLE ONLY obanalytics.level3_02005s201907
     ADD CONSTRAINT level3_02005s201907_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02005s201908 level3_02005s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005s201908
+    ADD CONSTRAINT level3_02005s201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02005s201908 level3_02005s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005s201908
+    ADD CONSTRAINT level3_02005s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02005s201908 level3_02005s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005s201908
+    ADD CONSTRAINT level3_02005s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -17943,6 +18639,30 @@ ALTER TABLE ONLY obanalytics.level3_02006b201907
 
 
 --
+-- Name: level3_02006b201908 level3_02006b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006b201908
+    ADD CONSTRAINT level3_02006b201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02006b201908 level3_02006b201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006b201908
+    ADD CONSTRAINT level3_02006b201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02006b201908 level3_02006b201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006b201908
+    ADD CONSTRAINT level3_02006b201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_bitstamp_btceur_s level3_bitstamp_btceur_s_pair_id_side_microtimestamp_order__key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -18119,6 +18839,30 @@ ALTER TABLE ONLY obanalytics.level3_02006s201907
 
 
 --
+-- Name: level3_02006s201908 level3_02006s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006s201908
+    ADD CONSTRAINT level3_02006s201908_pair_id_side_microtimestamp_order_id_ev_key UNIQUE (pair_id, side, microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02006s201908 level3_02006s201908_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006s201908
+    ADD CONSTRAINT level3_02006s201908_pkey PRIMARY KEY (microtimestamp, order_id, event_no);
+
+
+--
+-- Name: level3_02006s201908 level3_02006s201908_unique_next; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006s201908
+    ADD CONSTRAINT level3_02006s201908_unique_next UNIQUE (next_microtimestamp, order_id, next_event_no) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_02001b201901 level3_02b001201901_pkey; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -18209,6 +18953,14 @@ ALTER TABLE ONLY obanalytics.matches_01001201907
 
 
 --
+-- Name: matches_01001201908 matches_01001201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01001201908
+    ADD CONSTRAINT matches_01001201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
 -- Name: matches_01002201902 matches_01002201902_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -18257,6 +19009,14 @@ ALTER TABLE ONLY obanalytics.matches_01002201907
 
 
 --
+-- Name: matches_01002201908 matches_01002201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01002201908
+    ADD CONSTRAINT matches_01002201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
 -- Name: matches_01003201902 matches_01003201902_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -18302,6 +19062,14 @@ ALTER TABLE ONLY obanalytics.matches_01003201906
 
 ALTER TABLE ONLY obanalytics.matches_01003201907
     ADD CONSTRAINT matches_01003201907_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
+-- Name: matches_01003201908 matches_01003201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01003201908
+    ADD CONSTRAINT matches_01003201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
 
 
 --
@@ -18369,6 +19137,14 @@ ALTER TABLE ONLY obanalytics.matches_02001201907
 
 
 --
+-- Name: matches_02001201908 matches_02001201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02001201908
+    ADD CONSTRAINT matches_02001201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
 -- Name: matches_02002201901 matches_02002201901_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -18422,6 +19198,14 @@ ALTER TABLE ONLY obanalytics.matches_02002201906
 
 ALTER TABLE ONLY obanalytics.matches_02002201907
     ADD CONSTRAINT matches_02002201907_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
+-- Name: matches_02002201908 matches_02002201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02002201908
+    ADD CONSTRAINT matches_02002201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
 
 
 --
@@ -18481,6 +19265,14 @@ ALTER TABLE ONLY obanalytics.matches_02003201907
 
 
 --
+-- Name: matches_02003201908 matches_02003201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02003201908
+    ADD CONSTRAINT matches_02003201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
 -- Name: matches_02004201901 matches_02004201901_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -18534,6 +19326,14 @@ ALTER TABLE ONLY obanalytics.matches_02004201906
 
 ALTER TABLE ONLY obanalytics.matches_02004201907
     ADD CONSTRAINT matches_02004201907_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
+-- Name: matches_02004201908 matches_02004201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02004201908
+    ADD CONSTRAINT matches_02004201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
 
 
 --
@@ -18593,6 +19393,14 @@ ALTER TABLE ONLY obanalytics.matches_02005201907
 
 
 --
+-- Name: matches_02005201908 matches_02005201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02005201908
+    ADD CONSTRAINT matches_02005201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
 -- Name: matches_02006201901 matches_02006201901_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -18646,6 +19454,14 @@ ALTER TABLE ONLY obanalytics.matches_02006201906
 
 ALTER TABLE ONLY obanalytics.matches_02006201907
     ADD CONSTRAINT matches_02006201907_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
+
+
+--
+-- Name: matches_02006201908 matches_02006201908_unique_order_ids_combination; Type: CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02006201908
+    ADD CONSTRAINT matches_02006201908_unique_order_ids_combination UNIQUE (buy_order_id, sell_order_id);
 
 
 --
@@ -18706,6 +19522,13 @@ ALTER INDEX obanalytics.level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_ord
 
 
 --
+-- Name: level3_02001b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001b201908_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
 -- Name: level3_02001s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
 --
 
@@ -18752,6 +19575,13 @@ ALTER INDEX obanalytics.level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_ord
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001s201907_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02001s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btcusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02001s201908_pair_id_side_microtimestamp_order_id_ev_key;
 
 
 --
@@ -18804,6 +19634,13 @@ ALTER INDEX obanalytics.level3_bitstamp_ltcusd_b_pair_id_side_microtimestamp_ord
 
 
 --
+-- Name: level3_02002b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_ltcusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02002b201908_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
 -- Name: level3_02002s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
 --
 
@@ -18850,6 +19687,13 @@ ALTER INDEX obanalytics.level3_bitstamp_ltcusd_s_pair_id_side_microtimestamp_ord
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_ltcusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02002s201907_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02002s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_ltcusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02002s201908_pair_id_side_microtimestamp_order_id_ev_key;
 
 
 --
@@ -18902,6 +19746,13 @@ ALTER INDEX obanalytics.level3_bitstamp_ethusd_b_pair_id_side_microtimestamp_ord
 
 
 --
+-- Name: level3_02003b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_ethusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02003b201908_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
 -- Name: level3_02003s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
 --
 
@@ -18948,6 +19799,13 @@ ALTER INDEX obanalytics.level3_bitstamp_ethusd_s_pair_id_side_microtimestamp_ord
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_ethusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02003s201907_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02003s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_ethusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02003s201908_pair_id_side_microtimestamp_order_id_ev_key;
 
 
 --
@@ -19000,6 +19858,13 @@ ALTER INDEX obanalytics.level3_bitstamp_xrpusd_b_pair_id_side_microtimestamp_ord
 
 
 --
+-- Name: level3_02004b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_xrpusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02004b201908_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
 -- Name: level3_02004s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
 --
 
@@ -19046,6 +19911,13 @@ ALTER INDEX obanalytics.level3_bitstamp_xrpusd_s_pair_id_side_microtimestamp_ord
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_xrpusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02004s201907_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02004s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_xrpusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02004s201908_pair_id_side_microtimestamp_order_id_ev_key;
 
 
 --
@@ -19098,6 +19970,13 @@ ALTER INDEX obanalytics.level3_bitstamp_bchusd_b_pair_id_side_microtimestamp_ord
 
 
 --
+-- Name: level3_02005b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_bchusd_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02005b201908_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
 -- Name: level3_02005s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
 --
 
@@ -19144,6 +20023,13 @@ ALTER INDEX obanalytics.level3_bitstamp_bchusd_s_pair_id_side_microtimestamp_ord
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_bchusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02005s201907_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02005s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_bchusd_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02005s201908_pair_id_side_microtimestamp_order_id_ev_key;
 
 
 --
@@ -19196,6 +20082,13 @@ ALTER INDEX obanalytics.level3_bitstamp_btceur_b_pair_id_side_microtimestamp_ord
 
 
 --
+-- Name: level3_02006b201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btceur_b_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02006b201908_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
 -- Name: level3_02006s201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
 --
 
@@ -19242,6 +20135,13 @@ ALTER INDEX obanalytics.level3_bitstamp_btceur_s_pair_id_side_microtimestamp_ord
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_btceur_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02006s201907_pair_id_side_microtimestamp_order_id_ev_key;
+
+
+--
+-- Name: level3_02006s201908_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
+--
+
+ALTER INDEX obanalytics.level3_bitstamp_btceur_s_pair_id_side_microtimestamp_order__key ATTACH PARTITION obanalytics.level3_02006s201908_pair_id_side_microtimestamp_order_id_ev_key;
 
 
 --
@@ -19455,6 +20355,20 @@ CREATE TRIGGER level3_01001b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_01001b201908 level3_01001b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01001b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01001b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01001b201908 level3_01001b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01001b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01001b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_01001s201902 level3_01001s201902_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -19536,6 +20450,20 @@ CREATE TRIGGER level3_01001s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_01001s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01001s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01001s201908 level3_01001s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01001s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01001s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01001s201908 level3_01001s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01001s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01001s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -19623,6 +20551,20 @@ CREATE TRIGGER level3_01002b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_01002b201908 level3_01002b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01002b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01002b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01002b201908 level3_01002b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01002b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01002b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_01002s201902 level3_01002s201902_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -19704,6 +20646,20 @@ CREATE TRIGGER level3_01002s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_01002s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01002s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01002s201908 level3_01002s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01002s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01002s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01002s201908 level3_01002s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01002s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01002s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -19791,6 +20747,20 @@ CREATE TRIGGER level3_01003b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_01003b201908 level3_01003b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01003b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01003b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01003b201908 level3_01003b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01003b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01003b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_01003s201902 level3_01003s201902_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -19872,6 +20842,20 @@ CREATE TRIGGER level3_01003s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_01003s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01003s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_01003s201908 level3_01003s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01003s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_01003s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_01003s201908 level3_01003s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_01003s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_01003s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -19987,6 +20971,20 @@ CREATE TRIGGER level3_02001b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_02001b201908 level3_02001b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02001b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02001b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02001b201908 level3_02001b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02001b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02001b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_02001s201902 level3_02001s201902_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -20068,6 +21066,20 @@ CREATE TRIGGER level3_02001s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_02001s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02001s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_02001s201908 level3_02001s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02001s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02001s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02001s201908 level3_02001s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02001s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02001s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -20169,6 +21181,20 @@ CREATE TRIGGER level3_02002b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_02002b201908 level3_02002b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02002b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02002b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02002b201908 level3_02002b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02002b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02002b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_02002s201901 level3_02002s201901_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -20264,6 +21290,20 @@ CREATE TRIGGER level3_02002s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_02002s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02002s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_02002s201908 level3_02002s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02002s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02002s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02002s201908 level3_02002s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02002s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02002s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -20365,6 +21405,20 @@ CREATE TRIGGER level3_02003b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_02003b201908 level3_02003b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02003b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02003b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02003b201908 level3_02003b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02003b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02003b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_02003s201901 level3_02003s201901_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -20460,6 +21514,20 @@ CREATE TRIGGER level3_02003s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_02003s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02003s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_02003s201908 level3_02003s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02003s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02003s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02003s201908 level3_02003s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02003s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02003s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -20561,6 +21629,20 @@ CREATE TRIGGER level3_02004b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_02004b201908 level3_02004b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02004b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02004b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02004b201908 level3_02004b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02004b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02004b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_02004s201901 level3_02004s201901_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -20656,6 +21738,20 @@ CREATE TRIGGER level3_02004s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_02004s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02004s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_02004s201908 level3_02004s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02004s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02004s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02004s201908 level3_02004s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02004s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02004s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -20757,6 +21853,20 @@ CREATE TRIGGER level3_02005b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_02005b201908 level3_02005b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02005b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02005b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02005b201908 level3_02005b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02005b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02005b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_02005s201901 level3_02005s201901_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -20852,6 +21962,20 @@ CREATE TRIGGER level3_02005s201907_ba_incorporate_new_event BEFORE INSERT ON oba
 --
 
 CREATE TRIGGER level3_02005s201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02005s201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: level3_02005s201908 level3_02005s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02005s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02005s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02005s201908 level3_02005s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02005s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02005s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -20953,6 +22077,20 @@ CREATE TRIGGER level3_02006b201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_02006b201908 level3_02006b201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02006b201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02006b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02006b201908 level3_02006b201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02006b201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02006b201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: level3_02006s201901 level3_02006s201901_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21051,6 +22189,20 @@ CREATE TRIGGER level3_02006s201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: level3_02006s201908 level3_02006s201908_ba_incorporate_new_event; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02006s201908_ba_incorporate_new_event BEFORE INSERT ON obanalytics.level3_02006s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_incorporate_new_event();
+
+
+--
+-- Name: level3_02006s201908 level3_02006s201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER level3_02006s201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.level3_02006s201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: matches_01001201902 matches_01001201902_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21090,6 +22242,13 @@ CREATE TRIGGER matches_01001201906_bz_save_exchange_microtimestamp BEFORE UPDATE
 --
 
 CREATE TRIGGER matches_01001201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01001201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_01001201908 matches_01001201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_01001201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01001201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -21135,6 +22294,13 @@ CREATE TRIGGER matches_01002201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: matches_01002201908 matches_01002201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_01002201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01002201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: matches_01003201902 matches_01003201902_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21177,6 +22343,13 @@ CREATE TRIGGER matches_01003201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: matches_01003201908 matches_01003201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_01003201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_01003201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: matches_01004201902 matches_01004201902_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21216,6 +22389,13 @@ CREATE TRIGGER matches_02001201906_bz_save_exchange_microtimestamp BEFORE UPDATE
 --
 
 CREATE TRIGGER matches_02001201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02001201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_02001201908 matches_02001201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_02001201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02001201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -21268,6 +22448,13 @@ CREATE TRIGGER matches_02002201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: matches_02002201908 matches_02002201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_02002201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02002201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: matches_02003201901 matches_02003201901_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21314,6 +22501,13 @@ CREATE TRIGGER matches_02003201906_bz_save_exchange_microtimestamp BEFORE UPDATE
 --
 
 CREATE TRIGGER matches_02003201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02003201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_02003201908 matches_02003201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_02003201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02003201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -21366,6 +22560,13 @@ CREATE TRIGGER matches_02004201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: matches_02004201908 matches_02004201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_02004201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02004201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: matches_02005201901 matches_02005201901_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21415,6 +22616,13 @@ CREATE TRIGGER matches_02005201907_bz_save_exchange_microtimestamp BEFORE UPDATE
 
 
 --
+-- Name: matches_02005201908 matches_02005201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_02005201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02005201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
 -- Name: matches_02006201901 matches_02006201901_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21461,6 +22669,13 @@ CREATE TRIGGER matches_02006201906_bz_save_exchange_microtimestamp BEFORE UPDATE
 --
 
 CREATE TRIGGER matches_02006201907_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02006201907 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches_02006201908 matches_02006201908_bz_save_exchange_microtimestamp; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER matches_02006201908_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02006201908 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
 
 
 --
@@ -21572,6 +22787,22 @@ ALTER TABLE ONLY obanalytics.level3_01001b201907
 
 
 --
+-- Name: level3_01001b201908 level3_01001b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001b201908
+    ADD CONSTRAINT level3_01001b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01001b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01001b201908 level3_01001b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001b201908
+    ADD CONSTRAINT level3_01001b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01001b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_01001s201903 level3_01001s201903_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21649,6 +22880,22 @@ ALTER TABLE ONLY obanalytics.level3_01001s201907
 
 ALTER TABLE ONLY obanalytics.level3_01001s201907
     ADD CONSTRAINT level3_01001s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01001s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01001s201908 level3_01001s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001s201908
+    ADD CONSTRAINT level3_01001s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01001s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01001s201908 level3_01001s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01001s201908
+    ADD CONSTRAINT level3_01001s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01001s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -21732,6 +22979,22 @@ ALTER TABLE ONLY obanalytics.level3_01002b201907
 
 
 --
+-- Name: level3_01002b201908 level3_01002b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002b201908
+    ADD CONSTRAINT level3_01002b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01002b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01002b201908 level3_01002b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002b201908
+    ADD CONSTRAINT level3_01002b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01002b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_01002s201903 level3_01002s201903_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21809,6 +23072,22 @@ ALTER TABLE ONLY obanalytics.level3_01002s201907
 
 ALTER TABLE ONLY obanalytics.level3_01002s201907
     ADD CONSTRAINT level3_01002s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01002s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01002s201908 level3_01002s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002s201908
+    ADD CONSTRAINT level3_01002s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01002s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01002s201908 level3_01002s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01002s201908
+    ADD CONSTRAINT level3_01002s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01002s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -21892,6 +23171,22 @@ ALTER TABLE ONLY obanalytics.level3_01003b201907
 
 
 --
+-- Name: level3_01003b201908 level3_01003b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003b201908
+    ADD CONSTRAINT level3_01003b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01003b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01003b201908 level3_01003b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003b201908
+    ADD CONSTRAINT level3_01003b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01003b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_01003s201903 level3_01003s201903_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -21969,6 +23264,22 @@ ALTER TABLE ONLY obanalytics.level3_01003s201907
 
 ALTER TABLE ONLY obanalytics.level3_01003s201907
     ADD CONSTRAINT level3_01003s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01003s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01003s201908 level3_01003s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003s201908
+    ADD CONSTRAINT level3_01003s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_01003s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_01003s201908 level3_01003s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_01003s201908
+    ADD CONSTRAINT level3_01003s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_01003s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -22196,6 +23507,22 @@ ALTER TABLE ONLY obanalytics.level3_02001b201907
 
 
 --
+-- Name: level3_02001b201908 level3_02001b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201908
+    ADD CONSTRAINT level3_02001b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02001b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02001b201908 level3_02001b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001b201908
+    ADD CONSTRAINT level3_02001b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02001b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_02001s201902 level3_02001s201902_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -22289,6 +23616,22 @@ ALTER TABLE ONLY obanalytics.level3_02001s201907
 
 ALTER TABLE ONLY obanalytics.level3_02001s201907
     ADD CONSTRAINT level3_02001s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02001s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02001s201908 level3_02001s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201908
+    ADD CONSTRAINT level3_02001s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02001s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02001s201908 level3_02001s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02001s201908
+    ADD CONSTRAINT level3_02001s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02001s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -22404,6 +23747,22 @@ ALTER TABLE ONLY obanalytics.level3_02002b201907
 
 
 --
+-- Name: level3_02002b201908 level3_02002b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002b201908
+    ADD CONSTRAINT level3_02002b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02002b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02002b201908 level3_02002b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002b201908
+    ADD CONSTRAINT level3_02002b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02002b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_02002s201901 level3_02002s201901_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -22513,6 +23872,22 @@ ALTER TABLE ONLY obanalytics.level3_02002s201907
 
 ALTER TABLE ONLY obanalytics.level3_02002s201907
     ADD CONSTRAINT level3_02002s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02002s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02002s201908 level3_02002s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002s201908
+    ADD CONSTRAINT level3_02002s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02002s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02002s201908 level3_02002s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02002s201908
+    ADD CONSTRAINT level3_02002s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02002s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -22628,6 +24003,22 @@ ALTER TABLE ONLY obanalytics.level3_02003b201907
 
 
 --
+-- Name: level3_02003b201908 level3_02003b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003b201908
+    ADD CONSTRAINT level3_02003b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02003b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02003b201908 level3_02003b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003b201908
+    ADD CONSTRAINT level3_02003b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02003b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_02003s201901 level3_02003s201901_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -22737,6 +24128,22 @@ ALTER TABLE ONLY obanalytics.level3_02003s201907
 
 ALTER TABLE ONLY obanalytics.level3_02003s201907
     ADD CONSTRAINT level3_02003s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02003s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02003s201908 level3_02003s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003s201908
+    ADD CONSTRAINT level3_02003s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02003s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02003s201908 level3_02003s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02003s201908
+    ADD CONSTRAINT level3_02003s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02003s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -22852,6 +24259,22 @@ ALTER TABLE ONLY obanalytics.level3_02004b201907
 
 
 --
+-- Name: level3_02004b201908 level3_02004b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004b201908
+    ADD CONSTRAINT level3_02004b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02004b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02004b201908 level3_02004b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004b201908
+    ADD CONSTRAINT level3_02004b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02004b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_02004s201901 level3_02004s201901_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -22961,6 +24384,22 @@ ALTER TABLE ONLY obanalytics.level3_02004s201907
 
 ALTER TABLE ONLY obanalytics.level3_02004s201907
     ADD CONSTRAINT level3_02004s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02004s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02004s201908 level3_02004s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004s201908
+    ADD CONSTRAINT level3_02004s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02004s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02004s201908 level3_02004s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02004s201908
+    ADD CONSTRAINT level3_02004s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02004s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -23076,6 +24515,22 @@ ALTER TABLE ONLY obanalytics.level3_02005b201907
 
 
 --
+-- Name: level3_02005b201908 level3_02005b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005b201908
+    ADD CONSTRAINT level3_02005b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02005b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02005b201908 level3_02005b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005b201908
+    ADD CONSTRAINT level3_02005b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02005b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_02005s201901 level3_02005s201901_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -23185,6 +24640,22 @@ ALTER TABLE ONLY obanalytics.level3_02005s201907
 
 ALTER TABLE ONLY obanalytics.level3_02005s201907
     ADD CONSTRAINT level3_02005s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02005s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02005s201908 level3_02005s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005s201908
+    ADD CONSTRAINT level3_02005s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02005s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02005s201908 level3_02005s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02005s201908
+    ADD CONSTRAINT level3_02005s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02005s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -23300,6 +24771,22 @@ ALTER TABLE ONLY obanalytics.level3_02006b201907
 
 
 --
+-- Name: level3_02006b201908 level3_02006b201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006b201908
+    ADD CONSTRAINT level3_02006b201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02006b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02006b201908 level3_02006b201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006b201908
+    ADD CONSTRAINT level3_02006b201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02006b201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: level3_02006s201901 level3_02006s201901_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -23409,6 +24896,22 @@ ALTER TABLE ONLY obanalytics.level3_02006s201907
 
 ALTER TABLE ONLY obanalytics.level3_02006s201907
     ADD CONSTRAINT level3_02006s201907_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02006s201907(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02006s201908 level3_02006s201908_fkey_level3_next; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006s201908
+    ADD CONSTRAINT level3_02006s201908_fkey_level3_next FOREIGN KEY (next_microtimestamp, order_id, next_event_no) REFERENCES obanalytics.level3_02006s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: level3_02006s201908 level3_02006s201908_fkey_level3_price; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.level3_02006s201908
+    ADD CONSTRAINT level3_02006s201908_fkey_level3_price FOREIGN KEY (price_microtimestamp, order_id, price_event_no) REFERENCES obanalytics.level3_02006s201908(microtimestamp, order_id, event_no) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -23572,6 +25075,22 @@ ALTER TABLE ONLY obanalytics.matches_01001201907
 
 
 --
+-- Name: matches_01001201908 matches_01001201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01001201908
+    ADD CONSTRAINT matches_01001201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_01001b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_01001201908 matches_01001201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01001201908
+    ADD CONSTRAINT matches_01001201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_01001s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: matches_01002201902 matches_01002201902_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -23668,6 +25187,22 @@ ALTER TABLE ONLY obanalytics.matches_01002201907
 
 
 --
+-- Name: matches_01002201908 matches_01002201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01002201908
+    ADD CONSTRAINT matches_01002201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_01002b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_01002201908 matches_01002201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01002201908
+    ADD CONSTRAINT matches_01002201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_01002s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: matches_01003201902 matches_01003201902_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -23761,6 +25296,22 @@ ALTER TABLE ONLY obanalytics.matches_01003201907
 
 ALTER TABLE ONLY obanalytics.matches_01003201907
     ADD CONSTRAINT matches_01003201907_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_01003s201907(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_01003201908 matches_01003201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01003201908
+    ADD CONSTRAINT matches_01003201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_01003b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_01003201908 matches_01003201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_01003201908
+    ADD CONSTRAINT matches_01003201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_01003s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -23892,6 +25443,22 @@ ALTER TABLE ONLY obanalytics.matches_02001201907
 
 
 --
+-- Name: matches_02001201908 matches_02001201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02001201908
+    ADD CONSTRAINT matches_02001201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_02001b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02001201908 matches_02001201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02001201908
+    ADD CONSTRAINT matches_02001201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02001s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: matches_02002201901 matches_02002201901_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -24001,6 +25568,22 @@ ALTER TABLE ONLY obanalytics.matches_02002201907
 
 ALTER TABLE ONLY obanalytics.matches_02002201907
     ADD CONSTRAINT matches_02002201907_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02002s201907(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02002201908 matches_02002201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02002201908
+    ADD CONSTRAINT matches_02002201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_02002b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02002201908 matches_02002201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02002201908
+    ADD CONSTRAINT matches_02002201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02002s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -24116,6 +25699,22 @@ ALTER TABLE ONLY obanalytics.matches_02003201907
 
 
 --
+-- Name: matches_02003201908 matches_02003201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02003201908
+    ADD CONSTRAINT matches_02003201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_02003b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02003201908 matches_02003201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02003201908
+    ADD CONSTRAINT matches_02003201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02003s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: matches_02004201901 matches_02004201901_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -24225,6 +25824,22 @@ ALTER TABLE ONLY obanalytics.matches_02004201907
 
 ALTER TABLE ONLY obanalytics.matches_02004201907
     ADD CONSTRAINT matches_02004201907_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02004s201907(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02004201908 matches_02004201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02004201908
+    ADD CONSTRAINT matches_02004201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_02004b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02004201908 matches_02004201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02004201908
+    ADD CONSTRAINT matches_02004201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02004s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -24340,6 +25955,22 @@ ALTER TABLE ONLY obanalytics.matches_02005201907
 
 
 --
+-- Name: matches_02005201908 matches_02005201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02005201908
+    ADD CONSTRAINT matches_02005201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_02005b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02005201908 matches_02005201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02005201908
+    ADD CONSTRAINT matches_02005201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02005s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: matches_02006201901 matches_02006201901_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -24449,6 +26080,22 @@ ALTER TABLE ONLY obanalytics.matches_02006201907
 
 ALTER TABLE ONLY obanalytics.matches_02006201907
     ADD CONSTRAINT matches_02006201907_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02006s201907(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02006201908 matches_02006201908_fkey_level3_buys; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02006201908
+    ADD CONSTRAINT matches_02006201908_fkey_level3_buys FOREIGN KEY (buy_event_no, microtimestamp, buy_order_id) REFERENCES obanalytics.level3_02006b201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
+
+
+--
+-- Name: matches_02006201908 matches_02006201908_fkey_level3_sells; Type: FK CONSTRAINT; Schema: obanalytics; Owner: ob-analytics
+--
+
+ALTER TABLE ONLY obanalytics.matches_02006201908
+    ADD CONSTRAINT matches_02006201908_fkey_level3_sells FOREIGN KEY (sell_event_no, microtimestamp, sell_order_id) REFERENCES obanalytics.level3_02006s201908(event_no, microtimestamp, order_id) ON UPDATE CASCADE DEFERRABLE INITIALLY DEFERRED;
 
 
 --

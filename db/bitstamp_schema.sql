@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 11.2
--- Dumped by pg_dump version 11.3
+-- Dumped from database version 11.4
+-- Dumped by pg_dump version 11.4
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -491,7 +491,7 @@ BEGIN
 	
 	-- Keep the first  'order_created' and 'order_deleted' events for the given order id and delete the other
 	WITH duplicates AS (
-		SELECT order_id, event, lead(microtimestamp) OVER (PARTITION BY event, order_id ORDER BY microtimestamp) AS microtimestamp
+		SELECT order_id, event, lead(microtimestamp) OVER (PARTITION BY event, order_id ORDER BY microtimestamp) AS microtimestamp, pair_id
 		FROM bitstamp.transient_live_orders
 		WHERE event <> 'order_changed'
 		  AND pair_id = v_pair_id
@@ -501,6 +501,7 @@ BEGIN
 	DELETE FROM bitstamp.transient_live_orders
 	USING duplicates
 	WHERE transient_live_orders.order_id = duplicates.order_id
+	  and transient_live_orders.pair_id = duplicates.pair_id
 	  AND transient_live_orders.microtimestamp = duplicates.microtimestamp;	
 	  
 	WITH deleted AS (
@@ -2461,8 +2462,11 @@ begin
 					update bitstamp.live_orders
 					set microtimestamp = next_microtimestamp
 					where microtimestamp between v_start and v_end
-					  and ( fill > 0 or fill is null )
-					  and trade_id is null	-- this event should has been matched to some trade but couldn't
+					  and (
+						  	( ( fill > 0 or fill is null ) and trade_id is null ) -- this event should has been matched to some trade but couldn't
+						    or
+						  	event_no = 1 -- an order_created event in case its next_event has been moved backwards
+						   )
 					  and next_microtimestamp > '-infinity'
 					  and next_microtimestamp < microtimestamp
 					  and pair_id = v_pair_id
@@ -3296,8 +3300,30 @@ ALTER TABLE bitstamp.diff_order_book OWNER TO "ob-analytics";
 -- Name: live_buy_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TABLE bitstamp.live_buy_orders PARTITION OF bitstamp.live_orders
-FOR VALUES IN ('buy');
+CREATE TABLE bitstamp.live_buy_orders (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no smallint NOT NULL,
+    event bitstamp.live_orders_event NOT NULL,
+    order_type bitstamp.direction NOT NULL,
+    price numeric NOT NULL,
+    amount numeric,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no smallint,
+    trade_id bigint,
+    orig_microtimestamp timestamp with time zone,
+    pair_id smallint NOT NULL,
+    local_timestamp timestamp with time zone,
+    datetime timestamp with time zone NOT NULL,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no smallint,
+    CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
+    CONSTRAINT minus_infinity CHECK (((event <> 'order_deleted'::bitstamp.live_orders_event) OR (next_microtimestamp = '-infinity'::timestamp with time zone))),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+);
+ALTER TABLE ONLY bitstamp.live_orders ATTACH PARTITION bitstamp.live_buy_orders FOR VALUES IN ('buy');
 
 
 ALTER TABLE bitstamp.live_buy_orders OWNER TO "ob-analytics";
@@ -3318,8 +3344,30 @@ ALTER TABLE bitstamp.live_orders_eras OWNER TO "ob-analytics";
 -- Name: live_sell_orders; Type: TABLE; Schema: bitstamp; Owner: ob-analytics
 --
 
-CREATE TABLE bitstamp.live_sell_orders PARTITION OF bitstamp.live_orders
-FOR VALUES IN ('sell');
+CREATE TABLE bitstamp.live_sell_orders (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no smallint NOT NULL,
+    event bitstamp.live_orders_event NOT NULL,
+    order_type bitstamp.direction NOT NULL,
+    price numeric NOT NULL,
+    amount numeric,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no smallint,
+    trade_id bigint,
+    orig_microtimestamp timestamp with time zone,
+    pair_id smallint NOT NULL,
+    local_timestamp timestamp with time zone,
+    datetime timestamp with time zone NOT NULL,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no smallint,
+    CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
+    CONSTRAINT minus_infinity CHECK (((event <> 'order_deleted'::bitstamp.live_orders_event) OR (next_microtimestamp = '-infinity'::timestamp with time zone))),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+);
+ALTER TABLE ONLY bitstamp.live_orders ATTACH PARTITION bitstamp.live_sell_orders FOR VALUES IN ('sell');
 
 
 ALTER TABLE bitstamp.live_sell_orders OWNER TO "ob-analytics";
@@ -3657,6 +3705,13 @@ CREATE INDEX live_sell_orders_idx_pair_selection ON bitstamp.live_sell_orders US
 --
 
 CREATE INDEX spread_idx_pair_selection ON bitstamp.spread USING btree (pair_id, microtimestamp);
+
+
+--
+-- Name: transient_live_orders_idx_pair_id_microtimestamp; Type: INDEX; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE INDEX transient_live_orders_idx_pair_id_microtimestamp ON bitstamp.transient_live_orders USING btree (pair_id, microtimestamp);
 
 
 --
