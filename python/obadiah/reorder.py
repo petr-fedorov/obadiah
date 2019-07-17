@@ -4,7 +4,7 @@ import logging
 from heapq import heappush, heappop
 from datetime import datetime, timedelta
 from functools import total_ordering
-from obanalyticsdb.utils import QueueSizeLogger
+from obadiah.utils import QueueSizeLogger
 
 
 @total_ordering

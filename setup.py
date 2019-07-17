@@ -1,13 +1,13 @@
 from setuptools import setup, find_packages
 setup(
-    name="obanalyticsdb",
+    name="obadiah",
     version="0.1.3",
     python_requires=">=3.6",
     packages=find_packages('python'),
     package_dir={'': 'python'},
     entry_points={
         'console_scripts': [
-            'obanalyticsdb = obanalyticsdb.__main__:main'
+            'obadiah = obadiah.__main__:main'
         ]
     },
     install_requires=[

@@ -4,9 +4,9 @@ from multiprocessing import set_start_method, Event, Process, Queue
 import signal
 import argparse
 import sys
-import obanalyticsdb.bitstamp as bs
-import obanalyticsdb.bitfinex as bf
-from obanalyticsdb.utils import listener_process, logging_configurer
+import obadiah.bitstamp as bs
+import obadiah.bitfinex as bf
+from obadiah.utils import listener_process, logging_configurer
 import asyncio
 import functools
 
@@ -54,7 +54,7 @@ def main():
             listener.start()
 
             logging_configurer(log_queue, logging.INFO)
-            logger = logging.getLogger("obanalyticsdb.main")
+            logger = logging.getLogger("obadiah.main")
             logger.info('Started')
 
             exchanges = {'BITSTAMP': bs.capture}
@@ -80,7 +80,7 @@ def main():
             logging.basicConfig(format='%(asctime)s %(process)-6d %(name)s '
                                 '%(levelname)-8s %(message)s', handlers=[h])
 
-            logging.getLogger("obanalyticsdb").setLevel(logging.INFO)
+            logging.getLogger("obadiah").setLevel(logging.INFO)
             logging.getLogger("websockets").setLevel(logging.INFO)
             logger = logging.getLogger(__name__ + ".main")
 

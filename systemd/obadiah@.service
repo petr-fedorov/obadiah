@@ -1,19 +1,20 @@
-# The obanalyticdb service unit file
+# The obadiah service unit file
 #
 # Quick HowTo:
-# 1. Copy this file to /etc/systemd/system/obanalyticsdb-<DATABASE>@.service, 
-#    substituting <DATABASE> with the name of PostgreSQL database where data will be saved (i.e. ob-analytics-devel)
-# 2. Edit <USER>, <DATABASE> and <ENVIRONMENT>, where <ENVIRONMENT> is a Python environment where obanalyticsdb is installed
-#    ("/bin/bash -c "source $HOME/envs/obanalyticsdb-devel/bin/activate; cd /var/log/$LOGNAME; $HOME/envs/obanalyticsdb-devel/bin/obanalyticsdb -d ob-analytics-devel -s %i"
+# 1. Copy this file to /etc/systemd/system/obadiah-<DATABASE>@.service, 
+#    substituting <DATABASE> with the name of PostgreSQL database where data will be saved (i.e. obadiah-devel)
+# 2. Edit <USER>, <DATABASE> and <ENVIRONMENT>, where <ENVIRONMENT> is a Python environment where obadiah is installed
+#    ("/bin/bash -c "source $HOME/envs/obadiah-devel/bin/activate; cd /var/log/$LOGNAME; $HOME/envs/obadiah-devel/bin/obadiah -d obadiah-devel -s %i"
 # 3. Create the directory to store log files: sudo mkdir /var/log/<USER>  sudo chown <USER>.<USER> /var/log/<USER>
 # 3. Run `systemctl daemon-reload`
-# 4. Start service `systemctl start obanalytics-<DATABASE>@PAIR:EXCHANGE.service` where PAIR and EXCHANGE are runtime parameters of obanalyticsdb (see obanalyticsdb --help)
+# 4. Start service `systemctl start obanalytics-<DATABASE>@PAIR:EXCHANGE.service` where PAIR and EXCHANGE are runtime parameters of obadiah (see obadiah --help)
 #
 
 
 [Unit]
 
 Description=A data loading service for Order Book Aalytics Database
+After=postgresql-11.service
 
 
 [Service]
@@ -23,7 +24,11 @@ User=<USER>
 Type=simple
 Restart=on-failure
 RestartSec=30
-ExecStart=/bin/bash -c "source <ENVIRONMENT>/bin/activate; cd /var/log/$LOGNAME; <ENVIRONMENT>/bin/obanalyticsdb -d <DATABASE> -s %i"
+ExecStart=/bin/bash -c "source <ENVIRONMENT>/bin/activate; cd /var/log/$LOGNAME; <ENVIRONMENT>/bin/obadiah -d <DATABASE> -s %i"
 KillSignal=SIGINT
 # websockets might have a lot of messages in its buffer - we want to have them all saved. 10 minutes should be enough?
 TimeoutStopSec=600
+
+
+[Install]
+WantedBy=multi-user.target

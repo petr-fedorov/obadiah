@@ -5,8 +5,8 @@ from multiprocessing import Process, Queue
 from threading import Thread
 from queue import Empty
 import pusherclient
-from obanalyticsdb.utils import connect_db, Spawned, log_notices
-from obanalyticsdb.reorder import OrderedDatabaseInsertion, Reorderer
+from obadiah.utils import connect_db, Spawned, log_notices
+from obadiah.reorder import OrderedDatabaseInsertion, Reorderer
 
 
 def get_pair(pair, dbname, user):
