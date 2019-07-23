@@ -2318,8 +2318,8 @@ begin
 
 	end;
 	
-	create temp table if not exists level1 (like obanalytics.level1);
-	create temp table if not exists level2 (like obanalytics.level2);
+	create temp table if not exists level1 (like obanalytics.level1) on commit delete rows;
+	create temp table if not exists level2 (like obanalytics.level2) on commit delete rows;
 	
 	
 	for e in   select starts, ends, first_level1, first_level2
