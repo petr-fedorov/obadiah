@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 setup(
     name="obadiah",
-    version="0.1.3",
+    version="0.1.4",
     python_requires=">=3.6",
     packages=find_packages('python'),
     package_dir={'': 'python'},
@@ -12,12 +12,12 @@ setup(
     },
     install_requires=[
         'psycopg2-binary',
-        'pusherclient',
         'websockets',
         'asyncpg',
         'aiohttp',
         'cchardet',
-        'aiodns'
+        'aiodns',
+        'sslkeylog'
     ],
 
 
