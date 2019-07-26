@@ -1,5 +1,9 @@
 #' @import lubridate
-#' @importFrom dplyr lead if_else
+#' @importFrom dplyr lead if_else filter select full_join rename mutate
+#' @importFrom plyr . empty
+#' @importFrom magrittr  %>%
+#' @importFrom zoo na.locf
+#' @importFrom reshape2 dcast melt
 
 
 #' @export
