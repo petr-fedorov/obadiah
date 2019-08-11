@@ -1213,7 +1213,6 @@ BEGIN
 				END IF;
 				
 			ELSE -- it is ex-nihilo 'order_changed' or 'order_deleted' event
-
 				NEW.fill := NULL;	-- we still don't know fill (yet). Can later try to figure it out from trade. amount will be null too
 				-- INSERT the initial 'order_created' event when missing
 				NEW.price_microtimestamp := CASE WHEN NEW.datetime < v_era THEN v_era ELSE NEW.datetime END;
@@ -1226,8 +1225,7 @@ BEGIN
 				VALUES (NEW.order_id, NEW.amount, 'order_created'::bitstamp.live_orders_event, NEW.price_event_no, NEW.order_type,
 						NEW.datetime, NEW.price_microtimestamp, 
 						NEW.pair_id, NEW.price, -NEW.amount, NEW.microtimestamp, NEW.event_no, NEW.price_microtimestamp, 
-					   NEW.price_event_no);
-			
+						NEW.price_event_no);			
 			END IF;
 		END IF;
 		
