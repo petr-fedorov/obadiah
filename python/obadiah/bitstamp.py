@@ -89,7 +89,7 @@ class BitstampMessageHandler(MessageHandler):
             await self.con.copy_records_to_table(
                 "transient_live_orders",
                 records=self.events,
-                columns=["microtimestamp", "datetime", "amount", "price", 
+                columns=["microtimestamp", "datetime", "amount", "price",
                          "order_id", "order_type", "event", "era",
                          "pair_id", "local_timestamp"],
                 schema_name="bitstamp"

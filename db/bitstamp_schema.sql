@@ -401,7 +401,7 @@ BEGIN
 				COALESCE(lead(microtimestamp) OVER o, case event when 'order_deleted' then '-infinity'::timestamptz else 'infinity'::timestamptz end) AS next_microtimestamp,
 				CASE WHEN lead(microtimestamp) OVER o IS NOT NULL THEN row_number() OVER o + 1 ELSE NULL END AS next_event_no
 		FROM deleted
-		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp)
+		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp, local_timestamp)
 		
 	)
 	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price,
@@ -1753,6 +1753,11 @@ DECLARE
 BEGIN 
 	v_execution_start_time := clock_timestamp();
 	SET CONSTRAINTS ALL DEFERRED;
+	
+	-- Not very often Bitstamp sends events from the previous era when new era just started (after reconnect). We need to assign them to the previous era ...
+	update bitstamp.transient_live_orders t
+	set (era ) = (select max(era) from bitstamp.live_orders_eras where live_orders_eras.pair_id = t.pair_id and live_orders_eras.era <= t.microtimestamp)
+	where era > microtimestamp;
 	
 	FOR v_era IN SELECT DISTINCT era FROM bitstamp.transient_live_orders JOIN bitstamp.pairs USING (pair_id) WHERE pairs.pair = p_pair ORDER BY era
 		LOOP
