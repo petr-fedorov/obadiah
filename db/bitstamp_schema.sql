@@ -246,7 +246,7 @@ CREATE TABLE bitstamp.live_orders (
     CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
     CONSTRAINT minus_infinity CHECK (((event <> 'order_deleted'::bitstamp.live_orders_event) OR (next_microtimestamp = '-infinity'::timestamp with time zone))),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (order_type);
 
@@ -2466,7 +2466,7 @@ CREATE TABLE bitstamp.live_buy_orders (
     CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
     CONSTRAINT minus_infinity CHECK (((event <> 'order_deleted'::bitstamp.live_orders_event) OR (next_microtimestamp = '-infinity'::timestamp with time zone))),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 );
 ALTER TABLE ONLY bitstamp.live_orders ATTACH PARTITION bitstamp.live_buy_orders FOR VALUES IN ('buy');
 
@@ -2510,7 +2510,7 @@ CREATE TABLE bitstamp.live_sell_orders (
     CONSTRAINT created_is_matchless CHECK (((event <> 'order_created'::bitstamp.live_orders_event) OR ((event = 'order_created'::bitstamp.live_orders_event) AND (trade_id IS NULL)))),
     CONSTRAINT minus_infinity CHECK (((event <> 'order_deleted'::bitstamp.live_orders_event) OR (next_microtimestamp = '-infinity'::timestamp with time zone))),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_is_positive CHECK ((price > (0)::numeric))
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 );
 ALTER TABLE ONLY bitstamp.live_orders ATTACH PARTITION bitstamp.live_sell_orders FOR VALUES IN ('sell');
 
