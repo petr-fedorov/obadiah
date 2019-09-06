@@ -1,4 +1,4 @@
-#' @import lubridate
+#' @importFrom lubridate with_tz ymd_hms
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
 #' @importFrom magrittr  %>%
@@ -53,12 +53,12 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 .depth_changes <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE)   {
 
-  query <- paste0(" SELECT obanalytics._in_milliseconds(timestamp) AS timestamp,
-                  price, volume, side FROM obanalytics.oba_depth(",
+  query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,
+                  price, volume, side FROM get.depth(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), "), ",
                   "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
   if(debug.query) cat(query)
   depth <- DBI::dbGetQuery(conn, query)
@@ -70,11 +70,11 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 .starting_depth <- function(conn, start.time, exchange, pair, debug.query = FALSE)   {
 
-  query <- paste0(" SELECT obanalytics._in_milliseconds(timestamp) AS timestamp,
-                  price, volume, side FROM obanalytics.oba_depth(",
+  query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,
+                  price, volume, side FROM get.depth(",
                   shQuote(format(start.time,usetz=T)), ", NULL, ",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), "), ",
                   "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
   if(debug.query) cat(query)
   depth <- DBI::dbGetQuery(conn, query)
@@ -127,16 +127,16 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
 .spread <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
 
-  query <- paste0(" SELECT distinct on (obanalytics._in_milliseconds(timestamp) )	obanalytics._in_milliseconds(timestamp) AS timestamp,
+  query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp,
                   \"best.bid.price\",
                   \"best.bid.volume\",
                   \"best.ask.price\",
                   \"best.ask.volume\"
-                  FROM obanalytics.oba_spread(",
+                  FROM get.spread(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ") ",
                   ") ORDER BY 1, timestamp desc ")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
@@ -188,7 +188,7 @@ events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
   query <- paste0(" SELECT 	\"event.id\",
                   \"id\"::numeric,
-                  obanalytics._in_milliseconds(timestamp) AS timestamp,
+                  get._in_milliseconds(timestamp) AS timestamp,
                   \"exchange.timestamp\",
                   price,
                   volume,
@@ -198,11 +198,11 @@ events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
                   \"matching.event\",
                   \"type\",
                   \"aggressiveness.bps\"
-                  FROM obanalytics.oba_events(",
+                  FROM get.events(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ")",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ")",
                   ")")
   if(debug.query) cat(query)
   events <- DBI::dbGetQuery(conn, query)
@@ -250,17 +250,17 @@ trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL,  debu
 
 .trades <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
 
-  query <- paste0(" SELECT 	obanalytics._in_milliseconds(timestamp) AS timestamp,
+  query <- paste0(" SELECT 	get._in_milliseconds(timestamp) AS timestamp,
                   price, volume, direction,
                   \"maker.event.id\",
                   \"taker.event.id\",
                   maker::numeric,
                   taker::numeric,
-                  \"exchange.trade.id\" FROM obanalytics.oba_trades(",
+                  \"exchange.trade.id\" FROM get.trades(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ")",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ")",
                   ") ORDER BY timestamp")
   if(debug.query) cat(query)
   trades <- DBI::dbGetQuery(conn, query)
@@ -332,14 +332,14 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL
                                    volume,
                                    side,
                                    bps_level,
-                                   rank() over (partition by obanalytics._in_milliseconds(timestamp) order by timestamp desc) as r
-                            from obanalytics.oba_depth_summary(",
+                                   rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r
+                            from get.depth_summary(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ") ",
                   " ))
-                          select obanalytics._in_milliseconds(timestamp) as timestamp,
+                          select get._in_milliseconds(timestamp) as timestamp,
                                  side,
                                  bps_level,
                                  price,
@@ -375,10 +375,10 @@ order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA
 
 
   query <- paste0("select ts, \"timestamp\", id, price, volume, liquidity, bps, side, \"exchange.timestamp\"
-                   from obanalytics.oba_order_book(",
+                   from get.order_book(",
                   shQuote(format(tp, usetz=T)), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), "), ",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), "), ",
                   max.levels,  ",",
                   bps.range,  ",",
                   min.bid,  ",",
@@ -401,11 +401,11 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
 
-  query <- paste0(" select * from obanalytics.oba_export(", shQuote(start.time),
+  query <- paste0(" select * from get.export(", shQuote(start.time),
                   ", ",
                   shQuote(format(end.time, usetz=T)), ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ") ",
                   ") order by timestamp")
   if(debug.query) cat(query)
   events <- DBI::dbGetQuery(conn, query)
@@ -463,18 +463,18 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw
 
 .draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type, debug.query = FALSE) {
 
-  query <- paste0(" select obanalytics._in_milliseconds(\"timestamp\") AS \"timestamp\",
-                  obanalytics._in_milliseconds(\"draw.end\") AS \"draw.end\",
+  query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\",
+                  get._in_milliseconds(\"draw.end\") AS \"draw.end\",
                   \"start.price\",
                   \"end.price\",
                   \"draw.size\"
-                  FROM obanalytics.oba_draws(",
+                  FROM get.draws(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
                   shQuote(draw.type), ",",
                   minimal.draw, ",",
-                  "obanalytics.oba_pair_id(",shQuote(pair),"), " ,
-                  "obanalytics.oba_exchange_id(", shQuote(exchange), ") ",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ") ",
                   ") order by 1")
   if(debug.query) cat(query)
   draws <- DBI::dbGetQuery(conn, query)
@@ -484,3 +484,73 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw
 }
 
 
+#' @export
+intervals <- function(conn, start.time=NULL, end.time=NULL, exchange = NULL, pair = NULL, debug.query = FALSE, tz='UTC') {
+
+  if(!is.null(start.time)) {
+    if(is.character(start.time)) start.time <- ymd_hms(start.time)
+    stopifnot(inherits(start.time, 'POSIXt'))
+    start.time <- with_tz(start.time, tz='UTC')
+    start.time <- shQuote(format(start.time,"%Y-%m-%d %H:%M:%S%z")) # ISO 8601 format which is understood by both: Postgres and ymd_hms()
+  }
+  else
+    start.time <- "NULL"
+
+  if(!is.null(end.time)) {
+    if(is.character(end.time)) end.time <- ymd_hms(end.time)
+    stopifnot(inherits(end.time, 'POSIXt'))
+    end.time <- with_tz(end.time, tz='UTC')
+    end.time <- shQuote(format(end.time,"%Y-%m-%d %H:%M:%S%z"))
+  }
+  else
+    end.time <- "NULL"
+
+
+  if(!is.null(pair)) pair <- paste0(" get.pair_id(",shQuote(pair),") ")
+  if(!is.null(exchange)) exchange <- paste0(" get.exchange_id(", shQuote(exchange), ") ")
+  if(!is.null(pair) & !is.null(exchange)) sep <- "," else sep <- ""
+
+  # Various PostgreSQL-drivers in R are not able to handle timezone conversion correctly/consistently
+  # So we use EXTRACT epoch and then convert the epoch to POSIXct on the R side
+
+  query <- paste0("select exchange_id, pair_id,
+                          extract(epoch from interval_start) as interval_start,
+                          extract(epoch from interval_end) as interval_end,
+                          case when events and depth then 'G' when events then 'Y' else 'R' end as c,
+                          dense_rank() over (order by exchange_id, pair_id)::integer as y,
+                          exchange, pair,
+                          extract(epoch from era) as era
+                  from get.events_intervals( ",
+                  pair,
+                  sep,
+                  exchange,
+                  ")",
+                  " where interval_end > coalesce( ", start.time, " , interval_end - '1 second'::interval ) ",
+                  "   and interval_start < coalesce( ", end.time, " , interval_start + '1 second'::interval ) "
+                  )
+
+  if(debug.query) cat(query)
+  intervals <- DBI::dbGetQuery(conn, query)
+
+  intervals <- intervals %>%
+    mutate(interval_start=as.POSIXct(interval_start, origin="1970-01-01"),
+           interval_end=as.POSIXct(interval_end, origin="1970-01-01"),
+           era=as.POSIXct(era, origin="1970-01-01")
+           )
+
+  if(start.time != "NULL") {
+    start.time <- ymd_hms(start.time)
+    intervals <- intervals %>% mutate(interval_start=if_else(interval_start < start.time, start.time, interval_start))
+  }
+  if(end.time != "NULL") {
+    end.time <- ymd_hms(end.time)
+    intervals <- intervals %>% mutate(interval_end=if_else(interval_end > end.time, end.time, interval_end))
+  }
+
+  intervals$interval_start <- with_tz(intervals$interval_start, tz)
+  intervals$interval_end <- with_tz(intervals$interval_end, tz)
+  intervals$era <- with_tz(intervals$era, tz)
+
+  intervals
+
+}
