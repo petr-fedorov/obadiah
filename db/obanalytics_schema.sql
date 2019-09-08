@@ -1481,6 +1481,174 @@ $$;
 ALTER FUNCTION obanalytics.fix_crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
+-- Name: level3_eras; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_eras (
+    era timestamp with time zone NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_id smallint NOT NULL,
+    level1 timestamp with time zone,
+    level2 timestamp with time zone,
+    level3 timestamp with time zone
+);
+
+
+ALTER TABLE obanalytics.level3_eras OWNER TO "ob-analytics";
+
+--
+-- Name: COLUMN level3_eras.level1; Type: COMMENT; Schema: obanalytics; Owner: ob-analytics
+--
+
+COMMENT ON COLUMN obanalytics.level3_eras.level1 IS 'A microtimestamp of the latest calculated level1 event in this era ';
+
+
+--
+-- Name: insert_level3_era(timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.insert_level3_era(p_new_era timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3_eras
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_previous_era obanalytics.level3_eras%rowtype;
+	v_new_era obanalytics.level3_eras%rowtype;
+	v_next_era obanalytics.level3_eras%rowtype;
+begin
+
+	select distinct on (pair_id, exchange_id) * into strict v_previous_era 
+	from obanalytics.level3_eras
+	where pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and era <= p_new_era
+	order by exchange_id, pair_id, era desc;
+	
+	select distinct on (pair_id, exchange_id) * into strict v_next_era 
+	from obanalytics.level3_eras
+	where pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and era >= p_new_era
+	order by exchange_id, pair_id, era ;
+	
+	
+	if exists (select * 
+			    from obanalytics.level1 
+			    where microtimestamp >= p_new_era 
+			   	  and microtimestamp < v_next_era.era
+			      and pair_id = p_pair_id
+			      and exchange_id = p_exchange_id ) or
+		exists (select * 
+			    from obanalytics.level2
+			    where microtimestamp >= p_new_era 
+				  and microtimestamp < v_next_era.era
+			      and pair_id = p_pair_id
+			      and exchange_id = p_exchange_id ) then 
+		raise exception 'Can not insert new era - clear level1 & level2 first!';
+	end if;
+	
+	if p_new_era = v_previous_era.era or p_new_era = v_next_era.era then
+		raise exception 'Can not insert new era - already exists!';
+	end if;
+	
+	with events as (
+		select *
+		from obanalytics.level3
+		where pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+		  and event_no > 1			-- events with event_no > 1 are processed differently
+		  and microtimestamp >= v_previous_era.era 
+		  and microtimestamp < p_new_era
+		  and next_microtimestamp >= p_new_era
+		  and next_microtimestamp < 'infinity'
+	)
+	update obanalytics.level3
+	   set event_no = level3.event_no - events.event_no + 1
+	from events
+	where level3.pair_id = p_pair_id
+	  and level3.exchange_id = p_exchange_id
+	  and level3.microtimestamp >= p_new_era
+	  and level3.microtimestamp < v_next_era.era
+	  and level3.order_id = events.order_id;
+	
+	insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
+								     pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp)
+	select p_new_era,
+			order_id,
+			1,				-- event_no: must be always 1
+			side, 
+			price, 
+			amount, 
+			fill,
+			next_microtimestamp, 
+			next_event_no,
+			pair_id,
+			exchange_id,
+			null::timestamptz,	--	local_timestamp
+			p_new_era,
+			1,
+			null::timestamptz	-- exchange_timestamp
+	from obanalytics.level3
+	where pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and microtimestamp >= v_previous_era.era 
+	  and microtimestamp < p_new_era
+	  and next_microtimestamp >= p_new_era
+	  and next_microtimestamp < 'infinity';
+	  
+	update obanalytics.level3	  
+	  set next_microtimestamp = 'infinity',
+	      next_event_no = null
+	where pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and microtimestamp >= v_previous_era.era 
+	  and microtimestamp < p_new_era
+	  and next_microtimestamp >= p_new_era
+	  and next_microtimestamp < 'infinity'
+	  ;
+	  
+	update obanalytics.level3_eras
+	  set  level2 = (select max(microtimestamp) 
+					from obanalytics.level2
+					where pair_id = p_pair_id
+				      and exchange_id = p_exchange_id
+				      and microtimestamp >= v_previous_era.era
+				      and microtimestamp < p_new_era),
+	   	    level1 = (select max(microtimestamp) 
+					from obanalytics.level1
+					where pair_id = p_pair_id
+				      and exchange_id = p_exchange_id
+				      and microtimestamp >= v_previous_era.era
+				      and microtimestamp < p_new_era),
+	  		 level3 = (select max(microtimestamp) 
+					from obanalytics.level3
+					where pair_id = p_pair_id
+				      and exchange_id = p_exchange_id
+				      and microtimestamp >= v_previous_era.era
+				      and microtimestamp < p_new_era)
+	where era = v_previous_era.era
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id;
+	  
+    insert into obanalytics.level3_eras (era, pair_id, exchange_id, level3)	  
+	values (p_new_era, p_pair_id, p_exchange_id, (select max(microtimestamp)
+					   	 from obanalytics.level3
+					     where pair_id = p_pair_id
+					       and exchange_id = p_exchange_id
+					       and microtimestamp >= p_new_era
+					       and microtimestamp < v_next_era.era ));
+	return query select *
+				  from obanalytics.level3_eras
+				  where pair_id = p_pair_id
+				    and exchange_id = p_exchange_id
+					and era between v_previous_era.era and v_next_era.era;
+	return;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.insert_level3_era(p_new_era timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: level1_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -13792,29 +13960,6 @@ ALTER TABLE ONLY obanalytics.level3_02006s201910 ALTER COLUMN microtimestamp SET
 
 
 ALTER TABLE obanalytics.level3_02006s201910 OWNER TO "ob-analytics";
-
---
--- Name: level3_eras; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level3_eras (
-    era timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    exchange_id smallint NOT NULL,
-    level1 timestamp with time zone,
-    level2 timestamp with time zone,
-    level3 timestamp with time zone
-);
-
-
-ALTER TABLE obanalytics.level3_eras OWNER TO "ob-analytics";
-
---
--- Name: COLUMN level3_eras.level1; Type: COMMENT; Schema: obanalytics; Owner: ob-analytics
---
-
-COMMENT ON COLUMN obanalytics.level3_eras.level1 IS 'A microtimestamp of the latest calculated level1 event in this era ';
-
 
 --
 -- Name: level3_eras_bitfinex; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
