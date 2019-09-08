@@ -98,6 +98,31 @@ $$;
 ALTER FUNCTION get.available_period(p_exchange_id integer, p_pair_id integer) OWNER TO "ob-analytics";
 
 --
+-- Name: data_overview(text, text, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get.data_overview(p_exchange text DEFAULT NULL::text, p_pair text DEFAULT NULL::text, p_r integer DEFAULT 1) RETURNS TABLE(level2_delay interval, pair text, pair_id smallint, exchange text, exchange_id smallint, era timestamp with time zone, level3 timestamp with time zone, level2 timestamp with time zone, level1 timestamp with time zone)
+    LANGUAGE sql
+    AS $$
+with eras as (
+	select level3_eras, pair, exchange, era, level3, level2, level1, pair_id, exchange_id,
+			row_number() over (partition by pair_id, exchange_id order by era desc) as r,
+			coalesce(lead(era) over (partition by pair_id, exchange_id order by era), 'infinity') as next_era
+	from obanalytics.level3_eras join obanalytics.exchanges using (exchange_id) join obanalytics.pairs using (pair_id)
+	where pair = coalesce(upper(p_pair), pair) 
+	  and exchange = coalesce(lower(p_exchange),exchange)
+)
+select coalesce(level3, era) - coalesce(level2, era),
+		pair, pair_id, exchange, exchange_id, era, level3, level2, level1
+from eras
+where r <= coalesce(p_r, r)
+order by era desc;
+$$;
+
+
+ALTER FUNCTION get.data_overview(p_exchange text, p_pair text, p_r integer) OWNER TO "ob-analytics";
+
+--
 -- Name: depth(timestamp with time zone, timestamp with time zone, integer, integer, boolean, boolean); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 

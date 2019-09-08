@@ -1222,7 +1222,9 @@ CREATE FUNCTION obanalytics.crossed_books(p_start_time timestamp with time zone,
 
 with base_order_books as (
 	select ts, exists (select * from unnest(ob) where not is_maker) as is_crossed
-	from  obanalytics.order_book_by_episode(p_start_time, p_end_time + '00:00:05'::interval,	-- next_uncrossed may be few seconds beyond p_end_time
+	from  obanalytics.order_book_by_episode(p_start_time, p_end_time + 
+											make_interval(
+												secs := parameters.max_microtimestamp_change()),	-- next_uncrossed may be few seconds beyond p_end_time
 											p_pair_id, p_exchange_id, false) ob					-- if we dont' find it, merge_crossed_books() will stuck 
 																								-- i.e. will not be able to fix an invalid taker event
 	),
@@ -1379,6 +1381,104 @@ $$;
 
 
 ALTER FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
+
+--
+-- Name: fix_crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.fix_crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+
+-- NOTE:
+--		This function is supposed to be doing something useful only after pga_spread() is failed due to crossed order book
+--		It is expected that Bitfinex produces rather few 'bad' events and rarely, so order book is crossed for relatively short
+-- 		period of time (i.e. 5 minutes). Otherwise one has to run this function manually, with higher p_max_interval
+
+declare 
+	v_current_timestamp timestamptz;
+	
+begin 
+	v_current_timestamp := clock_timestamp();
+	
+	-- First remove eternal and crossed orders, which should have been removed by Bitfinex, but weren't for some reasons
+	return query 
+		insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
+		select distinct on (microtimestamp, order_id)  ts, order_id, 
+				null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
+				side, price, amount, fill, '-infinity',
+				null as next_event_no,
+				pair_id, exchange_id, null as local_timestamp,
+				null as price_microtimestamp, 
+				null as price_event_no
+		from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
+		join unnest(ob) ob on true 
+		where is_crossed and next_microtimestamp = 'infinity'
+		order by microtimestamp, order_id,
+				  ts	-- we need the earliest ts where order book became crossed
+		returning level3.*;
+		
+	-- Second remove crossed orders, which have been removed by Bitfinex, but for some reasons too late!
+	return query 		
+		with crossed as (
+			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
+			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
+			join unnest(ob) as ob on true
+			where is_crossed 
+		),
+		updated as (
+			update obanalytics.level3
+			  set microtimestamp = crossed.microtimestamp
+			from crossed
+			where exchange_id = p_exchange_id
+			  and pair_id = p_pair_id
+			  and level3.microtimestamp = crossed.next_microtimestamp
+			  and level3.order_id = crossed.order_id
+			  and level3.event_no = crossed.next_event_no
+			  and level3.next_microtimestamp = '-infinity'
+			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
+			returning level3.*
+		)
+		select *
+		from updated;  
+		
+	-- Third remove takers, which have been removed by Bitfinex, but again for some reasons too late!
+	return query 		
+		with takers as (
+			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
+			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
+			join unnest(ob) as ob on true
+			where not is_maker
+		),
+		updated as (
+			update obanalytics.level3
+			  set microtimestamp = takers.microtimestamp
+			from takers
+			where exchange_id = p_exchange_id
+			  and pair_id = p_pair_id
+			  and level3.microtimestamp = takers.next_microtimestamp
+			  and level3.order_id = takers.order_id
+			  and level3.event_no = takers.next_event_no
+			  and level3.next_microtimestamp = '-infinity'
+			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
+			returning level3.*
+		)
+		select *
+		from updated;  
+		
+		
+			
+	-- Finally, try to merge remaining episodes producing crossed order books
+	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id);
+	
+	raise debug 'fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
+	return;
+end;
+
+$$;
+
+
+ALTER FUNCTION obanalytics.fix_crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: level1_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1768,10 +1868,10 @@ $$;
 ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
--- Name: pga_summarize(text, text, interval, timestamp with time zone, boolean); Type: PROCEDURE; Schema: obanalytics; Owner: ob-analytics
+-- Name: pga_summarize(text, text, interval, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE PROCEDURE obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval DEFAULT '04:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_commit_each_era boolean DEFAULT true)
+CREATE FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval DEFAULT '01:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS TABLE(summarized text, pair text, exchange text, first_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, record_count integer)
     LANGUAGE plpgsql
     AS $$
 
@@ -1801,11 +1901,11 @@ begin
 	
 	select pair_id into strict v_pair_id
 	from obanalytics.pairs 
-	where pair = upper(p_pair);
+	where pairs.pair = upper(p_pair);
 	
 	select exchange_id into strict v_exchange_id
 	from obanalytics.exchanges
-	where exchange = lower(p_exchange);
+	where exchanges.exchange = lower(p_exchange);
 	
 	begin
 
@@ -1956,37 +2056,69 @@ begin
 					v_ob_before := v_ob;
 				end loop;			
 				
+				select 'level1', p_pair, p_exchange, min(microtimestamp), max(microtimestamp), count(*) 
+				from level1
+				group by exchange_id, pair_id
+				into summarized, pair, exchange, first_microtimestamp, last_microtimestamp, record_count;
+				return next;
+				
+				select 'level2', p_pair, p_exchange, min(microtimestamp), max(microtimestamp), count(*) 
+				from level2
+				group by exchange_id, pair_id
+				into summarized, pair, exchange, first_microtimestamp, last_microtimestamp, record_count;
+				return next;
+				
 				insert into obanalytics.level1
 				select * from level1;
 				
 				insert into obanalytics.level2
 				select * from level2;
+				
+		exception
+			when raise_exception then
+				declare
+					v_bad_episode timestamptz;
+					v_fixed integer;
+				begin
+					select substring(sqlerrm from 'Invalid taker event: ([0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1]) (2[0-3]|[01][0-9]):[0-5][0-9]:[0-5][0-9](.[0-9]+|)(\+|1)[0-2][0-4])')
+					into v_bad_episode;
+					
+					if v_bad_episode is not null then
+						raise log '%', sqlerrm;
+						select count(*) into v_fixed
+						from obanalytics.fix_crossed_books(v_bad_episode, v_bad_episode, v_pair_id, v_exchange_id);
+						if v_fixed > 0 then 
+							raise log 'Inserted/updated % for invalid taker at % ', v_fixed, v_bad_episode;
+							exit;	-- We stop the summarization now. Next call this procedure will try to summarize this era again with the hope that the errors were fixed by the code above
+						else
+							-- We got stuck, so report an error!
+							raise exception 'STUCK: inserted/updated % for invalid taker at % ', v_fixed, v_bad_episode;
+						end if;
+					else 
+						raise exception '%', sqlerrm;	-- We caught an unexpected exception, re-throw it
+					end if;
+				end;
 		end;
-
-		if p_commit_each_era then
-			commit;
-			raise debug 'pga_summarize(%, %) era commited start: %, end: %, remaining interval: %', p_exchange, p_pair, least(e.first_level1,  e.first_level2), e.ends, p_max_interval;	 
-		end if;
 
 		if p_max_interval is not null then 
 			p_max_interval := greatest('00:00:00'::interval, p_max_interval - (e.ends - least(e.first_level1,  e.first_level2)));
-			
+
 			if p_max_interval = '00:00:00'::interval then
 				exit;
 			end if;
-			
+
 		end if;
 		
 	end loop;
 	
-	raise debug 'pga_summarize() exec time: %', clock_timestamp() - v_current_timestamp;
+	raise debug 'pga_summarize(%, %, %, %) exec time: %', p_exchange, p_pair, p_max_interval, p_ts_within_era, clock_timestamp() - v_current_timestamp;
 	return;
 end;
 
 $$;
 
 
-ALTER PROCEDURE obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone, p_commit_each_era boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: save_exchange_microtimestamp(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1996,6 +2128,9 @@ CREATE FUNCTION obanalytics.save_exchange_microtimestamp() RETURNS trigger
     LANGUAGE plpgsql
     AS $$ 
 begin
+	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change() then	
+		raise exception 'An attempt to move % % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, old.exchange_id, new.microtimestamp;
+	end if;
 	-- It is assumed that the first-ever value of microtimestamp column is set by an exchange.
 	-- If it is changed for the first time, then save it to exchange_microtimestamp.
 	if old.exchange_microtimestamp is null then

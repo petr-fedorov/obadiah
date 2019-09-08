@@ -1109,6 +1109,11 @@ CREATE FUNCTION bitstamp.live_orders_manage_orig_microtimestamp() RETURNS trigge
     LANGUAGE plpgsql
     AS $$ 
 BEGIN
+
+	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change() then	
+		raise exception 'An attempt to move % % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, old.exchange_id, new.microtimestamp;
+	end if;
+
 	if TG_OP =  'UPDATE' and old.orig_microtimestamp is null and  old.microtimestamp <> new.microtimestamp then 
 					new.orig_microtimestamp := old.microtimestamp;
 	end if;

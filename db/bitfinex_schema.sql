@@ -787,75 +787,7 @@ begin
 	
 	raise debug 'v_last_spread: %, p_max_interval: %,  v_end: %, v_pair_id: % ', v_last_spread, p_max_interval, v_end, v_pair_id;	  
 	
-	-- First remove eternal and crossed orders, which should have been removed by Bitfinex, but weren't for some reasons
-	return query 
-		insert into obanalytics.level3_bitfinex (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
-		select distinct on (microtimestamp, order_id)  ts, order_id, 
-				null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
-				side, price, amount, fill, '-infinity',
-				null as next_event_no,
-				pair_id, exchange_id, null as local_timestamp,
-				null as price_microtimestamp, 
-				null as price_event_no
-		from obanalytics.order_book_by_episode(v_last_spread, v_end, v_pair_id, v_exchange_id, p_check_takers :=false) 
-		join unnest(ob) ob on true 
-		where is_crossed and next_microtimestamp = 'infinity'
-		order by microtimestamp, order_id,
-				  ts	-- we need the earliest ts where order book became crossed
-		returning level3_bitfinex.*;
-		
-	-- Second remove crossed orders, which have been removed by Bitfinex, but for some reasons too late!
-	return query 		
-		with crossed as (
-			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
-			from obanalytics.order_book_by_episode(v_last_spread, v_end, v_pair_id, v_exchange_id, p_check_takers :=false) 
-			join unnest(ob) as ob on true
-			where is_crossed 
-		),
-		updated as (
-			update obanalytics.level3
-			  set microtimestamp = crossed.microtimestamp
-			from crossed
-			where exchange_id = v_exchange_id
-			  and pair_id = v_pair_id
-			  and level3.microtimestamp = crossed.next_microtimestamp
-			  and level3.order_id = crossed.order_id
-			  and level3.event_no = crossed.next_event_no
-			  and level3.next_microtimestamp = '-infinity'
-			  and level3.microtimestamp between v_last_spread and v_end
-			returning level3.*
-		)
-		select *
-		from updated;  
-		
-	-- Third remove takers, which have been removed by Bitfinex, but again for some reasons too late!
-	return query 		
-		with takers as (
-			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
-			from obanalytics.order_book_by_episode(v_last_spread, v_end, v_pair_id, v_exchange_id, p_check_takers :=false) 
-			join unnest(ob) as ob on true
-			where not is_maker
-		),
-		updated as (
-			update obanalytics.level3
-			  set microtimestamp = takers.microtimestamp
-			from takers
-			where exchange_id = v_exchange_id
-			  and pair_id = v_pair_id
-			  and level3.microtimestamp = takers.next_microtimestamp
-			  and level3.order_id = takers.order_id
-			  and level3.event_no = takers.next_event_no
-			  and level3.next_microtimestamp = '-infinity'
-			  and level3.microtimestamp between v_last_spread and v_end
-			returning level3.*
-		)
-		select *
-		from updated;  
-		
-		
-			
-	-- Finally, try to merge remaining episodes producing crossed order books
-	return query select * from obanalytics.merge_crossed_books(v_last_spread, v_end, v_pair_id, v_exchange_id);
+	return query select * from obanalytics.fix_crossed_books(v_last_spread, v_end, v_pair_id, v_exchange_id);
 	
 	raise debug 'pga_fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
