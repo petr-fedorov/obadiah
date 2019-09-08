@@ -1418,31 +1418,7 @@ begin
 				  ts	-- we need the earliest ts where order book became crossed
 		returning level3.*;
 		
-	-- Second remove crossed orders, which have been removed by Bitfinex, but for some reasons too late!
-	return query 		
-		with crossed as (
-			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
-			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
-			join unnest(ob) as ob on true
-			where is_crossed 
-		),
-		updated as (
-			update obanalytics.level3
-			  set microtimestamp = crossed.microtimestamp
-			from crossed
-			where exchange_id = p_exchange_id
-			  and pair_id = p_pair_id
-			  and level3.microtimestamp = crossed.next_microtimestamp
-			  and level3.order_id = crossed.order_id
-			  and level3.event_no = crossed.next_event_no
-			  and level3.next_microtimestamp = '-infinity'
-			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
-			returning level3.*
-		)
-		select *
-		from updated;  
-		
-	-- Third remove takers, which have been removed by Bitfinex, but again for some reasons too late!
+	-- Second, remove takers, which have been removed by an exchange, but for some reasons too late!
 	return query 		
 		with takers as (
 			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
@@ -1466,6 +1442,30 @@ begin
 		select *
 		from updated;  
 		
+	-- Thirs remove crossed orders, which have been removed by an exchange, but again for some reasons too late!
+	-- This step must be done AFTER removal of takers above
+	return query 		
+		with crossed as (
+			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
+			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
+			join unnest(ob) as ob on true
+			where is_crossed 
+		),
+		updated as (
+			update obanalytics.level3
+			  set microtimestamp = crossed.microtimestamp
+			from crossed
+			where exchange_id = p_exchange_id
+			  and pair_id = p_pair_id
+			  and level3.microtimestamp = crossed.next_microtimestamp
+			  and level3.order_id = crossed.order_id
+			  and level3.event_no = crossed.next_event_no
+			  and level3.next_microtimestamp = '-infinity'
+			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
+			returning level3.*
+		)
+		select *
+		from updated;  
 		
 			
 	-- Finally, try to merge remaining episodes producing crossed order books
@@ -2068,11 +2068,19 @@ begin
 				into summarized, pair, exchange, first_microtimestamp, last_microtimestamp, record_count;
 				return next;
 				
+				with deleted as (
+					delete from level1
+					returning level1.*
+				)
 				insert into obanalytics.level1
-				select * from level1;
+				select * from deleted;
 				
+				with deleted as (
+					delete from level2
+					returning level2.*
+				)
 				insert into obanalytics.level2
-				select * from level2;
+				select * from deleted;
 				
 		exception
 			when raise_exception then
