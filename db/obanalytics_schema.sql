@@ -1401,7 +1401,7 @@ declare
 begin 
 	v_current_timestamp := clock_timestamp();
 	
-	-- First remove eternal and crossed orders, which should have been removed by Bitfinex, but weren't for some reasons
+	-- First remove eternal and crossed orders, which should have been removed by an exchange, but weren't for some reasons
 	return query 
 		insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
 		select distinct on (microtimestamp, order_id)  ts, order_id, 
@@ -1421,14 +1421,15 @@ begin
 	-- Second, remove takers, which have been removed by an exchange, but for some reasons too late!
 	return query 		
 		with takers as (
-			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
+			select distinct  on (microtimestamp, order_id, event_no) ts, order_id, next_microtimestamp, next_event_no, side
 			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
 			join unnest(ob) as ob on true
 			where not is_maker
+			order by microtimestamp, order_id, event_no, ts
 		),
 		updated as (
 			update obanalytics.level3
-			  set microtimestamp = takers.microtimestamp
+			  set microtimestamp = takers.ts
 			from takers
 			where exchange_id = p_exchange_id
 			  and pair_id = p_pair_id
@@ -1446,14 +1447,15 @@ begin
 	-- This step must be done AFTER removal of takers above
 	return query 		
 		with crossed as (
-			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, event_no, next_microtimestamp, next_event_no
+			select distinct  on (microtimestamp, order_id, event_no) ts, order_id, event_no, next_microtimestamp, next_event_no, side
 			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
 			join unnest(ob) as ob on true
 			where is_crossed 
+			order by microtimestamp, order_id, event_no, ts
 		),
 		updated as (
 			update obanalytics.level3
-			  set microtimestamp = crossed.microtimestamp
+			  set microtimestamp = crossed.ts
 			from crossed
 			where exchange_id = p_exchange_id
 			  and pair_id = p_pair_id
@@ -1469,7 +1471,7 @@ begin
 		
 			
 	-- Finally, try to merge remaining episodes producing crossed order books
-	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id);
+	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id); 
 	
 	raise debug 'fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
@@ -1885,6 +1887,36 @@ $$;
 ALTER FUNCTION obanalytics.level3_update_level3_eras() OWNER TO "ob-analytics";
 
 --
+-- Name: matches_propagate_microtimestamp_update(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.matches_propagate_microtimestamp_update() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+begin 
+	update obanalytics.level3
+	set microtimestamp = new.microtimestamp
+	where exchange_id = new.exchange_id
+	  and pair_id = new.pair_id
+	  and order_id = new.sell_order_id
+	  and event_no = new.sell_event_no
+	  and microtimestamp = old.microtimestamp;
+	  
+	update obanalytics.level3
+	set microtimestamp = new.microtimestamp
+	where exchange_id = new.exchange_id
+	  and pair_id = new.pair_id
+	  and order_id = new.buy_order_id
+	  and event_no = new.buy_event_no
+	  and microtimestamp = old.microtimestamp;
+	return null;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.matches_propagate_microtimestamp_update() OWNER TO "ob-analytics";
+
+--
 -- Name: merge_crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -2262,13 +2294,13 @@ begin
 					if v_bad_episode is not null then
 						raise log '%', sqlerrm;
 						select count(*) into v_fixed
-						from obanalytics.fix_crossed_books(v_bad_episode, v_bad_episode, v_pair_id, v_exchange_id);
+						from obanalytics.fix_crossed_books(v_bad_episode, e.ends, v_pair_id, v_exchange_id);
 						if v_fixed > 0 then 
-							raise log 'Inserted/updated % for invalid taker at % ', v_fixed, v_bad_episode;
+							raise log 'Inserted/updated % for invalid taker at % till %', v_fixed, v_bad_episode, e.ends;
 							exit;	-- We stop the summarization now. Next call this procedure will try to summarize this era again with the hope that the errors were fixed by the code above
 						else
 							-- We got stuck, so report an error!
-							raise exception 'STUCK: inserted/updated % for invalid taker at % ', v_fixed, v_bad_episode;
+							raise exception 'STUCK: inserted/updated % for invalid taker at % till % e.ends', v_fixed, v_bad_episode, e.ends;
 						end if;
 					else 
 						raise exception '%', sqlerrm;	-- We caught an unexpected exception, re-throw it
@@ -26940,6 +26972,13 @@ CREATE TRIGGER matches_02006201909_bz_save_exchange_microtimestamp BEFORE UPDATE
 --
 
 CREATE TRIGGER matches_02006201910_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02006201910 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
+
+
+--
+-- Name: matches propagate_microtimestamp_change; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER propagate_microtimestamp_change AFTER UPDATE OF microtimestamp ON obanalytics.matches FOR EACH ROW EXECUTE PROCEDURE obanalytics.matches_propagate_microtimestamp_update();
 
 
 --
