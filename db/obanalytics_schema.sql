@@ -122,7 +122,8 @@ CREATE TABLE obanalytics.level3 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (exchange_id);
 
@@ -1120,8 +1121,8 @@ begin
 							as is_maker,
 							coalesce(
 								case side 
-									when 'b' then price >= min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
-									when 's' then price <= max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
+									when 'b' then price > min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
+									when 's' then price < max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
 								end,
 							false )	-- if there are only 'b' or 's' orders in the order book at some moment in time, then all of them are not crossed
 							as is_crossed
@@ -1389,7 +1390,6 @@ ALTER FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_
 CREATE FUNCTION obanalytics.fix_crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3
     LANGUAGE plpgsql
     AS $$
-
 -- NOTE:
 --		This function is supposed to be doing something useful only after pga_spread() is failed due to crossed order book
 --		It is expected that Bitfinex produces rather few 'bad' events and rarely, so order book is crossed for relatively short
@@ -1401,7 +1401,39 @@ declare
 begin 
 	v_current_timestamp := clock_timestamp();
 	
-	-- First remove eternal and crossed orders, which should have been removed by an exchange, but weren't for some reasons
+	
+	-- Merge crossed books to the next taker's event if it is exists (i.e. next_microtimestamp is not -infinity)
+	return query 		
+		with takers as (
+			select distinct  on (microtimestamp, order_id, event_no) ts, order_id, next_microtimestamp, next_event_no, side
+			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
+			join unnest(ob) as ob on true
+			where not is_maker
+			  and next_microtimestamp > '-infinity'
+			  and next_microtimestamp <= microtimestamp + make_interval(secs := parameters.max_microtimestamp_change())
+			order by microtimestamp, order_id, event_no,
+					  ts	-- we need the earliest ts where order book became crossed			
+		),
+		updated as (
+			update obanalytics.level3
+			  set microtimestamp = takers.ts,
+				  next_microtimestamp = case when level3.next_microtimestamp > '-infinity'
+												   and level3.next_microtimestamp < takers.ts  then takers.ts 
+											  else level3.next_microtimestamp 
+											  end 
+			from takers
+			where exchange_id = p_exchange_id
+			  and pair_id = p_pair_id
+			  and level3.microtimestamp >= takers.ts 
+			  and level3.microtimestamp < takers.next_microtimestamp
+			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
+			returning level3.*
+		)
+		select *
+		from updated;
+	
+	
+	-- Fix eternal crossed orders, which should have been removed by an exchange, but weren't for some reasons
 	return query 
 		insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
 		select distinct on (microtimestamp, order_id)  ts, order_id, 
@@ -1418,61 +1450,9 @@ begin
 				  ts	-- we need the earliest ts where order book became crossed
 		returning level3.*;
 		
-	-- Second, remove takers, which have been removed by an exchange, but for some reasons too late!
-	return query 		
-		with takers as (
-			select distinct  on (microtimestamp, order_id, event_no) ts, order_id, next_microtimestamp, next_event_no, side
-			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
-			join unnest(ob) as ob on true
-			where not is_maker
-			order by microtimestamp, order_id, event_no, ts
-		),
-		updated as (
-			update obanalytics.level3
-			  set microtimestamp = takers.ts
-			from takers
-			where exchange_id = p_exchange_id
-			  and pair_id = p_pair_id
-			  and level3.microtimestamp = takers.next_microtimestamp
-			  and level3.order_id = takers.order_id
-			  and level3.event_no = takers.next_event_no
-			  and level3.next_microtimestamp = '-infinity'
-			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
-			returning level3.*
-		)
-		select *
-		from updated;  
-		
-	-- Thirs remove crossed orders, which have been removed by an exchange, but again for some reasons too late!
-	-- This step must be done AFTER removal of takers above
-	return query 		
-		with crossed as (
-			select distinct  on (microtimestamp, order_id, event_no) ts, order_id, event_no, next_microtimestamp, next_event_no, side
-			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
-			join unnest(ob) as ob on true
-			where is_crossed 
-			order by microtimestamp, order_id, event_no, ts
-		),
-		updated as (
-			update obanalytics.level3
-			  set microtimestamp = crossed.ts
-			from crossed
-			where exchange_id = p_exchange_id
-			  and pair_id = p_pair_id
-			  and level3.microtimestamp = crossed.next_microtimestamp
-			  and level3.order_id = crossed.order_id
-			  and level3.event_no = crossed.next_event_no
-			  and level3.next_microtimestamp = '-infinity'
-			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
-			returning level3.*
-		)
-		select *
-		from updated;  
-		
-			
 	-- Finally, try to merge remaining episodes producing crossed order books
 	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id); 
-	
+
 	raise debug 'fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
 end;
@@ -1887,36 +1867,6 @@ $$;
 ALTER FUNCTION obanalytics.level3_update_level3_eras() OWNER TO "ob-analytics";
 
 --
--- Name: matches_propagate_microtimestamp_update(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.matches_propagate_microtimestamp_update() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-begin 
-	update obanalytics.level3
-	set microtimestamp = new.microtimestamp
-	where exchange_id = new.exchange_id
-	  and pair_id = new.pair_id
-	  and order_id = new.sell_order_id
-	  and event_no = new.sell_event_no
-	  and microtimestamp = old.microtimestamp;
-	  
-	update obanalytics.level3
-	set microtimestamp = new.microtimestamp
-	where exchange_id = new.exchange_id
-	  and pair_id = new.pair_id
-	  and order_id = new.buy_order_id
-	  and event_no = new.buy_event_no
-	  and microtimestamp = old.microtimestamp;
-	return null;
-end;
-$$;
-
-
-ALTER FUNCTION obanalytics.matches_propagate_microtimestamp_update() OWNER TO "ob-analytics";
-
---
 -- Name: merge_crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1936,7 +1886,11 @@ begin
 		end if;
 		return query with updated as (
 						  update obanalytics.level3
-							 set	microtimestamp = crossed_books.next_uncrossed	-- just merge all 'crossed' order books into the next uncrossed one 
+							 set	microtimestamp = crossed_books.next_uncrossed,	-- just merge all 'crossed' order books into the next uncrossed one 
+									next_microtimestamp = case when level3.next_microtimestamp > '-infinity' 
+			 													     and level3.next_microtimestamp < crossed_books.next_uncrossed then crossed_books.next_uncrossed
+																else level3.next_microtimestamp
+															end
 /* 
 						  select crossed_books.next_uncrossed as microtimestamp, order_id, event_no, side, price, amount, fill,
 								 next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp, is_maker, is_crossed						 
@@ -1986,8 +1940,8 @@ CREATE FUNCTION obanalytics.order_book(p_ts timestamp with time zone, p_pair_id 
 					as is_maker,
 					coalesce(
 						case side 
-							when 'b' then price >= min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
-							when 's' then price <= max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
+							when 'b' then price > min(price) filter (where side = 's' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
+							when 's' then price < max(price) filter (where side = 'b' and amount > 0 ) over (order by price_microtimestamp desc, microtimestamp desc)
 						end,
 					false )	-- if there are only 'b' or 's' orders in the order book at some moment in time, then all of them are not crossed
 					as is_crossed
@@ -2292,7 +2246,7 @@ begin
 					into v_bad_episode;
 					
 					if v_bad_episode is not null then
-						raise log '%', sqlerrm;
+						raise log '% % %', sqlerrm, e.starts, e.ends;
 						select count(*) into v_fixed
 						from obanalytics.fix_crossed_books(v_bad_episode, e.ends, v_pair_id, v_exchange_id);
 						if v_fixed > 0 then 
@@ -6753,7 +6707,8 @@ CREATE TABLE obanalytics.level3_bitfinex (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (pair_id);
 ALTER TABLE ONLY obanalytics.level3 ATTACH PARTITION obanalytics.level3_bitfinex FOR VALUES IN ('1');
@@ -6787,7 +6742,8 @@ CREATE TABLE obanalytics.level3_bitfinex_btcusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_btcusd FOR VALUES IN ('1');
@@ -6822,7 +6778,8 @@ CREATE TABLE obanalytics.level3_bitfinex_btcusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd ATTACH PARTITION obanalytics.level3_bitfinex_btcusd_b FOR VALUES IN ('b');
@@ -6857,7 +6814,8 @@ CREATE TABLE obanalytics.level3_01001b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -6892,7 +6850,8 @@ CREATE TABLE obanalytics.level3_01001b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -6927,7 +6886,8 @@ CREATE TABLE obanalytics.level3_01001b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -6962,7 +6922,8 @@ CREATE TABLE obanalytics.level3_01001b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -6997,7 +6958,8 @@ CREATE TABLE obanalytics.level3_01001b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -7032,7 +6994,8 @@ CREATE TABLE obanalytics.level3_01001b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -7067,7 +7030,8 @@ CREATE TABLE obanalytics.level3_01001b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -7102,7 +7066,8 @@ CREATE TABLE obanalytics.level3_01001b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -7137,7 +7102,8 @@ CREATE TABLE obanalytics.level3_01001b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_b ATTACH PARTITION obanalytics.level3_01001b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -7171,7 +7137,8 @@ CREATE TABLE obanalytics.level3_bitfinex_btcusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd ATTACH PARTITION obanalytics.level3_bitfinex_btcusd_s FOR VALUES IN ('s');
@@ -7206,7 +7173,8 @@ CREATE TABLE obanalytics.level3_01001s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -7241,7 +7209,8 @@ CREATE TABLE obanalytics.level3_01001s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -7276,7 +7245,8 @@ CREATE TABLE obanalytics.level3_01001s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -7311,7 +7281,8 @@ CREATE TABLE obanalytics.level3_01001s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -7346,7 +7317,8 @@ CREATE TABLE obanalytics.level3_01001s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -7381,7 +7353,8 @@ CREATE TABLE obanalytics.level3_01001s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -7416,7 +7389,8 @@ CREATE TABLE obanalytics.level3_01001s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -7451,7 +7425,8 @@ CREATE TABLE obanalytics.level3_01001s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -7486,7 +7461,8 @@ CREATE TABLE obanalytics.level3_01001s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_btcusd_s ATTACH PARTITION obanalytics.level3_01001s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -7521,7 +7497,8 @@ CREATE TABLE obanalytics.level3_bitfinex_ltcusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_ltcusd FOR VALUES IN ('2');
@@ -7556,7 +7533,8 @@ CREATE TABLE obanalytics.level3_bitfinex_ltcusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd ATTACH PARTITION obanalytics.level3_bitfinex_ltcusd_b FOR VALUES IN ('b');
@@ -7591,7 +7569,8 @@ CREATE TABLE obanalytics.level3_01002b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -7626,7 +7605,8 @@ CREATE TABLE obanalytics.level3_01002b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -7661,7 +7641,8 @@ CREATE TABLE obanalytics.level3_01002b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -7696,7 +7677,8 @@ CREATE TABLE obanalytics.level3_01002b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -7731,7 +7713,8 @@ CREATE TABLE obanalytics.level3_01002b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -7766,7 +7749,8 @@ CREATE TABLE obanalytics.level3_01002b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -7801,7 +7785,8 @@ CREATE TABLE obanalytics.level3_01002b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -7836,7 +7821,8 @@ CREATE TABLE obanalytics.level3_01002b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -7871,7 +7857,8 @@ CREATE TABLE obanalytics.level3_01002b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_b ATTACH PARTITION obanalytics.level3_01002b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -7905,7 +7892,8 @@ CREATE TABLE obanalytics.level3_bitfinex_ltcusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd ATTACH PARTITION obanalytics.level3_bitfinex_ltcusd_s FOR VALUES IN ('s');
@@ -7940,7 +7928,8 @@ CREATE TABLE obanalytics.level3_01002s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -7975,7 +7964,8 @@ CREATE TABLE obanalytics.level3_01002s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -8010,7 +8000,8 @@ CREATE TABLE obanalytics.level3_01002s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -8045,7 +8036,8 @@ CREATE TABLE obanalytics.level3_01002s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -8080,7 +8072,8 @@ CREATE TABLE obanalytics.level3_01002s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -8115,7 +8108,8 @@ CREATE TABLE obanalytics.level3_01002s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -8150,7 +8144,8 @@ CREATE TABLE obanalytics.level3_01002s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -8185,7 +8180,8 @@ CREATE TABLE obanalytics.level3_01002s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -8220,7 +8216,8 @@ CREATE TABLE obanalytics.level3_01002s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ltcusd_s ATTACH PARTITION obanalytics.level3_01002s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -8255,7 +8252,8 @@ CREATE TABLE obanalytics.level3_bitfinex_ethusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_ethusd FOR VALUES IN ('3');
@@ -8290,7 +8288,8 @@ CREATE TABLE obanalytics.level3_bitfinex_ethusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd ATTACH PARTITION obanalytics.level3_bitfinex_ethusd_b FOR VALUES IN ('b');
@@ -8325,7 +8324,8 @@ CREATE TABLE obanalytics.level3_01003b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -8360,7 +8360,8 @@ CREATE TABLE obanalytics.level3_01003b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -8395,7 +8396,8 @@ CREATE TABLE obanalytics.level3_01003b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -8430,7 +8432,8 @@ CREATE TABLE obanalytics.level3_01003b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -8465,7 +8468,8 @@ CREATE TABLE obanalytics.level3_01003b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -8500,7 +8504,8 @@ CREATE TABLE obanalytics.level3_01003b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -8535,7 +8540,8 @@ CREATE TABLE obanalytics.level3_01003b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -8570,7 +8576,8 @@ CREATE TABLE obanalytics.level3_01003b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -8605,7 +8612,8 @@ CREATE TABLE obanalytics.level3_01003b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_b ATTACH PARTITION obanalytics.level3_01003b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -8639,7 +8647,8 @@ CREATE TABLE obanalytics.level3_bitfinex_ethusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd ATTACH PARTITION obanalytics.level3_bitfinex_ethusd_s FOR VALUES IN ('s');
@@ -8674,7 +8683,8 @@ CREATE TABLE obanalytics.level3_01003s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -8709,7 +8719,8 @@ CREATE TABLE obanalytics.level3_01003s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -8744,7 +8755,8 @@ CREATE TABLE obanalytics.level3_01003s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -8779,7 +8791,8 @@ CREATE TABLE obanalytics.level3_01003s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -8814,7 +8827,8 @@ CREATE TABLE obanalytics.level3_01003s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -8849,7 +8863,8 @@ CREATE TABLE obanalytics.level3_01003s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -8884,7 +8899,8 @@ CREATE TABLE obanalytics.level3_01003s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -8919,7 +8935,8 @@ CREATE TABLE obanalytics.level3_01003s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -8954,7 +8971,8 @@ CREATE TABLE obanalytics.level3_01003s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_ethusd_s ATTACH PARTITION obanalytics.level3_01003s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -8989,7 +9007,8 @@ CREATE TABLE obanalytics.level3_bitfinex_xrpusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitfinex ATTACH PARTITION obanalytics.level3_bitfinex_xrpusd FOR VALUES IN ('4');
@@ -9023,7 +9042,8 @@ CREATE TABLE obanalytics.level3_bitfinex_xrpusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ATTACH PARTITION obanalytics.level3_bitfinex_xrpusd_b FOR VALUES IN ('b');
@@ -9057,7 +9077,8 @@ CREATE TABLE obanalytics.level3_01004b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_b ATTACH PARTITION obanalytics.level3_01004b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -9092,7 +9113,8 @@ CREATE TABLE obanalytics.level3_bitfinex_xrpusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd ATTACH PARTITION obanalytics.level3_bitfinex_xrpusd_s FOR VALUES IN ('s');
@@ -9126,7 +9148,8 @@ CREATE TABLE obanalytics.level3_01004s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitfinex_xrpusd_s ATTACH PARTITION obanalytics.level3_01004s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -9161,7 +9184,8 @@ CREATE TABLE obanalytics.level3_bitstamp (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (pair_id);
 ALTER TABLE ONLY obanalytics.level3 ATTACH PARTITION obanalytics.level3_bitstamp FOR VALUES IN ('2');
@@ -9195,7 +9219,8 @@ CREATE TABLE obanalytics.level3_bitstamp_btcusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_btcusd FOR VALUES IN ('1');
@@ -9230,7 +9255,8 @@ CREATE TABLE obanalytics.level3_bitstamp_btcusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd ATTACH PARTITION obanalytics.level3_bitstamp_btcusd_b FOR VALUES IN ('b');
@@ -9265,7 +9291,8 @@ CREATE TABLE obanalytics.level3_02001b201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -9300,7 +9327,8 @@ CREATE TABLE obanalytics.level3_02001b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -9335,7 +9363,8 @@ CREATE TABLE obanalytics.level3_02001b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -9370,7 +9399,8 @@ CREATE TABLE obanalytics.level3_02001b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -9405,7 +9435,8 @@ CREATE TABLE obanalytics.level3_02001b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -9440,7 +9471,8 @@ CREATE TABLE obanalytics.level3_02001b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -9475,7 +9507,8 @@ CREATE TABLE obanalytics.level3_02001b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -9510,7 +9543,8 @@ CREATE TABLE obanalytics.level3_02001b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -9545,7 +9579,8 @@ CREATE TABLE obanalytics.level3_02001b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -9580,7 +9615,8 @@ CREATE TABLE obanalytics.level3_02001b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_b ATTACH PARTITION obanalytics.level3_02001b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -9614,7 +9650,8 @@ CREATE TABLE obanalytics.level3_bitstamp_btcusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd ATTACH PARTITION obanalytics.level3_bitstamp_btcusd_s FOR VALUES IN ('s');
@@ -9649,7 +9686,8 @@ CREATE TABLE obanalytics.level3_02001s201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -9684,7 +9722,8 @@ CREATE TABLE obanalytics.level3_02001s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_enabled='true', autovacuum_vacuum_scale_factor='0.0', autovacuum_analyze_scale_factor='0.0', autovacuum_analyze_threshold='10000', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -9719,7 +9758,8 @@ CREATE TABLE obanalytics.level3_02001s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -9754,7 +9794,8 @@ CREATE TABLE obanalytics.level3_02001s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -9789,7 +9830,8 @@ CREATE TABLE obanalytics.level3_02001s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -9824,7 +9866,8 @@ CREATE TABLE obanalytics.level3_02001s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -9859,7 +9902,8 @@ CREATE TABLE obanalytics.level3_02001s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -9894,7 +9938,8 @@ CREATE TABLE obanalytics.level3_02001s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -9929,7 +9974,8 @@ CREATE TABLE obanalytics.level3_02001s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -9964,7 +10010,8 @@ CREATE TABLE obanalytics.level3_02001s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btcusd_s ATTACH PARTITION obanalytics.level3_02001s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -9999,7 +10046,8 @@ CREATE TABLE obanalytics.level3_bitstamp_ltcusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_ltcusd FOR VALUES IN ('2');
@@ -10034,7 +10082,8 @@ CREATE TABLE obanalytics.level3_bitstamp_ltcusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd ATTACH PARTITION obanalytics.level3_bitstamp_ltcusd_b FOR VALUES IN ('b');
@@ -10069,7 +10118,8 @@ CREATE TABLE obanalytics.level3_02002b201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -10104,7 +10154,8 @@ CREATE TABLE obanalytics.level3_02002b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -10139,7 +10190,8 @@ CREATE TABLE obanalytics.level3_02002b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -10174,7 +10226,8 @@ CREATE TABLE obanalytics.level3_02002b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -10209,7 +10262,8 @@ CREATE TABLE obanalytics.level3_02002b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -10244,7 +10298,8 @@ CREATE TABLE obanalytics.level3_02002b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -10279,7 +10334,8 @@ CREATE TABLE obanalytics.level3_02002b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -10314,7 +10370,8 @@ CREATE TABLE obanalytics.level3_02002b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -10349,7 +10406,8 @@ CREATE TABLE obanalytics.level3_02002b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -10384,7 +10442,8 @@ CREATE TABLE obanalytics.level3_02002b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_b ATTACH PARTITION obanalytics.level3_02002b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -10418,7 +10477,8 @@ CREATE TABLE obanalytics.level3_bitstamp_ltcusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd ATTACH PARTITION obanalytics.level3_bitstamp_ltcusd_s FOR VALUES IN ('s');
@@ -10453,7 +10513,8 @@ CREATE TABLE obanalytics.level3_02002s201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -10488,7 +10549,8 @@ CREATE TABLE obanalytics.level3_02002s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -10523,7 +10585,8 @@ CREATE TABLE obanalytics.level3_02002s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -10558,7 +10621,8 @@ CREATE TABLE obanalytics.level3_02002s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -10593,7 +10657,8 @@ CREATE TABLE obanalytics.level3_02002s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -10628,7 +10693,8 @@ CREATE TABLE obanalytics.level3_02002s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -10663,7 +10729,8 @@ CREATE TABLE obanalytics.level3_02002s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -10698,7 +10765,8 @@ CREATE TABLE obanalytics.level3_02002s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -10733,7 +10801,8 @@ CREATE TABLE obanalytics.level3_02002s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -10768,7 +10837,8 @@ CREATE TABLE obanalytics.level3_02002s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ltcusd_s ATTACH PARTITION obanalytics.level3_02002s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -10803,7 +10873,8 @@ CREATE TABLE obanalytics.level3_bitstamp_ethusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_ethusd FOR VALUES IN ('3');
@@ -10838,7 +10909,8 @@ CREATE TABLE obanalytics.level3_bitstamp_ethusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd ATTACH PARTITION obanalytics.level3_bitstamp_ethusd_b FOR VALUES IN ('b');
@@ -10873,7 +10945,8 @@ CREATE TABLE obanalytics.level3_02003b201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -10908,7 +10981,8 @@ CREATE TABLE obanalytics.level3_02003b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -10943,7 +11017,8 @@ CREATE TABLE obanalytics.level3_02003b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -10978,7 +11053,8 @@ CREATE TABLE obanalytics.level3_02003b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -11013,7 +11089,8 @@ CREATE TABLE obanalytics.level3_02003b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -11048,7 +11125,8 @@ CREATE TABLE obanalytics.level3_02003b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -11083,7 +11161,8 @@ CREATE TABLE obanalytics.level3_02003b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -11118,7 +11197,8 @@ CREATE TABLE obanalytics.level3_02003b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -11153,7 +11233,8 @@ CREATE TABLE obanalytics.level3_02003b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -11188,7 +11269,8 @@ CREATE TABLE obanalytics.level3_02003b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_b ATTACH PARTITION obanalytics.level3_02003b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -11222,7 +11304,8 @@ CREATE TABLE obanalytics.level3_bitstamp_ethusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd ATTACH PARTITION obanalytics.level3_bitstamp_ethusd_s FOR VALUES IN ('s');
@@ -11257,7 +11340,8 @@ CREATE TABLE obanalytics.level3_02003s201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -11292,7 +11376,8 @@ CREATE TABLE obanalytics.level3_02003s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -11327,7 +11412,8 @@ CREATE TABLE obanalytics.level3_02003s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -11362,7 +11448,8 @@ CREATE TABLE obanalytics.level3_02003s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -11397,7 +11484,8 @@ CREATE TABLE obanalytics.level3_02003s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -11432,7 +11520,8 @@ CREATE TABLE obanalytics.level3_02003s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -11467,7 +11556,8 @@ CREATE TABLE obanalytics.level3_02003s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -11502,7 +11592,8 @@ CREATE TABLE obanalytics.level3_02003s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -11537,7 +11628,8 @@ CREATE TABLE obanalytics.level3_02003s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -11572,7 +11664,8 @@ CREATE TABLE obanalytics.level3_02003s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_ethusd_s ATTACH PARTITION obanalytics.level3_02003s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -11607,7 +11700,8 @@ CREATE TABLE obanalytics.level3_bitstamp_xrpusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd FOR VALUES IN ('4');
@@ -11642,7 +11736,8 @@ CREATE TABLE obanalytics.level3_bitstamp_xrpusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd_b FOR VALUES IN ('b');
@@ -11677,7 +11772,8 @@ CREATE TABLE obanalytics.level3_02004b201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -11712,7 +11808,8 @@ CREATE TABLE obanalytics.level3_02004b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -11747,7 +11844,8 @@ CREATE TABLE obanalytics.level3_02004b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -11782,7 +11880,8 @@ CREATE TABLE obanalytics.level3_02004b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -11817,7 +11916,8 @@ CREATE TABLE obanalytics.level3_02004b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -11852,7 +11952,8 @@ CREATE TABLE obanalytics.level3_02004b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -11887,7 +11988,8 @@ CREATE TABLE obanalytics.level3_02004b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -11922,7 +12024,8 @@ CREATE TABLE obanalytics.level3_02004b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -11957,7 +12060,8 @@ CREATE TABLE obanalytics.level3_02004b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -11992,7 +12096,8 @@ CREATE TABLE obanalytics.level3_02004b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_b ATTACH PARTITION obanalytics.level3_02004b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -12026,7 +12131,8 @@ CREATE TABLE obanalytics.level3_bitstamp_xrpusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd_s FOR VALUES IN ('s');
@@ -12061,7 +12167,8 @@ CREATE TABLE obanalytics.level3_02004s201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -12096,7 +12203,8 @@ CREATE TABLE obanalytics.level3_02004s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -12131,7 +12239,8 @@ CREATE TABLE obanalytics.level3_02004s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -12166,7 +12275,8 @@ CREATE TABLE obanalytics.level3_02004s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -12201,7 +12311,8 @@ CREATE TABLE obanalytics.level3_02004s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -12236,7 +12347,8 @@ CREATE TABLE obanalytics.level3_02004s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -12271,7 +12383,8 @@ CREATE TABLE obanalytics.level3_02004s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -12306,7 +12419,8 @@ CREATE TABLE obanalytics.level3_02004s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -12341,7 +12455,8 @@ CREATE TABLE obanalytics.level3_02004s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -12376,7 +12491,8 @@ CREATE TABLE obanalytics.level3_02004s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_xrpusd_s ATTACH PARTITION obanalytics.level3_02004s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -12411,7 +12527,8 @@ CREATE TABLE obanalytics.level3_bitstamp_bchusd (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_bchusd FOR VALUES IN ('5');
@@ -12446,7 +12563,8 @@ CREATE TABLE obanalytics.level3_bitstamp_bchusd_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd ATTACH PARTITION obanalytics.level3_bitstamp_bchusd_b FOR VALUES IN ('b');
@@ -12481,7 +12599,8 @@ CREATE TABLE obanalytics.level3_02005b201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -12516,7 +12635,8 @@ CREATE TABLE obanalytics.level3_02005b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -12551,7 +12671,8 @@ CREATE TABLE obanalytics.level3_02005b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -12586,7 +12707,8 @@ CREATE TABLE obanalytics.level3_02005b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -12621,7 +12743,8 @@ CREATE TABLE obanalytics.level3_02005b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -12656,7 +12779,8 @@ CREATE TABLE obanalytics.level3_02005b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -12691,7 +12815,8 @@ CREATE TABLE obanalytics.level3_02005b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -12726,7 +12851,8 @@ CREATE TABLE obanalytics.level3_02005b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -12761,7 +12887,8 @@ CREATE TABLE obanalytics.level3_02005b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -12796,7 +12923,8 @@ CREATE TABLE obanalytics.level3_02005b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_b ATTACH PARTITION obanalytics.level3_02005b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -12830,7 +12958,8 @@ CREATE TABLE obanalytics.level3_bitstamp_bchusd_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd ATTACH PARTITION obanalytics.level3_bitstamp_bchusd_s FOR VALUES IN ('s');
@@ -12865,7 +12994,8 @@ CREATE TABLE obanalytics.level3_02005s201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -12900,7 +13030,8 @@ CREATE TABLE obanalytics.level3_02005s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -12935,7 +13066,8 @@ CREATE TABLE obanalytics.level3_02005s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -12970,7 +13102,8 @@ CREATE TABLE obanalytics.level3_02005s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -13005,7 +13138,8 @@ CREATE TABLE obanalytics.level3_02005s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -13040,7 +13174,8 @@ CREATE TABLE obanalytics.level3_02005s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -13075,7 +13210,8 @@ CREATE TABLE obanalytics.level3_02005s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -13110,7 +13246,8 @@ CREATE TABLE obanalytics.level3_02005s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -13145,7 +13282,8 @@ CREATE TABLE obanalytics.level3_02005s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -13180,7 +13318,8 @@ CREATE TABLE obanalytics.level3_02005s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_bchusd_s ATTACH PARTITION obanalytics.level3_02005s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -13215,7 +13354,8 @@ CREATE TABLE obanalytics.level3_bitstamp_btceur (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY LIST (side);
 ALTER TABLE ONLY obanalytics.level3_bitstamp ATTACH PARTITION obanalytics.level3_bitstamp_btceur FOR VALUES IN ('6');
@@ -13250,7 +13390,8 @@ CREATE TABLE obanalytics.level3_bitstamp_btceur_b (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur ATTACH PARTITION obanalytics.level3_bitstamp_btceur_b FOR VALUES IN ('b');
@@ -13285,7 +13426,8 @@ CREATE TABLE obanalytics.level3_02006b201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -13320,7 +13462,8 @@ CREATE TABLE obanalytics.level3_02006b201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -13355,7 +13498,8 @@ CREATE TABLE obanalytics.level3_02006b201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -13390,7 +13534,8 @@ CREATE TABLE obanalytics.level3_02006b201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -13425,7 +13570,8 @@ CREATE TABLE obanalytics.level3_02006b201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -13460,7 +13606,8 @@ CREATE TABLE obanalytics.level3_02006b201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -13495,7 +13642,8 @@ CREATE TABLE obanalytics.level3_02006b201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -13530,7 +13678,8 @@ CREATE TABLE obanalytics.level3_02006b201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -13565,7 +13714,8 @@ CREATE TABLE obanalytics.level3_02006b201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -13600,7 +13750,8 @@ CREATE TABLE obanalytics.level3_02006b201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_b ATTACH PARTITION obanalytics.level3_02006b201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -13634,7 +13785,8 @@ CREATE TABLE obanalytics.level3_bitstamp_btceur_s (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 PARTITION BY RANGE (microtimestamp);
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur ATTACH PARTITION obanalytics.level3_bitstamp_btceur_s FOR VALUES IN ('s');
@@ -13669,7 +13821,8 @@ CREATE TABLE obanalytics.level3_02006s201901 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201901 FOR VALUES FROM ('2019-01-01 00:00:00+03') TO ('2019-02-01 00:00:00+03');
@@ -13704,7 +13857,8 @@ CREATE TABLE obanalytics.level3_02006s201902 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201902 FOR VALUES FROM ('2019-02-01 00:00:00+03') TO ('2019-03-01 00:00:00+03');
@@ -13739,7 +13893,8 @@ CREATE TABLE obanalytics.level3_02006s201903 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201903 FOR VALUES FROM ('2019-03-01 00:00:00+03') TO ('2019-04-01 00:00:00+03');
@@ -13774,7 +13929,8 @@ CREATE TABLE obanalytics.level3_02006s201904 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201904 FOR VALUES FROM ('2019-04-01 00:00:00+03') TO ('2019-05-01 00:00:00+03');
@@ -13809,7 +13965,8 @@ CREATE TABLE obanalytics.level3_02006s201905 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201905 FOR VALUES FROM ('2019-05-01 00:00:00+03') TO ('2019-06-01 00:00:00+03');
@@ -13844,7 +14001,8 @@ CREATE TABLE obanalytics.level3_02006s201906 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201906 FOR VALUES FROM ('2019-06-01 00:00:00+03') TO ('2019-07-01 00:00:00+03');
@@ -13879,7 +14037,8 @@ CREATE TABLE obanalytics.level3_02006s201907 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201907 FOR VALUES FROM ('2019-07-01 00:00:00+03') TO ('2019-08-01 00:00:00+03');
@@ -13914,7 +14073,8 @@ CREATE TABLE obanalytics.level3_02006s201908 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201908 FOR VALUES FROM ('2019-08-01 00:00:00+03') TO ('2019-09-01 00:00:00+03');
@@ -13949,7 +14109,8 @@ CREATE TABLE obanalytics.level3_02006s201909 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201909 FOR VALUES FROM ('2019-09-01 00:00:00+03') TO ('2019-10-01 00:00:00+03');
@@ -13984,7 +14145,8 @@ CREATE TABLE obanalytics.level3_02006s201910 (
     CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
     CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
     CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
-    CONSTRAINT price_not_negative CHECK ((price >= (0)::numeric))
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
 )
 WITH (autovacuum_vacuum_scale_factor='0.0', autovacuum_vacuum_threshold='10000');
 ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ATTACH PARTITION obanalytics.level3_02006s201910 FOR VALUES FROM ('2019-10-01 00:00:00+03') TO ('2019-11-01 00:00:00+03');
@@ -26972,13 +27134,6 @@ CREATE TRIGGER matches_02006201909_bz_save_exchange_microtimestamp BEFORE UPDATE
 --
 
 CREATE TRIGGER matches_02006201910_bz_save_exchange_microtimestamp BEFORE UPDATE OF microtimestamp ON obanalytics.matches_02006201910 FOR EACH ROW EXECUTE PROCEDURE obanalytics.save_exchange_microtimestamp();
-
-
---
--- Name: matches propagate_microtimestamp_change; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TRIGGER propagate_microtimestamp_change AFTER UPDATE OF microtimestamp ON obanalytics.matches FOR EACH ROW EXECUTE PROCEDURE obanalytics.matches_propagate_microtimestamp_update();
 
 
 --
