@@ -1416,9 +1416,9 @@ begin
 		),
 		updated as (
 			update obanalytics.level3
-			  set microtimestamp = takers.ts,
+			  set microtimestamp = takers.next_microtimestamp,
 				  next_microtimestamp = case when level3.next_microtimestamp > '-infinity'
-												   and level3.next_microtimestamp < takers.ts  then takers.ts 
+												   and level3.next_microtimestamp < takers.next_microtimestamp then takers.next_microtimestamp
 											  else level3.next_microtimestamp 
 											  end 
 			from takers
@@ -2022,14 +2022,12 @@ $$;
 ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
--- Name: pga_summarize(text, text, interval, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: pga_summarize(text, text, interval, timestamp with time zone, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval DEFAULT '01:00:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS TABLE(summarized text, pair text, exchange text, first_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, record_count integer)
+CREATE FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval DEFAULT '00:15:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval) RETURNS TABLE(summarized text, pair text, exchange text, first_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, record_count integer)
     LANGUAGE plpgsql
-    AS $$
-
--- PARAMETERS:
+    AS $$-- PARAMETERS:
 --
 --	p_max_interval	interval 		If NULL, summarize using all available data, subject to limitations, enforced by the other parameters.
 -- 									If NOT NULL, then sum of all summarized intervals (for different eras, if more than one) will not exceed p_max_interval
@@ -2100,22 +2098,26 @@ begin
 	create temp table if not exists level1 (like obanalytics.level1) on commit delete rows;
 	create temp table if not exists level2 (like obanalytics.level2) on commit delete rows;
 	
+	raise debug 'v_first_era=%  v_last_era=%', v_first_era, v_last_era;
 	
 	for e in   select starts, ends, first_level1, first_level2
 				from (
-					select era as starts,
-							coalesce(level3, 
-								coalesce(lead(era) over (order by era)  - '00:00:00.000001'::interval, 'infinity'::timestamptz)
-									) as ends,
+					select era as starts, case 
+											when lead(era) over (order by era) is not null then 
+												coalesce(level3, lead(era) over (order by era)  - '00:00:00.000001'::interval)
+											else
+												coalesce(level3 - p_delay, era)
+											end as ends,
 							coalesce(level1 + '00:00:00.000001'::interval, era) as first_level1,
 							coalesce(level2 + '00:00:00.000001'::interval, era) as first_level2
 					from obanalytics.level3_eras 
 					where pair_id = v_pair_id
 					  and exchange_id = v_exchange_id
+					  and level3 is not null
 				) a
 				where a.starts between v_first_era and v_last_era
 				order by starts loop
-				
+		raise debug 'e.starts=%, e.ends=%', e.starts, e.ends;
 		e.starts :=  least(e.first_level1, e.first_level2);
 		e.ends := least(e.ends, e.starts + p_max_interval);
 		
@@ -2266,6 +2268,7 @@ begin
 			p_max_interval := greatest('00:00:00'::interval, p_max_interval - (e.ends - least(e.first_level1,  e.first_level2)));
 
 			if p_max_interval = '00:00:00'::interval then
+				raise debug 'p_max_interval is 0, exiting ... ';
 				exit;
 			end if;
 
@@ -2280,7 +2283,7 @@ end;
 $$;
 
 
-ALTER FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone, p_delay interval) OWNER TO "ob-analytics";
 
 --
 -- Name: save_exchange_microtimestamp(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2290,7 +2293,8 @@ CREATE FUNCTION obanalytics.save_exchange_microtimestamp() RETURNS trigger
     LANGUAGE plpgsql
     AS $$ 
 begin
-	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change() then	
+	if  new.microtimestamp > old.microtimestamp + make_interval(secs := parameters.max_microtimestamp_change()) or
+		new.microtimestamp < old.microtimestamp then	
 		raise exception 'An attempt to move % % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, old.exchange_id, new.microtimestamp;
 	end if;
 	-- It is assumed that the first-ever value of microtimestamp column is set by an exchange.
