@@ -26,6 +26,19 @@ CREATE SCHEMA get;
 ALTER SCHEMA get OWNER TO "ob-analytics";
 
 --
+-- Name: draw_type; Type: TYPE; Schema: get; Owner: ob-analytics
+--
+
+CREATE TYPE get.draw_type AS ENUM (
+    'bid',
+    'ask',
+    'mid-price'
+);
+
+
+ALTER TYPE get.draw_type OWNER TO "ob-analytics";
+
+--
 -- Name: _in_milliseconds(timestamp with time zone); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
@@ -193,20 +206,21 @@ $$;
 ALTER FUNCTION get.depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer) OWNER TO "ob-analytics";
 
 --
--- Name: draws(timestamp with time zone, timestamp with time zone, obanalytics.oba_draw_type, numeric, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
+-- Name: draws(timestamp with time zone, timestamp with time zone, get.draw_type, numeric, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type obanalytics.oba_draw_type, p_minimal_draw numeric, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, "draw.end" timestamp with time zone, "start.price" numeric, "end.price" numeric, "draw.size" numeric)
+CREATE FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_minimal_draw_pct numeric, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, "draw.end" timestamp with time zone, "start.price" numeric, "end.price" numeric, "draw.size" numeric, "draw.speed" numeric)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
-	select start_microtimestamp, end_microtimestamp, start_price, end_price, draw_size 
-	from obanalytics.draws_from_spread(	p_start_time, p_end_time, p_exchange_id, p_pair_id, p_draw_type::text,p_minimal_draw);
+	select start_microtimestamp, end_microtimestamp, start_price, end_price, draw_size,
+			round(draw_size/extract(epoch from end_microtimestamp-start_microtimestamp)::numeric, 2)
+	from obanalytics.draws_from_spread(	p_start_time, p_end_time, p_exchange_id, p_pair_id, p_draw_type::text,p_minimal_draw_pct);
 	
 $$;
 
 
-ALTER FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type obanalytics.oba_draw_type, p_minimal_draw numeric, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_minimal_draw_pct numeric, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: events(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics

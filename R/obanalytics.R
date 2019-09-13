@@ -1,4 +1,4 @@
-#' @importFrom lubridate with_tz ymd_hms
+#' @importFrom lubridate with_tz ymd_hms seconds
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
 #' @importFrom magrittr  %>%
@@ -415,7 +415,7 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
 
 
 #' @export
-draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type='mid-price', cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type='mid-price', cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -432,21 +432,21 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw
   before <- seconds(10)
 
   if(is.null(cache) || start.time > cache.bound)
-    draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw, draw.type, debug.query)
+    draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw.pct, draw.type, debug.query)
   else
     if(end.time <= cache.bound )
       draws <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query,
                             function(conn, start.time, end.time, exchange, pair, debug.query) {
-                              .draws(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type, debug.query)
+                              .draws(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, debug.query)
                               },
-                            .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw)))
+                            .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct)))
   else
     draws <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query,
                                 function(conn, start.time, end.time, exchange, pair, debug.query) {
-                                  .draws(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type,  debug.query)
+                                  .draws(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type,  debug.query)
                                 },
-                                .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw))),
-                    .draws(conn, cache.bound, end.time, exchange, pair,minimal.draw, draw.type, debug.query)
+                                .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct))),
+                    .draws(conn, cache.bound, end.time, exchange, pair,minimal.draw.pct, draw.type, debug.query)
     )
 
   if(!empty(draws)) {
@@ -461,18 +461,19 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw
   draws
 }
 
-.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw, draw.type, debug.query = FALSE) {
+.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, debug.query = FALSE) {
 
   query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\",
                   get._in_milliseconds(\"draw.end\") AS \"draw.end\",
                   \"start.price\",
                   \"end.price\",
-                  \"draw.size\"
+                  \"draw.size\",
+                  \"draw.speed\"
                   FROM get.draws(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
                   shQuote(draw.type), ",",
-                  minimal.draw, ",",
+                  minimal.draw.pct, ",",
                   "get.pair_id(",shQuote(pair),"), " ,
                   "get.exchange_id(", shQuote(exchange), ") ",
                   ") order by 1")
