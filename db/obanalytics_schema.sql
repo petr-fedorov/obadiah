@@ -1524,25 +1524,46 @@ begin
 		raise exception 'Can not insert new era - already exists!';
 	end if;
 	
-	with events as (
-		select *
+	with recursive to_be_updated as (
+		select next_microtimestamp as microtimestamp, order_id, next_event_no as event_no, 2::integer as new_event_no,
+				p_new_era as new_price_microtimestamp,	1::integer as new_price_event_no 
 		from obanalytics.level3
-		where pair_id = p_pair_id
-		  and exchange_id = p_exchange_id
-		  and event_no > 1			-- events with event_no > 1 are processed differently
-		  and microtimestamp >= v_previous_era.era 
+		where exchange_id = p_exchange_id
+		  and pair_id = p_pair_id
+		  and microtimestamp >= v_previous_era.era
 		  and microtimestamp < p_new_era
 		  and next_microtimestamp >= p_new_era
-		  and next_microtimestamp < 'infinity'
+		  and isfinite(next_microtimestamp)
+		union all
+		select next_microtimestamp, order_id, next_event_no, to_be_updated.new_event_no + 1,
+				case when price_microtimestamp < new_price_microtimestamp 
+						then new_price_microtimestamp
+					  else price_microtimestamp
+				end,
+				case when price_microtimestamp < new_price_microtimestamp 
+						then price_event_no 
+					  else event_no
+				end
+		from (select * from obanalytics.level3 
+			   where microtimestamp >= p_new_era
+				 and microtimestamp < v_next_era.era
+				 and exchange_id = p_exchange_id
+				 and pair_id = p_pair_id
+			  ) level3 join to_be_updated using (microtimestamp, order_id, event_no)
+		where isfinite(next_microtimestamp)
 	)
 	update obanalytics.level3
-	   set event_no = level3.event_no - events.event_no + 1
-	from events
+	   set event_no = to_be_updated.new_event_no,
+	   	    price_microtimestamp = to_be_updated.new_price_microtimestamp,
+			price_event_no = to_be_updated.new_price_event_no
+	from to_be_updated
 	where level3.pair_id = p_pair_id
 	  and level3.exchange_id = p_exchange_id
 	  and level3.microtimestamp >= p_new_era
 	  and level3.microtimestamp < v_next_era.era
-	  and level3.order_id = events.order_id;
+	  and level3.microtimestamp = to_be_updated.microtimestamp
+	  and level3.order_id = to_be_updated.order_id
+	  and level3.event_no = to_be_updated.event_no;
 	
 	insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, 
 								     pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp)
