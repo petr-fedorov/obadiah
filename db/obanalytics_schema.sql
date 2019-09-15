@@ -1187,6 +1187,27 @@ $$;
 ALTER FUNCTION obanalytics._spread_from_order_book(p_ts timestamp with time zone, p_order_book obanalytics.level3[]) OWNER TO "ob-analytics";
 
 --
+-- Name: check_microtimestamp_change(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.check_microtimestamp_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ 
+BEGIN
+	if  new.microtimestamp > old.microtimestamp + make_interval(secs := parameters.max_microtimestamp_change()) or
+		new.microtimestamp < old.microtimestamp then	
+		raise exception 'An attempt to move % % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, old.exchange_id, new.microtimestamp;
+	end if;
+	return null;
+END;
+	
+
+$$;
+
+
+ALTER FUNCTION obanalytics.check_microtimestamp_change() OWNER TO "ob-analytics";
+
+--
 -- Name: create_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -2328,10 +2349,6 @@ CREATE FUNCTION obanalytics.save_exchange_microtimestamp() RETURNS trigger
     LANGUAGE plpgsql
     AS $$ 
 begin
-	if  new.microtimestamp > old.microtimestamp + make_interval(secs := parameters.max_microtimestamp_change()) or
-		new.microtimestamp < old.microtimestamp then	
-		raise exception 'An attempt to move % % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, old.exchange_id, new.microtimestamp;
-	end if;
 	-- It is assumed that the first-ever value of microtimestamp column is set by an exchange.
 	-- If it is changed for the first time, then save it to exchange_microtimestamp.
 	if old.exchange_microtimestamp is null then
@@ -24135,6 +24152,13 @@ ALTER INDEX obanalytics.level3_bitstamp_pair_id_side_microtimestamp_order_id_eve
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_xrpusd_pair_id_side_microtimestamp_order_id_key ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd_s_pair_id_side_microtimestamp_order__key;
+
+
+--
+-- Name: level3 check_microtimestamp_change; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE CONSTRAINT TRIGGER check_microtimestamp_change AFTER UPDATE OF microtimestamp ON obanalytics.level3 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE obanalytics.check_microtimestamp_change();
 
 
 --

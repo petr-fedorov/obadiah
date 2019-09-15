@@ -506,6 +506,27 @@ $$;
 ALTER FUNCTION bitstamp.capture_transient_trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text) OWNER TO "ob-analytics";
 
 --
+-- Name: check_microtimestamp_change(); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE FUNCTION bitstamp.check_microtimestamp_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$ 
+BEGIN
+
+	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change() then	
+		raise exception 'An attempt to move % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, new.microtimestamp;
+	end if;
+	return null;
+END;
+	
+
+$$;
+
+
+ALTER FUNCTION bitstamp.check_microtimestamp_change() OWNER TO "ob-analytics";
+
+--
 -- Name: crossed_books(timestamp with time zone, timestamp with time zone, text); Type: FUNCTION; Schema: bitstamp; Owner: ob-analytics
 --
 
@@ -1109,10 +1130,6 @@ CREATE FUNCTION bitstamp.live_orders_manage_orig_microtimestamp() RETURNS trigge
     LANGUAGE plpgsql
     AS $$ 
 BEGIN
-
-	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change() then	
-		raise exception 'An attempt to move % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, new.microtimestamp;
-	end if;
 
 	if TG_OP =  'UPDATE' and old.orig_microtimestamp is null and  old.microtimestamp <> new.microtimestamp then 
 					new.orig_microtimestamp := old.microtimestamp;
@@ -2755,6 +2772,13 @@ CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtim
 --
 
 CREATE TRIGGER bz_manage_orig_microtimestamp BEFORE INSERT OR UPDATE OF microtimestamp, orig_microtimestamp ON bitstamp.live_sell_orders FOR EACH ROW EXECUTE PROCEDURE bitstamp.live_orders_manage_orig_microtimestamp();
+
+
+--
+-- Name: live_orders check_microtimestamp_change; Type: TRIGGER; Schema: bitstamp; Owner: ob-analytics
+--
+
+CREATE CONSTRAINT TRIGGER check_microtimestamp_change AFTER UPDATE OF microtimestamp ON bitstamp.live_orders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE bitstamp.check_microtimestamp_change();
 
 
 --
