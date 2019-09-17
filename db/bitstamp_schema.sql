@@ -857,7 +857,7 @@ DECLARE
 	e bitstamp.live_orders;
 	is_e_agressor boolean;
 	
-	max_interval CONSTANT numeric := 2.0;	-- must be less or equal to the threshould in interval_between_events_must_be_small check constraint on bitstamp.live_trades
+	max_interval CONSTANT numeric := 0.5;	-- to events will be matched only if they are close thatn max_interval seconds
 	
 	trade_parts		bitstamp.live_orders[];
 	trade_part		bitstamp.live_orders;
