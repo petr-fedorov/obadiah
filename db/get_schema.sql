@@ -61,6 +61,24 @@ COMMENT ON FUNCTION get._in_milliseconds(ts timestamp with time zone) IS 'Since 
 
 
 --
+-- Name: _validate_parameters(text, timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get._validate_parameters(p_request text, p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$declare
+	MAXIMUM_PERIOD constant interval default '1 month';
+begin
+	if p_start_time + MAXIMUM_PERIOD < p_end_time then 
+		raise exception '[%, %) for %, %, % exceeds %', p_start_time, p_end_time,  p_request, p_pair_id, p_exchange_id, MAXIMUM_PERIOD;
+	end if;
+end;
+$$;
+
+
+ALTER FUNCTION get._validate_parameters(p_request text, p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: available_exchanges(); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
@@ -559,17 +577,18 @@ ALTER FUNCTION get.pair_id(p_pair text) OWNER TO "ob-analytics";
 --
 
 CREATE FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
-    LANGUAGE sql STABLE SECURITY DEFINER
-    AS $$
-
--- ARGUMENTS
+    LANGUAGE sql SECURITY DEFINER
+    AS $$-- ARGUMENTS
 --	See obanalytics.spread_by_episode()
 
-	select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
-	from obanalytics.level1 
-	where pair_id = p_pair_id
-	  and exchange_id = p_exchange_id
-	  and microtimestamp between p_start_time and p_end_time;
+select * from get._validate_parameters('spread', p_start_time, p_end_time, p_pair_id, p_exchange_id);
+
+select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+from obanalytics.level1 
+where pair_id = p_pair_id
+  and exchange_id = p_exchange_id
+  and microtimestamp >= p_start_time 
+  and microtimestamp < p_end_time
 	
 $$;
 
