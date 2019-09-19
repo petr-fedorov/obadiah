@@ -5,9 +5,9 @@ title: "A theory of power-law distributions in financial market fluctuations"
 output: html_document
 params:
   exchange: Bitstamp
-  pair: BTCUSD
+  pair: LTCUSD
   start_time: 2019-02-01 00:00:00+03
-  end_time: 2019-03-21 00:00:00+03
+  end_time: 2019-09-17 00:00:00+03
   period: 15 min
 references:
 - id: Gabaix2003
@@ -67,6 +67,13 @@ knit_hooks$set(source = function(x, options) {
   default_source_hook(x, options)
 })
 
+# for substitution into sql chunks 
+
+sql_exchange <- params$exchange
+sql_pair <- params$pair
+sql_start_time <- params$start_time
+sql_end_time <- params$end_time
+
 
 ```
 
@@ -74,7 +81,7 @@ According to [@Gabaix2003]:
 
 > Power laws appear to describe histograms of relevant financial fluctuations, such as fluctuations in stock price, trading volume and the number of trades. **Surprisingly, the exponents that characterize these power laws are similar for different types and sizes of markets, for different market trends and even for different countries—suggesting that a generic theoretical basis may underlie these phenomena.**
 
-Let's check whether these exponents are similar for cryptocurrencies too. Spoiler: they are not.
+Let's check whether these exponents are similar for cryptocurrencies too. Spoiler: not always.
 
 
 
@@ -105,21 +112,20 @@ We need only **real** trades, i.e. those having `exchange.trade.id` set and only
 ```{r}
 trades <- trades %>% 
   filter(!is.na(exchange.trade.id)) %>% 
-  select(timestamp, volume, price, direction, exchange.trade.id)
+  select(timestamp, volume, price, direction, exchange.trade.id) 
 kable(head(trades))
 ```
 
 There are `r scales::number_format(big.mark=',')(nrow(trades))` **real** trades in total. Let's calculate a trading volume and number of trades per `r params$period` period:
 
 
+
+
+
 ```{r}
-by_period <- left_join(tibble(period_end=seq(ceiling_date(ymd_hms(params$start_time), params$period),
-                                                 ceiling_date(ymd_hms(params$end_time), params$period),
-                                                 by=params$period)),
-                           trades %>% 
-                             mutate(period_end=ceiling_date(timestamp, params$period))
-                           , by="period_end") %>% 
-  mutate(volume=replace_na(volume, 0)) %>%
+by_period <- trades %>%
+  mutate(period_end=ceiling_date(timestamp, params$period)) %>% 
+  mutate(volume=replace_na(volume, 0), price=replace_na(price, 0)) %>%
   group_by(period_end) %>%
   summarize(volume=sum(volume), number.of.trades=sum(!is.na(timestamp)))
 
@@ -137,7 +143,7 @@ V <- by_period %>%
   mutate(prob=r/max(r), sigma=volume/sd(volume)) %>%
   filter(sigma >= 0.1)
 
-s_i <- coef(lm(log10(prob) ~ log10(sigma), V %>% filter(sigma >=2)))
+s_i <- coef(lm(log10(prob) ~ log10(sigma), V %>% filter(sigma >=10)))
 zeta_V <- -s_i[2]
 ```
 
@@ -177,7 +183,7 @@ N <- by_period %>%
   mutate(prob=r/max(r), sigma=number.of.trades/sd(number.of.trades), category='N') %>%
   filter(sigma > 0.1)
 
-s_i <- coef(lm(log10(prob) ~ log10(sigma), N %>% filter(sigma >=2)))
+s_i <- coef(lm(log10(prob) ~ log10(sigma), N %>% filter(sigma >=9)))
 zeta_N <- -s_i[2]
 
 ```
@@ -195,7 +201,7 @@ ggplot(N ,  aes(sigma, prob)) + geom_point(size=0.1) +
                 breaks=c(0.1, 1, 2, 10, 40),
                 limits=c(0.1, 40),
                 labels=scales::number_format(0.01)) +
-  geom_abline(slope=-zeta_V, intercept=s_i[1], colour="blue") +
+  geom_abline(slope=-zeta_N, intercept=s_i[1], colour="blue") +
   annotate("text",
            x=10, 
            y=0.01, 
@@ -205,7 +211,7 @@ ggplot(N ,  aes(sigma, prob)) + geom_point(size=0.1) +
 ```
 
 
-We see that $\zeta_N=`r round(zeta_N,2)` \neq 3.4$. 
+We see that $\zeta_N=`r round(zeta_N,2)` \approx 3.4$. 
 
 ## Returns
 
@@ -215,54 +221,46 @@ In [@Gabaix2003] we read:
 > Define $p_t$ as the price of a given stock and the stock price ‘return’ $r_t$ as the change of the logarithm of stock price in a given time interval $\Delta t$, $r_t \equiv \ln p_t - \ln p_{t -\Delta t}$. The probability that a return has an absolute value larger than $x$ is found empirically to be: $$ P(| r_t | > x) \sim x^{-\zeta_r} \tag{1}$$ with $\zeta_r \approx 3$. The ‘inverse cubic law’ of equation (1) is rather ‘universal’, holding over as many as 80 standard deviations for some stock markets, with $\Delta t$ ranging from one minute to one month, across different sizes of stocks, different time periods, and also for different stock market indices.
 
 
-Let's load all level 1 change records for **`r params$pair`** pair traded at **`r params$exchange`** from `r params$start_time` till `r params$end_time`:
+Let's load spreads  at the end of every `r params$period` interval for **`r params$pair`** pair traded at **`r params$exchange`** from `r params$start_time` till `r params$end_time`. Since there are too many of them to be loaded at once, we will process them by time ranges:
+
+
+```{r}
+ranges <- tibble(s=with_tz(seq(ymd_hms(params$start_time), ymd_hms(params$end_time), by="1 week"), tz="Europe/Moscow"))
+ranges$e <- c(tail(ranges$s, -1),ymd_hms(params$end_time))
+kable(head(ranges))
+
+```
+
+We will use a *mid-price* (best bid price plus best ask price divided by two) as a proxy for $p_t$:
 
 
 ```{r, cache=TRUE}
-spread <- obadiah::spread(con, 
-                          params$start_time, 
-                          params$end_time, 
-                          params$exchange, 
-                          params$pair, 
-                          cache=cache,  tz='Europe/Moscow')
-kable(head(spread))
-```
-
-We will use a *mid-price* as a proxy for $p_t$:
-
-```{r}
-spread <- spread %>%
-  mutate(mid.price=(best.ask.price+best.bid.price)/2) %>%
-  select(timestamp, mid.price)
-kable(head(spread))  
-```
-
-
-```{r}
-by_period <- left_join(tibble(period_end=seq(ceiling_date(ymd_hms(params$start_time), params$period),
-                                                 ceiling_date(ymd_hms(params$end_time), params$period),
-                                                 by=params$period)),
-                           spread %>% 
-                             mutate(period_end=ceiling_date(timestamp, params$period))
-                           , by="period_end") %>%
-  group_by(period_end) %>%
-  summarize(price=last(mid.price, order_by=timestamp))  %>%
+by_period <- ranges %>% rowwise() %>% do({
+  obadiah::spread(con, .$s, .$e, params$exchange, params$pair, by.interval=duration(params$period), cache=cache,  tz='Europe/Moscow') %>% 
+    mutate(price=(best.ask.price+best.bid.price)/2) %>% # mid-price
+    select(timestamp, price)
+  }) %>%  
+  ungroup() %>% 
+  fill(price) %>%
   mutate(abs_r=abs(log(price) - log(lag(price))))  %>% 
-  filter(!is.na(abs_r))
+  filter(!is.na(abs_r)) 
 
 kable(head(by_period))
+
 ```
 
 
 
-```{r}
+
+
+```{r }
 R <- by_period %>%
   arrange(-abs_r) %>%
   mutate(r=row_number()) %>%
   mutate(prob=r/max(r), sigma=abs_r/sd(abs_r)) %>%
   filter(sigma >= 0.1)
 
-s_i <- coef(lm(log10(prob) ~ log10(sigma), R %>% filter(sigma >=2)))
+s_i <- coef(lm(log10(prob) ~ log10(sigma), R %>% filter(sigma >=11)))
 zeta_r <- -s_i[2]
 
 
@@ -271,7 +269,7 @@ zeta_r <- -s_i[2]
 $x$ is measured in units of sample standard deviation of `abs_r`: $\sigma_r =$`sd(abs_r)` $\approx$ `r round(sd(by_period$abs_r),4)`.  
 
 
-```{r, fig.width=7}
+```{r fig.width=7}
 ggplot(R ,  aes(sigma, prob)) + 
   geom_point(size=0.1) + 
   scale_y_log10(TeX('$P(|r_t| > x)$'),
@@ -290,7 +288,7 @@ ggplot(R ,  aes(sigma, prob)) +
 
 ```
 
-Again we see that $\zeta_r=`r round(zeta_r,2)` \neq 3$. 
+Again we see that $\zeta_r=`r round(zeta_r,2)` \approx 3$. 
 
 ## References
 
