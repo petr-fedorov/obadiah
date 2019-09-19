@@ -32,7 +32,7 @@ ALTER SCHEMA parameters OWNER TO "ob-analytics";
 CREATE FUNCTION parameters.max_microtimestamp_change() RETURNS integer
     LANGUAGE plpgsql LEAKPROOF PARALLEL SAFE
     AS $$begin
-	return 3.5; -- 3.5 seconds. 
+	return 4.5; -- 4.5 seconds. 
 end;
 $$;
 
