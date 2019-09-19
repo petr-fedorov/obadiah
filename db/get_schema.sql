@@ -39,6 +39,22 @@ CREATE TYPE get.draw_type AS ENUM (
 ALTER TYPE get.draw_type OWNER TO "ob-analytics";
 
 --
+-- Name: _date_ceiling(timestamp with time zone, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get._date_ceiling(base_date timestamp with time zone, round_interval interval) RETURNS timestamp with time zone
+    LANGUAGE sql STABLE
+    AS $_$
+-- See date_round() there: //wiki.postgresql.org/wiki/Round_time
+
+SELECT TO_TIMESTAMP((EXTRACT(epoch FROM $1)::INTEGER + EXTRACT(epoch FROM $2)::INTEGER)
+                / EXTRACT(epoch FROM $2)::INTEGER * EXTRACT(epoch FROM $2)::INTEGER)
+$_$;
+
+
+ALTER FUNCTION get._date_ceiling(base_date timestamp with time zone, round_interval interval) OWNER TO "ob-analytics";
+
+--
 -- Name: _in_milliseconds(timestamp with time zone); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 

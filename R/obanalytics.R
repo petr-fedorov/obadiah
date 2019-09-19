@@ -1,4 +1,4 @@
-#' @importFrom lubridate with_tz ymd_hms seconds
+#' @importFrom lubridate with_tz ymd_hms seconds ceiling_date floor_date now minutes duration
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
 #' @importFrom magrittr  %>%
@@ -86,7 +86,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
 
 
 #' @export
-spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL, cache=NULL, debug.query = FALSE, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -102,15 +102,31 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
 
   before <- seconds(10)
 
+  if (is.null(by.interval)) {
+    from_rdbms <- .spread
+    spread_type <- "spread"
+  }
+  else {
+    stopifnot(inherits(by.interval, 'Duration'))
+
+    from_rdbms <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
+      .spread_by_interval(conn, start.time, end.time, exchange, pair, by.interval=paste0(as.numeric(by.interval), ' seconds'), debug.query)
+    }
+    spread_type <- paste0("spread_by_",as.numeric(by.interval))
+  }
+
+
+
   if(is.null(cache) || start.time > cache.bound)
-    spread <- .spread(conn, start.time - before, end.time, exchange, pair, debug.query)
+    spread <- from_rdbms(conn, start.time - before, end.time, exchange, pair, debug.query)
   else
     if(end.time <= cache.bound )
-      spread <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread"))
-  else
-    spread <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query, .spread, .leaf_cache(cache, exchange, pair, "spread") ),
-                    .spread(conn, cache.bound, end.time, exchange, pair, debug.query)
-    )
+      spread <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type))
+    else
+      spread <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type) ),
+                      from_rdbms(conn, cache.bound, end.time, exchange, pair, debug.query)
+      )
+
 
   if(!empty(spread)) {
     # Assign timezone of start.time, if any, to timestamp column
@@ -143,6 +159,30 @@ spread <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug
   spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
   spread
 }
+
+.spread_by_interval <- function(conn, start.time, end.time, exchange, pair, by.interval , debug.query = FALSE) {
+
+  query <- paste0(" SELECT distinct on ( ",
+                  "get._in_milliseconds(get._date_ceiling(timestamp,",shQuote(paste0(by.interval, " seconds")), "::interval ) )",
+                  ")	",
+                  "get._in_milliseconds(get._date_ceiling(timestamp,",shQuote(paste0(by.interval, " seconds")), "::interval ) )",
+                  " AS timestamp,
+                  \"best.bid.price\",
+                  \"best.bid.volume\",
+                  \"best.ask.price\",
+                  \"best.ask.volume\"
+                  FROM get.spread(",
+                  shQuote(format(start.time, usetz=T)), ",",
+                  shQuote(format(end.time, usetz=T)), ",",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ") ",
+                  ") ORDER BY 1, timestamp desc ")
+  if(debug.query) cat(query)
+  spread <- DBI::dbGetQuery(conn, query)
+  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
+  spread
+}
+
 
 
 
