@@ -20,7 +20,9 @@ Imports:
     reshape2,
     zoo,
     lubridate,
-    futile.logger
+    futile.logger,
+    purrr,
+    tibble
 Suggests: testthat,
     knitr,
     rmarkdown

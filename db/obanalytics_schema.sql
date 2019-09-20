@@ -1402,8 +1402,7 @@ ALTER FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_
 
 CREATE FUNCTION obanalytics.fix_crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3
     LANGUAGE plpgsql
-    AS $$
--- NOTE:
+    AS $$-- NOTE:
 --		This function is supposed to be doing something useful only after pga_spread() is failed due to crossed order book
 --		It is expected that Bitfinex produces rather few 'bad' events and rarely, so order book is crossed for relatively short
 -- 		period of time (i.e. 5 minutes). Otherwise one has to run this function manually, with higher p_max_interval
@@ -1413,7 +1412,7 @@ declare
 	
 begin 
 	v_current_timestamp := clock_timestamp();
-	
+	raise debug 'Started fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
 	
 	-- Merge crossed books to the next taker's event if it is exists (i.e. next_microtimestamp is not -infinity)
 	return query 		
@@ -1445,6 +1444,7 @@ begin
 		select *
 		from updated;
 	
+	raise debug 'Merged crossed books to the next takers event - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
 	
 	-- Fix eternal crossed orders, which should have been removed by an exchange, but weren't for some reasons
 	return query 
@@ -1462,6 +1462,8 @@ begin
 		order by microtimestamp, order_id,
 				  ts	-- we need the earliest ts where order book became crossed
 		returning level3.*;
+		
+	raise debug 'Fixed eternal crossed orders - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
 		
 	-- Finally, try to merge remaining episodes producing crossed order books
 	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id); 

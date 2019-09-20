@@ -44,11 +44,10 @@ ALTER TYPE get.draw_type OWNER TO "ob-analytics";
 
 CREATE FUNCTION get._date_ceiling(base_date timestamp with time zone, round_interval interval) RETURNS timestamp with time zone
     LANGUAGE sql STABLE
-    AS $_$
--- See date_round() there: //wiki.postgresql.org/wiki/Round_time
+    AS $_$-- See date_round() there: //wiki.postgresql.org/wiki/Round_time
 
-SELECT TO_TIMESTAMP((EXTRACT(epoch FROM $1)::INTEGER + EXTRACT(epoch FROM $2)::INTEGER)
-                / EXTRACT(epoch FROM $2)::INTEGER * EXTRACT(epoch FROM $2)::INTEGER)
+SELECT TO_TIMESTAMP(EXTRACT(epoch FROM $1)::integer + EXTRACT(epoch FROM $2)::integer
+                / EXTRACT(epoch FROM $2)::integer * EXTRACT(epoch FROM $2)::integer)
 $_$;
 
 
@@ -610,6 +609,52 @@ $$;
 
 
 ALTER FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: spread_by_interval(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get.spread_by_interval(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_interval interval) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone, era timestamp with time zone)
+    LANGUAGE sql SECURITY DEFINER
+    AS $$
+
+-- ARGUMENTS
+--	p_interval interval 
+
+with spread_changes as (
+	select distinct on (get._date_ceiling(timestamp, p_interval ))
+			get._date_ceiling(timestamp, p_interval ) AS timestamp,
+			"best.bid.price",
+		    "best.bid.volume",
+		    "best.ask.price",
+		    "best.ask.volume"
+	from get.spread(p_start_time, p_end_time, p_pair_id, p_exchange_id ) 
+),
+all_timestamps as (
+	select get._date_ceiling(timestamp, p_interval ) as timestamp
+	from generate_series(p_start_time,p_end_time, p_interval) timestamp
+),
+eras as (
+	select * 
+	from obanalytics.level3_eras
+	where exchange_id = p_exchange_id and pair_id = p_pair_id 
+)
+select coalesce("best.bid.price", last("best.bid.price") over e) as "best.bid.price",
+	    coalesce("best.bid.volume",last("best.bid.volume") over e) as "best.bid.volume",
+	    coalesce("best.ask.price", last("best.ask.price") over e) as "best.ask.price",
+	    coalesce("best.ask.volume",last("best.ask.volume") over e) as "best.ask.volume",
+		timestamp,
+		era
+from all_timestamps left join spread_changes using (timestamp) join eras on timestamp between era and get._date_ceiling(level1, p_interval) 
+window e as (partition by era order by timestamp)
+order by timestamp
+
+
+	
+$$;
+
+
+ALTER FUNCTION get.spread_by_interval(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_interval interval) OWNER TO "ob-analytics";
 
 --
 -- Name: trades(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics

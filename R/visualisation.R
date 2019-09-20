@@ -3,7 +3,7 @@
 #' @importFrom dplyr select group_by summarize mutate
 
 #' @export
-plotEventsIntervals <- function(intervals) {
+plotDataAvailability <- function(intervals) {
 
   from.time <- min(intervals$interval_start)
   to.time <- max(intervals$interval_end)
@@ -21,10 +21,14 @@ plotEventsIntervals <- function(intervals) {
   }
 
 
+ intervals <- intervals %>%
+   group_by(exchange) %>%
+   mutate(y=dense_rank(desc(pair)))
+
   ggplot(intervals,
-         aes(xmin=interval_start, xmax=interval_end, ymin=y, ymax=y+0.7, fill=c))+
-    geom_rect(colour="black", size=0.02) +
-    scale_fill_manual(values=c("G"="green4", "Y"="yellow2", "R"="red")) +
+         aes(xmin=interval_start, xmax=interval_end, ymin=y, ymax=y+0.7))+
+    geom_rect(mapping=aes(fill=c), colour="black", size=0.02) +
+    scale_fill_manual("Available:" , values=c("G"="green4", "Y"="yellow2", "R"="red"), breaks=c("G", "Y", "R"), labels=c("events, depth, spread", "events only", "nothing")) +
     scale_x_datetime(NULL,
                      breaks=seq(min(intervals$interval_start), max(intervals$interval_end), length.out=5),
                      labels=scales::date_format(format=fmt, tz=tz(intervals$interval_start))) +
@@ -37,5 +41,5 @@ plotEventsIntervals <- function(intervals) {
                 mutate(interval_end = interval_start, c="R"),
               hjust="left", size=2, vjust="top") +
     facet_grid(rows=vars(exchange), scales="free_y", switch="y") +
-    theme(legend.position="none")
+    theme(legend.position="bottom")
 }

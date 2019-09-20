@@ -1,9 +1,11 @@
-#' @importFrom lubridate with_tz ymd_hms seconds ceiling_date floor_date now minutes duration
+#' @importFrom lubridate with_tz ymd_hms seconds ceiling_date floor_date now minutes duration round_date
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
 #' @importFrom magrittr  %>%
 #' @importFrom zoo na.locf
 #' @importFrom reshape2 dcast melt
+#' @importFrom tibble tibble
+#' @importFrom purrr pmap_dfr
 
 
 #' @export
@@ -100,14 +102,27 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
 
-  before <- seconds(10)
 
   if (is.null(by.interval)) {
     from_rdbms <- .spread
     spread_type <- "spread"
+    before <- seconds(10)
+
   }
   else {
     stopifnot(inherits(by.interval, 'Duration'))
+
+    by.interval <- duration(round(as.numeric(by.interval)), 'seconds')
+
+    if(by.interval > seconds(60))
+      before <- by.interval
+    else
+      before <- seconds(round(60/as.integer(by.interval)+1)*as.integer(by.interval))
+
+    start.time <- round_date(start.time, 'second')
+    end.time <- round_date(end.time, 'second')
+
+
 
     from_rdbms <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
       .spread_by_interval(conn, start.time, end.time, exchange, pair, by.interval=paste0(as.numeric(by.interval), ' seconds'), debug.query)
@@ -116,29 +131,37 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
   }
 
 
-
-  if(is.null(cache) || start.time > cache.bound)
-    spread <- from_rdbms(conn, start.time - before, end.time, exchange, pair, debug.query)
-  else
-    if(end.time <= cache.bound )
-      spread <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type))
+  pmap_dfr(tibble(pair, exchange), function(pair, exchange) {
+    if(is.null(cache) || start.time > cache.bound)
+      spread <- from_rdbms(conn, start.time - before, end.time, exchange, pair, debug.query)
     else
-      spread <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type) ),
-                      from_rdbms(conn, cache.bound, end.time, exchange, pair, debug.query)
-      )
+      if(end.time <= cache.bound )
+        spread <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type))
+      else
+        spread <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type) ),
+                        from_rdbms(conn, cache.bound, end.time, exchange, pair, debug.query)
+        )
 
 
-  if(!empty(spread)) {
-    # Assign timezone of start.time, if any, to timestamp column
-    spread$timestamp <- with_tz(spread$timestamp, tzone)
-  }
-  spread<- spread  %>%
-    arrange(timestamp) %>%
-    filter(lead(timestamp) > start.time & timestamp <= end.time) %>%
-    mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time))
-  last_spread <- tail(spread, 1)
-  last_spread$timestamp <- end.time
-  rbind(spread,last_spread)
+      if(!empty(spread)) {
+        # Assign timezone of start.time, if any, to timestamp column
+        spread$timestamp <- with_tz(spread$timestamp, tzone)
+        spread<- spread  %>%
+          arrange(timestamp) %>%
+          filter(lead(timestamp) > start.time & timestamp <= end.time) %>%
+          mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time),
+                 pair=toupper(pair),
+                 exchange=tolower(exchange)
+                 )
+        if(!empty(spread)) {
+          last_spread <- tail(spread, 1)
+          last_spread$timestamp <- end.time
+          spread <- rbind(head(spread,-1),last_spread)
+        }
+      }
+      spread
+  })
+
 }
 
 .spread <- function(conn, start.time, end.time, exchange, pair, debug.query = FALSE) {
@@ -153,7 +176,7 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
                   shQuote(format(end.time, usetz=T)), ",",
                   "get.pair_id(",shQuote(pair),"), " ,
                   "get.exchange_id(", shQuote(exchange), ") ",
-                  ") ORDER BY 1, timestamp desc ")
+                  ") ORDER BY 1")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
   spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
@@ -162,21 +185,23 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
 
 .spread_by_interval <- function(conn, start.time, end.time, exchange, pair, by.interval , debug.query = FALSE) {
 
-  query <- paste0(" SELECT distinct on ( ",
-                  "get._in_milliseconds(get._date_ceiling(timestamp,",shQuote(paste0(by.interval, " seconds")), "::interval ) )",
-                  ")	",
-                  "get._in_milliseconds(get._date_ceiling(timestamp,",shQuote(paste0(by.interval, " seconds")), "::interval ) )",
-                  " AS timestamp,
+  query <- paste0(" select ",
+                  "get._in_milliseconds(timestamp) AS timestamp,
                   \"best.bid.price\",
                   \"best.bid.volume\",
                   \"best.ask.price\",
-                  \"best.ask.volume\"
-                  FROM get.spread(",
+                  \"best.ask.volume\",
+                  \"era\"
+                  from get.spread_by_interval(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
                   "get.pair_id(",shQuote(pair),"), " ,
-                  "get.exchange_id(", shQuote(exchange), ") ",
-                  ") ORDER BY 1, timestamp desc ")
+                  "get.exchange_id(", shQuote(exchange), "), ",
+                  shQuote(by.interval), "::interval",
+                  ") ",
+                  " where \"best.bid.price\" is not null or \"best.bid.volume\" is not null or ",
+                  " \"best.ask.price\" is not null or \"best.ask.volume\" is not null",
+                  " order by 1")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
   spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
@@ -546,52 +571,53 @@ intervals <- function(conn, start.time=NULL, end.time=NULL, exchange = NULL, pai
   else
     end.time <- "NULL"
 
+  if(!is.null(pair)) pair <- paste0(" get.pair_id(",shQuote(pair),") ") else pair <- "NULL"
+  if(!is.null(exchange)) exchange <- paste0(" get.exchange_id(", shQuote(exchange), ") ") else exchange <- "NULL"
 
-  if(!is.null(pair)) pair <- paste0(" get.pair_id(",shQuote(pair),") ")
-  if(!is.null(exchange)) exchange <- paste0(" get.exchange_id(", shQuote(exchange), ") ")
-  if(!is.null(pair) & !is.null(exchange)) sep <- "," else sep <- ""
 
-  # Various PostgreSQL-drivers in R are not able to handle timezone conversion correctly/consistently
-  # So we use EXTRACT epoch and then convert the epoch to POSIXct on the R side
+  pmap_dfr(tibble(pair, exchange),function(pair, exchange) {
 
-  query <- paste0("select exchange_id, pair_id,
+    # Various PostgreSQL-drivers in R are not able to handle timezone conversion correctly/consistently
+    # So we use EXTRACT epoch and then convert the epoch to POSIXct on the R side
+
+    query <- paste0("select exchange_id, pair_id,
                           extract(epoch from interval_start) as interval_start,
                           extract(epoch from interval_end) as interval_end,
                           case when events and depth then 'G' when events then 'Y' else 'R' end as c,
-                          dense_rank() over (order by exchange_id, pair_id)::integer as y,
                           exchange, pair,
                           extract(epoch from era) as era
                   from get.events_intervals( ",
-                  pair,
-                  sep,
-                  exchange,
-                  ")",
-                  " where interval_end > coalesce( ", start.time, " , interval_end - '1 second'::interval ) ",
-                  "   and interval_start < coalesce( ", end.time, " , interval_start + '1 second'::interval ) "
-                  )
+                    " p_pair_id => ", pair,
+                    ", ",
+                    " p_exchange_id => ", exchange,
+                    ")",
+                    " where interval_end > coalesce( ", start.time, " , interval_end - '1 second'::interval ) ",
+                    "   and interval_start < coalesce( ", end.time, " , interval_start + '1 second'::interval ) "
+    )
 
-  if(debug.query) cat(query)
-  intervals <- DBI::dbGetQuery(conn, query)
+    if(debug.query) cat(query)
+    intervals <- DBI::dbGetQuery(conn, query)
 
-  intervals <- intervals %>%
-    mutate(interval_start=as.POSIXct(interval_start, origin="1970-01-01"),
-           interval_end=as.POSIXct(interval_end, origin="1970-01-01"),
-           era=as.POSIXct(era, origin="1970-01-01")
-           )
+    intervals <- intervals %>%
+      mutate(interval_start=as.POSIXct(interval_start, origin="1970-01-01"),
+             interval_end=as.POSIXct(interval_end, origin="1970-01-01"),
+             era=as.POSIXct(era, origin="1970-01-01")
+      )
 
-  if(start.time != "NULL") {
-    start.time <- ymd_hms(start.time)
-    intervals <- intervals %>% mutate(interval_start=if_else(interval_start < start.time, start.time, interval_start))
-  }
-  if(end.time != "NULL") {
-    end.time <- ymd_hms(end.time)
-    intervals <- intervals %>% mutate(interval_end=if_else(interval_end > end.time, end.time, interval_end))
-  }
+    if(start.time != "NULL") {
+      start.time <- ymd_hms(start.time)
+      intervals <- intervals %>% mutate(interval_start=if_else(interval_start < start.time, start.time, interval_start))
+    }
+    if(end.time != "NULL") {
+      end.time <- ymd_hms(end.time)
+      intervals <- intervals %>% mutate(interval_end=if_else(interval_end > end.time, end.time, interval_end))
+    }
 
-  intervals$interval_start <- with_tz(intervals$interval_start, tz)
-  intervals$interval_end <- with_tz(intervals$interval_end, tz)
-  intervals$era <- with_tz(intervals$era, tz)
+    intervals$interval_start <- with_tz(intervals$interval_start, tz)
+    intervals$interval_end <- with_tz(intervals$interval_end, tz)
+    intervals$era <- with_tz(intervals$era, tz)
 
-  intervals
+    intervals
+  } )
 
 }
