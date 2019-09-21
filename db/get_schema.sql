@@ -46,7 +46,7 @@ CREATE FUNCTION get._date_ceiling(base_date timestamp with time zone, round_inte
     LANGUAGE sql STABLE
     AS $_$-- See date_round() there: //wiki.postgresql.org/wiki/Round_time
 
-SELECT TO_TIMESTAMP(EXTRACT(epoch FROM $1)::integer + EXTRACT(epoch FROM $2)::integer
+SELECT TO_TIMESTAMP((EXTRACT(epoch FROM $1)::integer + EXTRACT(epoch FROM $2)::integer)
                 / EXTRACT(epoch FROM $2)::integer * EXTRACT(epoch FROM $2)::integer)
 $_$;
 
@@ -616,9 +616,7 @@ ALTER FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time time
 
 CREATE FUNCTION get.spread_by_interval(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_interval interval) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone, era timestamp with time zone)
     LANGUAGE sql SECURITY DEFINER
-    AS $$
-
--- ARGUMENTS
+    AS $$-- ARGUMENTS
 --	p_interval interval 
 
 with spread_changes as (
@@ -635,7 +633,7 @@ all_timestamps as (
 	from generate_series(p_start_time,p_end_time, p_interval) timestamp
 ),
 eras as (
-	select * 
+	select *, least(get._date_ceiling(level1, p_interval), lead(era) over (order by era)) as era_end
 	from obanalytics.level3_eras
 	where exchange_id = p_exchange_id and pair_id = p_pair_id 
 )
@@ -645,7 +643,7 @@ select coalesce("best.bid.price", last("best.bid.price") over e) as "best.bid.pr
 	    coalesce("best.ask.volume",last("best.ask.volume") over e) as "best.ask.volume",
 		timestamp,
 		era
-from all_timestamps left join spread_changes using (timestamp) join eras on timestamp between era and get._date_ceiling(level1, p_interval) 
+from all_timestamps left join spread_changes using (timestamp) join eras on	timestamp between era and era_end
 window e as (partition by era order by timestamp)
 order by timestamp
 
