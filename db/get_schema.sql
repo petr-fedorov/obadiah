@@ -82,7 +82,7 @@ COMMENT ON FUNCTION get._in_milliseconds(ts timestamp with time zone) IS 'Since 
 CREATE FUNCTION get._validate_parameters(p_request text, p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$declare
-	MAXIMUM_PERIOD constant interval default '1 month';
+	MAXIMUM_PERIOD constant interval default '1 month 1 minute';
 begin
 	if p_start_time + MAXIMUM_PERIOD < p_end_time then 
 		raise exception '[%, %) for %, %, % exceeds %', p_start_time, p_end_time,  p_request, p_pair_id, p_exchange_id, MAXIMUM_PERIOD;
@@ -633,7 +633,7 @@ all_timestamps as (
 	from generate_series(p_start_time,p_end_time, p_interval) timestamp
 ),
 eras as (
-	select *, least(get._date_ceiling(level1, p_interval), lead(era) over (order by era)) as era_end
+	select *, least(get._date_ceiling(coalesce(level1, era), p_interval), coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity')) as era_end
 	from obanalytics.level3_eras
 	where exchange_id = p_exchange_id and pair_id = p_pair_id 
 )

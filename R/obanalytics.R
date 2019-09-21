@@ -132,34 +132,38 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
 
 
   pmap_dfr(tibble(pair, exchange), function(pair, exchange) {
-    if(is.null(cache) || start.time > cache.bound)
+
+    if(is.null(cache) || start.time > cache.bound) {
       spread <- from_rdbms(conn, start.time - before, end.time, exchange, pair, debug.query)
-    else
+    }
+    else {
       if(end.time <= cache.bound )
         spread <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type))
       else
         spread <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type) ),
                         from_rdbms(conn, cache.bound, end.time, exchange, pair, debug.query)
         )
+    }
 
-
+    if(!empty(spread)) {
+      # Assign timezone of start.time, if any, to timestamp column
+      spread$timestamp <- with_tz(spread$timestamp, tzone)
+      spread<- spread  %>%
+        arrange(timestamp) %>%
+        filter(lead(timestamp) > start.time & timestamp <= end.time) %>%
+        mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time),
+               pair=toupper(pair),
+               exchange=tolower(exchange)
+               )
       if(!empty(spread)) {
-        # Assign timezone of start.time, if any, to timestamp column
-        spread$timestamp <- with_tz(spread$timestamp, tzone)
-        spread<- spread  %>%
-          arrange(timestamp) %>%
-          filter(lead(timestamp) > start.time & timestamp <= end.time) %>%
-          mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time),
-                 pair=toupper(pair),
-                 exchange=tolower(exchange)
-                 )
-        if(!empty(spread)) {
-          last_spread <- tail(spread, 1)
+        last_spread <- tail(spread, 1)
+        if(last_spread$timestamp < end.time) {
           last_spread$timestamp <- end.time
-          spread <- rbind(head(spread,-1),last_spread)
+          spread <- rbind(spread,last_spread)
         }
       }
-      spread
+    }
+    spread
   })
 
 }
@@ -176,7 +180,7 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
                   shQuote(format(end.time, usetz=T)), ",",
                   "get.pair_id(",shQuote(pair),"), " ,
                   "get.exchange_id(", shQuote(exchange), ") ",
-                  ") ORDER BY 1")
+                  ") ORDER BY 1, timestamp desc")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
   spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
@@ -185,9 +189,8 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
 
 .spread_by_interval <- function(conn, start.time, end.time, exchange, pair, by.interval , debug.query = FALSE) {
 
-  query <- paste0(" select ",
-                  "get._in_milliseconds(timestamp) AS timestamp,
-                  \"best.bid.price\",
+  query <- paste0(" select distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp,",
+                  "\"best.bid.price\",
                   \"best.bid.volume\",
                   \"best.ask.price\",
                   \"best.ask.volume\",
@@ -201,7 +204,7 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
                   ") ",
                   " where \"best.bid.price\" is not null or \"best.bid.volume\" is not null or ",
                   " \"best.ask.price\" is not null or \"best.ask.volume\" is not null",
-                  " order by 1")
+                  " order by 1, timestamp desc")
   if(debug.query) cat(query)
   spread <- DBI::dbGetQuery(conn, query)
   spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
