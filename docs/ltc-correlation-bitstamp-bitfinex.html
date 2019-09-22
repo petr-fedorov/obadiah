@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+<head>
+
+<meta charset="utf-8" />
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+
+<meta name="author" content="Petr Fedorov" />
+
+<meta name="date" content="2019-09-22" />
+
+<title>An analysis of the correlations between LTCUSD price movements at Bitstamp and Bitfinex</title>
+
+<script src="site_libs/jquery-1.11.3/jquery.min.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link href="site_libs/bootstrap-3.3.5/css/bootstrap.min.css" rel="stylesheet" />
+<script src="site_libs/bootstrap-3.3.5/js/bootstrap.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/html5shiv.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/respond.min.js"></script>
+<script src="site_libs/navigation-1.1/tabsets.js"></script>
+<link href="site_libs/highlightjs-9.12.0/default.css" rel="stylesheet" />
+<script src="site_libs/highlightjs-9.12.0/highlight.js"></script>
+
+<style type="text/css">code{white-space: pre;}</style>
+<style type="text/css">
+  pre:not([class]) {
+    background-color: white;
+  }
+</style>
+<script type="text/javascript">
+if (window.hljs) {
+  hljs.configure({languages: []});
+  hljs.initHighlightingOnLoad();
+  if (document.readyState && document.readyState === "complete") {
+    window.setTimeout(function() { hljs.initHighlighting(); }, 0);
+  }
+}
+</script>
+
+
+
+<style type="text/css">
+h1 {
+  font-size: 34px;
+}
+h1.title {
+  font-size: 38px;
+}
+h2 {
+  font-size: 30px;
+}
+h3 {
+  font-size: 24px;
+}
+h4 {
+  font-size: 18px;
+}
+h5 {
+  font-size: 16px;
+}
+h6 {
+  font-size: 12px;
+}
+.table th:not([align]) {
+  text-align: left;
+}
+</style>
+
+
+
+
+<style type = "text/css">
+.main-container {
+  max-width: 940px;
+  margin-left: auto;
+  margin-right: auto;
+}
+code {
+  color: inherit;
+  background-color: rgba(0, 0, 0, 0.04);
+}
+img {
+  max-width:100%;
+}
+.tabbed-pane {
+  padding-top: 12px;
+}
+.html-widget {
+  margin-bottom: 20px;
+}
+button.code-folding-btn:focus {
+  outline: none;
+}
+summary {
+  display: list-item;
+}
+</style>
+
+
+<style type="text/css">
+/* padding for bootstrap navbar */
+body {
+  padding-top: 51px;
+  padding-bottom: 40px;
+}
+/* offset scroll position for anchor links (for fixed navbar)  */
+.section h1 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h2 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h3 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h4 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h5 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h6 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.dropdown-submenu {
+  position: relative;
+}
+.dropdown-submenu>.dropdown-menu {
+  top: 0;
+  left: 100%;
+  margin-top: -6px;
+  margin-left: -1px;
+  border-radius: 0 6px 6px 6px;
+}
+.dropdown-submenu:hover>.dropdown-menu {
+  display: block;
+}
+.dropdown-submenu>a:after {
+  display: block;
+  content: " ";
+  float: right;
+  width: 0;
+  height: 0;
+  border-color: transparent;
+  border-style: solid;
+  border-width: 5px 0 5px 5px;
+  border-left-color: #cccccc;
+  margin-top: 5px;
+  margin-right: -10px;
+}
+.dropdown-submenu:hover>a:after {
+  border-left-color: #ffffff;
+}
+.dropdown-submenu.pull-left {
+  float: none;
+}
+.dropdown-submenu.pull-left>.dropdown-menu {
+  left: -100%;
+  margin-left: 10px;
+  border-radius: 6px 0 6px 6px;
+}
+</style>
+
+<script>
+// manage active state of menu based on current page
+$(document).ready(function () {
+  // active menu anchor
+  href = window.location.pathname
+  href = href.substr(href.lastIndexOf('/') + 1)
+  if (href === "")
+    href = "index.html";
+  var menuAnchor = $('a[href="' + href + '"]');
+
+  // mark it active
+  menuAnchor.parent().addClass('active');
+
+  // if it's got a parent navbar menu mark it active as well
+  menuAnchor.closest('li.dropdown').addClass('active');
+});
+</script>
+
+<!-- tabsets -->
+
+<style type="text/css">
+.tabset-dropdown > .nav-tabs {
+  display: inline-table;
+  max-height: 500px;
+  min-height: 44px;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+.tabset-dropdown > .nav-tabs > li.active:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li.active:before {
+  content: "&#xe258;";
+  border: none;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs > li.active {
+  display: block;
+}
+
+.tabset-dropdown > .nav-tabs > li > a,
+.tabset-dropdown > .nav-tabs > li > a:focus,
+.tabset-dropdown > .nav-tabs > li > a:hover {
+  border: none;
+  display: inline-block;
+  border-radius: 4px;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li {
+  display: block;
+  float: none;
+}
+
+.tabset-dropdown > .nav-tabs > li {
+  display: none;
+}
+</style>
+
+<!-- code folding -->
+
+
+
+
+</head>
+
+<body>
+
+
+<div class="container-fluid main-container">
+
+
+
+
+<div class="navbar navbar-default  navbar-fixed-top" role="navigation">
+  <div class="container">
+    <div class="navbar-header">
+      <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar">
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+      </button>
+      <a class="navbar-brand" href="index.html">Obadiah</a>
+    </div>
+    <div id="navbar" class="navbar-collapse collapse">
+      <ul class="nav navbar-nav">
+        <li>
+  <a href="index.html">Home</a>
+</li>
+<li>
+  <a href="explore.html">Explore</a>
+</li>
+<li>
+  <a href="verify.html">Verify</a>
+</li>
+<li>
+  <a href="research.html">Research</a>
+</li>
+<li>
+  <a href="trade.html">Trade</a>
+</li>
+<li>
+  <a href="about.html">About</a>
+</li>
+      </ul>
+      <ul class="nav navbar-nav navbar-right">
+        
+      </ul>
+    </div><!--/.nav-collapse -->
+  </div><!--/.container -->
+</div><!--/.navbar -->
+
+<div class="fluid-row" id="header">
+
+
+
+<h1 class="title toc-ignore">An analysis of the correlations between LTCUSD price movements at Bitstamp and Bitfinex</h1>
+<h4 class="author">Petr Fedorov</h4>
+<h4 class="date">September 22, 2019</h4>
+
+</div>
+
+
+<div id="introduction" class="section level1">
+<h1>Introduction</h1>
+<p>On the figure below the white line shows how the mid-price of LTCUSD pair changes at Bitfinex and Bitstamp between 2019-09-21 00:20:00+03 and 2019-09-21 00:30:00+03. The changes look similar but they are not completely the same. One could ask: is it possible to use the mid-price change that <em>has just happened</em> at one of the exchanges to predict the change that <em>will hapen</em> at the other? Let’s try to answer this question.</p>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-1-1.png" width="672" style="display: block; margin: auto;" /></p>
+</div>
+<div id="method" class="section level1">
+<h1>Method</h1>
+<p>We will sample LTCUSD mid-price at regular intervals (2, 10 and 30 seconds) at Bitstamp and Bitfinex from 2019-09-01 00:00:00+03 till 2019-09-22 00:00:00+03. Then we’ll calculate mid-price change during each interval. Finally we’ll estimate Pearson correlation between mid-price change at Bitstamp and at Bitfinex using intervals of the same length but shifted relative to each other in time. We’ll also look at the size of mid-price changes.</p>
+<p>We start from creating a tibble whith definitions of two instruments we will compare. It will be used to call functions from obadiah package that are vectorized over instruments:</p>
+<pre class="r"><code>instruments &lt;- tribble(~exchange, ~pair,
+                       &#39;Bitfinex&#39;, &#39;LTCUSD&#39;,
+                       &#39;Bitstamp&#39;, &#39;LTCUSD&#39;)</code></pre>
+<p>The first such function allows us to check whether we have required data in the database:</p>
+<pre class="r"><code>obadiah::plotDataAvailability( 
+  with(instruments, obadiah::intervals(con, &#39;2019-09-01 00:00:00+03&#39;, &#39;2019-09-22 00:00:00+03&#39;, exchange, pair, tz=&#39;Europe/Moscow&#39;)) 
+)</code></pre>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-3-1.png" width="672" style="display: block; margin: auto;" /></p>
+<p>Almost everything is green, so we may start the analysis.</p>
+<p><code>obadiah::spread()</code> will load from the database the spread the the end of the interval specified <code>by.interval</code> parameter. The function is vectorized over <code>exchange</code> and <code>pair</code> parameters so we utilize our <code>instruments</code> here. We will analyse several intervals held in <code>intervals</code> vector:</p>
+<pre class="r"><code>intervals &lt;- c( 2, 10, 30)  # seconds 
+
+mid.price.changes &lt;- purrr::map_dfr(intervals, 
+                                 function(d) {
+                                   with(instruments,
+                                        obadiah::spread(con,
+                                                        &#39;2019-09-01 00:00:00+03&#39;,
+                                                        &#39;2019-09-22 00:00:00+03&#39;,
+                                                        exchange=exchange,
+                                                        pair=pair,
+                                                        by.interval=dseconds(d),
+                                                        tz=&#39;Europe/Moscow&#39;,
+                                                        debug.query = FALSE)) %&gt;% 
+                                     group_by(exchange, pair) %&gt;%
+                                     mutate(mid.price.change=log10(best.bid.price+best.ask.price) -
+                                                             log10(lag(best.bid.price)+lag(best.ask.price)),
+                                            instrument=paste0(pair,&#39;_&#39;,exchange),
+                                            duration=!! enquo(d)) %&gt;%
+                                     filter(!is.na(mid.price.change))  %&gt;% 
+                                     ungroup() %&gt;%  
+                                     select(duration, timestamp, mid.price.change, instrument) %&gt;%
+                                     tidyr::spread(instrument, mid.price.change)  # Note that it is tidyr::spread() - spreads key-value pair accross multiple columns
+                                   }
+                                 )
+kable(tail(mid.price.changes))</code></pre>
+<table>
+<thead>
+<tr class="header">
+<th align="right">duration</th>
+<th align="left">timestamp</th>
+<th align="right">LTCUSD_bitfinex</th>
+<th align="right">LTCUSD_bitstamp</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="right">30</td>
+<td align="left">2019-09-21 23:57:30</td>
+<td align="right">0</td>
+<td align="right">0.0001491</td>
+</tr>
+<tr class="even">
+<td align="right">30</td>
+<td align="left">2019-09-21 23:58:00</td>
+<td align="right">0</td>
+<td align="right">0.0000000</td>
+</tr>
+<tr class="odd">
+<td align="right">30</td>
+<td align="left">2019-09-21 23:58:30</td>
+<td align="right">0</td>
+<td align="right">-0.0000596</td>
+</tr>
+<tr class="even">
+<td align="right">30</td>
+<td align="left">2019-09-21 23:59:00</td>
+<td align="right">0</td>
+<td align="right">0.0000596</td>
+</tr>
+<tr class="odd">
+<td align="right">30</td>
+<td align="left">2019-09-21 23:59:30</td>
+<td align="right">0</td>
+<td align="right">-0.0000596</td>
+</tr>
+<tr class="even">
+<td align="right">30</td>
+<td align="left">2019-09-22 00:00:00</td>
+<td align="right">0</td>
+<td align="right">0.0000596</td>
+</tr>
+</tbody>
+</table>
+<p>The number of non-NA observations is significant for all intervals:</p>
+<pre class="r"><code>
+kable(mid.price.changes %&gt;%
+  group_by(duration) %&gt;%
+  summarize(non_NA_bitstamp=sum(!is.na(LTCUSD_bitstamp)), non_NA_bitfinex=sum(!is.na(LTCUSD_bitfinex))), col.names=c(&quot;Duration of interval&quot;, &quot;Bitstamp&quot;, &quot;Bitfinex&quot;), align=c(&quot;c&quot;, &#39;c&#39;, &#39;c&#39;), caption=&quot;Number of non-NA mid-price changes&quot;)</code></pre>
+<table>
+<caption>Number of non-NA mid-price changes</caption>
+<thead>
+<tr class="header">
+<th align="center">Duration of interval</th>
+<th align="center">Bitstamp</th>
+<th align="center">Bitfinex</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="center">2</td>
+<td align="center">895998</td>
+<td align="center">894214</td>
+</tr>
+<tr class="even">
+<td align="center">10</td>
+<td align="center">179212</td>
+<td align="center">179072</td>
+</tr>
+<tr class="odd">
+<td align="center">30</td>
+<td align="center">59747</td>
+<td align="center">59753</td>
+</tr>
+</tbody>
+</table>
+<p>We will calculate correlation between <code>LTCUSD_bitstamp</code> and <code>lead(LTCUSD_bitfinex,n)</code> or <code>lag(LTCUSD_bitfinex,-n)</code> where <code>n</code> is the number of periods ahead or behind Bitstamp period respectively.</p>
+<pre class="r"><code>correlations &lt;- mid.price.changes %&gt;%
+  group_by(duration) %&gt;%
+  group_modify( function(sc, d) {
+    purrr::map_dfr(-5:5, function(n) {
+      if(n &gt;= 0)
+        with(sc, tibble(n=n, correlation=cor(LTCUSD_bitstamp, lead(LTCUSD_bitfinex,n), use=&quot;complete.obs&quot;)))
+      else      
+        with(sc, tibble(n=n, correlation=cor(LTCUSD_bitstamp, lag(LTCUSD_bitfinex,-n), use=&quot;complete.obs&quot;)))
+      })
+    }
+    )</code></pre>
+</div>
+<div id="results" class="section level1">
+<h1>Results</h1>
+<p>The estimated correlations are visualized below:</p>
+<pre class="r"><code>ggplot(correlations %&gt;% 
+         filter(abs(n*duration) &lt;= 30 &amp; abs(n) &lt;= 3),
+       aes(x=n*duration, 
+           y=correlation, 
+           group=duration, 
+           colour=as.factor(duration))
+       ) + 
+  geom_line() + 
+  geom_point() + 
+  scale_y_continuous(&quot;Correlation between mid-price changes&quot;, 
+                     labels = scales::percent,
+                     breaks=seq(0,1,0.1), 
+                     minor_breaks=seq(-1,1,0.01)) + 
+  scale_x_continuous(&quot;Time relative to the Bitstamp&#39;s interval end, seconds&quot;, 
+                     breaks=c(seq(-40,40,10), seq(-10,10,2)),
+                     minor_breaks =seq(-40,40,1) ) + 
+  geom_text(aes(label=paste0(duration, &#39;:&#39;, n)), 
+            vjust=0,
+            hjust=0, 
+            nudge_x=1, 
+            nudge_y=-0.01, 
+            size=3) + 
+  scale_color_discrete(&quot;Duration of intervals, seconds&quot;) + 
+  theme(legend.position = &quot;bottom&quot;)</code></pre>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-7-1.png" width="672" style="display: block; margin: auto;" /></p>
+<p>We see that:</p>
+<ol style="list-style-type: decimal">
+<li><p>The strongest correlation is between mid-price changes happened during simultaneous 30-seconds intervals at Bitstamp and Bitfinex (point 30:0).</p></li>
+<li><p>The correlation is getting lower when the interval diminishes and becomes weak for 2-seconds intervals (point 2:0).</p></li>
+<li><p>There is no correlation between the mid-price change during 30-seconds interval at Bitstamp and <em>next</em> 30-seconds interval at Bitfinex (point 30:1).</p></li>
+<li><p>There is a weak correlation between the mid-price change during 10-seconds and especially 2-seconds interval at Bitstamp and <em>next</em> and <em>previous</em> intervals of the same duration at Bitfinex (points 10:1, 10:-1, 2:1, 2:-1).</p></li>
+</ol>
+<p>The scatter plots below show the relative size of mid-price changes during 2- and 30- seconds intervals. Surprisingly, they are almost the same.</p>
+<pre class="r"><code>ggplot(mid.price.changes %&gt;%
+         filter(duration %in% c(2, 30)) %&gt;%
+         mutate(LTCUSD_bitfinex=lead(LTCUSD_bitfinex, n=1)) %&gt;%
+         filter(!is.na(LTCUSD_bitstamp) &amp; !is.na(LTCUSD_bitfinex)),
+       aes(x=LTCUSD_bitstamp, y=LTCUSD_bitfinex)) + 
+  geom_point(shape=&#39;.&#39;) + 
+  scale_x_continuous(labels=scales::percent) +
+  scale_y_continuous(labels=scales::percent) +
+  coord_fixed(xlim = c(-0.003, 0.003), ylim=c(-0.003, 0.003)) +
+  geom_smooth(method=&quot;lm&quot;) + 
+  labs(x=&quot;Mid-price change that has happened at Bitstamp&quot;, y=&quot;Mid-price change that will happen at Bitfinex&quot;) +
+  facet_grid(cols=vars(duration))</code></pre>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-8-1.png" width="672" style="display: block; margin: auto;" /></p>
+</div>
+<div id="discussion" class="section level1">
+<h1>Discussion</h1>
+<p>At the time of writing the highest taker’s fee at Bitfinex was 0.2% while at Bitstamp it was 0.5%, i.e. comparable or even greater than the maximum mid-price change during 2-seconds interval. This makes profitable arbitrage strategy utilizing the correlation discovered unlikely.</p>
+</div>
+
+
+
+
+</div>
+
+<script>
+
+// add bootstrap table styles to pandoc tables
+function bootstrapStylePandocTables() {
+  $('tr.header').parent('thead').parent('table').addClass('table table-condensed');
+}
+$(document).ready(function () {
+  bootstrapStylePandocTables();
+});
+
+
+</script>
+
+<!-- tabsets -->
+
+<script>
+$(document).ready(function () {
+  window.buildTabsets("TOC");
+});
+
+$(document).ready(function () {
+  $('.tabset-dropdown > .nav-tabs > li').click(function () {
+    $(this).parent().toggleClass('nav-tabs-open')
+  });
+});
+</script>
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>
