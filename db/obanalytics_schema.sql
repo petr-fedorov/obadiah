@@ -1464,9 +1464,31 @@ begin
 		returning level3.*;
 		
 	raise debug 'Fixed eternal crossed orders - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
+	
+	
+	-- Fix eternal takers, which should have been removed by an exchange, but weren't for some reasons
+	return query 
+		insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
+		select distinct on (microtimestamp, order_id)  ts, order_id, 
+				null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
+				side, price, amount, fill, '-infinity',
+				null as next_event_no,
+				pair_id, exchange_id, null as local_timestamp,
+				null as price_microtimestamp, 
+				null as price_event_no
+		from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
+		join unnest(ob) ob on true 
+		where not is_maker and next_microtimestamp = 'infinity'
+		order by microtimestamp, order_id,
+				  ts	-- we need the earliest ts where order book became crossed
+		returning level3.*;
 		
+	raise debug 'Fixed eternal takers  - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
+	
+	
 	-- Finally, try to merge remaining episodes producing crossed order books
 	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id); 
+	
 
 	raise debug 'fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
