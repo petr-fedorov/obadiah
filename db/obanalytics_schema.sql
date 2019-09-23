@@ -619,21 +619,18 @@ $$;
 ALTER FUNCTION obanalytics._create_matches_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
 
 --
--- Name: _create_or_extend_draw(obanalytics.draw_interim_price[], timestamp with time zone, numeric, numeric); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: _create_or_extend_draw(obanalytics.draw_interim_price[], timestamp with time zone, numeric, numeric, numeric); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_minimal_draw numeric) RETURNS obanalytics.draw_interim_price[]
+CREATE FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_minimal_draw numeric, p_minimal_draw_decline numeric) RETURNS obanalytics.draw_interim_price[]
     LANGUAGE plpgsql
-    AS $$
-declare 
+    AS $$declare 
 	ONE_PCT constant numeric := 0.01;	-- one percent
 begin 
-	p_minimal_draw := p_minimal_draw*ONE_PCT;
 	if p_draw is null then	
 		-- p_draw[1] - the current draw start
 		-- p_draw[2] - the latest turning point (see below)
 		-- p_draw[3] - the current draw end
-		-- p_draw[4] - the previous draw (end, price change)
 		p_draw := array[row(p_microtimestamp, p_price), row(p_microtimestamp, p_price), row(p_microtimestamp,  p_price), row(p_microtimestamp,  0.0)];
 	else
 		-- The turning point helps us to decide whether the current draw is to be extended or a new draw is to be started
@@ -644,20 +641,21 @@ begin
 			    (p_draw[2].price <= p_draw[1].price and p_price < p_draw[2].price) 	)  then 
 					p_draw[2] := row(p_microtimestamp, p_price);
 					p_draw[3] := row(p_microtimestamp, p_price);
+					raise debug '%, % - the current draw extended', p_microtimestamp, p_price;
+					
 			else	-- check whether the current draw ended and new draw is to be started
-				if abs(p_draw[2].price - p_draw[1].price)>= p_draw[4].price*p_minimal_draw then -- the current draw has exceeded the minimal draw so check the turning (next) draw  ...
-					if abs(p_price - p_draw[2].price)>= abs(p_draw[2].price - p_draw[1].price)*p_minimal_draw then -- the turn after the curent draw exceeded  the minmal draw too so start new draw FROM THE TURNING POINT (i.e. in the past)
-						p_draw := array[p_draw[2],
-										row(p_microtimestamp, p_price)::obanalytics.draw_interim_price,
-										row(p_microtimestamp, p_price)::obanalytics.draw_interim_price,
-										row(p_microtimestamp, abs(p_draw[2].price - p_draw[1].price))::obanalytics.draw_interim_price
-									   ];
-					else	-- not yet, extend the turning draw from the turning point
-						p_draw[3] := row(p_microtimestamp, p_price);
-					end if;
-				else
-					p_draw[2] := row(p_microtimestamp, p_price);
+				-- the magical formula below for p_minimal_draw ensures that the turning point will not be too far away
+				p_minimal_draw := ONE_PCT*p_minimal_draw/(1 + p_minimal_draw_decline*extract(epoch from p_draw[2].microtimestamp - p_draw[1].microtimestamp));
+				raise debug 'p_minimal draw %', p_minimal_draw;
+				if abs(p_price - p_draw[2].price)>= abs(p_draw[2].price - p_draw[1].price)*p_minimal_draw then -- the turn after the curent draw exceeded  the minmal draw too so start new draw FROM THE TURNING POINT (i.e. in the past)
+					raise debug '%, % - TURNING POINT: the draw % - % completed', p_microtimestamp, p_price, p_draw[1].microtimestamp, p_draw[2].microtimestamp;
+					p_draw := array[p_draw[2],
+									row(p_microtimestamp, p_price)::obanalytics.draw_interim_price,
+									row(p_microtimestamp, p_price)::obanalytics.draw_interim_price
+								   ];
+				else	-- not yet, extend the turning draw from the turning point
 					p_draw[3] := row(p_microtimestamp, p_price);
+					raise debug '%, % - the draw after turning point extended', p_microtimestamp, p_price;
 				end if;
 			end if;
 		end if;
@@ -667,7 +665,7 @@ end;
 $$;
 
 
-ALTER FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_minimal_draw numeric) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_minimal_draw numeric, p_minimal_draw_decline numeric) OWNER TO "ob-analytics";
 
 --
 -- Name: _depth_after_depth_change(obanalytics.level2_depth_record[], obanalytics.level2_depth_record[], timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1316,10 +1314,10 @@ $$;
 ALTER FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_minimal_draw_pct numeric DEFAULT 0.0, p_price_decimal_places integer DEFAULT 2) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, exchange_id smallint, pair_id smallint, draw_type text, draw_size numeric, minimal_draw numeric, exchange text, pair text)
+CREATE FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_minimal_draw_pct numeric DEFAULT 0.0, p_minimal_draw_decline numeric DEFAULT 0.01, p_price_decimal_places integer DEFAULT 2) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, exchange_id smallint, pair_id smallint, draw_type text, draw_size numeric, minimal_draw numeric, exchange text, pair text)
     LANGUAGE sql STABLE
     AS $$ 
 
@@ -1338,7 +1336,7 @@ base_draws as (
 								    when 'ask' then round(best_ask_price, p_price_decimal_places)
 								    when 'mid-price' then round((best_bid_price + best_ask_price)/2, p_price_decimal_places)
 								 end,
-								 p_minimal_draw_pct) over w as draw, 
+								 p_minimal_draw_pct, p_minimal_draw_decline) over w as draw, 
 			p_draw_type as draw_type
 	from spread
 	window w as (order by microtimestamp)
@@ -1374,7 +1372,7 @@ order by draw_type, start_microtimestamp, end_microtimestamp desc, last_microtim
 $$;
 
 
-ALTER FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_minimal_draw_pct numeric, p_price_decimal_places integer) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_minimal_draw_pct numeric, p_minimal_draw_decline numeric, p_price_decimal_places integer) OWNER TO "ob-analytics";
 
 --
 -- Name: drop_leaf_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2549,16 +2547,16 @@ CREATE AGGREGATE obanalytics.depth_summary_agg(obanalytics.level2_depth_record[]
 ALTER AGGREGATE obanalytics.depth_summary_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer, integer, integer) OWNER TO "ob-analytics";
 
 --
--- Name: draw_agg(timestamp with time zone, numeric, numeric); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
+-- Name: draw_agg(timestamp with time zone, numeric, numeric, numeric); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE AGGREGATE obanalytics.draw_agg(microtimestamp timestamp with time zone, price numeric, minimal_draw numeric) (
+CREATE AGGREGATE obanalytics.draw_agg(microtimestamp timestamp with time zone, price numeric, minimal_draw numeric, minimal_draw_decline numeric) (
     SFUNC = obanalytics._create_or_extend_draw,
     STYPE = obanalytics.draw_interim_price[]
 );
 
 
-ALTER AGGREGATE obanalytics.draw_agg(microtimestamp timestamp with time zone, price numeric, minimal_draw numeric) OWNER TO "ob-analytics";
+ALTER AGGREGATE obanalytics.draw_agg(microtimestamp timestamp with time zone, price numeric, minimal_draw numeric, minimal_draw_decline numeric) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book_agg(obanalytics.level3[], boolean); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
