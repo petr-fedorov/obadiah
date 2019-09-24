@@ -1,15 +1,18 @@
-Obadiah
+OBADiah
 ================
 
-Obadiah (**O**rder **B**ook **A**nalytics **D**atabase) is a system
+OBADiah (**O**rder **B**ook **A**nalytics **D**atabase) is a system
 consisting of (i) a Python module for capturing raw high-frequency data
 from an exchange, (ii) a PostgreSQL database for processing & storing
 the captured data and (iii) the R package for rendering the processed
 data in the format suitable for visualization by
 [`obAnalytics`](https://github.com/phil8192/ob-analytics) R package.
 
-To access the database one needs to get a signed SSL certificate as
-described
+You can browse the database online using **obadiah-browser** application
+available [here.](https://petr-fedorov.shinyapps.io/obadiah-browser/)
+
+To access the database programmatically one needs to get a signed SSL
+certificate as described
 [here](https://github.com/petr-fedorov/obadiah/wiki/How-to-connect-to-the-database).
 Afterwards it is possible to connect:
 
@@ -36,12 +39,13 @@ exchange <- 'Bitfinex'
 pair <- 'BTCUSD'
 ```
 
-Now the data can be downloaded
+Now the data can be
+downloaded
 
 ``` r
-depth <- obadiah::depth(con,start.time, end.time, exchange, pair)
-spread <- obadiah::spread(con,start.time, end.time, exchange, pair)
-trades <- obadiah::trades(con,start.time, end.time, exchange, pair)
+depth <- obadiah::depth(con,start.time, end.time, exchange, pair, tz='Europe/Moscow')
+spread <- obadiah::spread(con,start.time, end.time, exchange, pair, tz='Europe/Moscow')
+trades <- obadiah::trades(con,start.time, end.time, exchange, pair, tz='Europe/Moscow')
 ```
 
 and

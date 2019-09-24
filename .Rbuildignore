@@ -1,2 +1,12 @@
 ^.*\.Rproj$
 ^\.Rproj\.user$
+^shiny$
+^python$
+.*\.py
+^README.*$
+^docs$
+^systemd$
+^doc$
+^db$
+^bash$
+^sample_config\.yml$
