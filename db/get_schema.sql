@@ -162,7 +162,7 @@ ALTER FUNCTION get.available_period(p_exchange_id integer, p_pair_id integer) OW
 -- Name: data_overview(text, text, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.data_overview(p_exchange text DEFAULT NULL::text, p_pair text DEFAULT NULL::text, p_r integer DEFAULT 1) RETURNS TABLE(level2_delay interval, pair text, pair_id smallint, exchange text, exchange_id smallint, era timestamp with time zone, level3 timestamp with time zone, level2 timestamp with time zone, level1 timestamp with time zone)
+CREATE FUNCTION get.data_overview(p_exchange text DEFAULT NULL::text, p_pair text DEFAULT NULL::text, p_r integer DEFAULT NULL::integer) RETURNS TABLE(level2_delay interval, pair text, pair_id smallint, exchange text, exchange_id smallint, era timestamp with time zone, level3 timestamp with time zone, level2 timestamp with time zone, level1 timestamp with time zone)
     LANGUAGE sql
     AS $$
 with eras as (

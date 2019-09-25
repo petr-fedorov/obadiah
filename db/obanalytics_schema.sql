@@ -398,7 +398,6 @@ ALTER FUNCTION obanalytics._create_level2_partition(p_exchange text, p_pair text
 CREATE FUNCTION obanalytics._create_level3_partition(p_exchange text, p_side character, p_pair text, p_year integer, p_month integer, p_execute boolean DEFAULT true) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
-
 declare
 	i integer;
 	v_exchange_id smallint;
@@ -503,6 +502,9 @@ begin
 	i := i+1;
 	v_statements[i] := 'create trigger '||v_table_name||'_bz_save_exchange_microtimestamp before update of microtimestamp on '||V_SCHEMA||v_table_name||
 		' for each row execute procedure obanalytics.save_exchange_microtimestamp()';
+		
+    i := i+1;
+	v_statements[i] := 'create index '||v_table_name||'_fkey_level3_price on'|| V_SCHEMA || v_table_name || '(price_microtimestamp, order_id, price_event_no)';
 
 	
 							
@@ -1243,7 +1245,7 @@ ALTER FUNCTION obanalytics.create_partitions(p_exchange text, p_pair text, p_yea
 -- Name: crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(previous_uncrossed timestamp with time zone, next_uncrossed timestamp with time zone, pair_id smallint, exchange_id smallint)
+CREATE FUNCTION obanalytics.crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(previous_uncrossed timestamp with time zone, first_crossed timestamp with time zone, next_uncrossed timestamp with time zone, pair_id smallint, exchange_id smallint)
     LANGUAGE sql STABLE
     AS $$
 
@@ -1258,10 +1260,11 @@ with base_order_books as (
 order_books as (
 	select ts, is_crossed, 
 	coalesce(max(ts) filter (where not is_crossed) over (order by ts), p_start_time - '00:00:00.000001'::interval ) as previous_uncrossed,
-	min(ts) filter (where not is_crossed) over (order by ts desc) as next_uncrossed
+	min(ts) filter (where not is_crossed) over (order by ts desc) as next_uncrossed,
+	min(ts) filter (where is_crossed) over (order by ts) as first_crossed
 	from base_order_books 
 )
-select distinct previous_uncrossed, next_uncrossed, p_pair_id::smallint, p_exchange_id::smallint
+select distinct previous_uncrossed, first_crossed, next_uncrossed, p_pair_id::smallint, p_exchange_id::smallint
 from order_books
 where is_crossed 
   and previous_uncrossed < p_end_time
@@ -1430,7 +1433,7 @@ begin
 	-- Merge crossed books to the next taker's event if it is exists (i.e. next_microtimestamp is not -infinity)
 	return query 		
 		with takers as (
-			select distinct  on (microtimestamp, order_id, event_no) ts, order_id, next_microtimestamp, next_event_no, side
+			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, next_microtimestamp, next_event_no
 			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
 			join unnest(ob) as ob on true
 			where not is_maker
@@ -1439,23 +1442,23 @@ begin
 			order by microtimestamp, order_id, event_no,
 					  ts	-- we need the earliest ts where order book became crossed			
 		),
-		updated as (
-			update obanalytics.level3
-			  set microtimestamp = takers.next_microtimestamp,
-				  next_microtimestamp = case when level3.next_microtimestamp > '-infinity'
-												   and level3.next_microtimestamp < takers.next_microtimestamp then takers.next_microtimestamp
-											  else level3.next_microtimestamp 
-											  end 
-			from takers
-			where exchange_id = p_exchange_id
-			  and pair_id = p_pair_id
-			  and level3.microtimestamp >= takers.ts 
-			  and level3.microtimestamp < takers.next_microtimestamp
-			  and level3.microtimestamp between p_start_time and p_end_time + make_interval(secs := parameters.max_microtimestamp_change())
-			returning level3.*
+		merge_intervals as (	-- there may be several takers, so first we need to understand which episodes to merge. 
+								-- the algorithm has been adapted from here: https://wiki.postgresql.org/wiki/Range_aggregation
+			select min(microtimestamp) as microtimestamp, max(next_microtimestamp) as next_microtimestamp 
+			from (
+				select microtimestamp, order_id, next_microtimestamp, next_event_no, last(interval_start) over (order by microtimestamp) as interval_start
+				from (
+					select microtimestamp, order_id, next_microtimestamp, next_event_no,
+							case when microtimestamp < coalesce(max(next_microtimestamp) over (order by microtimestamp rows between unbounded preceding and 1 preceding), microtimestamp) then null
+									else microtimestamp end 
+							as interval_start
+					from takers		
+				) takers
+			) merge_intervals
+			group by interval_start
 		)
-		select *
-		from updated;
+		select merge_episodes.*
+		from merge_intervals join obanalytics.merge_episodes(microtimestamp, next_microtimestamp, p_pair_id, p_exchange_id) on true;
 	
 	raise debug 'Merged crossed books to the next takers event - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
 	
@@ -1905,6 +1908,53 @@ $$;
 ALTER FUNCTION obanalytics.level3_incorporate_new_event() OWNER TO "ob-analytics";
 
 --
+-- Name: level3_update_chain_after_delete(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level3_update_chain_after_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$declare
+	v_previous_event obanalytics.level3%rowtype;
+begin 
+	if old.event_no > 1 then
+	
+		update obanalytics.level3
+		   set next_microtimestamp = case when isfinite(old.next_microtimestamp) then old.next_microtimestamp else 'infinity' end,
+		       next_event_no = case when isfinite(old.next_microtimestamp) then old.next_event_no else null end
+		where exchange_id = old.exchange_id
+		  and pair_id = old.pair_id
+		  and microtimestamp between (	select max(era)
+									     from obanalytics.level3_eras
+									     where exchange_id = old.exchange_id
+									  	   and pair_id = old.pair_id
+									       and era <= old.microtimestamp ) and old.microtimestamp
+		  and order_id = old.order_id										   
+		  and event_no = old.event_no - 1
+		returning level3.* into v_previous_event;
+	 		
+	end if;
+	
+	-- NOT READY: need to update price_microtimestamp recursively!!!
+	
+	if isfinite(old.next_microtimestamp) then
+		update obanalytics.level3
+		   set price_microtimestamp = v_previous_event.price_microtimestamp,
+		       price_event_no = v_previous_event.price_event_no
+		where exchange_id = old.exchange_id
+		  and pair_id = old.pair_id
+		  and microtimestamp = old.next_microtimestamp
+		  and order_id = old.order_id										   
+		  and event_no = old.next_event_no
+		  and price_microtimestamp = old.microtimestamp
+		  and price_event_no = old.event_no;
+	end if;
+	return old;
+end;$$;
+
+
+ALTER FUNCTION obanalytics.level3_update_chain_after_delete() OWNER TO "ob-analytics";
+
+--
 -- Name: level3_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1955,26 +2005,7 @@ begin
 		if crossed_books.next_uncrossed is null then 
 			raise exception 'Unable to find next uncrossed order book:  previous_uncrossed=%, pair_id=%, exchange_id=%', crossed_books.previous_uncrossed, p_pair_id, p_exchange_id;
 		end if;
-		return query with updated as (
-						  update obanalytics.level3
-							 set	microtimestamp = crossed_books.next_uncrossed,	-- just merge all 'crossed' order books into the next uncrossed one 
-									next_microtimestamp = case when level3.next_microtimestamp > '-infinity' 
-			 													     and level3.next_microtimestamp < crossed_books.next_uncrossed then crossed_books.next_uncrossed
-																else level3.next_microtimestamp
-															end
-/* 
-						  select crossed_books.next_uncrossed as microtimestamp, order_id, event_no, side, price, amount, fill,
-								 next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no, exchange_microtimestamp, is_maker, is_crossed						 
-						  from obanalytics.level3
-*/			
-						  where level3.pair_id = p_pair_id
-			                and level3.exchange_id = p_exchange_id
-							and level3.microtimestamp > crossed_books.previous_uncrossed
-							and level3.microtimestamp < crossed_books.next_uncrossed
-						  returning level3.*
-						)
-						select *
-						from updated;
+		return query select * from obanalytics.merge_episodes(crossed_books.first_crossed, crossed_books.next_uncrossed, p_pair_id, p_exchange_id);
 	end loop;
 	raise debug 'merge_crossed_books() exec time: %', clock_timestamp() - v_execution_start_time;	
 end;	
@@ -1990,6 +2021,82 @@ ALTER FUNCTION obanalytics.merge_crossed_books(p_start_time timestamp with time 
 
 COMMENT ON FUNCTION obanalytics.merge_crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) IS 'Merges episode(s) which produce crossed book into the next one which does not ';
 
+
+--
+-- Name: merge_episodes(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.merge_episodes(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3
+    LANGUAGE sql
+    AS $$
+with to_be_updated as (
+	select coalesce(min(microtimestamp) filter (where next_microtimestamp = '-infinity') over (partition by order_id order by microtimestamp desc), 
+					'infinity'::timestamptz) as next_death,
+			first_value(microtimestamp) over (partition by order_id order by microtimestamp desc) as last_seen,
+			microtimestamp, order_id, event_no 
+	from obanalytics.level3
+	where pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and microtimestamp >= p_start_time
+	  and microtimestamp < p_end_time
+)
+update obanalytics.level3
+    set microtimestamp = case when next_death < p_end_time 
+							         and next_death < last_seen -- the order is resurrected after next_death.
+									 							-- Bitfinex does that and we can use next_death for Bitfinex because all matches are single-sided
+																-- In case of Bitstamp we would have to move both sides of the match - much more difficult to do ...
+									then next_death
+							   else p_end_time 
+							   end,
+		next_microtimestamp = case when level3.next_microtimestamp > '-infinity'and level3.next_microtimestamp <= next_death 
+											and isfinite(level3.next_microtimestamp) and isfinite(next_death) 
+											and next_death < last_seen -- the order is resurrected after next_death. Bitfinex does that
+										then next_death
+									when level3.next_microtimestamp > '-infinity'and level3.next_microtimestamp < p_end_time
+										then p_end_time
+									else level3.next_microtimestamp 
+									end
+from to_be_updated 
+/*select case when next_death < p_end_time 
+			then next_death
+		   else p_end_time 
+	    end as microtimestamp,
+		level3.order_id,
+		level3.event_no,
+		level3.side,
+		level3.price,
+		level3.amount,
+		level3.fill,
+		case when level3.next_microtimestamp > '-infinity'and level3.next_microtimestamp <= next_death and isfinite(level3.next_microtimestamp)
+				then next_death
+			  when level3.next_microtimestamp > '-infinity'and level3.next_microtimestamp < p_end_time
+			  	then p_end_time
+			  else level3.next_microtimestamp 
+			  end as next_microtimestamp,
+	     level3.next_event_no,
+		 level3.pair_id,
+		 level3.exchange_id,
+		 level3.local_timestamp,
+		 level3.price_microtimestamp,
+		 level3.price_event_no,
+		 level3.exchange_microtimestamp,
+		 level3.is_maker,
+		 level3.is_crossed
+from obanalytics.level3, to_be_updated 
+*/
+where level3.pair_id = p_pair_id
+  and level3.exchange_id = p_exchange_id
+  and level3.microtimestamp >= p_start_time
+  and level3.microtimestamp < p_end_time
+  and level3.microtimestamp = to_be_updated.microtimestamp
+  and level3.order_id = to_be_updated.order_id
+  and level3.event_no = to_be_updated.event_no
+returning level3.*;  
+
+$$;
+
+
+ALTER FUNCTION obanalytics.merge_episodes(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: order_book(timestamp with time zone, integer, integer, boolean, boolean, boolean, character); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -23226,6 +23333,258 @@ ALTER TABLE ONLY obanalytics.pairs
 
 
 --
+-- Name: level3_01001b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01001b201909_fkey_price ON obanalytics.level3_01001b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01001b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01001b201910_fkey_price ON obanalytics.level3_01001b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01001s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01001s201909_fkey_price ON obanalytics.level3_01001s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01001s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01001s201910_fkey_price ON obanalytics.level3_01001s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01002b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01002b201909_fkey_price ON obanalytics.level3_01002b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01002b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01002b201910_fkey_price ON obanalytics.level3_01002b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01002s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01002s201909_fkey_price ON obanalytics.level3_01002s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01002s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01002s201910_fkey_price ON obanalytics.level3_01002s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01003b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01003b201909_fkey_price ON obanalytics.level3_01003b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01003b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01003b201910_fkey_price ON obanalytics.level3_01003b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01003s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01003s201909_fkey_price ON obanalytics.level3_01003s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01003s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01003s201910_fkey_price ON obanalytics.level3_01003s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02001b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02001b201909_fkey_price ON obanalytics.level3_02001b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02001b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02001b201910_fkey_price ON obanalytics.level3_02001b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02001s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02001s201909_fkey_price ON obanalytics.level3_02001s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02001s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02001s201910_fkey_price ON obanalytics.level3_02001s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02002b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02002b201909_fkey_price ON obanalytics.level3_02002b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02002b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02002b201910_fkey_price ON obanalytics.level3_02002b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02002s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02002s201909_fkey_price ON obanalytics.level3_02002s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02002s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02002s201910_fkey_price ON obanalytics.level3_02002s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02003b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02003b201909_fkey_price ON obanalytics.level3_02003b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02003b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02003b201910_fkey_price ON obanalytics.level3_02003b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02003s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02003s201909_fkey_price ON obanalytics.level3_02003s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02003s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02003s201910_fkey_price ON obanalytics.level3_02003s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02004b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02004b201909_fkey_price ON obanalytics.level3_02004b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02004b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02004b201910_fkey_price ON obanalytics.level3_02004b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02004s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02004s201909_fkey_price ON obanalytics.level3_02004s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02004s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02004s201910_fkey_price ON obanalytics.level3_02004s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02005b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02005b201909_fkey_price ON obanalytics.level3_02005b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02005b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02005b201910_fkey_price ON obanalytics.level3_02005b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02005s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02005s201909_fkey_price ON obanalytics.level3_02005s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02005s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02005s201910_fkey_price ON obanalytics.level3_02005s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02006b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02006b201909_fkey_price ON obanalytics.level3_02006b201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02006b201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02006b201910_fkey_price ON obanalytics.level3_02006b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02006s201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02006s201909_fkey_price ON obanalytics.level3_02006s201909 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_02006s201910_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_02006s201910_fkey_price ON obanalytics.level3_02006s201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
 -- Name: level3_02001b201901_pair_id_side_microtimestamp_order_id_ev_key; Type: INDEX ATTACH; Schema: obanalytics; Owner: 
 --
 
@@ -27241,6 +27600,13 @@ CREATE TRIGGER matches_02006201910_bz_save_exchange_microtimestamp BEFORE UPDATE
 --
 
 CREATE TRIGGER propagate_microtimestamp_change AFTER UPDATE OF microtimestamp ON obanalytics.level3 FOR EACH ROW WHEN ((old.exchange_id = 2)) EXECUTE PROCEDURE obanalytics.propagate_microtimestamp_change();
+
+
+--
+-- Name: level3 update_chain_after_delete; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER update_chain_after_delete AFTER DELETE ON obanalytics.level3 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_update_chain_after_delete();
 
 
 --
