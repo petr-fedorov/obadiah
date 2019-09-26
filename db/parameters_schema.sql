@@ -47,7 +47,7 @@ ALTER SCHEMA parameters OWNER TO "ob-analytics";
 CREATE FUNCTION parameters.max_microtimestamp_change() RETURNS integer
     LANGUAGE plpgsql LEAKPROOF PARALLEL SAFE
     AS $$begin
-	return 4.5; -- 4.5 seconds. 
+	return 5.5; -- Bitstamp 4148387835 BTCEUR 2019-09-25 2019-09-25 23:52:28.40318+03
 end;
 $$;
 
