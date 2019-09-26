@@ -1025,7 +1025,6 @@ ALTER FUNCTION bitstamp.inferred_trades(p_start_time timestamp with time zone, p
 CREATE FUNCTION bitstamp.live_orders_incorporate_new_event() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-
 DECLARE
 	v_era timestamptz;
 	v_amount numeric;
@@ -1103,7 +1102,8 @@ BEGIN
 			ELSE -- it is ex-nihilo 'order_changed' or 'order_deleted' event
 				NEW.fill := NULL;	-- we still don't know fill (yet). Can later try to figure it out from trade. amount will be null too
 				-- INSERT the initial 'order_created' event when missing
-				NEW.price_microtimestamp := CASE WHEN NEW.datetime < v_era THEN v_era ELSE NEW.datetime END;
+				NEW.price_microtimestamp := new.microtimestamp;	-- 'datetime ' column provided by Bitstamp is unreliable - order often crosses the book at 'datetime'. 
+																 -- So order_created will be inserted together with ex-nihilo order
 				NEW.price_event_no := 1;
 				NEW.event_no := 2;
 
