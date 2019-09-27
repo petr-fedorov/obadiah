@@ -373,7 +373,6 @@ ALTER FUNCTION bitstamp._spread_from_order_book(p_s bitstamp.order_book_record[]
 CREATE FUNCTION bitstamp.capture_transient_orders(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair text DEFAULT 'BTCUSD'::text) RETURNS SETOF bitstamp.live_orders
     LANGUAGE plpgsql
     AS $$
-
 DECLARE 
 
 	v_tolerance numeric;
@@ -416,7 +415,9 @@ BEGIN
 				COALESCE(lead(microtimestamp) OVER o, case event when 'order_deleted' then '-infinity'::timestamptz else 'infinity'::timestamptz end) AS next_microtimestamp,
 				CASE WHEN lead(microtimestamp) OVER o IS NOT NULL THEN row_number() OVER o + 1 ELSE NULL END AS next_event_no
 		FROM deleted
-		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp, local_timestamp)
+		WINDOW o AS (PARTITION BY order_id ORDER BY microtimestamp, 
+					 									"event",	-- Bitstamp sometimes sends order_created after order_changed. Need to be "fixed" here
+					 									local_timestamp)
 		
 	)
 	INSERT INTO bitstamp.live_orders (order_id, amount, "event", order_type, datetime, microtimestamp, local_timestamp, pair_id, price,
@@ -1024,8 +1025,7 @@ ALTER FUNCTION bitstamp.inferred_trades(p_start_time timestamp with time zone, p
 
 CREATE FUNCTION bitstamp.live_orders_incorporate_new_event() RETURNS trigger
     LANGUAGE plpgsql
-    AS $$
-DECLARE
+    AS $$DECLARE
 	v_era timestamptz;
 	v_amount numeric;
 	
@@ -1106,6 +1106,8 @@ BEGIN
 																 -- So order_created will be inserted together with ex-nihilo order
 				NEW.price_event_no := 1;
 				NEW.event_no := 2;
+				
+				raise debug 'Inserting for % % %', new.microtimestamp, new.order_id, new.event_no;
 
 				INSERT INTO bitstamp.live_orders (order_id, amount, event, event_no, order_type, datetime, microtimestamp, 
 												  pair_id, price, fill, next_microtimestamp, next_event_no,
