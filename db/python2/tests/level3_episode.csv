@@ -1,0 +1,4 @@
+"microtimestamp","order_id","event_no","side","price","amount","fill","next_microtimestamp","next_event_no","pair_id","exchange_id","local_timestamp","price_microtimestamp","price_event_no","exchange_microtimestamp","is_maker","is_crossed"
+2019-09-27 04:15:57.038078+03,4154960397,2,"s",7990.40,1.00000000,0.00000000,"-infinity",NULL,1,2,2019-09-27 04:15:57.109212+03,2019-09-27 04:15:56.700608+03,1,NULL,NULL,NULL
+2019-09-27 04:15:57.038079+03,4154960398,2,"s",7992,1.00000000,0.00000000, "infinity",NULL,1,2,2019-09-27 04:15:57.109212+03,2019-09-27 04:15:56.700608+03,1,NULL,NULL,NULL
+2019-09-27 04:15:57.038080+03,4154961174,2,"s",7993,1.00000000,0.00000000, "infinity",NULL,1,2,2019-09-27 04:15:57.109212+03,2019-09-27 04:15:56.700608+03,1,NULL,NULL,NULL

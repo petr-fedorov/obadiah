@@ -17,8 +17,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 11.4
--- Dumped by pg_dump version 11.4
+-- Dumped from database version 11.5
+-- Dumped by pg_dump version 11.5
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -1043,8 +1043,8 @@ BEGIN
 		update bitstamp.live_orders 
 		set microtimestamp = new.microtimestamp,
 			local_timestamp = new.local_timestamp
-		where microtimestamp between v_era and new.microtimestamp -- existing order_created's microtimestamp equals either v_era or datetime 
-																	-- (in case ex-nihilo was received with datetime > v_era) and is earlier than new.microtimestamp
+		where microtimestamp >= v_era  -- existing order_created's microtimestamp equals either v_era or datetime 
+										-- (in case ex-nihilo was received with datetime > v_era) 
 		  and  order_id = new.order_id 
 		  and order_type = new.order_type 
 		  and event = 'order_created'

@@ -17,8 +17,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 11.4
--- Dumped by pg_dump version 11.4
+-- Dumped from database version 11.5
+-- Dumped by pg_dump version 11.5
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -1151,6 +1151,49 @@ $$;
 
 
 ALTER FUNCTION obanalytics._order_book_after_episode(p_ob obanalytics.level3[], p_ep obanalytics.level3[], p_check_takers boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: _order_book_after_episode_ff(integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._order_book_after_episode_ff(p_state integer) RETURNS obanalytics.level3[]
+    LANGUAGE plpython2u
+    AS $$
+return [e for e in GD["ob"].output()]
+$$;
+
+
+ALTER FUNCTION obanalytics._order_book_after_episode_ff(p_state integer) OWNER TO "ob-analytics";
+
+--
+-- Name: _order_book_after_episode_st(integer, obanalytics.level3[], boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._order_book_after_episode_st(p_state integer, p_episode obanalytics.level3[], p_check_takers boolean) RETURNS integer
+    LANGUAGE plpython2u
+    AS $$
+from obadiah_db.orderbook import OrderBook
+import os
+import logging
+logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
+plpy.notice(os.getcwd())
+if p_state is None:
+	ts = p_episode[0]["microtimestamp"]
+	pair_id = p_episode[0]["pair_id"]
+	exchange_id = p_episode[0]["exchange_id"]
+	logging.debug('Starts %s', ts)
+	GD["ob"] = OrderBook(plpy.execute("select ob.* from obanalytics.order_book( '{0}', {1}, {2}, false, true, {3} ) join unnest(ob) ob on true".format(ts, pair_id, exchange_id, p_check_takers)),
+						 True
+						)
+	internal_state = 1
+else:
+	internal_state = p_state + 1
+GD["ob"].update(p_episode)
+return internal_state
+$$;
+
+
+ALTER FUNCTION obanalytics._order_book_after_episode_st(p_state integer, p_episode obanalytics.level3[], p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: level1; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -2691,6 +2734,19 @@ CREATE AGGREGATE obanalytics.order_book_agg(event obanalytics.level3[], boolean)
 
 
 ALTER AGGREGATE obanalytics.order_book_agg(event obanalytics.level3[], boolean) OWNER TO "ob-analytics";
+
+--
+-- Name: order_book_agg2(obanalytics.level3[], boolean); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE AGGREGATE obanalytics.order_book_agg2(event obanalytics.level3[], boolean) (
+    SFUNC = obanalytics._order_book_after_episode_st,
+    STYPE = integer,
+    FINALFUNC = obanalytics._order_book_after_episode_ff
+);
+
+
+ALTER AGGREGATE obanalytics.order_book_agg2(event obanalytics.level3[], boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: restore_depth_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
@@ -23361,6 +23417,13 @@ CREATE INDEX level3_01001s201910_fkey_price ON obanalytics.level3_01001s201910 U
 
 
 --
+-- Name: level3_01002b201905_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01002b201905_fkey_price ON obanalytics.level3_01002b201905 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
 -- Name: level3_01002b201909_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -23372,6 +23435,13 @@ CREATE INDEX level3_01002b201909_fkey_price ON obanalytics.level3_01002b201909 U
 --
 
 CREATE INDEX level3_01002b201910_fkey_price ON obanalytics.level3_01002b201910 USING btree (price_microtimestamp, order_id, price_event_no);
+
+
+--
+-- Name: level3_01002s201905_fkey_price; Type: INDEX; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE INDEX level3_01002s201905_fkey_price ON obanalytics.level3_01002s201905 USING btree (price_microtimestamp, order_id, price_event_no);
 
 
 --
