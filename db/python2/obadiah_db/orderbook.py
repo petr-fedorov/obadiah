@@ -48,6 +48,38 @@ class OrderBook(object):
             self.add(e)
 
     def output(self):
+        best_bid_price = None
+        best_sell_price = None
         for price in self.by_price:
             for e in self.by_price[price]:
+                if e["side"] == 'b':
+                    if best_bid_price is None or e["price"] > best_bid_price:
+                        best_bid_price = e["price"]
+                    if best_sell_price is None:
+                        e["is_maker"] = True
+                        e["is_crossed"] = False
+                    elif e["price"] <= best_sell_price:
+                        e["is_maker"] = True
+                        if e["price"] > best_sell_price:
+                            e["is_crossed"] = True
+                        else:
+                            e["is_crossed"] = False
+                    else:
+                        e["is_maker"] = False
+                        e["is_crossed"] = True
+                else:
+                    if best_sell_price is None or e["price"] < best_sell_price:
+                        best_sell_price = e["price"]
+                    if best_bid_price is None:
+                        e["is_maker"] = True
+                        e["is_crossed"] = False
+                    elif e["price"] >= best_bid_price:
+                        e["is_maker"] = True
+                        if e["price"] < best_bid_price:
+                            e["is_crossed"] = True
+                        else:
+                            e["is_crossed"] = False
+                    else:
+                        e["is_maker"] = False
+                        e["is_crossed"] = True
                 yield e

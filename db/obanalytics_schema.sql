@@ -1097,8 +1097,7 @@ ALTER FUNCTION obanalytics._level3_uuid(p_microtimestamp timestamp with time zon
 
 CREATE FUNCTION obanalytics._order_book_after_episode(p_ob obanalytics.level3[], p_ep obanalytics.level3[], p_check_takers boolean) RETURNS obanalytics.level3[]
     LANGUAGE plpgsql STABLE
-    AS $$
-begin
+    AS $$begin
 	if p_ob is null then
 		select ob into p_ob
 		from obanalytics.order_book(p_ep[1].microtimestamp, p_ep[1].pair_id, p_ep[1].exchange_id, p_only_makers := false, p_before := true, p_check_takers := p_check_takers );
@@ -1142,7 +1141,7 @@ begin
 					where is_maker 
 					    or not p_check_takers 
 					    or obanalytics._is_valid_taker_event(microtimestamp, order_id, event_no, pair_id, exchange_id, next_microtimestamp)
-					order by microtimestamp, order_id, event_no 
+					order by price, microtimestamp, order_id, event_no 
 					-- order by must be the same as in obanalytics.order_book(). Change both!					
 				));
 end;   
@@ -1175,15 +1174,14 @@ CREATE FUNCTION obanalytics._order_book_after_episode_st(p_state integer, p_epis
 from obadiah_db.orderbook import OrderBook
 import os
 import logging
-logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
-plpy.notice(os.getcwd())
+# logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
 if p_state is None:
 	ts = p_episode[0]["microtimestamp"]
 	pair_id = p_episode[0]["pair_id"]
 	exchange_id = p_episode[0]["exchange_id"]
-	logging.debug('Starts %s', ts)
+	# logging.debug('Starts %s', ts)
 	GD["ob"] = OrderBook(plpy.execute("select ob.* from obanalytics.order_book( '{0}', {1}, {2}, false, true, {3} ) join unnest(ob) ob on true".format(ts, pair_id, exchange_id, p_check_takers)),
-						 True
+						 False
 						)
 	internal_state = 1
 else:
@@ -2148,7 +2146,6 @@ ALTER FUNCTION obanalytics.merge_episodes(p_start_time timestamp with time zone,
 CREATE FUNCTION obanalytics.order_book(p_ts timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_makers boolean, p_before boolean, p_check_takers boolean DEFAULT false, p_side character DEFAULT NULL::bpchar) RETURNS TABLE(ts timestamp with time zone, ob obanalytics.level3[])
     LANGUAGE sql STABLE
     AS $$
-
 	with orders as (
 			select microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp,
 					price_microtimestamp, price_event_no, exchange_microtimestamp, 
@@ -2180,7 +2177,7 @@ CREATE FUNCTION obanalytics.order_book(p_ts timestamp with time zone, p_pair_id 
 			  and exchange_id = p_exchange_id		
 		)
 	select (select max(microtimestamp) from orders ) as ts,
-			array_agg(orders::obanalytics.level3 order by microtimestamp, order_id, event_no) 	
+			array_agg(orders::obanalytics.level3 order by price, microtimestamp, order_id, event_no) 	
 				  -- order by must be the same as in obanalytics._order_book_after_episode(). Change both!
     from orders
 	where is_maker OR NOT p_only_makers
