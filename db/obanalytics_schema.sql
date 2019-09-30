@@ -749,8 +749,7 @@ ALTER FUNCTION obanalytics._depth_change(p_obs obanalytics.pair_of_ob) OWNER TO 
 CREATE FUNCTION obanalytics._depth_change(p_ob_before obanalytics.level3[], p_ob_after obanalytics.level3[]) RETURNS obanalytics.level2_depth_record[]
     LANGUAGE sql
     AS $$
-
-select array_agg(row(price, coalesce(af.amount, 0), side, null::integer)::obanalytics.level2_depth_record  order by price desc)
+select array_agg(row(price, coalesce(af.amount, 0), side, null::integer)::obanalytics.level2_depth_record  order by price)
 from (
 	select a.price, sum(a.amount) as amount,a.side
 	from unnest(p_ob_before) a 
@@ -1371,6 +1370,51 @@ $$;
 
 
 ALTER FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: depth_change_by_episode2(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.depth_change_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level2
+    LANGUAGE plpython2u STABLE
+    AS $_$
+
+from obadiah_db.orderbook import OrderBook
+# import logging
+# logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
+
+def generator():
+	ob=OrderBook(False) 
+	ob.update(
+		plpy.execute(
+			plpy.prepare('''select ob.* 
+							from obanalytics.order_book( $1, $2, $3, false, true, $4 ) join unnest(ob) ob on true
+						 ''', ["timestamptz", "integer", "integer", "boolean"]),
+		[p_start_time, p_pair_id, p_exchange_id, False]))
+	for e in plpy.cursor(
+		plpy.prepare('''	with level3 as (
+					 			-- we take only the latest event per episode. In case an order was created and deleted within an episode it will be ignored completely ...
+								select distinct on (microtimestamp, order_id) *	
+								from obanalytics.level3
+								where microtimestamp between $1 and $2
+							  	  and pair_id = $3
+							   	  and exchange_id = $4
+								order by microtimestamp, order_id, event_no desc
+							)
+							select microtimestamp as ts, array_agg(level3) as episode
+							from level3
+							group by microtimestamp
+					 		order by microtimestamp
+					''',["timestamptz", "timestamptz", "integer", "integer"]),
+		[p_start_time, p_end_time, p_pair_id, p_exchange_id]):
+		
+		yield {"microtimestamp": e["ts"], "pair_id": p_pair_id, "exchange_id": p_exchange_id, "precision":'r0', "depth_change": ob.update(e["episode"])}
+return generator()
+
+$_$;
+
+
+ALTER FUNCTION obanalytics.depth_change_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
