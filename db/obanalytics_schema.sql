@@ -2638,11 +2638,67 @@ $$;
 ALTER FUNCTION obanalytics.spread_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean, p_with_order_book boolean) OWNER TO "ob-analytics";
 
 --
--- Name: FUNCTION spread_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean, p_with_order_book boolean); Type: COMMENT; Schema: obanalytics; Owner: ob-analytics
+-- Name: spread_by_episode2(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-COMMENT ON FUNCTION obanalytics.spread_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean, p_with_order_book boolean) IS 'Calculates the best bid and ask prices and quantities (so called "spread") after each episode in the ''level3'' table that hits the interval between p_start_time and p_end_time for the given "pair". The spread is calculated using all available data before p_start_time';
+CREATE FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, exchange_id smallint, order_book obanalytics.level3[])
+    LANGUAGE plpython2u STABLE
+    AS $_$
 
+from obadiah_db.orderbook import OrderBook
+import logging
+logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
+
+def generator():
+	ob=OrderBook(True) 
+	r =	plpy.execute(
+			plpy.prepare('''select ts, ob
+							from obanalytics.order_book( $1, $2, $3, false, true, $4 )
+						 ''', ["timestamptz", "integer", "integer", "boolean"]),
+		[p_start_time, p_pair_id, p_exchange_id, False])
+	ob.update(r[0]["ob"])
+	spread = ob.spread()
+	spread["microtimestamp"] = r[0]["ts"]
+	spread["pair_id"] = p_pair_id
+	spread["exchange_id"] = p_exchange_id
+	spread["order_book"] = None
+	# yield spread
+	spread["best_bid_price"] = None 
+	for e in plpy.cursor(
+		plpy.prepare('''	with level3 as (
+					 			-- we take only the latest event per episode. In case an order was created and deleted within an episode it will be ignored completely ...
+								select distinct on (microtimestamp, order_id) *	
+								from obanalytics.level3
+								where microtimestamp between $1 and $2
+							  	  and pair_id = $3
+							   	  and exchange_id = $4
+								order by microtimestamp, order_id, event_no desc
+							)
+							select microtimestamp as ts, array_agg(level3) as episode
+							from level3
+							group by microtimestamp
+					 		order by microtimestamp
+					''',["timestamptz", "timestamptz", "integer", "integer"]),
+		[p_start_time, p_end_time, p_pair_id, p_exchange_id]):
+		ob.update(e["episode"])
+		updated_spread = ob.spread()
+		
+		if 	updated_spread["best_bid_price"] != spread["best_bid_price"] or\
+				updated_spread["best_ask_price"] != spread["best_ask_price"] or\
+				updated_spread["best_bid_qty"] != spread["best_bid_qty"] or\
+				updated_spread["best_ask_qty"] != spread["best_ask_qty"]:
+			updated_spread["microtimestamp"] = e["ts"]
+			updated_spread["pair_id"] = p_pair_id
+			updated_spread["exchange_id"] = p_exchange_id
+			updated_spread["order_book"] = None
+			spread = updated_spread
+			yield spread
+return generator()
+
+$_$;
+
+
+ALTER FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: summary(text, text, timestamp with time zone, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics

@@ -1,6 +1,7 @@
 from sortedcollections import SortedList, SortedDict
 from csv import DictReader
 from decimal import Decimal
+
 import logging
 
 
@@ -19,6 +20,23 @@ def price_level_log(price, price_level):
                 e["order_id"],
                 e["event_no"],
                 e["side"]) for e in price_level.events()]))
+
+
+def spread_log(ob):
+    if ob.best_bid_level is not None:
+        best_bid_price = ob.best_bid_level.price
+        best_bid_amount = ob.best_bid_level.amount('b')
+    else:
+        best_bid_price = None
+        best_bid_amount = None
+    if ob.best_ask_level is not None:
+        best_ask_price = ob.best_ask_level.price
+        best_ask_amount = ob.best_ask_level.amount('s')
+    else:
+        best_ask_price = None
+        best_ask_amount = None
+    return "Spread BID p: {0} a:{1} ASK p: {2}, a: {3}".format(
+        best_bid_price, best_bid_amount, best_ask_price, best_ask_amount)
 
 
 def read_level3_csv(filename):
@@ -49,8 +67,9 @@ def read_level3_csv(filename):
 
 
 class PriceLevel(object):
-    def __init__(self):
+    def __init__(self, price):
         self.amounts = {}
+        self.price = price
         self.e = SortedList(
             key=lambda e: (e["price_microtimestamp"],
                            e["microtimestamp"],
@@ -95,6 +114,8 @@ class OrderBook(object):
     def __init__(self, log_enabled=False):
         self.by_price = SortedDict()
         self.by_order_id = {}
+        self.best_bid_level = None
+        self.best_ask_level = None
         self.log_enabled = log_enabled
         self.logger = logging.getLogger(__name__)
 
@@ -105,11 +126,21 @@ class OrderBook(object):
 
             price_level = self.by_price.get(e["price"])
             if price_level is None:
-                price_level = PriceLevel()
+                price_level = PriceLevel(e["price"])
                 self.by_price[e["price"]] = price_level
             price_level.add(e)
             self.by_order_id[e["order_id"]] = e
             self.changed_price_levels[e["price"]] = price_level
+
+            if e["side"] == 'b':
+                if self.best_bid_level is None or\
+                        e["price"] > self.best_bid_level.price:
+                    self.best_bid_level = price_level
+            else:
+                if self.best_ask_level is None or\
+                        e["price"] < self.best_ask_level.price:
+                    self.best_ask_level = price_level
+
             if self.log_enabled:
                 self.logger.debug('PL-add: %s', price_level_log(e["price"],
                                                                 price_level))
@@ -131,8 +162,55 @@ class OrderBook(object):
                                   price_level_log(old_event["price"],
                                                   old_price_level))
             self.changed_price_levels[old_event["price"]] = old_price_level
+            if old_event["side"] == 'b' and\
+                    self.best_bid_level == old_price_level and\
+                    old_price_level.amount('b') == Decimal(0):
+                self.best_bid_level = None
+                new_best_bid_level = old_price_level
+                i = self.by_price.bisect_left(new_best_bid_level.price)
+                while i > 0:
+                    new_best_bid_level = self.by_price.values()[i-1]
+                    if new_best_bid_level.amount('b') > Decimal(0):
+                        self.best_bid_level = new_best_bid_level
+                        break
+                    else:
+                        i = self.by_price.bisect_left(new_best_bid_level.price)
+            elif old_event["side"] == 's' and\
+                    self.best_ask_level == old_price_level and\
+                    old_price_level.amount('s') == Decimal(0):
+                self.best_ask_level = None
+                i = self.by_price.bisect_right(old_price_level.price)
+                while i < len(self.by_price):
+                    new_best_ask_level = self.by_price.values()[i]
+                    if new_best_ask_level.amount('s') > Decimal(0):
+                        self.best_ask_level = new_best_ask_level
+                        break
+                    else:
+                        i = self.by_price.bisect_right(
+                            new_best_ask_level.price)
 
         return old_event
+
+    def _post_update(self):
+        depth_changes = []
+        for price in self.changed_price_levels.keys():
+            price_level = self.changed_price_levels[price]
+            if self.log_enabled:
+                self.logger.debug('Changed PL: %s',
+                                  price_level_log(price, price_level))
+            for side in ['b', 's']:
+                amount = price_level.amount(side)
+                if amount >= Decimal(0):
+                    # obanalytics.level2_depth_record
+                    depth_changes.append({"price": price,
+                                          "volume": amount,
+                                          "side": side,
+                                          "bps_level": None})
+            price_level.purge()
+            if price_level.amount("s") is None and\
+                    price_level.amount("b") is None:
+                del self.by_price[price]
+        return depth_changes
 
     def update(self, episode):
         if self.log_enabled:
@@ -143,34 +221,37 @@ class OrderBook(object):
         for e in episode:
             if e["event_no"] > 1:
                 self._remove(e["order_id"])
+                if self.log_enabled:
+                    self.logger.debug(spread_log(self))
             self._add(e)
-
-        result = []
-        for price in self.changed_price_levels.keys():
-            price_level = self.changed_price_levels[price]
             if self.log_enabled:
-                self.logger.debug('Changed PL: %s',
-                                  price_level_log(price, price_level))
-            for side in ['b', 's']:
-                amount = price_level.amount(side)
-                if amount >= Decimal(0):
-                    # obanalytics.level2_depth_record
-                    result.append({"price": price,
-                                   "volume": amount,
-                                   "side": side,
-                                   "bps_level": None})
-            price_level.purge()
-            if price_level.amount("s") is None and\
-                    price_level.amount("b") is None:
-                del self.by_price[price]
+                self.logger.debug(spread_log(self))
+
+        depth_changes = self._post_update()
 
         if self.log_enabled:
             self.logger.debug('OB update %s ends',
                               episode[0]["microtimestamp"])
-        return result
+        return depth_changes
 
     def event(self, order_id):
         return self.by_order_id.get(order_id)
+
+    def spread(self):
+        spread = {}
+        if self.best_bid_level is not None:
+            spread["best_bid_price"] = self.best_bid_level.price
+            spread["best_bid_qty"] = self.best_bid_level.amount('b')
+        else:
+            spread["best_bid_price"] = None
+            spread["best_bid_qty"] = None
+        if self.best_ask_level is not None:
+            spread["best_ask_price"] = self.best_ask_level.price
+            spread["best_ask_qty"] = self.best_ask_level.amount('s')
+        else:
+            spread["best_ask_price"] = None
+            spread["best_ask_qty"] = None
+        return spread
 
     def events(self, price):
         price_level = self.by_price.get(price)
