@@ -147,7 +147,8 @@ class OrderBook(object):
 
             return True
         else:
-            self.logger.debug('Ign %s', event_log(e))
+            if self.log_enabled:
+                self.logger.debug('Ign %s', event_log(e))
             return False
 
     def _remove(self, order_id):
