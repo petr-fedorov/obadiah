@@ -53,7 +53,7 @@ fluidPage(
                          # "1 day"=86399,
                          # "custom"=0
                     ),
-                    selected=3600),
+                    selected=900),
         h5("Center"),
         verbatimTextOutput("time.point.out"),
         fluidRow(column(6, dateInput("date",

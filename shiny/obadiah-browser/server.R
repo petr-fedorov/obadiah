@@ -237,15 +237,16 @@ server <- function(input, output, session) {
 
   spread <- reactive( {
     tp <- timePoint()
-    from.time <- tp-zoomWidth()/2
-    to.time <- tp+zoomWidth()/2
-    exchange <- isolate(input$exchange)
-    pair <- pair()
-
-
-    withProgress(message="loading spread...", {
-        obadiah::spread(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
-      })
+    # from.time <- tp-zoomWidth()/2
+    # to.time <- tp+zoomWidth()/2
+    # exchange <- isolate(input$exchange)
+    # pair <- pair()
+    #
+    #
+    # withProgress(message="loading spread...", {
+    #     obadiah::spread(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
+    #   })
+    obadiah::depth2spread(depth(), tz=tz(tp))
   })
 
   trades <- reactive( {

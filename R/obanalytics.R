@@ -14,16 +14,46 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 
-
-
+#' @import magrittr
 #' @importFrom lubridate with_tz ymd_hms seconds ceiling_date floor_date now minutes duration round_date
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
-#' @importFrom magrittr  %>%
 #' @importFrom zoo na.locf
 #' @importFrom reshape2 dcast melt
-#' @importFrom tibble tibble
+#' @importFrom magrittr  %>%
 #' @importFrom purrr pmap_dfr
+#' @importFrom tibble tibble
+#' @useDynLib obadiah
+
+
+.dummy <- function() {}
+
+#' Securely connects to the OBADiah database
+#'
+#' Establishes a secure TCP/IP connection to the OBADiah database and returns a connection object.
+#' The object is used to communicate with the database.
+#'
+#' @param sslcert path to the client's SSL certificate file, signed by OBADiah database owner
+#' @param sslkey path to the clients' SSL private key
+#' @param host name or IP address of the PostgreSQL server running the OBADiah database
+#' @param port port
+#' @param user user
+#' @param dbname name of PostgreSQL database
+#' @return the connection object as returned by DBI::dbConnect()
+#'
+#' @export
+connect <- function(sslcert, sslkey, host, port, user="obademo",  dbname="ob-analytics-prod") {
+  DBI::dbConnect(RPostgres::Postgres(),
+                 user=user,
+                 dbname=dbname,
+                 host=host,
+                 port=port,
+                 sslmode="require",
+                 sslrootcert=system.file('extdata/root.crt', package="obadiah"),
+                 sslcert=sslcert,
+                 sslkey=sslkey)
+}
+
 
 
 #' @export
@@ -101,6 +131,16 @@ depth <- function(conn, start.time, end.time, exchange, pair, cache=NULL, debug.
   depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
   depth$side <- factor(depth$side, c("bid", "ask"))
   depth
+}
+
+
+#' @export
+depth2spread <- function(depth, tz='UTC') {
+  spread <- with(depth, spread_from_depth(timestamp, price, volume, side))
+  if(!empty(spread)) {
+    spread$timestamp <- with_tz(spread$timestamp, tz)
+  }
+  spread
 }
 
 
@@ -497,7 +537,6 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
   events <- DBI::dbGetQuery(conn, query)
   write.csv(events, file = file, row.names = FALSE)
 }
-
 
 
 #' @export
