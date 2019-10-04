@@ -1,0 +1,7 @@
+# depslib dependency file v1.0
+1570206272 source:/home/petr/repos/obadiah/db/c/spread_by_episode/spread_by_episode.c
+	"postgres.h"
+	"fmgr.h"
+	"funcapi.h"
+	"executor/spi.h"
+

@@ -1828,8 +1828,7 @@ ALTER FUNCTION obanalytics.level1_update_level3_eras() OWNER TO "ob-analytics";
 
 CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level2
     LANGUAGE sql STABLE
-    AS $$
--- NOTE:
+    AS $$-- NOTE:
 --	When 'microtimestamp' in returned record 
 --		1. equals to 'p_start_time' and equals to some 'era' from obanalytics.level3_eras then 'depth_change' is a full depth from obanalytics.order_book(microtimestamp)
 --		2. equals to 'p_start_time' and in the middle of an era or 
@@ -1861,7 +1860,7 @@ from starting_depth_change
 union all
 select level2.*
 -- from periods join obanalytics.level2 on true 
-from periods join obanalytics.depth_change_by_episode(period_start, period_end, p_pair_id, p_exchange_id) level2 on true 
+from periods join obanalytics.depth_change_by_episode2(period_start, period_end, p_pair_id, p_exchange_id) level2 on true 
 where microtimestamp > period_start
   and microtimestamp <= period_end
   and level2.pair_id = p_pair_id
@@ -2716,6 +2715,17 @@ $_$;
 
 
 ALTER FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: spread_by_episode3(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.spread_by_episode3() RETURNS SETOF obanalytics.level1
+    LANGUAGE c STRICT
+    AS '$libdir/libspread_by_episode', 'spread_by_episode';
+
+
+ALTER FUNCTION obanalytics.spread_by_episode3() OWNER TO "ob-analytics";
 
 --
 -- Name: summary(text, text, timestamp with time zone, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
