@@ -1829,7 +1829,6 @@ ALTER FUNCTION obanalytics.level1_update_level3_eras() OWNER TO "ob-analytics";
 CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level2
     LANGUAGE sql STABLE
     AS $$
-
 -- NOTE:
 --	When 'microtimestamp' in returned record 
 --		1. equals to 'p_start_time' and equals to some 'era' from obanalytics.level3_eras then 'depth_change' is a full depth from obanalytics.order_book(microtimestamp)
@@ -1861,7 +1860,8 @@ select *
 from starting_depth_change
 union all
 select level2.*
-from periods join obanalytics.level2 on true 
+-- from periods join obanalytics.level2 on true 
+from periods join obanalytics.depth_change_by_episode(period_start, period_end, p_pair_id, p_exchange_id) level2 on true 
 where microtimestamp > period_start
   and microtimestamp <= period_end
   and level2.pair_id = p_pair_id
@@ -2644,55 +2644,72 @@ ALTER FUNCTION obanalytics.spread_by_episode(p_start_time timestamp with time zo
 CREATE FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, exchange_id smallint, order_book obanalytics.level3[])
     LANGUAGE plpython2u STABLE
     AS $_$
-
 from obadiah_db.orderbook import OrderBook
 import logging
 logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
-
+logger = logging.getLogger(__name__)
 def generator():
-	ob=OrderBook(True) 
-	r =	plpy.execute(
-			plpy.prepare('''select ts, ob
-							from obanalytics.order_book( $1, $2, $3, false, true, $4 )
-						 ''', ["timestamptz", "integer", "integer", "boolean"]),
-		[p_start_time, p_pair_id, p_exchange_id, False])
-	ob.update(r[0]["ob"])
-	spread = ob.spread()
-	spread["microtimestamp"] = r[0]["ts"]
-	spread["pair_id"] = p_pair_id
-	spread["exchange_id"] = p_exchange_id
-	spread["order_book"] = None
-	# yield spread
-	spread["best_bid_price"] = None 
-	for e in plpy.cursor(
-		plpy.prepare('''	with level3 as (
-					 			-- we take only the latest event per episode. In case an order was created and deleted within an episode it will be ignored completely ...
-								select distinct on (microtimestamp, order_id) *	
-								from obanalytics.level3
-								where microtimestamp between $1 and $2
-							  	  and pair_id = $3
-							   	  and exchange_id = $4
-								order by microtimestamp, order_id, event_no desc
-							)
-							select microtimestamp as ts, array_agg(level3) as episode
-							from level3
-							group by microtimestamp
-					 		order by microtimestamp
-					''',["timestamptz", "timestamptz", "integer", "integer"]),
+	spread = None
+	for era in plpy.execute(
+					plpy.prepare('''
+								 with eras as (
+									 select era as era_start, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity') as era_end
+									 from obanalytics.level3_eras
+									 where pair_id = $3
+									   and exchange_id = $4
+								 )
+								 select greatest(era_start, $1) as start_time, least(era_end, $2) as end_time
+								 from eras
+								 where era_start <= $2
+								   and era_end >= $1
+						   ''', ["timestamptz","timestamptz", "integer", "integer"]),
 		[p_start_time, p_end_time, p_pair_id, p_exchange_id]):
-		ob.update(e["episode"])
-		updated_spread = ob.spread()
+		logger.debug('Calculating spreads for %s - %s', era["start_time"],  era["end_time"])
+		ob=OrderBook(False) 
+		if spread is None:
+			r =	plpy.execute(
+					plpy.prepare('''select ts, ob
+									from obanalytics.order_book( $1, $2, $3, false, true, $4 )
+								 ''', ["timestamptz", "integer", "integer", "boolean"]),
+				[era["start_time"], p_pair_id, p_exchange_id, False])
+			if r[0]["ts"] is not None:
+				ob.update(r[0]["ob"])
+			spread = ob.spread()
+			spread["pair_id"] = p_pair_id
+			spread["exchange_id"] = p_exchange_id
+			spread["order_book"] = None
+
+			spread["best_bid_price"] = None 
 		
-		if 	updated_spread["best_bid_price"] != spread["best_bid_price"] or\
-				updated_spread["best_ask_price"] != spread["best_ask_price"] or\
-				updated_spread["best_bid_qty"] != spread["best_bid_qty"] or\
-				updated_spread["best_ask_qty"] != spread["best_ask_qty"]:
-			updated_spread["microtimestamp"] = e["ts"]
-			updated_spread["pair_id"] = p_pair_id
-			updated_spread["exchange_id"] = p_exchange_id
-			updated_spread["order_book"] = None
-			spread = updated_spread
-			yield spread
+		for e in plpy.cursor(
+			plpy.prepare('''	with level3 as (
+									-- we take only the latest event per episode. In case an order was created and deleted within an episode it will be ignored completely ...
+									select distinct on (microtimestamp, order_id) *	
+									from obanalytics.level3
+									where microtimestamp between $1 and $2
+									  and pair_id = $3
+									  and exchange_id = $4
+									order by microtimestamp, order_id, event_no desc
+								)
+								select microtimestamp as ts, array_agg(level3) as episode
+								from level3
+								group by microtimestamp
+								order by microtimestamp
+						''',["timestamptz", "timestamptz", "integer", "integer"]),
+			[era["start_time"], era["end_time"], p_pair_id, p_exchange_id]):
+			ob.update(e["episode"])
+			updated_spread = ob.spread()
+
+			if 	updated_spread["best_bid_price"] != spread["best_bid_price"] or\
+					updated_spread["best_ask_price"] != spread["best_ask_price"] or\
+					updated_spread["best_bid_qty"] != spread["best_bid_qty"] or\
+					updated_spread["best_ask_qty"] != spread["best_ask_qty"]:
+				updated_spread["microtimestamp"] = e["ts"]
+				updated_spread["pair_id"] = p_pair_id
+				updated_spread["exchange_id"] = p_exchange_id
+				updated_spread["order_book"] = None
+				spread = updated_spread
+				yield spread
 return generator()
 
 $_$;

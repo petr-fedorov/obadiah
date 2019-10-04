@@ -614,10 +614,9 @@ CREATE FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time tim
 select * from get._validate_parameters('spread', p_start_time, p_end_time, p_pair_id, p_exchange_id);
 
 select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
-from obanalytics.level1 
-where pair_id = p_pair_id
-  and exchange_id = p_exchange_id
-  and microtimestamp >= p_start_time 
+from obanalytics.spread_by_episode2(p_start_time, p_end_time, p_pair_id, p_exchange_id)
+-- from obanalytics.level1 
+where microtimestamp >= p_start_time 
   and microtimestamp < p_end_time
 	
 $$;
