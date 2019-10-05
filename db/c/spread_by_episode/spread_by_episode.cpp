@@ -1,19 +1,33 @@
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
 #include "postgres.h"
+#include "c.h"
+#include "utils/timestamp.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "executor/spi.h"
+#include "catalog/pg_type_d.h"
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(spread_by_episode);
 
+#ifdef __cplusplus
+}
+#endif // __cplusplus
+
+
+
+
+
 Datum
 spread_by_episode(PG_FUNCTION_ARGS)
 {
     FuncCallContext     *funcctx;
-    int                  call_cntr;
     TupleDesc            tupdesc;
     AttInMetadata       *attinmeta;
+
 
     if (SRF_IS_FIRSTCALL())
     {
@@ -31,17 +45,26 @@ spread_by_episode(PG_FUNCTION_ARGS)
         attinmeta = TupleDescGetAttInMetadata(tupdesc);
         funcctx->attinmeta = attinmeta;
 
+        Oid types[4];
+        types[0] = TIMESTAMPTZOID;
+        types[1] = TIMESTAMPTZOID;
+        types[2] = INT4OID;
+        types[3] = INT4OID;
+
+        Datum values[4];
+        values[0] = PG_GETARG_TIMESTAMPTZ(0);
+        values[1] = PG_GETARG_TIMESTAMPTZ(1);
+        values[2] = PG_GETARG_INT32(2);
+        values[3] = PG_GETARG_INT32(3);
+
         SPI_connect();
-        SPI_cursor_open_with_args("level1", "select * from obanalytics.level1_bitfinex_btcusd order by microtimestamp limit 2", 0, NULL, NULL, NULL, true, 0);
+        SPI_cursor_open_with_args("level1", "select * from obanalytics.level1 where microtimestamp between $1 and $2 and pair_id = $3 and exchange_id = $4 order by microtimestamp", 4, types, values, NULL, true, 0);
         SPI_finish();
 
         MemoryContextSwitchTo(oldcontext);
     }
 
     funcctx = SRF_PERCALL_SETUP();
-
-    call_cntr = funcctx->call_cntr;
-    elog(DEBUG1, "call_cntr: %i", call_cntr);
 
     attinmeta = funcctx->attinmeta;
 

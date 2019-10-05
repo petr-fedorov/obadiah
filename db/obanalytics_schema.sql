@@ -2717,15 +2717,15 @@ $_$;
 ALTER FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: spread_by_episode3(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: spread_by_episode3(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.spread_by_episode3() RETURNS SETOF obanalytics.level1
+CREATE FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level1
     LANGUAGE c STRICT
     AS '$libdir/libspread_by_episode', 'spread_by_episode';
 
 
-ALTER FUNCTION obanalytics.spread_by_episode3() OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
 -- Name: summary(text, text, timestamp with time zone, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
