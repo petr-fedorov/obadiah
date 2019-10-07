@@ -64,14 +64,14 @@ namespace obadiah_db {
         value_type*  // Use pointer if pointer is not a value_type*
         allocate(std::size_t n)
         {
-            elog(INFO, "Allocated!");
+            elog(INFO, "Allocated %lu", n);
             return static_cast<value_type*>(SPI_palloc(n*sizeof(value_type)));
         }
 
         void
-        deallocate(value_type* p, std::size_t) noexcept  // Use pointer if pointer is not a value_type*
+        deallocate(value_type* p, std::size_t n) noexcept  // Use pointer if pointer is not a value_type*
         {
-            elog(INFO, "Deallocated!");
+            elog(INFO, "Deallocated: %lu", n);
             SPI_pfree(p);
         }
 
@@ -181,6 +181,9 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
     funcctx = SRF_PERCALL_SETUP();
 
+    MemoryContext   oldcontext;
+    oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
 
     attinmeta = funcctx->attinmeta;
 
@@ -196,21 +199,15 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
         HeapTuple tuple_in = tuptable->vals[0];
         char **values = (char **) SPI_palloc(tupdesc->natts * sizeof(char *));
 
-
-        MemoryContext   oldcontext;
-        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-        if(funcctx->user_fctx) ((std::vector<int> *)funcctx->user_fctx)->push_back(1);
-
-        MemoryContextSwitchTo(oldcontext);
-
-
+        if(funcctx->user_fctx) ((std::vector<int, obadiah_db::allocator<int>> *)funcctx->user_fctx)->push_back(1);
 
         int i;
         for (i = 1; i <= tupdesc->natts; i++) {
             values[i-1] = SPI_getvalue(tuple_in, tupdesc, i);
         }
         SPI_finish();
+
+        MemoryContextSwitchTo(oldcontext);
 
         HeapTuple tuple_out = BuildTupleFromCStrings(attinmeta, values);
         Datum result = HeapTupleGetDatum(tuple_out);
@@ -220,15 +217,15 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
     }
     else    {   /* do when there is no more left */
 
-        MemoryContext   oldcontext;
-        oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-        elog(INFO, "Size %lu", ((std::vector<int> *)funcctx->user_fctx)->size() );
-        ((std::vector<int> *)funcctx->user_fctx)-> ~vector();
-        MemoryContextSwitchTo(oldcontext);
-
+        elog(INFO, "Size %lu", ((std::vector<int, obadiah_db::allocator<int>> *)funcctx ->user_fctx)->size() );
+        ((std::vector<int, obadiah_db::allocator<int>> *)funcctx->user_fctx)-> ~vector();
         SPI_pfree(funcctx->user_fctx);
+
 //        SPI_cursor_close(SPI_cursor_find("level2"));
         SPI_finish();
+        MemoryContextSwitchTo(oldcontext);
+
+
         SRF_RETURN_DONE(funcctx);
     }
 }
