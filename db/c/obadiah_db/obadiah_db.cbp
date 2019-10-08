@@ -34,8 +34,9 @@
 				</Linker>
 			</Target>
 			<Target title="Experiment">
-				<Option output="test" prefix_auto="1" extension_auto="1" />
-				<Option object_output="objs/Experiment/" />
+				<Option output="bin/Debug/test" prefix_auto="1" extension_auto="1" />
+				<Option working_dir="bin/Debug" />
+				<Option object_output="obj/Experiment/" />
 				<Option type="1" />
 				<Option compiler="gcc" />
 				<Option use_console_runner="0" />
@@ -54,6 +55,7 @@
 		<Extensions>
 			<code_completion>
 				<search_path add="/usr/pgsql-11/include" />
+				<search_path add="/usr/include/c++/8" />
 			</code_completion>
 			<debugger />
 		</Extensions>

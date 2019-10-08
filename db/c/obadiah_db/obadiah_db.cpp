@@ -34,13 +34,16 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 #endif // __cplusplus
 
 #include <vector>
+#include <string>
+#include <map>
 
 
 namespace obadiah_db {
 
+    using namespace std;
 
     template <class T>
-    class allocator
+    class spi_allocator
     {
     public:
         using value_type    = T;
@@ -58,20 +61,20 @@ namespace obadiah_db {
 
     //     template <class U> struct rebind {typedef allocator<U> other;};
 
-        allocator() noexcept {   elog(INFO, "Created!");}  // not required, unless used
-        template <class U> allocator(allocator<U> const&) noexcept {}
+        spi_allocator() noexcept {   elog(INFO, "spi_allocator instantiated");}  // not required, unless used
+        template <class U> spi_allocator(spi_allocator<U> const&) noexcept {}
 
         value_type*  // Use pointer if pointer is not a value_type*
         allocate(std::size_t n)
         {
-            elog(INFO, "Allocated %lu", n);
+            elog(INFO, "Allocated %lu", n*sizeof(value_type));
             return static_cast<value_type*>(SPI_palloc(n*sizeof(value_type)));
         }
 
         void
         deallocate(value_type* p, std::size_t n) noexcept  // Use pointer if pointer is not a value_type*
         {
-            elog(INFO, "Deallocated: %lu", n);
+            elog(INFO, "Deallocated: %lu", n*sizeof(value_type));
             SPI_pfree(p);
         }
 
@@ -115,23 +118,93 @@ namespace obadiah_db {
 
     template <class T, class U>
     bool
-    operator==(allocator<T> const&, allocator<U> const&) noexcept
+    operator==(spi_allocator<T> const&, spi_allocator<U> const&) noexcept
     {
         return true;
     }
 
     template <class T, class U>
     bool
-    operator!=(allocator<T> const& x, allocator<U> const& y) noexcept
+    operator!=(spi_allocator<T> const& x, spi_allocator<U> const& y) noexcept
     {
         return !(x == y);
     }
 
+
+    struct level3 {
+        TimestampTz microtimestamp;
+        int64 order_id;
+        int32 event_no;
+        char side;
+        basic_string<char, char_traits<char>, spi_allocator<char>>  price;
+        string amount;
+        TimestampTz price_microtimestamp;
+
+        level3 () {};
+
+        level3(TimestampTz m, int64 o, int32 e, char s, char *p, char *a, TimestampTz p_m):
+            microtimestamp(m), order_id(o), event_no(e), side(s), price(p), amount(a), price_microtimestamp(p_m) {};
+
+        level3 (const level3 &e) :
+            microtimestamp(e.microtimestamp),order_id(e.order_id), event_no(e.event_no), side(e.side), price(e.price),  amount(e.amount), price_microtimestamp(e.price_microtimestamp)
+         {};
+
+
+    };
+
+
+
+    struct Depth {
+        Depth() :fake_depth_change("{ \"(9860.0,0,b,)\", \"(9890.1,1,s,)\" }"), precision("r0") {};
+        void start_episode(string microtimestamp) {
+            episode = microtimestamp;
+
+        };
+
+
+        void process_level3(HeapTuple tuple, TupleDesc tupdesc) {
+            bool is_null;
+            level3 event {
+                DatumGetTimestampTz(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "microtimestamp"), &is_null)),
+                DatumGetInt64(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "order_id"), &is_null)),
+                DatumGetInt32(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "event_no"), &is_null)),
+                DatumGetChar(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "side"), &is_null)),
+                SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "price")),
+                SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "amount")),
+                DatumGetTimestampTz(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "price_microtimestamp"), &is_null))
+                };
+
+            by_order_id[event.order_id] = event;
+        };
+
+        string &end_episode() {
+            // char *result = (char *)SPI_palloc(fake_depth_change.size()+1);
+            // strcpy(result, fake_depth_change.c_str());
+            //return result;
+            return fake_depth_change;
+            };
+
+        string &get_precision() {
+            return precision;
+        }
+
+        std::string fake_depth_change;
+        std::string precision;
+        string episode;
+        map<int64, level3, less<int64>, spi_allocator<pair<int64, level3>>> by_order_id;
+
+    };
+
+
 }
+
 
 Datum
 depth_change_by_episode(PG_FUNCTION_ARGS)
 {
+    using namespace std;
+    using namespace obadiah_db;
+
     FuncCallContext     *funcctx;
     TupleDesc            tupdesc;
     AttInMetadata       *attinmeta;
@@ -166,16 +239,16 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
         values[3] = PG_GETARG_INT32(3);
 
         SPI_connect();
-        SPI_cursor_open_with_args("level2", "select * from obanalytics.level2 where microtimestamp between $1 and $2 and pair_id = $3 and exchange_id = $4 order by microtimestamp", 4, types, values, NULL, true, 0);
+        SPI_cursor_open_with_args("level3", "select *\
+                                             from obanalytics.level3\
+                                             where microtimestamp between $1 and $2\
+                                               and pair_id = $3\
+                                               and exchange_id = $4\
+                                             order by microtimestamp", 4, types, values, NULL, true, 0);
 
-        obadiah_db::allocator<int> a;
-
-        funcctx->user_fctx = new(SPI_palloc(sizeof(std::vector<int,obadiah_db::allocator<int>>))) std::vector<int,obadiah_db::allocator<int>>(a);
+        funcctx->user_fctx = new((Depth *)SPI_palloc(sizeof(Depth))) Depth {};
 
         SPI_finish();
-
-
-
         MemoryContextSwitchTo(oldcontext);
     }
 
@@ -186,42 +259,48 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
 
     attinmeta = funcctx->attinmeta;
+    Depth *depth = (Depth *) funcctx->user_fctx;
 
     SPI_connect();
-    Portal portal = SPI_cursor_find("level2");
+    Portal portal = SPI_cursor_find("level3");
+
     SPI_cursor_fetch(portal, true, 1);
+
     uint64 proc = SPI_processed;
 
     if(proc == 1 && SPI_tuptable != NULL ) {
 
-        SPITupleTable *tuptable = SPI_tuptable;
-        TupleDesc tupdesc = tuptable->tupdesc;
-        HeapTuple tuple_in = tuptable->vals[0];
-        char **values = (char **) SPI_palloc(tupdesc->natts * sizeof(char *));
+        TupleDesc tupdesc = SPI_tuptable->tupdesc;
+        HeapTuple tuple_in = SPI_tuptable->vals[0];
 
-        if(funcctx->user_fctx) ((std::vector<int, obadiah_db::allocator<int>> *)funcctx->user_fctx)->push_back(1);
+        depth -> process_level3(tuple_in, tupdesc);
 
-        int i;
-        for (i = 1; i <= tupdesc->natts; i++) {
-            values[i-1] = SPI_getvalue(tuple_in, tupdesc, i);
-        }
-        SPI_finish();
+        char **values = (char **) SPI_palloc(5*sizeof(char *)); // obanalytics.level2 has 5 columns
 
-        MemoryContextSwitchTo(oldcontext);
+        values[0] = SPI_getvalue(tuple_in, tupdesc, SPI_fnumber(tupdesc, "microtimestamp"));    // microtimestamp
+        values[1] = SPI_getvalue(tuple_in, tupdesc, SPI_fnumber(tupdesc, "pair_id"));           // pair_id
+        values[2] = SPI_getvalue(tuple_in, tupdesc, SPI_fnumber(tupdesc, "exchange_id"));       // exchange_id
+        values[3] = (char *)depth->get_precision().c_str();                                     // precision
+        values[4] = (char *)depth -> end_episode().c_str();                                     // depth_changes
+
 
         HeapTuple tuple_out = BuildTupleFromCStrings(attinmeta, values);
         Datum result = HeapTupleGetDatum(tuple_out);
 
+        SPI_finish();
+        MemoryContextSwitchTo(oldcontext);
         SRF_RETURN_NEXT(funcctx, result);
 
     }
     else    {   /* do when there is no more left */
 
-        elog(INFO, "Size %lu", ((std::vector<int, obadiah_db::allocator<int>> *)funcctx ->user_fctx)->size() );
-        ((std::vector<int, obadiah_db::allocator<int>> *)funcctx->user_fctx)-> ~vector();
-        SPI_pfree(funcctx->user_fctx);
 
-//        SPI_cursor_close(SPI_cursor_find("level2"));
+        SPI_cursor_close(SPI_cursor_find("level3"));
+
+        elog(INFO, "map size %lu", depth ->by_order_id.size());
+        depth ->~Depth();
+        SPI_pfree(depth);
+
         SPI_finish();
         MemoryContextSwitchTo(oldcontext);
 
