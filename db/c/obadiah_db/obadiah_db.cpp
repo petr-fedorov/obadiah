@@ -19,6 +19,7 @@ extern "C" {
 #endif // __cplusplus
 #include "postgres.h"
 #include "utils/timestamp.h"
+#include "utils/numeric.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "executor/spi.h"
@@ -36,6 +37,7 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 #include <vector>
 #include <string>
 #include <map>
+#include <set>
 
 
 namespace obadiah_db {
@@ -116,6 +118,16 @@ namespace obadiah_db {
     //     using is_always_equal                        = std::is_empty<allocator>;
     };
 
+
+    using spi_string = basic_string<char, char_traits<char>, spi_allocator<char>>;
+
+    template<class Key, class T, class Compare = less<Key>>
+    using spi_map = map<Key, T, Compare, spi_allocator<pair<Key,T>>>;
+
+    template<class T>
+    using spi_vector = vector<T, spi_allocator<T>>;
+
+
     template <class T, class U>
     bool
     operator==(spi_allocator<T> const&, spi_allocator<U> const&) noexcept
@@ -131,67 +143,92 @@ namespace obadiah_db {
     }
 
 
+
+
     struct level3 {
         TimestampTz microtimestamp;
         int64 order_id;
-        int32 event_no;
         char side;
-        basic_string<char, char_traits<char>, spi_allocator<char>>  price;
-        string amount;
+        spi_string  price_str;
+        spi_string  amount_str;
         TimestampTz price_microtimestamp;
+        spi_string next_microtimestamp;
 
         level3 () {};
 
-        level3(TimestampTz m, int64 o, int32 e, char s, char *p, char *a, TimestampTz p_m):
-            microtimestamp(m), order_id(o), event_no(e), side(s), price(p), amount(a), price_microtimestamp(p_m) {};
+        level3 (HeapTuple tuple, TupleDesc tupdesc) :
+                price_str(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "price"))),
+                amount_str(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "amount"))),
+                next_microtimestamp(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "next_microtimestamp"))) {
+            bool is_null;
+            Datum value;
+            value = SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "microtimestamp"), &is_null);
+            if(!is_null) microtimestamp = DatumGetTimestampTz(value);
+            value = SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "order_id"), &is_null);
+            if(!is_null) order_id = DatumGetInt64(value);
+            value = SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "side"), &is_null);
+            if(!is_null) side = DatumGetChar(value);
+            value=SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "price_microtimestamp"), &is_null);
+            if(!is_null) price_microtimestamp = DatumGetTimestampTz(value);
+        };
+
+        level3(TimestampTz m, int64 o, char s, char *p, char *a, TimestampTz p_m, char *n_m):
+            microtimestamp(m), order_id(o), side(s), price_str(p), amount_str(a), price_microtimestamp(p_m), next_microtimestamp(n_m) {};
 
         level3 (const level3 &e) :
-            microtimestamp(e.microtimestamp),order_id(e.order_id), event_no(e.event_no), side(e.side), price(e.price),  amount(e.amount), price_microtimestamp(e.price_microtimestamp)
+            microtimestamp(e.microtimestamp),order_id(e.order_id), side(e.side), price_str(e.price_str),  amount_str(e.amount_str), price_microtimestamp(e.price_microtimestamp),
+            next_microtimestamp(e.next_microtimestamp)
          {};
 
+         bool is_order_deleted() {
+            return next_microtimestamp.compare("-infinity");
+         }
 
     };
 
+    struct level3_compare {
+        bool operator() (const level3 *x, const level3 * y) const {return x->price_microtimestamp < y->price_microtimestamp; }    // TODO: write 'real' comparison
+    };
+
+    using same_price_level3 = set<level3 *, level3_compare,  spi_allocator<level3 *>>;
 
 
-    struct Depth {
-        Depth() :fake_depth_change("{ \"(9860.0,0,b,)\", \"(9890.1,1,s,)\" }"), precision("r0") {};
-        void start_episode(string microtimestamp) {
-            episode = microtimestamp;
+    struct depth {
+        depth() :fake_depth_change("{ \"(9860.0,0,b,)\", \"(9890.1,1,s,)\" }"), precision("r0") {};
 
+        inline void append_level3_to_episode(level3 &event) {
+            episode_ts = event.microtimestamp;
+            episode.push_back(event);
+            elog(INFO, "Added event to episode, episode.size() %lu", episode.size());
+
+            // level3 &inserted {by_order_id[event.order_id] = event};
+            // by_price[event.price_str].insert(&inserted);
+
+        }
+        spi_string &end_episode() {
+
+            if(episode.size() > 0 ) {
+                previous_depth_change.assign(fake_depth_change);
+                episode.clear();
+            }
+            else
+                previous_depth_change.erase();
+            elog(INFO, "End episode %s", previous_depth_change.c_str() );
+            return previous_depth_change;
         };
 
-
-        void process_level3(HeapTuple tuple, TupleDesc tupdesc) {
-            bool is_null;
-            level3 event {
-                DatumGetTimestampTz(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "microtimestamp"), &is_null)),
-                DatumGetInt64(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "order_id"), &is_null)),
-                DatumGetInt32(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "event_no"), &is_null)),
-                DatumGetChar(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "side"), &is_null)),
-                SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "price")),
-                SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "amount")),
-                DatumGetTimestampTz(SPI_getbinval(tuple, tupdesc, SPI_fnumber(tupdesc, "price_microtimestamp"), &is_null))
-                };
-
-            by_order_id[event.order_id] = event;
-        };
-
-        string &end_episode() {
-            // char *result = (char *)SPI_palloc(fake_depth_change.size()+1);
-            // strcpy(result, fake_depth_change.c_str());
-            //return result;
-            return fake_depth_change;
-            };
-
-        string &get_precision() {
+        spi_string &get_precision() {
             return precision;
         }
 
-        std::string fake_depth_change;
-        std::string precision;
-        string episode;
-        map<int64, level3, less<int64>, spi_allocator<pair<int64, level3>>> by_order_id;
+        spi_string fake_depth_change;
+        spi_string precision;
+
+        spi_map<int64, level3> by_order_id;
+        spi_map<spi_string, same_price_level3> by_price;
+        spi_vector<level3> episode;
+        TimestampTz episode_ts;
+        spi_string previous_depth_change;
 
     };
 
@@ -208,6 +245,8 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
     FuncCallContext     *funcctx;
     TupleDesc            tupdesc;
     AttInMetadata       *attinmeta;
+
+    TimestampTz         episode_microtimestamp {0};
 
     if (SRF_IS_FIRSTCALL())
     {
@@ -246,7 +285,7 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
                                                and exchange_id = $4\
                                              order by microtimestamp", 4, types, values, NULL, true, 0);
 
-        funcctx->user_fctx = new((Depth *)SPI_palloc(sizeof(Depth))) Depth {};
+        funcctx->user_fctx = new((depth *)SPI_palloc(sizeof(depth))) depth {};
 
         SPI_finish();
         MemoryContextSwitchTo(oldcontext);
@@ -259,29 +298,47 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
 
     attinmeta = funcctx->attinmeta;
-    Depth *depth = (Depth *) funcctx->user_fctx;
+    depth *current_depth = (depth *) funcctx->user_fctx;
 
     SPI_connect();
     Portal portal = SPI_cursor_find("level3");
 
     SPI_cursor_fetch(portal, true, 1);
 
-    uint64 proc = SPI_processed;
+    spi_string depth_change {};
 
-    if(proc == 1 && SPI_tuptable != NULL ) {
+    while (SPI_processed == 1 && SPI_tuptable != NULL ) {
 
-        TupleDesc tupdesc = SPI_tuptable->tupdesc;
-        HeapTuple tuple_in = SPI_tuptable->vals[0];
+        level3 event {SPI_tuptable->vals[0], SPI_tuptable->tupdesc};
 
-        depth -> process_level3(tuple_in, tupdesc);
+        if (episode_microtimestamp == 0) episode_microtimestamp = current_depth-> episode_ts;
 
-        char **values = (char **) SPI_palloc(5*sizeof(char *)); // obanalytics.level2 has 5 columns
+        if (episode_microtimestamp == current_depth-> episode_ts) {   // Continue accumulation of events for the current episode
+            current_depth -> append_level3_to_episode(event);
+        }
+        else {
+            depth_change = current_depth -> end_episode();
+            current_depth -> append_level3_to_episode(event);
+            break;
+        }
+        SPI_cursor_fetch(portal, true, 1);
+    }
 
-        values[0] = SPI_getvalue(tuple_in, tupdesc, SPI_fnumber(tupdesc, "microtimestamp"));    // microtimestamp
-        values[1] = SPI_getvalue(tuple_in, tupdesc, SPI_fnumber(tupdesc, "pair_id"));           // pair_id
-        values[2] = SPI_getvalue(tuple_in, tupdesc, SPI_fnumber(tupdesc, "exchange_id"));       // exchange_id
-        values[3] = (char *)depth->get_precision().c_str();                                     // precision
-        values[4] = (char *)depth -> end_episode().c_str();                                     // depth_changes
+    if(current_depth->episode.size() > 0) // The last episode
+        depth_change = current_depth -> end_episode();
+
+    if(!depth_change.empty()) {
+        char **values = (char **) SPI_palloc(5*sizeof(char *));                                 // obanalytics.level2 has 5 columns
+
+        string microtimestamp {timestamptz_to_str(episode_microtimestamp)};
+        string pair_id (to_string(PG_GETARG_INT32(2)));
+        string exchange_id {to_string(PG_GETARG_INT32(3))};
+
+        values[0] = (char *)microtimestamp.c_str();
+        values[1] = (char *)pair_id.c_str();
+        values[2] = (char *)exchange_id.c_str();
+        values[3] = (char *)current_depth -> get_precision().c_str();                           // precision
+        values[4] = (char *)depth_change.c_str();                                               // depth_changes
 
 
         HeapTuple tuple_out = BuildTupleFromCStrings(attinmeta, values);
@@ -290,24 +347,15 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
         SPI_finish();
         MemoryContextSwitchTo(oldcontext);
         SRF_RETURN_NEXT(funcctx, result);
-
     }
-    else    {   /* do when there is no more left */
-
-
-        SPI_cursor_close(SPI_cursor_find("level3"));
-
-        elog(INFO, "map size %lu", depth ->by_order_id.size());
-        depth ->~Depth();
-        SPI_pfree(depth);
-
-        SPI_finish();
-        MemoryContextSwitchTo(oldcontext);
-
-
-        SRF_RETURN_DONE(funcctx);
-    }
+    SPI_cursor_close(SPI_cursor_find("level3"));
+    current_depth ->~depth();
+    SPI_pfree(current_depth);
+    SPI_finish();
+    MemoryContextSwitchTo(oldcontext);
+    SRF_RETURN_DONE(funcctx);
 }
+
 
 
 
