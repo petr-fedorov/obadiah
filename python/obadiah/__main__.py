@@ -54,6 +54,9 @@ def main():
                         "PostgreSQL database role to be used to save the data"
                         "(default: ob-analytics),",
                         default="ob-analytics")
+    parser.add_argument("-p", "--port", help="where PORT is the listening port "
+                        "of the PostgreSQL server (default 5432)",
+                        default="5432")
     args = parser.parse_args()
     sslkeylog.set_keylog("sslkeylog.txt")
 
@@ -84,6 +87,7 @@ def main():
                                                 stream[0],
                                                 args.user,
                                                 args.dbname,
+                                                args.port,
                                                 ws_url,
                                                 mh))
         loop = asyncio.get_event_loop()

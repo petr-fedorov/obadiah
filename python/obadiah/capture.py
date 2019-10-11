@@ -96,12 +96,13 @@ class MessageHandler:
 
 
 
-async def capture(exchange, pair, user, database, url, message_handler):
+async def capture(exchange, pair, user, database, port, url, message_handler):
     logger = logging.getLogger(__name__ + ".capture")
-    logger.info(f'Started {exchange}, {pair}, {user}, {database}')
+    logger.info(f'Started {exchange}, {pair}, {user}, {database}, {port}')
 
     async with await asyncpg.create_pool(user=user, database=database,
-                                         min_size=1, max_size=1) as pool:
+                                         port=port, min_size=1,
+                                         max_size=1) as pool:
 
         async with pool.acquire() as con:
 
