@@ -13,7 +13,6 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -34,99 +33,24 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 }
 #endif // __cplusplus
 
+
 #include <vector>
 #include <string>
 #include <map>
 #include <set>
 #include <sstream>
-
-#define ELOGS 0
+#include "spi_allocator.h"
+#define ELOGS 1
 
 
 namespace obadiah_db {
 
     using namespace std;
 
-    template <class T>
-    class spi_allocator
-    {
-    public:
-        using value_type    = T;
-
-    //     using pointer       = value_type*;
-    //     using const_pointer = typename std::pointer_traits<pointer>::template
-    //                                                     rebind<value_type const>;
-    //     using void_pointer       = typename std::pointer_traits<pointer>::template
-    //                                                           rebind<void>;
-    //     using const_void_pointer = typename std::pointer_traits<pointer>::template
-    //                                                           rebind<const void>;
-
-    //     using difference_type = typename std::pointer_traits<pointer>::difference_type;
-    //     using size_type       = std::make_unsigned_t<difference_type>;
-
-    //     template <class U> struct rebind {typedef allocator<U> other;};
-
-        spi_allocator() noexcept {   //elog(DEBUG1, "spi_allocator instantiated");
-        }  // not required, unless used
-        template <class U> spi_allocator(spi_allocator<U> const&) noexcept {}
-
-        value_type*  // Use pointer if pointer is not a value_type*
-        allocate(std::size_t n)
-        {
-            // elog(DEBUG1, "Allocated %lu", n*sizeof(value_type));
-            return static_cast<value_type*>(SPI_palloc(n*sizeof(value_type)));
-        }
-
-        void
-        deallocate(value_type* p, std::size_t n) noexcept  // Use pointer if pointer is not a value_type*
-        {
-            // elog(DEBUG1, "Deallocated: %lu", n*sizeof(value_type));
-            SPI_pfree(p);
-        }
-
-    //     value_type*
-    //     allocate(std::size_t n, const_void_pointer)
-    //     {
-    //         return allocate(n);
-    //     }
-
-    //     template <class U, class ...Args>
-    //     void
-    //     construct(U* p, Args&& ...args)
-    //     {
-    //         ::new(p) U(std::forward<Args>(args)...);
-    //     }
-
-    //     template <class U>
-    //     void
-    //     destroy(U* p) noexcept
-    //     {
-    //         p->~U();
-    //     }
-
-    //     std::size_t
-    //     max_size() const noexcept
-    //     {
-    //         return std::numeric_limits<size_type>::max();
-    //     }
-
-    //     allocator
-    //     select_on_container_copy_construction() const
-    //     {
-    //         return *this;
-    //     }
-
-    //     using propagate_on_container_copy_assignment = std::false_type;
-    //     using propagate_on_container_move_assignment = std::false_type;
-    //     using propagate_on_container_swap            = std::false_type;
-    //     using is_always_equal                        = std::is_empty<allocator>;
-    };
-
-
     using spi_string = basic_string<char, char_traits<char>, spi_allocator<char>>;
 
     template<class Key, class T, class Compare = less<Key>>
-    using spi_map = map<Key, T, Compare, spi_allocator<pair<Key,T>>>;
+    using spi_map = map<Key, T, Compare, spi_allocator<pair<const Key, T>>>;
 
     template<class T>
     using spi_vector = vector<T, spi_allocator<T>>;
@@ -198,7 +122,7 @@ namespace obadiah_db {
          {};
 
          bool is_order_deleted() {
-            return next_microtimestamp.compare("-infinity");
+            return next_microtimestamp.compare("-infinity") == 0;
          }
 
          string __str__() const{
@@ -248,7 +172,7 @@ namespace obadiah_db {
                     else level.ask = event->amount;
             }
 #if ELOGS
-            elog(DEBUG1, "get_price_level(%s) returns (bid %Lf,  ask %Lf)", price_str.c_str(), level.bid, level.ask);
+            elog(DEBUG2, "get_price_level(%s) returns (bid %Lf,  ask %Lf)", price_str.c_str(), level.bid, level.ask);
 #endif
 
             return level;
@@ -257,7 +181,7 @@ namespace obadiah_db {
         inline void append_level3_to_episode(const level3 &event) {
             episode.push_back(event);
 #if ELOGS
-            elog(DEBUG1, "Added %s, episode.size() %lu", event.__str__().c_str() , episode.size());
+            elog(DEBUG3, "Added %s, episode.size() %lu", event.__str__().c_str() , episode.size());
 #endif // ELOGS
 
             // level3 &inserted {by_order_id[event.order_id] = event};
@@ -267,8 +191,8 @@ namespace obadiah_db {
 
         spi_string &end_episode() noexcept {
 #if ELOGS
-            elog(DEBUG1, "Ending episode %s", timestamptz_to_str(episode_ts));
-            elog(DEBUG1, "get_price_level() before ...");
+            elog(DEBUG2, "Ending episode %s", timestamptz_to_str(episode_ts));
+            elog(DEBUG2, "get_price_level() before ...");
 #endif
             map<spi_string,price_level> depth_before {};
 
@@ -283,7 +207,11 @@ namespace obadiah_db {
                         previous_event = &(by_order_id.at(event.order_id));
                         changed_prices.insert(previous_event->price_str);
                     }
-                    catch ( ... ) {};
+                    catch ( ... ) {
+#if ELOGS
+                        elog(WARNING, "No previous event for %s %lu %i",timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no );
+#endif
+                    };
 
                 }
 
@@ -292,16 +220,23 @@ namespace obadiah_db {
                 }
 
                 if(previous_event) {
+#if ELOGS
+                    elog(DEBUG3, "Removed %s %lu %i", timestamptz_to_str(previous_event->microtimestamp), previous_event->order_id, previous_event->event_no);
+#endif
                     by_price[previous_event->price_str].erase(previous_event);
                     by_order_id.erase(previous_event->order_id);
                 }
-                by_price[event.price_str].insert(&(by_order_id[event.order_id] = event));
-
+                if(!event.is_order_deleted()) {
+                    by_price[event.price_str].insert(&(by_order_id[event.order_id] = event));
+#if ELOGS
+                    elog(DEBUG3, "Added %s %lu %i", timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no);
+#endif
+                }
             }
 
             previous_depth_change.erase();
 #if ELOGS
-            elog(DEBUG1, "get_price_level() after ...");
+            elog(DEBUG2, "get_price_level() after ...");
 #endif
             previous_depth_change.append("{");
             for(auto &depth : depth_before) {
@@ -345,6 +280,7 @@ namespace obadiah_db {
 
         spi_string precision;
 
+        //map<int64, level3, less<int64>, spi_allocator<level3>> by_order_id;
         spi_map<int64, level3> by_order_id;
         spi_map<spi_string, same_price_level3> by_price;
         spi_vector<level3> episode;
@@ -372,7 +308,9 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
     if (SRF_IS_FIRSTCALL())
     {
 #if ELOGS
-        elog(DEBUG1, "started depth_change_by_episode");
+        string p_start_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(0))};
+        string p_end_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(1))};
+        elog(DEBUG1, "depth_change_by_episode(%s, %s, %i, %i)", p_start_time.c_str(), p_end_time.c_str(),PG_GETARG_INT32(2), PG_GETARG_INT32(3) );
 #endif // ELOGS
         MemoryContext   oldcontext;
 
@@ -458,16 +396,20 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
     SPI_cursor_fetch(portal, true, 1);
 
     spi_string depth_change {"{}"};
+    bool is_done = true;
 
     while (SPI_processed == 1 && SPI_tuptable != NULL ) {
 
         level3 event {SPI_tuptable->vals[0], SPI_tuptable->tupdesc};
 
+
         if (episode_microtimestamp == 0) {
             if ( current_depth-> episode_ts != 0 )
                 episode_microtimestamp = current_depth-> episode_ts;
-            else
+            else {
                 episode_microtimestamp = event.microtimestamp;
+                current_depth-> episode_ts = event.microtimestamp;
+            }
         }
 
         if (episode_microtimestamp == event.microtimestamp) {   // Continue accumulation of events for the current episode
@@ -475,15 +417,19 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
         }
         else {
             depth_change = current_depth -> end_episode();
+            current_depth-> episode_ts = event.microtimestamp;
             current_depth -> append_level3_to_episode(event);
-            // elog(DEBUG1,"Break, depth_change %s", depth_change.c_str());
-            break;
+            if(depth_change.compare("{}")!=0) {
+                is_done = false;
+                break;
+            }
         }
         SPI_cursor_fetch(portal, true, 1);
     }
 
-    if(depth_change.compare("{}") == 0 && current_depth->episode.size() > 0) { // The last episode
+    if(is_done && current_depth->episode.size() > 0) { // The last episode
         depth_change = current_depth -> end_episode();
+        episode_microtimestamp = current_depth->episode_ts;
 #if ELOGS
         elog(DEBUG1, "The last episode ended");
 #endif // ELOGS

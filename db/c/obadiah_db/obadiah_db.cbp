@@ -14,8 +14,10 @@
 				<Option createDefFile="1" />
 				<Option createStaticLib="1" />
 				<Compiler>
+					<Add option="-std=c++11" />
 					<Add option="-fPIC" />
 					<Add option="-g" />
+					<Add option="-v" />
 				</Compiler>
 			</Target>
 			<Target title="Release">
@@ -48,6 +50,10 @@
 			<Add option="-Wall" />
 		</Compiler>
 		<Unit filename="obadiah_db.cpp">
+			<Option target="Debug" />
+			<Option target="Release" />
+		</Unit>
+		<Unit filename="spi_allocator.h">
 			<Option target="Debug" />
 			<Option target="Release" />
 		</Unit>
