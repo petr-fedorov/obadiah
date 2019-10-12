@@ -40,7 +40,7 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 #include <set>
 #include <sstream>
 #include "spi_allocator.h"
-#define ELOGS 1
+#define ELOGS 0
 
 
 namespace obadiah_db {
@@ -436,7 +436,10 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
     }
 
     if(depth_change.compare("{}")!=0) {
-        char **values = (char **) SPI_palloc(5*sizeof(char *));                                 // obanalytics.level2 has 5 columns
+        SPI_finish();
+        MemoryContextSwitchTo(oldcontext);
+
+        char **values = (char **) palloc(5*sizeof(char *));                                 // obanalytics.level2 has 5 columns
 
         string microtimestamp {timestamptz_to_str(episode_microtimestamp)};
         string pair_id (to_string(PG_GETARG_INT32(2)));
@@ -447,13 +450,13 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
         values[2] = (char *)exchange_id.c_str();
         values[3] = (char *)current_depth -> get_precision().c_str();                           // precision
         values[4] = (char *)depth_change.c_str();                                               // depth_changes
-
+#if ELOGS
+	  elog(DEBUG2,"BuildTupleFromCStrings:  %s %s %s %s %s", values[0], values[1], values[2], values[3], values[4]);
+#endif
 
         HeapTuple tuple_out = BuildTupleFromCStrings(attinmeta, values);
         Datum result = HeapTupleGetDatum(tuple_out);
 
-        SPI_finish();
-        MemoryContextSwitchTo(oldcontext);
         SRF_RETURN_NEXT(funcctx, result);
     }
 #if ELOGS
