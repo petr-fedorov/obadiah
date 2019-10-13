@@ -181,7 +181,7 @@ namespace obadiah_db {
         inline void append_level3_to_episode(const level3 &event) {
             episode.push_back(event);
 #if ELOGS
-            elog(DEBUG3, "Added %s, episode.size() %lu", event.__str__().c_str() , episode.size());
+            elog(DEBUG3, "Added to episode %s, episode.size() %lu", event.__str__().c_str() , episode.size());
 #endif // ELOGS
 
             // level3 &inserted {by_order_id[event.order_id] = event};
@@ -221,7 +221,7 @@ namespace obadiah_db {
 
                 if(previous_event) {
 #if ELOGS
-                    elog(DEBUG3, "Removed %s %lu %i", timestamptz_to_str(previous_event->microtimestamp), previous_event->order_id, previous_event->event_no);
+                    elog(DEBUG3, "OB deleted %s %lu %i", timestamptz_to_str(previous_event->microtimestamp), previous_event->order_id, previous_event->event_no);
 #endif
                     by_price[previous_event->price_str].erase(previous_event);
                     by_order_id.erase(previous_event->order_id);
@@ -229,7 +229,7 @@ namespace obadiah_db {
                 if(!event.is_order_deleted()) {
                     by_price[event.price_str].insert(&(by_order_id[event.order_id] = event));
 #if ELOGS
-                    elog(DEBUG3, "Added %s %lu %i", timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no);
+                    elog(DEBUG3, "OB added %s %lu %i", timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no);
 #endif
                 }
             }
@@ -419,23 +419,22 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
             depth_change = current_depth -> end_episode();
             current_depth-> episode_ts = event.microtimestamp;
             current_depth -> append_level3_to_episode(event);
-            if(depth_change.compare("{}")!=0) {
-                is_done = false;
-                break;
-            }
+            is_done = false;
+            break;
         }
         SPI_cursor_fetch(portal, true, 1);
     }
 
     if(is_done && current_depth->episode.size() > 0) { // The last episode
-        depth_change = current_depth -> end_episode();
-        episode_microtimestamp = current_depth->episode_ts;
+      depth_change = current_depth -> end_episode();
+      episode_microtimestamp = current_depth->episode_ts;
+      is_done = false;
 #if ELOGS
-        elog(DEBUG1, "The last episode ended");
+      elog(DEBUG1, "The last episode ended");
 #endif // ELOGS
     }
 
-    if(depth_change.compare("{}")!=0) {
+    if(!is_done) {
         SPI_finish();
         MemoryContextSwitchTo(oldcontext);
 
@@ -459,6 +458,7 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
         SRF_RETURN_NEXT(funcctx, result);
     }
+
 #if ELOGS
     elog(DEBUG1, "End!");
 #endif
