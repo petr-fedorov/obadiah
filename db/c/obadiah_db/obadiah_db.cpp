@@ -40,7 +40,6 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 #include <set>
 #include <sstream>
 #include "spi_allocator.h"
-#define ELOGS 0
 
 
 namespace obadiah_db {
@@ -239,29 +238,34 @@ namespace obadiah_db {
             elog(DEBUG2, "get_price_level() after ...");
 #endif
             previous_depth_change.append("{");
+            const int BUFFER_SIZE = 50;
+            char buffer[BUFFER_SIZE];
             for(auto &depth : depth_before) {
                 price_level after = get_price_level(depth.first);
 
                 if(after.bid != depth.second.bid) {
                     if(previous_depth_change.size() > 1) previous_depth_change.append(",");
-                    const char *amount;
-                    if(after.bid > 0 ) amount = to_string(after.bid).c_str();
-                    else amount = "0";
+                    if(after.bid > 0 ) 
+                      snprintf(buffer, BUFFER_SIZE, "%.8LF", after.bid); //amount = to_string(after.bid).c_str();
+                    else
+                      snprintf(buffer, BUFFER_SIZE, "%.8LF", 0.0L); //amount = to_string(after.bid).c_str();
                     previous_depth_change.append("\"(");
                     previous_depth_change.append(depth.first);
                     previous_depth_change.append(",");
-                    previous_depth_change.append(amount);
+                    previous_depth_change.append(buffer);
                     previous_depth_change.append(",b,)\"");
                 }
                 if(after.ask != depth.second.ask) {
                     if(previous_depth_change.size() > 1) previous_depth_change.append(",");
-                    const char *amount;
-                    if(after.ask > 0 ) amount = to_string(after.ask).c_str();
-                    else amount = "0";
+                    // const char *amount;
+                    if(after.ask > 0 ) // amount = to_string(after.ask).c_str();
+                      snprintf(buffer, BUFFER_SIZE, "%.8LF", after.ask); //amount = to_string(after.bid).c_str();
+                    else // amount = "0";
+                      snprintf(buffer, BUFFER_SIZE, "%.8LF", 0.0L); //amount = to_string(after.bid).c_str();
                     previous_depth_change.append("\"(");
                     previous_depth_change.append(depth.first);
                     previous_depth_change.append(",");
-                    previous_depth_change.append(amount);
+                    previous_depth_change.append(buffer);
                     previous_depth_change.append(",s,)\"");
                 }
             }

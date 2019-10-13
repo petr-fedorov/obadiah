@@ -748,17 +748,16 @@ ALTER FUNCTION obanalytics._depth_change(p_obs obanalytics.pair_of_ob) OWNER TO 
 
 CREATE FUNCTION obanalytics._depth_change(p_ob_before obanalytics.level3[], p_ob_after obanalytics.level3[]) RETURNS obanalytics.level2_depth_record[]
     LANGUAGE sql
-    AS $$
-select array_agg(row(price, coalesce(af.amount, 0), side, null::integer)::obanalytics.level2_depth_record  order by price)
+    AS $$select array_agg(row(price, coalesce(af.amount, 0), side, null::integer)::obanalytics.level2_depth_record  order by price)
 from (
 	select a.price, sum(a.amount) as amount,a.side
 	from unnest(p_ob_before) a 
-	where a.is_maker 
+	-- where a.is_maker 
 	group by a.price, a.side, a.pair_id
 ) bf full join (
 	select a.price, sum(a.amount) as amount, a.side
 	from unnest(p_ob_after) a 
-	where a.is_maker 
+	-- where a.is_maker 
 	group by a.price, a.side, a.pair_id
 ) af using (price, side)
 where bf.amount is distinct from af.amount
@@ -1137,9 +1136,8 @@ CREATE FUNCTION obanalytics._order_book_after_episode(p_ob obanalytics.level3[],
 				select array(
 					select orders::obanalytics.level3
 					from orders
-					where is_maker 
-					    or not p_check_takers 
-					    or obanalytics._is_valid_taker_event(microtimestamp, order_id, event_no, pair_id, exchange_id, next_microtimestamp)
+					where not p_check_takers 
+					    or (is_maker or (not is_maker and obanalytics._is_valid_taker_event(microtimestamp, order_id, event_no, pair_id, exchange_id, next_microtimestamp)))
 					order by price, microtimestamp, order_id, event_no 
 					-- order by must be the same as in obanalytics.order_book(). Change both!					
 				));
@@ -1331,14 +1329,12 @@ PARTITION BY LIST (exchange_id);
 ALTER TABLE obanalytics.level2 OWNER TO "ob-analytics";
 
 --
--- Name: depth_change_by_episode(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: depth_change_by_episode(timestamp with time zone, timestamp with time zone, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level2
+CREATE FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean DEFAULT true) RETURNS SETOF obanalytics.level2
     LANGUAGE plpgsql STABLE
-    AS $$
-
--- ARGUMENTS
+    AS $$-- ARGUMENTS
 --		p_start_time - the start of the interval for the calculation of depths
 --		p_end_time	 - the end of the interval
 --		p_pair_id	 - the id of pair for which depths will be calculated
@@ -1351,15 +1347,16 @@ declare
 begin
 	
 	select ts, ob 
-	from obanalytics.order_book(p_start_time, p_pair_id, p_exchange_id, p_only_makers := true, p_before := true) 
+	from obanalytics.order_book(p_start_time, p_pair_id, p_exchange_id, p_only_makers := false, p_before := true) 
 	into v_ob_before;	-- so there will be a depth_change generated for the very first episode greater or equal to p_start_time
 	
-	for v_ob in select ts, ob from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id) 
+	for v_ob in select ts, ob from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers) 
 	loop
 		if v_ob_before is not null then -- if p_start_time equals to an era start then v_ob_before will be null 
 										 -- so we don't generate depth_change for the era start
+													 
 			return query 
-				select v_ob.ts, p_pair_id::smallint, p_exchange_id::smallint, 'r0'::character(2), d
+				select v_ob.ts, p_pair_id::smallint, p_exchange_id::smallint, 'r0'::character(2), coalesce(d, '{}')
 				from obanalytics._depth_change(v_ob_before.ob, v_ob.ob) d;
 		end if;
 		v_ob_before := v_ob;
@@ -1369,7 +1366,7 @@ end;
 $$;
 
 
-ALTER FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: depth_change_by_episode2(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1415,6 +1412,17 @@ $_$;
 
 
 ALTER FUNCTION obanalytics.depth_change_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: depth_change_by_episode3(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: postgres
+--
+
+CREATE FUNCTION obanalytics.depth_change_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level2
+    LANGUAGE c STRICT
+    AS '$libdir/libobadiah_db', 'depth_change_by_episode';
+
+
+ALTER FUNCTION obanalytics.depth_change_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO postgres;
 
 --
 -- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1860,7 +1868,7 @@ from starting_depth_change
 union all
 select level2.*
 -- from periods join obanalytics.level2 on true 
-from periods join obanalytics.depth_change_by_episode2(period_start, period_end, p_pair_id, p_exchange_id) level2 on true 
+from periods join obanalytics.depth_change_by_episode3(period_start, period_end, p_pair_id, p_exchange_id) level2 on true 
 where microtimestamp > period_start
   and microtimestamp <= period_end
   and level2.pair_id = p_pair_id
