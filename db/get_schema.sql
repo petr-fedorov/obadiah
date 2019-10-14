@@ -115,10 +115,9 @@ ALTER FUNCTION get._validate_parameters(p_request text, p_start_time timestamp w
 CREATE FUNCTION get.available_exchanges() RETURNS SETOF text
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
-
 select distinct exchange 
 from obanalytics.level3_eras join obanalytics.exchanges using (exchange_id)
-where level2 is not null
+where level3 is not null
 
 $$;
 
@@ -132,7 +131,6 @@ ALTER FUNCTION get.available_exchanges() OWNER TO "ob-analytics";
 CREATE FUNCTION get.available_pairs(p_exchange_id integer) RETURNS SETOF text
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
-
 select distinct pair
 from obanalytics.level3_eras join obanalytics.pairs using (pair_id)
 where exchange_id = p_exchange_id 
@@ -148,8 +146,7 @@ ALTER FUNCTION get.available_pairs(p_exchange_id integer) OWNER TO "ob-analytics
 
 CREATE FUNCTION get.available_period(p_exchange_id integer, p_pair_id integer) RETURNS TABLE(s timestamp with time zone, e timestamp with time zone)
     LANGUAGE sql SECURITY DEFINER
-    AS $$
- select min(level2), max(level2)
+    AS $$ select min(era), max(level3)
  from obanalytics.level3_eras
  where exchange_id = p_exchange_id
    and pair_id = p_pair_id
@@ -184,10 +181,10 @@ $$;
 ALTER FUNCTION get.data_overview(p_exchange text, p_pair text, p_r integer) OWNER TO "ob-analytics";
 
 --
--- Name: depth(timestamp with time zone, timestamp with time zone, integer, integer, boolean, boolean); Type: FUNCTION; Schema: get; Owner: ob-analytics
+-- Name: depth(timestamp with time zone, timestamp with time zone, integer, integer, interval, boolean, boolean); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_starting_depth boolean DEFAULT true, p_depth_changes boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
+CREATE FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_starting_depth boolean DEFAULT true, p_depth_changes boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
@@ -209,7 +206,8 @@ level2 as (
 									   					 -- will return full depth from order book - see comment above
 									    p_end_time,
 									    p_pair_id,
-									    p_exchange_id) level2
+									    p_exchange_id,
+									  	p_frequency) level2
 		  join unnest(level2.depth_change) d on true
 	where p_depth_changes
 )
@@ -227,7 +225,7 @@ where price is not null   -- null might happen if an aggressor order_created eve
 $$;
 
 
-ALTER FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_starting_depth boolean, p_depth_changes boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_starting_depth boolean, p_depth_changes boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: depth_summary(timestamp with time zone, timestamp with time zone, integer, integer, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics

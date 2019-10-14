@@ -157,8 +157,8 @@ namespace obadiah_db {
     };
 
 
-    struct depth {
-        depth() : precision("r0"), episode_ts(0) {};
+    struct order_book {
+        order_book() : precision("r0"), episode_ts(0) {};
 
         price_level get_price_level(const spi_string &price_str) noexcept {
             price_level level {};
@@ -311,11 +311,6 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
     if (SRF_IS_FIRSTCALL())
     {
-#if ELOGS
-        string p_start_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(0))};
-        string p_end_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(1))};
-        elog(DEBUG1, "depth_change_by_episode(%s, %s, %i, %i)", p_start_time.c_str(), p_end_time.c_str(),PG_GETARG_INT32(2), PG_GETARG_INT32(3) );
-#endif // ELOGS
         MemoryContext   oldcontext;
 
         funcctx = SRF_FIRSTCALL_INIT();
@@ -327,28 +322,37 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                      errmsg("function returning record called in context "
                             "that cannot accept type record")));
+        if( PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3) )
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("p_start_time, p_end_time, pair_id, exchange_id must not be NULL")));
+#if ELOGS
+        string p_start_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(0))};
+        string p_end_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(1))};
+        elog(DEBUG1, "depth_change_by_episode(%s, %s, %i, %i)", p_start_time.c_str(), p_end_time.c_str(),PG_GETARG_INT32(2), PG_GETARG_INT32(3) );
+#endif // ELOGS
         attinmeta = TupleDescGetAttInMetadata(tupdesc);
         funcctx->attinmeta = attinmeta;
 
 
         SPI_connect();
-        funcctx->user_fctx = new((depth *)SPI_palloc(sizeof(depth))) depth {};
+        funcctx->user_fctx = new((order_book *)SPI_palloc(sizeof(order_book))) order_book {};
 
-        Oid types[4];
+        Oid types[5];
         types[0] = TIMESTAMPTZOID;
         types[1] = INT4OID;
         types[2] = INT4OID;
 
-        Datum values[4];
+        Datum values[5];
         values[0] = PG_GETARG_TIMESTAMPTZ(0);
         values[1] = PG_GETARG_INT32(2);
         values[2] = PG_GETARG_INT32(3);
 
 
-        SPI_execute_with_args("select ts, ob.* from obanalytics.order_book($1, $2, $3, false, true, true) join unnest(ob) ob on true order by price", 3, types, values, NULL, true, 0);
+        SPI_execute_with_args("select ts, ob.* from obanalytics.order_book($1, $2, $3, false, true, false) join unnest(ob) ob on true order by price", 3, types, values, NULL, true, 0);
 
         if(SPI_processed > 0 && SPI_tuptable != NULL) {
-            depth *current_depth = (depth *)funcctx->user_fctx;
+            order_book *current_depth = (order_book *)funcctx->user_fctx;
             for(uint64 j = 0; j < SPI_processed; j++) {
                 level3 event {SPI_tuptable->vals[j], SPI_tuptable->tupdesc};
                 current_depth -> append_level3_to_episode(event);
@@ -372,14 +376,26 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
         values[2] = PG_GETARG_INT32(2);
         values[3] = PG_GETARG_INT32(3);
 
-
-        SPI_cursor_open_with_args("level3", "select *\
-                                             from obanalytics.level3\
-                                             where microtimestamp between $1 and $2\
-                                               and pair_id = $3\
-                                               and exchange_id = $4\
-                                             order by microtimestamp, order_id, event_no", 4, types, values, NULL, true, 0);
-
+	  if(PG_ARGISNULL(4)) {
+          SPI_cursor_open_with_args("level3", "select microtimestamp, order_id, event_no, side,\
+                                                      price, amount, next_microtimestamp, price_microtimestamp\
+                                               from obanalytics.level3\
+                                               where microtimestamp between $1 and $2\
+                                                 and pair_id = $3\
+                                                 and exchange_id = $4\
+                                               order by microtimestamp, order_id, event_no", 4, types, values, NULL, true, 0);
+	  }
+	  else {
+          types[4] = INTERVALOID;
+          values[4] = PG_GETARG_DATUM(4);
+          SPI_cursor_open_with_args("level3", "select get._date_ceiling(microtimestamp, $5) as microtimestamp,\
+                                                      order_id, event_no, side, price, amount, next_microtimestamp, price_microtimestamp\
+                                               from obanalytics.level3\
+                                               where microtimestamp between $1 and $2\
+                                                 and pair_id = $3\
+                                                 and exchange_id = $4\
+                                               order by microtimestamp, order_id, event_no", 5, types, values, NULL, true, 0);
+	  }
 
         SPI_finish();
         MemoryContextSwitchTo(oldcontext);
@@ -392,7 +408,7 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
 
     attinmeta = funcctx->attinmeta;
-    depth *current_depth = (depth *) funcctx->user_fctx;
+    order_book *current_depth = (order_book *) funcctx->user_fctx;
 
     SPI_connect();
     Portal portal = SPI_cursor_find("level3");
@@ -467,7 +483,7 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
     elog(DEBUG1, "End!");
 #endif
     SPI_cursor_close(SPI_cursor_find("level3"));
-    current_depth ->~depth();
+    current_depth ->~order_book();
     SPI_pfree(current_depth);
     SPI_finish();
     MemoryContextSwitchTo(oldcontext);

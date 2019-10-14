@@ -74,7 +74,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
   if( empty(cache$periods) ) {
     flog.debug('cache is empty, query: %s - %s ', format(start.time), format(end.time), name="obadiah.cache")
-    data <- loader(conn, start.time, end.time, exchange, pair, debug.query)
+    data <- loader(conn, start.time, end.time, exchange, pair, debug.query=debug.query)
     if(!empty(data)) {
       flog.debug('added to cache: %s - %s ', format(start.time), format(end.time), name="obadiah.cache")
       cache[[.cache_leaf_key(start.time, end.time)]] <- data
@@ -102,7 +102,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
         if (i > nrow(relevant)) {
           new.cache.entry <- rbind(new.cache.entry,
-                                   loader(conn, current.time, end.time, exchange, pair, debug.query),
+                                   loader(conn, current.time, end.time, exchange, pair, debug.query=debug.query),
                                    cache[[.cache_leaf_key(current.time, end.time)]]
           )
           flog.debug('nothing left in the cache, query, but not add to the cache yet %s - %s', format(current.time),format(end.time), name="obadiah.cache")
@@ -116,7 +116,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
             flog.debug('query, but not add to the cache yet: %s -%s', format(current.time), format(relevant[i, "s"]), name="obadiah.cache")
 
             new.cache.entry <- rbind(new.cache.entry,
-                                     loader(conn, current.time, relevant[i, "s"], exchange, pair, debug.query),
+                                     loader(conn, current.time, relevant[i, "s"], exchange, pair, debug.query=debug.query),
                                      cache[[key]]
             )
 

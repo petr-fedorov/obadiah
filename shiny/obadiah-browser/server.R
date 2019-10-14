@@ -199,8 +199,11 @@ server <- function(input, output, session) {
     exchange <- isolate(input$exchange)
     pair <- pair()
 
+    frequency <- as.integer(input$freq)
+    if (frequency == 0) frequency <- NULL
+
     withProgress(message="loading depth ...", {
-        obadiah::depth(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
+        obadiah::depth(con(), from.time, to.time, exchange, pair, frequency, debug.query=TRUE, cache=cache, tz=tz(tp))
         })
   })
 
@@ -476,7 +479,6 @@ server <- function(input, output, session) {
       from.time <- tp-width.seconds/2
       to.time <- tp+width.seconds/2
       depth <- depth()
-
       trades <- trades() %>% filter(direction %in% input$showtrades)
 
       if("with.ids.only" %in% input$showtrades) trades <- trades %>% filter(!is.na(exchange.trade.id))
