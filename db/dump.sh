@@ -15,11 +15,11 @@
 
 
 
-pg_dump -U ob-analytics  -d $1 $2 -n bitfinex -s -T bitfinex.*00000*  | cat header.sql - >${3:-.}/bitfinex_schema.sql
+pg_dump -U ob-analytics  -d $1 $2 -n bitfinex -s | cat header.sql - >${3:-.}/bitfinex_schema.sql
 pg_dump -U ob-analytics  -d $1 $2 -n bitstamp -s  | cat header.sql - > ${3:-.}/bitstamp_schema.sql
 pg_dump -U ob-analytics  -d $1 $2 -n get -s  | cat header.sql -   > ${3:-.}/get_schema.sql
 pg_dump -U ob-analytics  -d $1 $2 -n parameters -s  | cat header.sql -   > ${3:-.}/parameters_schema.sql
 pg_dump -U ob-analytics  -d $1 $2 -t bitstamp.pairs -a   | cat header.sql - > ${3:-.}/bitstamp_pairs.sql
-pg_dump -U ob-analytics  -d $1 $2 -n obanalytics -s   | cat header.sql - > ${3:-.}/obanalytics_schema.sql
+pg_dump -U ob-analytics  -d $1 $2 -n obanalytics -s -T obanalytics.level[1-3]_[0-9]{5}* -T obanalytics.matches_[0-9]{5}*   | cat header.sql - > ${3:-.}/obanalytics_schema.sql
 pg_dump -U ob-analytics  -d $1 $2 -t obanalytics.pairs -a   | cat header.sql - > ${3:-.}/obanalytics_pairs.sql
 pg_dump -U ob-analytics  -d $1 $2 -t obanalytics.exchanges -a   | cat header.sql - > ${3:-.}/obanalytics_exchanges.sql
