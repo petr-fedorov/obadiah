@@ -5,7 +5,7 @@
 
 ui <- function(req) {
 
-tz <- 'UTC'
+tz <- 'Europe/Moscow'
 
 fluidPage(
   includeCSS("www/bootstrap-slate.css"),
@@ -46,14 +46,13 @@ fluidPage(
                          "15 minutes"=900,
                          "30 minutes"=1800,
                          "1 hour"=3600,
-                         "3 hours"=10800
-                         # ,
-                         # "6 hours"=21600,
-                         # "12 hours"=43200,
+                         "3 hours"=10800,
+                         "6 hours"=21600,
+                         "12 hours"=43200
                          # "1 day"=86399,
                          # "custom"=0
                     ),
-                    selected=900),
+                    selected=180),
         h5("Center"),
         verbatimTextOutput("time.point.out"),
         h5("Depth sampling frequency"),
@@ -162,13 +161,15 @@ fluidPage(
     mainPanel(width=9,
       tabsetPanel(type="tabs", selected="Price level volume",
         tabPanel("Price level volume",
-                 plotOutput("depth.map.plot", height="800px", dblclick="price_level_volume_dblclick")
+                 plotOutput("depth.map.plot", height="800px", dblclick="price_level_volume_dblclick",
+                            hover = hoverOpts(id = "price_level_volume_hover", delayType = "throttle"))
                  ,
                  conditionalPanel(
                    condition="$.inArray('lp', input.showdepth) > -1",
                      plotOutput("depth.percentile.plot", height="400px"))
                  ,
                  wellPanel(
+                   verbatimTextOutput("price_level_volume_hoverinfo"),
                    fluidRow( column(2, wellPanel(radioButtons("showspread", label="Show spread", choices=c("Mid price"='M', "Best prices"='B', "None"='N'),
                                                     selected='M', inline=F))),
                              column(2, wellPanel(radioButtons("showdraws", label="Show draws", choices=c("None"='N', "Mid price"='mid-price', "Asks"='ask', "Bids"='bid'),
@@ -182,6 +183,7 @@ fluidPage(
                                column(6, conditionalPanel(condition="input.depthbias == 0",numericInput("depthbias.value", label="bias", value=0.1)))
                              )))
                              )
+
                  )
 #                 ,
 #                 wellPanel(

@@ -64,7 +64,8 @@ server <- function(input, output, session) {
 
   DBI::dbExecute(con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
-  cache <- new.env(parent=emptyenv())
+  #cache <- new.env(parent=emptyenv())
+  cache <- NULL
 
   query <- paste0("select available_exchanges as exchange from get.available_exchanges() order by 1" )
   exchanges <- RPostgres::dbGetQuery(con(), query)$exchange
@@ -207,6 +208,18 @@ server <- function(input, output, session) {
         })
   })
 
+
+
+  depth_filtered <- reactive( {
+
+    if(autoPvRange())
+      depth <- depth()
+    else{
+      depth <- depth() %>% filter(price >= priceVolumeRange()$price.from & price <= priceVolumeRange()$price.to &
+                                  volume >= priceVolumeRange()$volume.from & volume <= priceVolumeRange()$volume.to)
+    }
+    depth
+  })
 
   draws <- reactive( {
 
@@ -470,6 +483,8 @@ server <- function(input, output, session) {
 
   depthbiasvalue <- reactive( {input$depthbias.value}) %>% debounce(2000)
 
+
+
   # liquidity/depth map plot
   output$depth.map.plot <- renderPlot({
     withProgress(message="generating Price level volume ...", {
@@ -478,7 +493,7 @@ server <- function(input, output, session) {
       tz <- attr(tp, "tzone")
       from.time <- tp-width.seconds/2
       to.time <- tp+width.seconds/2
-      depth <- depth()
+      depth <- depth_filtered()
       trades <- trades() %>% filter(direction %in% input$showtrades)
 
       if("with.ids.only" %in% input$showtrades) trades <- trades %>% filter(!is.na(exchange.trade.id))
@@ -546,6 +561,20 @@ server <- function(input, output, session) {
       if (input$showdraws != 'N') p <- p + ggplot2::geom_segment(ggplot2::aes(x=timestamp, y=start.price, xend=draw.end, yend=end.price),draws, colour="white")
       p
     })
+  })
+
+
+
+  output$price_level_volume_hoverinfo <- renderPrint({
+    if(!is.null(input$price_level_volume_hover)) {
+      y <- input$price_level_volume_hover$domain$bottom + (input$price_level_volume_hover$domain$top - input$price_level_volume_hover$domain$bottom)*(input$price_level_volume_hover$range$bottom - input$price_level_volume_hover$coords_css$y)/(input$price_level_volume_hover$range$bottom - input$price_level_volume_hover$range$top)
+      x <- as.POSIXct(input$price_level_volume_hover$domain$left + (input$price_level_volume_hover$domain$right - input$price_level_volume_hover$domain$left)*(input$price_level_volume_hover$coords_css$x - input$price_level_volume_hover$range$left)/(input$price_level_volume_hover$range$right - input$price_level_volume_hover$range$left),origin="1970-01-01 00:00:00")
+      price_tolerance <- (input$price_level_volume_hover$domain$top - input$price_level_volume_hover$domain$bottom)*0.01
+      d <- tail(depth_filtered() %>% filter(timestamp >=timePoint() - zoomWidth()/2, timestamp <= x & abs(price -y) <= price_tolerance ),1) %>% filter(volume > 0)
+      if(nrow(d) == 1)
+        cat("price= ", d$price,  "volume=", d$volume, " since timestamp= ", format(d$timestamp ,format="%Y-%m-%d %H:%M:%OS3",usetz=TRUE), "side=", as.character(d$side),  "\n")
+    }
+    #str(input$price_level_volume_hover)
   })
 
   # liquidity percentile plot
