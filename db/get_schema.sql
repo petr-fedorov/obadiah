@@ -60,13 +60,31 @@ ALTER TYPE get.draw_type OWNER TO "ob-analytics";
 CREATE FUNCTION get._date_ceiling(base_date timestamp with time zone, round_interval interval) RETURNS timestamp with time zone
     LANGUAGE sql STABLE
     AS $_$-- See date_round() there: //wiki.postgresql.org/wiki/Round_time
-
-SELECT TO_TIMESTAMP((EXTRACT(epoch FROM $1)::integer + EXTRACT(epoch FROM $2)::integer)
-                / EXTRACT(epoch FROM $2)::integer * EXTRACT(epoch FROM $2)::integer)
+SELECT case when round_interval is not null and isfinite(base_date)  
+				then TO_TIMESTAMP(
+					(trunc(EXTRACT(epoch FROM $1 - '00:00:00.000001'::interval))::integer/trunc(EXTRACT(epoch FROM $2))::integer +1) * trunc(EXTRACT(epoch FROM $2))::integer)
+				else base_date end;
 $_$;
 
 
 ALTER FUNCTION get._date_ceiling(base_date timestamp with time zone, round_interval interval) OWNER TO "ob-analytics";
+
+--
+-- Name: _date_floor(timestamp with time zone, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get._date_floor(base_date timestamp with time zone, round_interval interval) RETURNS timestamp with time zone
+    LANGUAGE sql STABLE
+    AS $_$-- See date_round() there: //wiki.postgresql.org/wiki/Round_time
+
+SELECT case when round_interval is not null and isfinite(base_date)  
+				then TO_TIMESTAMP(
+					trunc(EXTRACT(epoch FROM $1))::integer/trunc(EXTRACT(epoch FROM $2))::integer * trunc(EXTRACT(epoch FROM $2))::integer)
+				else base_date end;
+$_$;
+
+
+ALTER FUNCTION get._date_floor(base_date timestamp with time zone, round_interval interval) OWNER TO "ob-analytics";
 
 --
 -- Name: _in_milliseconds(timestamp with time zone); Type: FUNCTION; Schema: get; Owner: ob-analytics
@@ -89,6 +107,31 @@ ALTER FUNCTION get._in_milliseconds(ts timestamp with time zone) OWNER TO "ob-an
 
 COMMENT ON FUNCTION get._in_milliseconds(ts timestamp with time zone) IS 'Since R''s POSIXct is not able to handle time with the precision higher than 0.1 of millisecond, this function converts timestamp to text with this precision to ensure that the timestamps are not mangled by an interface between Postgres and R somehow.';
 
+
+--
+-- Name: _periods_within_eras(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) RETURNS TABLE(period_start timestamp with time zone, period_end timestamp with time zone, previous_period_end timestamp with time zone)
+    LANGUAGE sql
+    AS $$	select period_start, period_end, lag(period_end) over (order by period_start) as previous_period_end
+	from (
+		select period_start, period_end
+		from (
+			select get._date_ceiling(greatest(era, p_start_time), p_frequency) as period_start, 
+					get._date_floor(least(coalesce(level3, era), p_end_time), p_frequency) as period_end
+			from obanalytics.level3_eras
+			where pair_id = p_pair_id
+			  and exchange_id = p_exchange_id
+			  and p_start_time <= coalesce(level3, era)
+			  and p_end_time >= era
+		) e
+		where period_end > period_start
+	) p
+$$;
+
+
+ALTER FUNCTION get._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
 -- Name: _validate_parameters(text, timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
@@ -187,10 +230,9 @@ ALTER FUNCTION get.data_overview(p_exchange text, p_pair text, p_r integer) OWNE
 CREATE FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_starting_depth boolean DEFAULT true, p_depth_changes boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
-
 with starting_depth as (
-	select p_start_time as microtimestamp, side, price, volume 
-	from obanalytics.order_book(p_start_time, 
+	select get._date_ceiling(p_start_time, p_frequency) as microtimestamp, side, price, volume 
+	from obanalytics.order_book(get._date_ceiling(p_start_time, p_frequency), 
 								p_pair_id,
 								p_exchange_id,
 								p_only_makers := true,
@@ -202,9 +244,9 @@ with starting_depth as (
 ),
 level2 as (
 	select microtimestamp, side, price, volume
-	from obanalytics.level2_continuous(p_start_time, 	-- if p_start_time is a start of an era, then level2_continous 
+	from obanalytics.level2_continuous(get._date_ceiling(p_start_time, p_frequency), 	-- if p_start_time is a start of an era, then level2_continous 
 									   					 -- will return full depth from order book - see comment above
-									    p_end_time,
+									    get._date_ceiling(p_end_time, p_frequency),
 									    p_pair_id,
 									    p_exchange_id,
 									  	p_frequency) level2
@@ -220,7 +262,7 @@ where price is not null   -- null might happen if an aggressor order_created eve
 							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
 							-- 'not null' constraint is to be added to price and depth_change columns of obanalytics.depth table. Then this check
 							-- will be redundant
-  and coalesce(microtimestamp < p_end_time, TRUE) -- for the convenience of client-side caching right, boundary must not be inclusive i.e. [p_staart_time, p_end_time)
+  and coalesce(microtimestamp < get._date_ceiling(p_end_time, p_frequency), TRUE) -- for the convenience of client-side caching right, boundary must not be inclusive i.e. [p_start_time, p_end_time)
 
 $$;
 

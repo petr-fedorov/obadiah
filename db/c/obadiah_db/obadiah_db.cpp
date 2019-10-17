@@ -83,6 +83,8 @@ namespace obadiah_db {
         TimestampTz price_microtimestamp;
         spi_string next_microtimestamp;
 
+	  unsigned long episode_seq_no;	
+
         level3 () {};
 
         level3 (HeapTuple tuple, TupleDesc tupdesc) noexcept :
@@ -138,12 +140,9 @@ namespace obadiah_db {
             return x->price_microtimestamp < y->price_microtimestamp;
         else if (x->microtimestamp != y->microtimestamp)
                 return x->microtimestamp < y->microtimestamp;
-             else if (x->order_id != y->order_id)
-                    return x->order_id < y->order_id;
-                  else
-                    return x->event_no < y->event_no;
+             else return x->episode_seq_no < y->episode_seq_no;
 
-        }    // TODO: write 'real' comparison
+        }    
     };
 
     using same_price_level3 = set<level3 *, level3_compare,  spi_allocator<level3 *>>;
@@ -158,7 +157,7 @@ namespace obadiah_db {
 
 
     struct order_book {
-        order_book() : precision("r0"), episode_ts(0) {};
+        order_book() : precision("r0"), episode_ts(0), episode_seq_no(0) {};
 
         price_level get_price_level(const spi_string &price_str) noexcept {
             price_level level {};
@@ -177,7 +176,8 @@ namespace obadiah_db {
             return level;
         }
 
-        inline void append_level3_to_episode(const level3 &event) {
+        inline void append_level3_to_episode(level3 &event) {
+		event.episode_seq_no = episode_seq_no++;
             episode.push_back(event);
 #if ELOGS
             elog(DEBUG3, "Added to episode %s, episode.size() %lu", event.__str__().c_str() , episode.size());
@@ -208,7 +208,7 @@ namespace obadiah_db {
                     }
                     catch ( ... ) {
 #if ELOGS
-                        elog(WARNING, "No previous event for %s %lu %i",timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no );
+                        elog(DEBUG1, "No previous event for %s %lu %i",timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no );
 #endif
                     };
 
@@ -271,6 +271,7 @@ namespace obadiah_db {
             }
             previous_depth_change.append("}");
             episode.clear();
+		episode_seq_no = 0;
 #if ELOGS
             elog(DEBUG1, "Ended episode %s, depth change: %s", timestamptz_to_str(episode_ts), previous_depth_change.c_str());
 #endif
@@ -290,6 +291,8 @@ namespace obadiah_db {
         spi_vector<level3> episode;
         TimestampTz episode_ts;
         spi_string previous_depth_change;
+
+	  unsigned long episode_seq_no;
 
     };
 
@@ -389,12 +392,14 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
           types[4] = INTERVALOID;
           values[4] = PG_GETARG_DATUM(4);
           SPI_cursor_open_with_args("level3", "select get._date_ceiling(microtimestamp, $5) as microtimestamp,\
-                                                      order_id, event_no, side, price, amount, next_microtimestamp, price_microtimestamp\
+                                                      order_id, event_no, side, price, amount,\
+								     	get._date_ceiling(next_microtimestamp, $5) as next_microtimestamp,\
+								      get._date_ceiling(price_microtimestamp, $5) as price_microtimestamp\
                                                from obanalytics.level3\
                                                where microtimestamp between $1 and $2\
                                                  and pair_id = $3\
                                                  and exchange_id = $4\
-                                               order by microtimestamp, order_id, event_no", 5, types, values, NULL, true, 0);
+                                               order by level3.microtimestamp, order_id, event_no", 5, types, values, NULL, true, 0);
 	  }
 
         SPI_finish();

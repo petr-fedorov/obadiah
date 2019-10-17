@@ -216,7 +216,7 @@ server <- function(input, output, session) {
       depth <- depth()
     else{
       depth <- depth() %>% filter(price >= priceVolumeRange()$price.from & price <= priceVolumeRange()$price.to &
-                                  volume >= priceVolumeRange()$volume.from & volume <= priceVolumeRange()$volume.to)
+                                  ( (volume >= priceVolumeRange()$volume.from & volume <= priceVolumeRange()$volume.to) | volume == 0) )
     }
     depth
   })
@@ -262,7 +262,7 @@ server <- function(input, output, session) {
     # withProgress(message="loading spread...", {
     #     obadiah::spread(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
     #   })
-    obadiah::depth2spread(depth(), tz=tz(tp))
+    obadiah::depth2spread(depth(), skip.crossed=input$skip.crossed, tz=tz(tp))
   })
 
   trades <- reactive( {
@@ -572,7 +572,7 @@ server <- function(input, output, session) {
       price_tolerance <- (input$price_level_volume_hover$domain$top - input$price_level_volume_hover$domain$bottom)*0.01
       d <- tail(depth_filtered() %>% filter(timestamp >=timePoint() - zoomWidth()/2, timestamp <= x & abs(price -y) <= price_tolerance ),1) %>% filter(volume > 0)
       if(nrow(d) == 1)
-        cat("price= ", d$price,  "volume=", d$volume, " since timestamp= ", format(d$timestamp ,format="%Y-%m-%d %H:%M:%OS3",usetz=TRUE), "side=", as.character(d$side),  "\n")
+        cat("side:", as.character(d$side),  " price:", d$price,  " volume:", d$volume, " since:", format(d$timestamp ,format="%Y-%m-%d %H:%M:%OS3",usetz=TRUE),"\n")
     }
     #str(input$price_level_volume_hover)
   })

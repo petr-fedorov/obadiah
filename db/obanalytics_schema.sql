@@ -1843,35 +1843,25 @@ CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time z
 --	It is not possible to use order_book(p_before :=true) as the start of an era since it will be empty!
 
 with periods as (
-	select greatest(era_start, p_start_time) as period_start, least(era_end, p_end_time) as period_end, era_start
-	from (
-		select era as era_start, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval , 'infinity') as era_end
-		from obanalytics.level3_eras
-		where pair_id = p_pair_id
-		  and exchange_id = p_exchange_id
-	) e
-	where p_start_time <= era_end
-	  and p_end_time >= era_start
+	select * 
+	from get._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
 ),
 starting_depth_change as (
 	select period_start, p_pair_id::smallint, p_exchange_id::smallint, 'r0', c
-	from periods join obanalytics.order_book(  case when era_start = p_start_time then null else period_start - '00:00:00.000001'::interval end,
-												p_pair_id,p_exchange_id, true, false,false ) b on true 
-				 join obanalytics.order_book( period_start, p_pair_id,p_exchange_id, true, false,false ) a on true 
+	from periods join obanalytics.order_book(previous_period_end, p_pair_id,p_exchange_id, true, false,false ) b on true 
+				 join obanalytics.order_book(period_start, p_pair_id,p_exchange_id, true, true, false ) a on true 
 				 join obanalytics._depth_change(b.ob, a.ob) c on true
 )
 select *
 from starting_depth_change
 union all
 select level2.*
--- from periods join obanalytics.level2 on true 
 from periods join obanalytics.depth_change_by_episode3(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level2 on true 
-where microtimestamp > period_start
+where microtimestamp >= period_start
   and microtimestamp <= period_end
   and level2.pair_id = p_pair_id
   and level2.exchange_id = p_exchange_id 
   and level2.precision = 'r0'
-  and microtimestamp > p_start_time and microtimestamp <= p_end_time -- otherwise, the query optimizer produces a crazy plan!
   ;
 
 $$;
@@ -2727,7 +2717,7 @@ ALTER FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time z
 
 CREATE FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level1
     LANGUAGE c STRICT
-    AS '$libdir/libspread_by_episode', 'spread_by_episode';
+    AS '$libdir/libobadiah_db', 'spread_by_episode';
 
 
 ALTER FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";

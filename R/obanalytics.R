@@ -73,8 +73,7 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
   # Convert to UTC, so internally only UTC is used
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
-
-  starting_depth <- .starting_depth(conn, start.time, exchange, pair, debug.query)
+  starting_depth <- .starting_depth(conn, start.time, exchange, pair, frequency, debug.query=debug.query)
   if(is.null(cache) || start.time > cache.bound)
     depth_changes <- .depth_changes(conn, start.time, end.time, exchange, pair, frequency, debug.query)
   else {
@@ -140,14 +139,22 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
 }
 
 
-.starting_depth <- function(conn, start.time, exchange, pair, debug.query = FALSE)   {
-
-  query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,
-                  price, volume, side FROM get.depth(",
-                  shQuote(format(start.time,usetz=T)), ", NULL, ",
-                  "get.pair_id(",shQuote(pair),"), " ,
-                  "get.exchange_id(", shQuote(exchange), "), ",
-                  "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
+.starting_depth <- function(conn, start.time, exchange, pair, frequency, debug.query = FALSE)   {
+  if(is.null(frequency))
+    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp,
+                    price, volume, side FROM get.depth(",
+                    shQuote(format(start.time,usetz=T)), ", NULL, ",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), "), ",
+                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
+  else
+    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp,
+                    price, volume, side FROM get.depth(",
+                    shQuote(format(start.time,usetz=T)), ", NULL, ",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), "), ",
+                    "p_frequency := ", shQuote(paste0(frequency, " seconds ")), ", ",
+                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
   if(debug.query) cat(query, "\n", file=stderr())
   depth <- DBI::dbGetQuery(conn, query)
   depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
@@ -157,11 +164,15 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
 
 
 #' @export
-depth2spread <- function(depth, tz='UTC') {
+depth2spread <- function(depth, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC') {
   spread <- with(depth, spread_from_depth(timestamp, price, volume, side))
   if(!empty(spread)) {
     spread$timestamp <- with_tz(spread$timestamp, tz)
   }
+  if(complete.cases)
+    spread <- spread[complete.cases(spread), ]
+  if(skip.crossed)
+    spread <- spread %>% filter(best.bid.price <= best.ask.price)
   spread
 }
 
