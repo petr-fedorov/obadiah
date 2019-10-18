@@ -472,7 +472,7 @@ ALTER FUNCTION get.events(p_start_time timestamp with time zone, p_end_time time
 -- Name: events_intervals(integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.events_intervals(p_pair_id integer DEFAULT NULL::integer, p_exchange_id integer DEFAULT NULL::integer, p_min_duration interval DEFAULT NULL::interval) RETURNS TABLE(era timestamp with time zone, exchange_id smallint, pair_id smallint, interval_start timestamp with time zone, interval_end timestamp with time zone, events boolean, depth boolean, spread boolean, duration interval, exchange text, pair text)
+CREATE FUNCTION get.events_intervals(p_pair_id integer DEFAULT NULL::integer, p_exchange_id integer DEFAULT NULL::integer, p_min_duration interval DEFAULT NULL::interval) RETURNS TABLE(era timestamp with time zone, exchange_id smallint, pair_id smallint, interval_start timestamp with time zone, interval_end timestamp with time zone, events boolean, duration interval, exchange text, pair text)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 with level3_eras as (
@@ -482,44 +482,31 @@ with level3_eras as (
 	  and exchange_id = coalesce(p_exchange_id, exchange_id)
 ),
 greens as (
-         select era, exchange_id, pair_id, era as s, level2 as e, true as l3, true as l2, true as l1
+         select era, exchange_id, pair_id, era as s, level3 as e, true as l3
            from level3_eras
-          where level2 is not null
-        ),
-yellows as (
-         select era, exchange_id, pair_id, level2 as s, level3 as e, true as l3, false as l2, false as l1
-           from level3_eras
-          where level2 <> level3
-        union all
-         select era, exchange_id, pair_id, era as s, level3 as e, true, false, false
-           from level3_eras
-          where level2 is null 
-	        and level3 is not null
+          where level3 is not null
         ),
 reds as (
          select era, exchange_id, pair_id, level3 as s,
 				 coalesce(next_era, now()) as e, 
-				 false as l3, false as l2, false as l1
+				 false as l3
          from level3_eras
 		 where level3 is not null
 		 union all
          select era, exchange_id, pair_id, era as s,
 				 coalesce(next_era, now()) as e, 
-				 false as l3, false as l2, false as l1
+				 false as l3
          from level3_eras
 		 where level3 is null
         ),
 all_colours as (
-         select era, exchange_id, pair_id, s, e, l3, l2, l1
+         select era, exchange_id, pair_id, s, e, l3
 		 from greens
         union all
-         select era, exchange_id, pair_id, s, e, l3, l2, l1
-         from yellows
-        union all
-         select era, exchange_id, pair_id, s, e, l3, l2, l1
+         select era, exchange_id, pair_id, s, e, l3
            from reds
         )
-select era, exchange_id, pair_id, s, e, l3, l2, l1,  justify_interval(e - s) as d, exchange, pair
+select era, exchange_id, pair_id, s, e, l3, justify_interval(e - s) as d, exchange, pair
 from all_colours join obanalytics.pairs using (pair_id) join obanalytics.exchanges using (exchange_id)
 where e - s >= coalesce(p_min_duration, e - s)
 order by exchange_id, pair_id, s desc

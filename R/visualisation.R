@@ -46,7 +46,7 @@ plotDataAvailability <- function(intervals) {
   ggplot(intervals,
          aes(xmin=interval_start, xmax=interval_end, ymin=y, ymax=y+0.7))+
     geom_rect(mapping=aes(fill=c), colour="black", size=0.02) +
-    scale_fill_manual("Available:" , values=c("G"="green4", "Y"="yellow2", "R"="red"), breaks=c("G", "Y", "R"), labels=c("events, depth, spread", "events only", "nothing")) +
+    scale_fill_manual("Data:" , values=c("G"="green4", "R"="red"), breaks=c("G", "R"), labels=c("Available", "Not available")) +
     scale_x_datetime(NULL,
                      breaks=seq(min(intervals$interval_start), max(intervals$interval_end), length.out=5),
                      labels=scales::date_format(format=fmt, tz=tz(intervals$interval_start))) +

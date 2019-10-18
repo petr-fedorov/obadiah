@@ -676,7 +676,7 @@ intervals <- function(conn, start.time=NULL, end.time=NULL, exchange = NULL, pai
     query <- paste0("select exchange_id, pair_id,
                           extract(epoch from interval_start) as interval_start,
                           extract(epoch from interval_end) as interval_end,
-                          case when events and depth then 'G' when events then 'Y' else 'R' end as c,
+                          case when events then 'G'  else 'R' end as c,
                           exchange, pair,
                           extract(epoch from era) as era
                   from get.events_intervals( ",
