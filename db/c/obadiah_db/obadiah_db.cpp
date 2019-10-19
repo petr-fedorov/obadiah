@@ -68,9 +68,7 @@ namespace obadiah_db {
     {
         return !(x == y);
     }
-
-
-
+    
 
     struct level3 {
         TimestampTz microtimestamp;
@@ -159,7 +157,8 @@ namespace obadiah_db {
     struct order_book {
         order_book() : precision("r0"), episode_ts(0), episode_seq_no(0) {};
 
-        price_level get_price_level(const spi_string &price_str) noexcept {
+        price_level get_price_level(const string &price) noexcept {
+		spi_string price_str {price.c_str()};
             price_level level {};
             for(auto event: by_price[price_str]) {
                 if(event->side == 'b')
@@ -188,23 +187,23 @@ namespace obadiah_db {
 
         }
 
-        spi_string &end_episode() noexcept {
+        string end_episode() noexcept {
 #if ELOGS
             elog(DEBUG2, "Ending episode %s", timestamptz_to_str(episode_ts));
             elog(DEBUG2, "get_price_level() before ...");
 #endif
-            map<spi_string,price_level> depth_before {};
+            map<string,price_level> depth_before {};
 
 
             for(auto &event: episode) {
-                set<spi_string> changed_prices {};
-                changed_prices.insert(event.price_str);
+                set<string> changed_prices {};
+                changed_prices.insert(event.price_str.c_str());
                 level3 *previous_event = nullptr;
 
                 if(event.event_no > 1) {
                     try {
                         previous_event = &(by_order_id.at(event.order_id));
-                        changed_prices.insert(previous_event->price_str);
+                        changed_prices.insert(previous_event->price_str.c_str());
                     }
                     catch ( ... ) {
 #if ELOGS
@@ -233,50 +232,51 @@ namespace obadiah_db {
                 }
             }
 
-            previous_depth_change.erase();
+            string depth_change_builder {"{"};
 #if ELOGS
             elog(DEBUG2, "get_price_level() after ...");
 #endif
-            previous_depth_change.append("{");
             const int BUFFER_SIZE = 50;
             char buffer[BUFFER_SIZE];
             for(auto &depth : depth_before) {
                 price_level after = get_price_level(depth.first);
 
                 if(after.bid != depth.second.bid) {
-                    if(previous_depth_change.size() > 1) previous_depth_change.append(",");
+                    if(depth_change_builder.size() > 1) depth_change_builder.append(",");
                     if(after.bid > 0 ) 
                       snprintf(buffer, BUFFER_SIZE, "%.8LF", after.bid); //amount = to_string(after.bid).c_str();
                     else
                       snprintf(buffer, BUFFER_SIZE, "%.8LF", 0.0L); //amount = to_string(after.bid).c_str();
-                    previous_depth_change.append("\"(");
-                    previous_depth_change.append(depth.first);
-                    previous_depth_change.append(",");
-                    previous_depth_change.append(buffer);
-                    previous_depth_change.append(",b,)\"");
+                    depth_change_builder.append("\"(");
+                    depth_change_builder.append(depth.first);
+                    depth_change_builder.append(",");
+                    depth_change_builder.append(buffer);
+                    depth_change_builder.append(",b,)\"");
                 }
                 if(after.ask != depth.second.ask) {
-                    if(previous_depth_change.size() > 1) previous_depth_change.append(",");
+                    if(depth_change_builder.size() > 1) depth_change_builder.append(",");
                     // const char *amount;
                     if(after.ask > 0 ) // amount = to_string(after.ask).c_str();
                       snprintf(buffer, BUFFER_SIZE, "%.8LF", after.ask); //amount = to_string(after.bid).c_str();
                     else // amount = "0";
                       snprintf(buffer, BUFFER_SIZE, "%.8LF", 0.0L); //amount = to_string(after.bid).c_str();
-                    previous_depth_change.append("\"(");
-                    previous_depth_change.append(depth.first);
-                    previous_depth_change.append(",");
-                    previous_depth_change.append(buffer);
-                    previous_depth_change.append(",s,)\"");
+                    depth_change_builder.append("\"(");
+                    depth_change_builder.append(depth.first);
+                    depth_change_builder.append(",");
+                    depth_change_builder.append(buffer);
+                    depth_change_builder.append(",s,)\"");
                 }
             }
-            previous_depth_change.append("}");
+            depth_change_builder.append("}");
+
             episode.clear();
 		episode_seq_no = 0;
 #if ELOGS
-            elog(DEBUG1, "Ended episode %s, depth change: %s", timestamptz_to_str(episode_ts), previous_depth_change.c_str());
+            elog(DEBUG1, "Ended episode %s", timestamptz_to_str(episode_ts));
+            elog(DEBUG2, "Depth change: %s", previous_depth_change.c_str());
 #endif
 
-            return previous_depth_change;
+            return depth_change_builder;
         };
 
         spi_string &get_precision() {
@@ -420,7 +420,7 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
     SPI_cursor_fetch(portal, true, 1);
 
-    spi_string depth_change {"{}"};
+    string depth_change {"{}"};
     bool is_done = true;
 
     while (SPI_processed == 1 && SPI_tuptable != NULL ) {
@@ -469,11 +469,16 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
         string pair_id (to_string(PG_GETARG_INT32(2)));
         string exchange_id {to_string(PG_GETARG_INT32(3))};
 
-        values[0] = (char *)microtimestamp.c_str();
-        values[1] = (char *)pair_id.c_str();
-        values[2] = (char *)exchange_id.c_str();
-        values[3] = (char *)current_depth -> get_precision().c_str();                           // precision
-        values[4] = (char *)depth_change.c_str();                                               // depth_changes
+        values[0] = (char *)palloc(sizeof(char)*(microtimestamp.size()+1));
+	  strcpy(values[0],microtimestamp.c_str());
+        values[1] = (char *)palloc(sizeof(char)*(pair_id.size()+1));
+	  strcpy(values[1],pair_id.c_str());
+        values[2] = (char *)palloc(sizeof(char)*(exchange_id.size()+1));
+	  strcpy(values[2],exchange_id.c_str());
+        values[3] = (char *)palloc(sizeof(char)*(current_depth -> get_precision().size()+1));
+	  strcpy(values[3],current_depth -> get_precision().c_str());
+        values[4] = (char *)palloc(sizeof(char)*(depth_change.size()+1));
+	  strcpy(values[4],depth_change.c_str());
 #if ELOGS
 	  elog(DEBUG2,"BuildTupleFromCStrings:  %s %s %s %s %s", values[0], values[1], values[2], values[3], values[4]);
 #endif
