@@ -229,10 +229,9 @@ ALTER FUNCTION get.data_overview(p_exchange text, p_pair text, p_r integer) OWNE
 
 CREATE FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_starting_depth boolean DEFAULT true, p_depth_changes boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
     LANGUAGE sql STABLE SECURITY DEFINER
-    AS $$
-with starting_depth as (
+    AS $$with starting_depth as (
 	select get._date_ceiling(p_start_time, p_frequency) as microtimestamp, side, price, volume 
-	from obanalytics.order_book(get._date_ceiling(p_start_time, p_frequency), 
+	from obanalytics.order_book(get._date_floor(p_start_time, p_frequency), 
 								p_pair_id,
 								p_exchange_id,
 								p_only_makers := true,
@@ -244,7 +243,7 @@ with starting_depth as (
 ),
 level2 as (
 	select microtimestamp, side, price, volume
-	from obanalytics.level2_continuous(get._date_ceiling(p_start_time, p_frequency), 	-- if p_start_time is a start of an era, then level2_continous 
+	from obanalytics.level2_continuous(get._date_floor(p_start_time, p_frequency), 	-- if p_start_time is a start of an era, then level2_continous 
 									   					 -- will return full depth from order book - see comment above
 									    get._date_ceiling(p_end_time, p_frequency),
 									    p_pair_id,

@@ -64,8 +64,8 @@ server <- function(input, output, session) {
 
   DBI::dbExecute(con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
-  #cache <- new.env(parent=emptyenv())
-  cache <- NULL
+  cache <- new.env(parent=emptyenv())
+  #cache <- NULL
 
   query <- paste0("select available_exchanges as exchange from get.available_exchanges() order by 1" )
   exchanges <- RPostgres::dbGetQuery(con(), query)$exchange
