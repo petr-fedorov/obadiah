@@ -77,16 +77,13 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
   if(is.null(cache) || start.time > cache.bound)
     depth_changes <- .depth_changes(conn, start.time, end.time, exchange, pair, frequency, debug.query)
   else {
-    if(is.null(frequency)) {
+    if(is.null(frequency))
       cache_key <- "depth"
-      loader <- .depth_changes
-    }
-    else {
+    else
       cache_key <- paste0("depth",frequency)
-      loader <- function(conn, start.time, end.time, exchange, pair, debug.query) {
-        .depth_changes(conn, start.time, end.time, exchange, pair, frequency, debug.query)
+    loader <- function(conn, start.time, end.time, exchange, pair, debug.query) {
+      .depth_changes(conn, start.time, end.time, exchange, pair, frequency, debug.query)
       }
-    }
     if(end.time <= cache.bound )
       depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, loader, .leaf_cache(cache, exchange, pair, cache_key))
     else
