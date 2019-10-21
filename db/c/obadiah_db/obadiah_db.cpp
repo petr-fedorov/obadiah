@@ -116,8 +116,9 @@ namespace obadiah_db {
         };
 
         level3 (const level3 &e) :
-            microtimestamp(e.microtimestamp),order_id(e.order_id), event_no(e.event_no), side(e.side), price_str(e.price_str),  amount_str(e.amount_str), amount(e.amount), price_microtimestamp(e.price_microtimestamp),
-            next_microtimestamp(e.next_microtimestamp)
+            microtimestamp(e.microtimestamp),order_id(e.order_id), event_no(e.event_no), side(e.side), price_str(e.price_str), 
+		amount_str(e.amount_str), amount(e.amount), price_microtimestamp(e.price_microtimestamp),
+            next_microtimestamp(e.next_microtimestamp), episode_seq_no(e.episode_seq_no)
          {};
 
          bool is_order_deleted() {
@@ -219,15 +220,24 @@ namespace obadiah_db {
 
                 if(previous_event) {
 #if ELOGS
-                    elog(DEBUG3, "OB deleted %s %lu %i", timestamptz_to_str(previous_event->microtimestamp), previous_event->order_id, previous_event->event_no);
+                    elog(DEBUG3, "OB deleted %s %lu %i %s", timestamptz_to_str(previous_event->microtimestamp), previous_event->order_id, previous_event->event_no, previous_event->price_str.c_str());
 #endif
                     by_price[previous_event->price_str].erase(previous_event);
                     by_order_id.erase(previous_event->order_id);
                 }
                 if(!event.is_order_deleted()) {
-                    by_price[event.price_str].insert(&(by_order_id[event.order_id] = event));
+                    same_price_level3& price_level = by_price[event.price_str];
+			  pair<same_price_level3::iterator, bool> result = price_level.insert(&(by_order_id[event.order_id] = event));
 #if ELOGS
-                    elog(DEBUG3, "OB added %s %lu %i", timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no);
+			  if(!result.second) {
+				elog(WARNING, "OB NOT added %s %lu %i %s. Events at the price_level: %lu",
+					  timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no, event.price_str.c_str(), price_level.size());
+				level3 *ptr = *result.first;
+				elog(WARNING, "OB already there: %s %lu %i %s", timestamptz_to_str(ptr->microtimestamp),  ptr->order_id, ptr->event_no, ptr->price_str.c_str());
+			  }
+			  else
+				elog(DEBUG3, "OB added %s %lu %i %s. Events at the price_level: %lu",
+					  timestamptz_to_str(event.microtimestamp), event.order_id, event.event_no, event.price_str.c_str(), price_level.size());
 #endif
                 }
             }
@@ -273,7 +283,7 @@ namespace obadiah_db {
 		episode_seq_no = 0;
 #if ELOGS
             elog(DEBUG1, "Ended episode %s", timestamptz_to_str(episode_ts));
-            elog(DEBUG2, "Depth change: %s", previous_depth_change.c_str());
+            elog(DEBUG2, "Depth change: %s", depth_change_builder.c_str());
 #endif
 
             return depth_change_builder;
