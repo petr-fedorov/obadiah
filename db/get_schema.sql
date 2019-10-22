@@ -230,7 +230,7 @@ ALTER FUNCTION get.data_overview(p_exchange text, p_pair text, p_r integer) OWNE
 CREATE FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_starting_depth boolean DEFAULT true, p_depth_changes boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$with starting_depth as (
-	select get._date_ceiling(p_start_time, p_frequency) as microtimestamp, side, price, volume 
+	select get._date_floor(p_start_time, p_frequency) as microtimestamp, side, price, volume 
 	from obanalytics.order_book(get._date_floor(p_start_time, p_frequency), 
 								p_pair_id,
 								p_exchange_id,
@@ -257,11 +257,13 @@ select microtimestamp, price, volume, case side
 										when 's' then 'ask'::text
 									  end as side
 from ( select * from starting_depth union all select * from level2) d
-where price is not null   -- null might happen if an aggressor order_created event is not part of an episode, i.e. dirty data.
-							-- But plotPriceLevels will fail if price is null, so we need to exclude such rows.
-							-- 'not null' constraint is to be added to price and depth_change columns of obanalytics.depth table. Then this check
-							-- will be redundant
-  and coalesce(microtimestamp < get._date_ceiling(p_end_time, p_frequency), TRUE) -- for the convenience of client-side caching right, boundary must not be inclusive i.e. [p_start_time, p_end_time)
+where price is not null   -- null might happen when order created and deleted within the same episode
+							-- plotPriceLevels will fail if price is null, so we need to exclude such rows.
+  and case when p_frequency is null 
+  				then coalesce(microtimestamp < p_end_time, TRUE) -- for the convenience of client-side caching the right-boundary event (if any!) must NOT BE included and will go to the start of the next period
+			when p_frequency is not null
+				then coalesce(microtimestamp <= get._date_ceiling(p_end_time, p_frequency), TRUE) -- for the client-side caching right-boundary interval MUST BE included
+	  end				
 
 $$;
 

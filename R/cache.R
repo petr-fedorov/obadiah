@@ -165,7 +165,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
   }
 }
 
-.load_from_cache <- function(start.time, end.time, cache) {
+.load_from_cache <- function(start.time, end.time, cache, right=FALSE) {
 
   flog.debug('.load_from_cache(%s, %s, %s)', format(start.time), format(end.time), cache$type, name="obadiah.cache")
 
@@ -176,7 +176,10 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
     if (!empty(cached_interval)) {
       cached_data <- cache[[.cache_leaf_key(head(cached_interval)$s, head(cached_interval)$e)]]
       flog.debug('requested data are found in the cache period %s %s', format(head(cached_interval)$s), format(head(cached_interval)$e), name="obadiah.cache")
-      data <- cached_data %>%  filter(timestamp >= start.time & timestamp < end.time)
+      if(right)
+        data <- cached_data %>%  filter(timestamp >= start.time & timestamp <= end.time)
+      else
+        data <- cached_data %>%  filter(timestamp >= start.time & timestamp < end.time)
     }
     else
       data <- data.frame()

@@ -1851,6 +1851,7 @@ starting_depth_change as (
 	from periods join obanalytics.order_book(previous_period_end, p_pair_id,p_exchange_id, true, false,false ) b on true 
 				 join obanalytics.order_book(period_start, p_pair_id,p_exchange_id, true, true, false ) a on true 
 				 join obanalytics._depth_change(b.ob, a.ob) c on true
+	where previous_period_end is not null
 )
 select *
 from starting_depth_change

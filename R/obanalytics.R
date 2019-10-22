@@ -77,17 +77,21 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
   if(is.null(cache) || start.time > cache.bound)
     depth_changes <- .depth_changes(conn, start.time, end.time, exchange, pair, frequency, debug.query)
   else {
-    if(is.null(frequency))
+    if(is.null(frequency)) {
       cache_key <- "depth"
-    else
+      right <- FALSE
+    }
+    else {
       cache_key <- paste0("depth",frequency)
+      right <- TRUE
+    }
     loader <- function(conn, start.time, end.time, exchange, pair, debug.query) {
       .depth_changes(conn, start.time, end.time, exchange, pair, frequency, debug.query)
       }
     if(end.time <= cache.bound )
-      depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, loader, .leaf_cache(cache, exchange, pair, cache_key))
+      depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair, debug.query, loader, .leaf_cache(cache, exchange, pair, cache_key), right=right)
     else
-      depth_changes <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, loader, .leaf_cache(cache, exchange, pair, cache_key) ),
+      depth_changes <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, debug.query, loader, .leaf_cache(cache, exchange, pair, cache_key), right=right ),
                              loader(conn, cache.bound, end.time, exchange, pair, debug.query)
                             )
   }
@@ -97,14 +101,14 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
     # Assign timezone of start.time, if any, to timestamp column
     depth$timestamp <- with_tz(depth$timestamp, tzone)
   }
-  depth %>% arrange(timestamp, -price)
+  depth %>% arrange(timestamp, -price, side)
 }
 
 
-.load_cached <- function(conn, start.time, end.time, exchange, pair, debug.query, loader, cache) {
+.load_cached <- function(conn, start.time, end.time, exchange, pair, debug.query, loader, cache, right=FALSE) {
 
   .update_cache(conn, floor_date(start.time), ceiling_date(end.time), exchange, pair, debug.query, loader, cache)
-  .load_from_cache(start.time, end.time, cache)
+  .load_from_cache(start.time, end.time, cache, right=right)
 }
 
 

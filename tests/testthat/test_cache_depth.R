@@ -28,7 +28,9 @@ fixture <- quote({
 
   .depth_changes_mock <- function(con, start.time, end.time, exchange, pair, ...) {
     queries <<- rbind(queries, data.frame(start.time=start.time, end.time = end.time, exchange=exchange, pair=pair))
-    bitstamp_btcusd_depth  %>% filter(timestamp >= start.time & timestamp < end.time) # [start.time, end.time)
+    bitstamp_btcusd_depth  %>%
+      filter(timestamp >= start.time & timestamp < end.time) %>%  # [start.time, end.time)
+      arrange(timestamp, -price, side)
     }
 
   })
@@ -41,7 +43,7 @@ test_that('the depth is downloaded from RDBMS and timestamps are in UTC time zon
   start.time <- with_tz(min(bitstamp_btcusd_depth$timestamp)) # no time zone!
   end.time <- max(bitstamp_btcusd_depth$timestamp)
 
-  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp < end.time ) # timestamp >= end.time must not be returned, i.e. [start.time, end.time)
+  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp < end.time ) %>% arrange(timestamp, -price, side) # timestamp >= end.time must not be returned, i.e. [start.time, end.time)
   expected_data$timestamp <- with_tz(expected_data$timestamp, tz='UTC') # start.time is WITHOUT tzone, so 'UTC' must be returned
 
   # All queries are supposed to be done in UTC time zone and start.time and end.time have to be rounded to seconds
@@ -75,7 +77,7 @@ test_that('the depth is downloaded from RDBMS and timestamps are in Europe/Mosco
   start.time <- ymd_hms("2019-04-13 01:00:00", tz=tzone)
   end.time <- ymd_hms("2019-04-13 01:14:59", tz=tzone)
 
-  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )
+  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time & timestamp < end.time )  %>% arrange(timestamp, -price, side)
   expected_data$timestamp <- with_tz(expected_data$timestamp, tz=tzone) # start.time in Europe/Moscow, so returned data has to be in the same time zone
 
   # All queries are supposed to be done in UTC time zone, no matter what is time zone of the parameters of depth()
@@ -105,7 +107,7 @@ test_that('depth is served from cache whenever requested range is cached',  {
   start.time <- ymd_hms("2019-04-13 01:00:00+0300")
   end.time <- ymd_hms('2019-04-13 01:14:59+0300')
 
-  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time + minutes(1) & timestamp < end.time - minutes(1) )
+  expected_data <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time + minutes(1) & timestamp < end.time - minutes(1) )  %>% arrange(timestamp, -price, side)
   expected_data$timestamp <- with_tz(expected_data$timestamp, tz='UTC')
 
   # We cache [start.time, end.time) interval and then request [start.time + minutes(1), end.time - minutes(1)) from cache
@@ -147,7 +149,7 @@ test_that("non-overlapping depths are downloaded from RDBMS", {
   end.time2 <- ymd_hms('2019-04-13 01:14:59', tz=tzone2)
 
 
-  expected_data2 <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time2 & timestamp < end.time2 )
+  expected_data2 <- bitstamp_btcusd_depth %>% filter(timestamp >= start.time2 & timestamp < end.time2 )  %>% arrange(timestamp, -price, side)
 
   expected_data2$timestamp <- with_tz(expected_data2$timestamp, tz=tzone2)  # must be the same tzone as time zone of start.time2
 
