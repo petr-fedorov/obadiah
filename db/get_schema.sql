@@ -109,31 +109,6 @@ COMMENT ON FUNCTION get._in_milliseconds(ts timestamp with time zone) IS 'Since 
 
 
 --
--- Name: _periods_within_eras(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
---
-
-CREATE FUNCTION get._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) RETURNS TABLE(period_start timestamp with time zone, period_end timestamp with time zone, previous_period_end timestamp with time zone)
-    LANGUAGE sql
-    AS $$	select period_start, period_end, lag(period_end) over (order by period_start) as previous_period_end
-	from (
-		select period_start, period_end
-		from (
-			select get._date_ceiling(greatest(era, p_start_time), p_frequency) as period_start, 
-					get._date_floor(least(coalesce(level3, era), p_end_time), p_frequency) as period_end
-			from obanalytics.level3_eras
-			where pair_id = p_pair_id
-			  and exchange_id = p_exchange_id
-			  and p_start_time <= coalesce(level3, era)
-			  and p_end_time >= era
-		) e
-		where period_end > period_start
-	) p
-$$;
-
-
-ALTER FUNCTION get._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
-
---
 -- Name: _validate_parameters(text, timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
@@ -230,14 +205,12 @@ ALTER FUNCTION get.data_overview(p_exchange text, p_pair text, p_r integer) OWNE
 CREATE FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_starting_depth boolean DEFAULT true, p_depth_changes boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, price numeric, volume numeric, side text)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$with starting_depth as (
-	select get._date_floor(p_start_time, p_frequency) as microtimestamp, side, price, volume 
-	from obanalytics.order_book(get._date_floor(p_start_time, p_frequency), 
-								p_pair_id,
-								p_exchange_id,
-								p_only_makers := true,
-								p_before :=true,		-- if p_start_time is a start of an era, 
-														-- then this order book will be null - see comment below
-								p_check_takers := false)
+	select period_start as microtimestamp, side, price, volume 
+	from (select period_start from obanalytics._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency) where previous_period_end is null ) p
+	join lateral obanalytics.order_book( period_start,  p_pair_id,p_exchange_id, p_only_makers := false,
+											p_before :=true,		-- if period_start is an exact start of an era, 
+																	-- then this order book will be null - see comment below
+								p_check_takers := false) on true
 	join lateral ( select price, side, sum(amount) as volume from unnest(ob) group by price, side ) d on true
 	where p_starting_depth 
 ),

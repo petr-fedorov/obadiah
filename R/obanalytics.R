@@ -65,8 +65,12 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
   stopifnot(is.null(frequency) || is.numeric(frequency))
+  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
 
-  flog.debug(paste0("depth(conn,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
+  if(is.null(frequency))
+    flog.debug(paste0("depth(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", shQuote(exchange), ", ", shQuote(pair),")" ), name="obadiah")
+  else
+    flog.debug(paste0("depth(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", shQuote(exchange), ", ", shQuote(pair),",", frequency, ")" ), name="obadiah")
 
   tzone <- tz
 
@@ -84,6 +88,10 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
     else {
       cache_key <- paste0("depth",frequency)
       right <- TRUE
+      if(frequency < 60)
+        end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
+      else
+        end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
     }
     loader <- function(conn, start.time, end.time, exchange, pair, debug.query) {
       .depth_changes(conn, start.time, end.time, exchange, pair, frequency, debug.query)

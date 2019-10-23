@@ -1188,6 +1188,31 @@ $$;
 ALTER FUNCTION obanalytics._order_book_after_episode_st(p_state integer, p_episode obanalytics.level3[], p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: _periods_within_eras(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) RETURNS TABLE(period_start timestamp with time zone, period_end timestamp with time zone, previous_period_end timestamp with time zone)
+    LANGUAGE sql
+    AS $$	select period_start, period_end, lag(period_end) over (order by period_start) as previous_period_end
+	from (
+		select period_start, period_end
+		from (
+			select greatest(get._date_ceiling(era, p_frequency), get._date_floor(p_start_time, p_frequency)) as period_start, 
+					least(coalesce(get._date_floor(level3, p_frequency), get._date_ceiling(era, p_frequency)), get._date_floor(p_end_time, p_frequency)) as period_end
+			from obanalytics.level3_eras
+			where pair_id = p_pair_id
+			  and exchange_id = p_exchange_id
+			  and get._date_floor(p_start_time, p_frequency) <= coalesce(get._date_floor(level3, p_frequency), get._date_ceiling(era, p_frequency))
+			  and get._date_floor(p_end_time, p_frequency) >= get._date_ceiling(era, p_frequency)
+		) e
+		where get._date_floor(period_end, p_frequency) > get._date_floor(period_start, p_frequency)
+	) p
+$$;
+
+
+ALTER FUNCTION obanalytics._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
+
+--
 -- Name: level1; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1844,12 +1869,12 @@ CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time z
 
 with periods as (
 	select * 
-	from get._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
+	from obanalytics._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
 ),
 starting_depth_change as (
 	select period_start, p_pair_id::smallint, p_exchange_id::smallint, 'r0', c
-	from periods join obanalytics.order_book(previous_period_end, p_pair_id,p_exchange_id, true, false,false ) b on true 
-				 join obanalytics.order_book(period_start, p_pair_id,p_exchange_id, true, true, false ) a on true 
+	from periods join obanalytics.order_book(previous_period_end, p_pair_id,p_exchange_id, false, false,false ) b on true 
+				 join obanalytics.order_book(period_start, p_pair_id,p_exchange_id, false, true, false ) a on true 
 				 join obanalytics._depth_change(b.ob, a.ob) c on true
 	where previous_period_end is not null
 )
@@ -1862,7 +1887,7 @@ where microtimestamp >= period_start
   and microtimestamp <= period_end
   and level2.pair_id = p_pair_id
   and level2.exchange_id = p_exchange_id 
-  and level2.precision = 'r0'
+  and level2.precision = 'r0' 
   ;
 
 $$;
