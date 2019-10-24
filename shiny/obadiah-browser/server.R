@@ -64,6 +64,9 @@ server <- function(input, output, session) {
 
   DBI::dbExecute(con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
+  #futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+  #futile.logger::flog.appender(futile.logger::appender.file('obadiah.log'), name='obadiah')
+
   cache <- new.env(parent=emptyenv())
   #cache <- NULL
 
@@ -127,7 +130,7 @@ server <- function(input, output, session) {
     pair <- input$pair
     tp <- timePoint()
 
-    req(pair %in% pairs )
+    req(pair %in% pairs, tp )
 
     query <- paste0("select s,e from get.available_period(",
                      "get.exchange_id(", shQuote(isolate(input$exchange)), ") , ",
@@ -153,7 +156,7 @@ server <- function(input, output, session) {
   })
 
 
-  values <- reactiveValues()
+  values <- reactiveValues(res=NULL)
 
   observeEvent(input$tz, {
     tz.before <- isolate(values$tz)
@@ -171,6 +174,22 @@ server <- function(input, output, session) {
     else {
       values$tz <- input$tz
     }
+  })
+
+  observeEvent(input$res, {
+    desired.sampling.freq <- as.integer(input$res)%/%900
+
+    if(desired.sampling.freq > max(as.integer(frequencies))) {
+      updateSelectInput(session, "freq", selected=max(as.integer(frequencies)))
+    }
+    else {
+      desired.sampling.freq <- frequencies[which.max(frequencies >= desired.sampling.freq)]
+      if(as.integer(desired.sampling.freq) > as.integer(input$freq) || as.integer(input$res) < as.integer(input$freq)) {
+        updateSelectInput(session, "freq", selected= desired.sampling.freq)
+      }
+
+    }
+    values$res <- input$res
   })
 
 
@@ -192,15 +211,24 @@ server <- function(input, output, session) {
 
 
 
+  period <- reactive({
+    req(values$res, input$freq)
+    list(res=as.integer(values$res), freq=as.integer(input$freq))
+  }) %>% debounce(3000)
+
+
+
   depth <- reactive( {
+
     tp <- timePoint()
+    frequency <- period()$freq
+
     from.time <- tp-zoomWidth()/2
     to.time <- tp+zoomWidth()/2
 
     exchange <- isolate(input$exchange)
     pair <- pair()
 
-    frequency <- as.integer(input$freq)
     if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading depth ...", {
@@ -223,13 +251,13 @@ server <- function(input, output, session) {
 
   draws <- reactive( {
 
+    exchange <- isolate(input$exchange)
+    pair <- pair()
 
     tp <- timePoint()
     from.time <- tp-zoomWidth()/2
     to.time <- tp+zoomWidth()/2
 
-    exchange <- isolate(input$exchange)
-    pair <- pair()
 
     withProgress(message="loading draws ...", {
       obadiah::draws(con(), from.time, to.time, exchange, pair, minimal.draw(), input$showdraws, tz=tz(tp))
@@ -267,12 +295,13 @@ server <- function(input, output, session) {
 
   trades <- reactive( {
 
+    exchange <- isolate(input$exchange)
+    pair <- pair()
+
     tp <- timePoint()
     from.time <- tp-12*60*60
     to.time <- tp+12*60*60
 
-    exchange <- isolate(input$exchange)
-    pair <- pair()
 
     withProgress(message="loading trades ...", {
       obadiah::trades(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
@@ -282,12 +311,12 @@ server <- function(input, output, session) {
 
   events <- reactive( {
 
+    exchange <- isolate(input$exchange)
+    pair <- pair()
     tp <- timePoint()
     from.time <- tp-zoomWidth()/2
     to.time <- tp+zoomWidth()/2
 
-    exchange <- isolate(input$exchange)
-    pair <- pair()
 
     withProgress(message="loading events ...", {
       obadiah::events(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
@@ -316,7 +345,8 @@ server <- function(input, output, session) {
 
   # time window
   zoomWidth <- reactive({
-    resolution <- as.integer(input$res)
+    req(period()$res)
+    resolution <- period()$res
     if(resolution == 0) return(input$zoom.width) # custom
     else return(resolution)
   })
@@ -328,12 +358,13 @@ server <- function(input, output, session) {
   # get order book given time point
   ob <- reactive({
 
+    exchange <- isolate(input$exchange)
+    pair <- pair()
+
     tp <- timePoint()
     from.time <- tp-zoomWidth()/2
     to.time <- tp+zoomWidth()/2
 
-    exchange <- isolate(input$exchange)
-    pair <- pair()
 
 
     order.book.data <- withProgress(message="loading order book ...", {
@@ -488,11 +519,6 @@ server <- function(input, output, session) {
   # liquidity/depth map plot
   output$depth.map.plot <- renderPlot({
     withProgress(message="generating Price level volume ...", {
-      width.seconds <- zoomWidth()
-      tp <- timePoint()
-      tz <- attr(tp, "tzone")
-      from.time <- tp-width.seconds/2
-      to.time <- tp+width.seconds/2
       depth <- depth_filtered()
       trades <- trades() %>% filter(direction %in% input$showtrades)
 
@@ -508,6 +534,13 @@ server <- function(input, output, session) {
       show.mp <- if(input$showspread == 'M') TRUE else FALSE
 
       show.all.depth <- "ro" %in% input$showdepth
+
+      width.seconds <- zoomWidth()
+      tp <- timePoint()
+      tz <- attr(tp, "tzone")
+      from.time <- tp-width.seconds/2
+      to.time <- tp+width.seconds/2
+
 
       if("lr" %in% input$showdepth) {
 
@@ -581,6 +614,7 @@ server <- function(input, output, session) {
   output$depth.percentile.plot <- renderPlot({
     withProgress(message="generating liquidity percentiles ...", {
       width.seconds <- zoomWidth()
+      freq <- period()$freq
       tp <- timePoint()
       from.time <- tp-width.seconds/2
       to.time <- tp+width.seconds/2

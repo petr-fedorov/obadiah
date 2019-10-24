@@ -24,7 +24,7 @@ fluidPage(
       wellPanel(
         h4("Instrument"),
         fluidRow(
-                column(6, selectInput("exchange", "Exchange", choices="")),
+                column(6, selectInput("exchange", "Exchange", choices="bitfinex")),
                 column(6, selectInput("pair", "Pair", choices=""))
                  )
       ),
@@ -36,30 +36,11 @@ fluidPage(
         h4("Period"),
         fluidRow(column(6,         selectInput("res",
                                                "Duration",
-                                               list("3 seconds"=3,
-                                                    "15 seconds"=15,
-                                                    "30 seconds"=30,
-                                                    "1 minute"=60,
-                                                    "3 minute"=180,
-                                                    "5 minutes"=300,
-                                                    "15 minutes"=900,
-                                                    "30 minutes"=1800,
-                                                    "1 hour"=3600,
-                                                    "3 hours"=10800,
-                                                    "6 hours"=21600,
-                                                    "12 hours"=43200
-                                                    # "1 day"=86399,
-                                                    # "custom"=0
-                                               ),
-                                               selected=180)),
+                                               durations,
+                                               selected=1800)),
                   column(6,        selectInput("freq",
                                                "Sampling frequency",
-                                               list("All"=0,
-                                                    "5 seconds"=5,
-                                                    "10 seconds"=10,
-                                                    "15 seconds"=15,
-                                                    "30 seconds"=30
-                                               ),
+                                               frequencies,
                                                selected=0)
                   )
                  ),
@@ -171,7 +152,7 @@ fluidPage(
                  wellPanel(
                    verbatimTextOutput("price_level_volume_hoverinfo"),
                    fluidRow( column(2, wellPanel(radioButtons("showspread", label="Show spread", choices=c("Mid price"='M', "Best prices"='B', "None"='N'),
-                                                    selected='M', inline=F),
+                                                    selected='B', inline=F),
                                                  checkboxInput("skip.crossed","Skip crossed", TRUE))),
                              column(2, wellPanel(radioButtons("showdraws", label="Show draws", choices=c("None"='N', "Mid price"='mid-price', "Asks"='ask', "Bids"='bid'),
                                                               selected='N', inline=F),

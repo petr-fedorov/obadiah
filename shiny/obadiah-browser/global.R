@@ -16,3 +16,29 @@
 tzlist <- OlsonNames()
 config <- config::get()
 Sys.chmod(config$sslkey, mode="0600")
+durations <- list("3 seconds"=3,
+   "15 seconds"=15,
+   "30 seconds"=30,
+   "1 minute"=60,
+   "3 minute"=180,
+   "5 minutes"=300,
+   "15 minutes"=900,
+   "30 minutes"=1800,
+   "1 hour"=3600,
+   "3 hours"=10800,
+   "6 hours"=21600,
+   "12 hours"=43200,
+   "1 day"=86400,
+   "2 day"=86400*2,
+   "3 day"=86400*3,
+   "4 day"=86400*4
+)
+
+frequencies <- list("All"=0,
+     "5 seconds"=5,
+     "10 seconds"=10,
+     "15 seconds"=15,
+     "30 seconds"=30,
+     "1 minute"=60,
+     "10 minutes"=600)
+
