@@ -42,7 +42,7 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 #include "spi_allocator.h"
 
 
-namespace obadiah_db {
+namespace obad {
 
     using namespace std;
 
@@ -55,20 +55,6 @@ namespace obadiah_db {
     using spi_vector = vector<T, spi_allocator<T>>;
 
 
-    template <class T, class U>
-    bool
-    operator==(spi_allocator<T> const&, spi_allocator<U> const&) noexcept
-    {
-        return true;
-    }
-
-    template <class T, class U>
-    bool
-    operator!=(spi_allocator<T> const& x, spi_allocator<U> const& y) noexcept
-    {
-        return !(x == y);
-    }
-    
 
     struct level3 {
         TimestampTz microtimestamp;
@@ -314,7 +300,7 @@ Datum
 depth_change_by_episode(PG_FUNCTION_ARGS)
 {
     using namespace std;
-    using namespace obadiah_db;
+    using namespace obad;
 
     FuncCallContext     *funcctx;
     TupleDesc            tupdesc;

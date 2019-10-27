@@ -29,7 +29,7 @@ extern "C" {
 #endif // __cplusplus
 
 
-namespace obadiah_db {
+namespace obad {
 
     template <class T>
     class spi_allocator
@@ -106,6 +106,20 @@ namespace obadiah_db {
     //     using is_always_equal                        = std::is_empty<allocator>;
     };
 
+    template <class T, class U>
+    bool
+    operator==(spi_allocator<T> const&, spi_allocator<U> const&) noexcept
+    {
+        return true;
+    }
+
+    template <class T, class U>
+    bool
+    operator!=(spi_allocator<T> const& x, spi_allocator<U> const& y) noexcept
+    {
+        return !(x == y);
+    }
+    
 }
 
 #endif
