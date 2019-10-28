@@ -40,7 +40,7 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 #include <set>
 #include <sstream>
 #include "spi_allocator.h"
-
+#include "spread.h"
 
 namespace obad {
 
@@ -498,23 +498,29 @@ depth_change_by_episode(PG_FUNCTION_ARGS)
 
 
 
-
-
 Datum
 spread_by_episode(PG_FUNCTION_ARGS)
 {
     FuncCallContext     *funcctx;
     TupleDesc            tupdesc;
     AttInMetadata       *attinmeta;
+    MemoryContext   oldcontext;
+    obad::depth *d;
 
 
     if (SRF_IS_FIRSTCALL())
     {
-        MemoryContext   oldcontext;
 
+#if ELOGS
+	  std::string p_start_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(0))};
+	  std::string p_end_time {timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(1))};
+        elog(DEBUG1, "spread_change_by_episode(%s, %s, %i, %i)", p_start_time.c_str(), p_end_time.c_str(),PG_GETARG_INT32(2), PG_GETARG_INT32(3) );
+#endif // ELOGS
         funcctx = SRF_FIRSTCALL_INIT();
 
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+	  d = new obad::depth();
+	  funcctx->user_fctx = d;
 
         if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
             ereport(ERROR,
@@ -524,59 +530,44 @@ spread_by_episode(PG_FUNCTION_ARGS)
         attinmeta = TupleDescGetAttInMetadata(tupdesc);
         funcctx->attinmeta = attinmeta;
 
-        Oid types[4];
-        types[0] = TIMESTAMPTZOID;
-        types[1] = TIMESTAMPTZOID;
-        types[2] = INT4OID;
-        types[3] = INT4OID;
 
-        Datum values[4];
-        values[0] = PG_GETARG_TIMESTAMPTZ(0);
-        values[1] = PG_GETARG_TIMESTAMPTZ(1);
-        values[2] = PG_GETARG_INT32(2);
-        values[3] = PG_GETARG_INT32(3);
+	  Datum frequency = obad::level2_episode::NULL_FREQ;
+	  if(PG_ARGISNULL(4)) frequency = PG_GETARG_DATUM(4);
 
         SPI_connect();
-        SPI_cursor_open_with_args("level1", "select * from obanalytics.level1 where microtimestamp between $1 and $2 and pair_id = $3 and exchange_id = $4 order by microtimestamp", 4, types, values, NULL, true, 0);
+	  obad::level2_episode episode {PG_GETARG_DATUM(0),PG_GETARG_DATUM(1), PG_GETARG_DATUM(2),PG_GETARG_DATUM(3), frequency};
+	  d->update(episode.initial());
         SPI_finish();
 
         MemoryContextSwitchTo(oldcontext);
     }
 
     funcctx = SRF_PERCALL_SETUP();
+    d = static_cast<obad::depth *>(funcctx->user_fctx);
 
     attinmeta = funcctx->attinmeta;
 
+    oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
     SPI_connect();
-    Portal portal = SPI_cursor_find("level1");
-    SPI_cursor_fetch(portal, true, 1);
-    uint64 proc = SPI_processed;
 
-    if(proc == 1 && SPI_tuptable != NULL ) {
+    obad::level2_episode episode {};
+    try {
+	  obad::level1 previous {d->spread()};
+	  obad::level1 next {};
+	  do {
+		next = d->update(episode.next());
+	  }
+	  while (previous == next);
 
-
-
-        SPITupleTable *tuptable = SPI_tuptable;
-        TupleDesc tupdesc = tuptable->tupdesc;
-        HeapTuple tuple_in = tuptable->vals[0];
-        char **values = (char **) SPI_palloc(tupdesc->natts * sizeof(char *));
-
-        int i;
-        for (i = 1; i <= tupdesc->natts; i++) {
-            values[i-1] = SPI_getvalue(tuple_in, tupdesc, i);
-        }
         SPI_finish();
+        MemoryContextSwitchTo(oldcontext);
 
-        HeapTuple tuple_out = BuildTupleFromCStrings(attinmeta, values);
-        Datum result = HeapTupleGetDatum(tuple_out);
-
-        SRF_RETURN_NEXT(funcctx, result);
-
+        SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(next.to_heap_tuple(attinmeta, PG_GETARG_INT32(2), PG_GETARG_INT32(3))));
     }
-    else    {   /* do when there is no more left */
-
-        SPI_cursor_close(SPI_cursor_find("level1"));
+    catch (...) {
         SPI_finish();
+        MemoryContextSwitchTo(oldcontext);
+	  delete d;
         SRF_RETURN_DONE(funcctx);
     }
 }
