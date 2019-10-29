@@ -18,7 +18,7 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif // __cplusplus
+#endif  // __cplusplus
 
 #include "postgres.h"
 #include "utils/timestamp.h"
@@ -28,80 +28,90 @@ extern "C" {
 
 #ifdef __cplusplus
 }
-#endif // __cplusplus
+#endif  // __cplusplus
 
 #include <vector>
 
 namespace obad {
-    using price = long double;
-    using amount = long double;
+using price = long double;
+using amount = long double;
 
-    class level2_impl;	// is supposed to have an SPI-aware new and delete operators ...
+class level2_impl;  // is supposed to have an SPI-aware new and delete operators
+                    // ...
 
-    class level2 {
-	  public:
-		level2() {
-		    p_impl = nullptr;
-		};
+class level2 {
+ public:
+  level2() {
+    p_impl = nullptr;
+  };
 
-		level2(TimestampTz, price, amount);
+  level2(TimestampTz, price, amount);
 
-		level2(level2&& m);
+  level2(level2 &&m);
 
-		~level2(); 
+  ~level2();
 
-		char side();
+  char side();
 
-		bool operator < (const level2 &);
+  bool operator<(const level2 &);
 
-	  private:
-		level2_impl *p_impl;
-    };
-    
-    struct level1 {
-	  price best_bid_price;
-	  amount best_bid_qty;
-	  price best_ask_price;
-	  amount best_ask_qty;
-	  TimestampTz microtimestamp;
+ private:
+  level2_impl *p_impl;
+};
 
-	  level1() : best_bid_price(-1), best_bid_qty(-1), best_ask_price(-1), best_ask_qty(-1), microtimestamp(0) {};
+struct level1 {
+  price best_bid_price;
+  amount best_bid_qty;
+  price best_ask_price;
+  amount best_ask_qty;
+  TimestampTz microtimestamp;
 
-	  HeapTuple to_heap_tuple(AttInMetadata *, int32, int32);
+  level1()
+      : best_bid_price(-1),
+        best_bid_qty(-1),
+        best_ask_price(-1),
+        best_ask_qty(-1),
+        microtimestamp(0) {};
 
-	  bool operator == (const level1 &c) { return (best_bid_price == c.best_bid_price) && (best_bid_qty == c.best_bid_qty) && (best_ask_price == c.best_ask_price) && (best_ask_qty == c.best_ask_qty); };
-	  bool operator != (const level1 &c) { return !(*this == c); };
-    };
+  HeapTuple to_heap_tuple(AttInMetadata *, int32, int32);
 
+  bool operator==(const level1 &c) {
+    return (best_bid_price == c.best_bid_price) &&
+           (best_bid_qty == c.best_bid_qty) &&
+           (best_ask_price == c.best_ask_price) &&
+           (best_ask_qty == c.best_ask_qty);
+  };
+  bool operator!=(const level1 &c) {
+    return !(*this == c);
+  };
+};
 
+class level2_episode {
+ public:
+  static const long unsigned NULL_FREQ = 0;
+  level2_episode();
+  level2_episode(Datum start_time, Datum end_time, Datum pair_id,
+                 Datum exchange_id, Datum frequency);
+  std::vector<level2> initial();
+  std::vector<level2> next();
+  TimestampTz microtimestamp();
 
-    class level2_episode {
-	  public:
-		static const long unsigned NULL_FREQ = 0;
-		level2_episode();
-		level2_episode(Datum start_time, Datum end_time, Datum pair_id, Datum exchange_id, Datum frequency);
-		std::vector<level2> initial();
-		std::vector<level2> next();
-		TimestampTz microtimestamp();
-	  private:
-		static constexpr const char * const INITIAL = "initial";
-		static constexpr const char * const CURSOR ="level2";
-		Portal portal;
-    };
+ private:
+  static constexpr const char *const INITIAL = "initial";
+  static constexpr const char *const CURSOR = "level2";
+  Portal portal;
+};
 
-    class depth {
-	  public:
-		level1 spread();
-		level1 update(std::vector<level2>); 
-		void * operator new(size_t s);
-		void operator delete(void *p, size_t s);
+class depth {
+ public:
+  level1 spread();
+  level1 update(std::vector<level2>);
+  void *operator new(size_t s);
+  void operator delete(void *p, size_t s);
 
-	  private:
-		TimestampTz episode;
-    };
-		
+ private:
+  TimestampTz episode;
+};
 }
-
-
 
 #endif
