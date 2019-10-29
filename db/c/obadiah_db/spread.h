@@ -31,6 +31,7 @@ extern "C" {
 #endif  // __cplusplus
 
 #include <vector>
+#include "spi_allocator.h"
 
 namespace obad {
 using price = long double;
@@ -45,17 +46,21 @@ class level2 {
     p_impl = nullptr;
   };
 
-  level2(TimestampTz, price, amount);
+  level2(HeapTuple, TupleDesc);
 
   level2(level2 &&m);
+
+  level2 &operator=(level2 &&);
 
   ~level2();
 
   char side();
 
-  bool operator<(const level2 &);
+  bool operator<(const level2 &) const;
 
  private:
+  level2(level2 &m);  // prohibits copying ...
+
   level2_impl *p_impl;
 };
 
@@ -104,6 +109,7 @@ class level2_episode {
 
 class depth {
  public:
+  ~depth();
   level1 spread();
   level1 update(std::vector<level2>);
   void *operator new(size_t s);
@@ -111,6 +117,9 @@ class depth {
 
  private:
   TimestampTz episode;
+  using depth_set =
+      std::set<level2, std::less<level2>, obad::spi_allocator<level2>>;
+  depth_set depth;
 };
 }
 

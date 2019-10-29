@@ -206,7 +206,7 @@ struct order_book {
         }
         catch (...) {
 #if ELOGS
-          elog(DEBUG1, "No previous event for %s %lu %i",
+          elog(DEBUG3, "No previous event for %s %lu %i",
                timestamptz_to_str(event.microtimestamp), event.order_id,
                event.event_no);
 #endif
@@ -536,13 +536,6 @@ Datum spread_by_episode(PG_FUNCTION_ARGS) {
 
   if (SRF_IS_FIRSTCALL()) {
 
-#if ELOGS
-    std::string p_start_time{timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(0))};
-    std::string p_end_time{timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(1))};
-    elog(DEBUG1, "spread_change_by_episode(%s, %s, %i, %i)",
-         p_start_time.c_str(), p_end_time.c_str(), PG_GETARG_INT32(2),
-         PG_GETARG_INT32(3));
-#endif  // ELOGS
     funcctx = SRF_FIRSTCALL_INIT();
 
     oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -558,7 +551,7 @@ Datum spread_by_episode(PG_FUNCTION_ARGS) {
     funcctx->attinmeta = attinmeta;
 
     Datum frequency = obad::level2_episode::NULL_FREQ;
-    if (PG_ARGISNULL(4)) frequency = PG_GETARG_DATUM(4);
+    if (!PG_ARGISNULL(4)) frequency = PG_GETARG_DATUM(4);
 
     SPI_connect();
     obad::level2_episode episode{PG_GETARG_DATUM(0), PG_GETARG_DATUM(1),
