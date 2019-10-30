@@ -31,6 +31,7 @@ extern "C" {
 #endif  // __cplusplus
 
 #include <vector>
+#include <map>
 #include "spi_allocator.h"
 
 namespace obad {
@@ -48,18 +49,21 @@ class level2 {
 
   level2(HeapTuple, TupleDesc);
 
+  level2(const level2 &m) = delete;
   level2(level2 &&m);
 
   level2 &operator=(level2 &&);
 
   ~level2();
 
-  char side();
+  TimestampTz get_microtimestamp();
+  price get_price();
+  amount get_volume();
+  char get_side();
 
   bool operator<(const level2 &) const;
 
  private:
-  level2(level2 &m);  // prohibits copying ...
 
   level2_impl *p_impl;
 };
@@ -78,6 +82,12 @@ struct level1 {
         best_ask_qty(-1),
         microtimestamp(0) {};
 
+  level1(price bbp, amount bbq, price bap, amount baq, TimestampTz m)
+      : best_bid_price(bbp),
+        best_bid_qty(bbq),
+        best_ask_price(bap),
+        best_ask_qty(baq),
+        microtimestamp(m) {};
   HeapTuple to_heap_tuple(AttInMetadata *, int32, int32);
 
   bool operator==(const level1 &c) {
@@ -99,6 +109,7 @@ class level2_episode {
                  Datum exchange_id, Datum frequency);
   std::vector<level2> initial();
   std::vector<level2> next();
+  void done() { SPI_cursor_close(portal);};
   TimestampTz microtimestamp();
 
  private:
@@ -109,6 +120,7 @@ class level2_episode {
 
 class depth {
  public:
+  depth();
   ~depth();
   level1 spread();
   level1 update(std::vector<level2>);
@@ -116,10 +128,15 @@ class depth {
   void operator delete(void *p, size_t s);
 
  private:
+  void update_spread(level2&);
   TimestampTz episode;
-  using depth_set =
-      std::set<level2, std::less<level2>, obad::spi_allocator<level2>>;
-  depth_set depth;
+  using depth_map =
+      std::map<price, level2, std::less<price>, obad::spi_allocator<std::pair<const price, level2>>>;
+  depth_map d;
+  price best_bid_price;
+  amount best_bid_qty;
+  price best_ask_price;
+  amount best_ask_qty;
 };
 }
 

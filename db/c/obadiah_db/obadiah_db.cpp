@@ -585,6 +585,7 @@ Datum spread_by_episode(PG_FUNCTION_ARGS) {
                                  PG_GETARG_INT32(3))));
   }
   catch (...) {
+    episode.done();
     SPI_finish();
     MemoryContextSwitchTo(oldcontext);
     delete d;

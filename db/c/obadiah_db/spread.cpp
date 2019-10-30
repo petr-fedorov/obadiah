@@ -23,7 +23,8 @@ extern "C" {
 #include <string>
 #include <sstream>
 #include <iomanip>
-#include <set>
+#include <limits>
+#include <map>
 #include "spread.h"
 namespace obad {
 
@@ -36,6 +37,19 @@ class level2_impl {
   };
   void operator delete(void *p, size_t s) {
     SPI_pfree(p);
+  };
+
+  TimestampTz get_microtimestamp() {
+    return m;
+  }
+  price get_price() {
+    return p;
+  };
+  char get_side() {
+    return s;
+  };
+  amount get_volume() {
+    return v;
   };
 
   bool operator<(const level2_impl &) const;
@@ -73,12 +87,12 @@ level2_impl::level2_impl(HeapTuple tuple, TupleDesc tupdesc) {
     ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
                     errmsg("Couldn't get microtimestamp %Lf %Lf %c", p, v, s)));
 #if ELOGS
-  elog(DEBUG1, "Created level2_impl from HeapTuple %s", __str__().c_str());
+  elog(DEBUG3, "Created level2_impl from HeapTuple %s", __str__().c_str());
 #endif
 }
 level2_impl::~level2_impl() {
 #if ELOGS
-  elog(DEBUG1, "Deleted level2_impl %s", __str__().c_str());
+  elog(DEBUG3, "Deleted level2_impl %s", __str__().c_str());
 #endif
 };
 
@@ -92,6 +106,37 @@ level2 &level2::operator=(level2 &&o) {
   p_impl = o.p_impl;
   o.p_impl = nullptr;
   return *this;
+};
+
+TimestampTz level2::get_microtimestamp() {
+  if (p_impl)
+    return p_impl->get_microtimestamp();
+  else
+    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                    errmsg("Couldn't get_microtimestamp from an empty level2 ")));
+};
+amount level2::get_price() {
+  if (p_impl)
+    return p_impl->get_price();
+  else
+    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                    errmsg("Couldn't get_price from an empty level2 ")));
+};
+
+char level2::get_side() {
+  if (p_impl)
+    return p_impl->get_side();
+  else
+    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                    errmsg("Couldn't get_side from an empty level2 ")));
+};
+
+amount level2::get_volume() {
+  if (p_impl)
+    return p_impl->get_volume();
+  else
+    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+                    errmsg("Couldn't get_volume from an empty level2 ")));
 };
 
 level2::~level2() {
@@ -123,7 +168,6 @@ bool level2_impl::operator<(const level2_impl &o) const {
   }
 }
 
-
 HeapTuple level1::to_heap_tuple(AttInMetadata *attinmeta, int32 pair_id,
                                 int32 exchange_id) {
   char **values = (char **)palloc(7 * sizeof(char *));
@@ -135,10 +179,10 @@ HeapTuple level1::to_heap_tuple(AttInMetadata *attinmeta, int32 pair_id,
   values[4] = (char *)palloc(BUFFER_SIZE * sizeof(char));
   values[5] = (char *)palloc(BUFFER_SIZE * sizeof(char));
   values[6] = (char *)palloc(BUFFER_SIZE * sizeof(char));
-  snprintf(values[0], BUFFER_SIZE, "%Lf", best_bid_price);
-  snprintf(values[1], BUFFER_SIZE, "%Lf", best_bid_qty);
-  snprintf(values[2], BUFFER_SIZE, "%Lf", best_ask_price);
-  snprintf(values[3], BUFFER_SIZE, "%Lf", best_ask_qty);
+  snprintf(values[0], BUFFER_SIZE, "%.5Lf", best_bid_price);
+  snprintf(values[1], BUFFER_SIZE, "%.8Lf", best_bid_qty);
+  snprintf(values[2], BUFFER_SIZE, "%.5Lf", best_ask_price);
+  snprintf(values[3], BUFFER_SIZE, "%.8Lf", best_ask_qty);
   snprintf(values[4], BUFFER_SIZE, "%s", timestamptz_to_str(microtimestamp));
   snprintf(values[5], BUFFER_SIZE, "%i", pair_id);
   snprintf(values[6], BUFFER_SIZE, "%i", exchange_id);
@@ -225,7 +269,7 @@ std::vector<level2> level2_episode::next() {
       result.reserve(episode_size);
 #if ELOGS
       ereport(DEBUG1,
-              (errmsg("episode=%s %lu",
+              (errmsg("episode microtimestamp=%s size=%lu",
                       SPI_getvalue(
                           SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
                           SPI_fnumber(SPI_tuptable->tupdesc, "microtimestamp")),
@@ -246,36 +290,95 @@ std::vector<level2> level2_episode::next() {
     throw 0;
 }
 
+
+
 std::vector<level2> level2_episode::initial() {
-  std::vector<level2> result{next()};
-  SPI_cursor_close(portal);
-  portal = nullptr;
-  return result;
+  std::vector<level2> result;
+  try {
+    std::vector<level2> result{next()};
+    SPI_cursor_close(portal);
+    portal = nullptr;
+    return result;
+  }
+  catch(...) { // we are fine, if the initial episode is an empty one 
+    SPI_cursor_close(portal);
+    portal = nullptr;
+    return std::vector<level2>{};
+  };  
 }
 
 level1 depth::spread() {
-  level1 result{};
-  result.best_bid_price = 1;
-  return result;
+  return level1{best_bid_price, best_bid_qty, best_ask_price,  best_ask_qty, episode};
 }
 
-level1 depth::update(std::vector<level2> v) {
-  for (level2 &l : v) {
-    std::pair<depth_set::iterator, bool> ret = depth.insert(std::move(l));
-    if (!ret.second) {  // The value of the elements in a set cannot be modified
-                        // once in the container (the elements are always
-                        // const), but they can be inserted or removed from the
-                        // container.
-      depth_set::iterator hint = ret.first;
-      hint++;
-      depth.erase(ret.first);
-      depth.insert(hint, std::move(l));
+void depth::update_spread(level2 &l) {
+  if (l.get_volume() > 0) {
+    if (l.get_side() == 's' && l.get_price() <= best_ask_price) {
+      best_ask_price = l.get_price();
+      best_ask_qty = l.get_volume();
+      return;
+    }
+
+    if (l.get_side() == 'b' && l.get_price() >= best_bid_price) {
+      best_bid_price = l.get_price();
+      best_bid_qty = l.get_volume();
+      return;
+    }
+  } else {
+    if (l.get_side() == 's' && l.get_price() == best_ask_price) {
+      for (depth_map::iterator it = d.find(l.get_price()); it != d.end(); ++it)
+        if (it->second.get_side() == 's' &&
+            it->second.get_price() > best_ask_price) {
+          best_ask_price = it->second.get_price();
+          best_ask_qty = it->second.get_volume();
+          return;
+        }
+      best_ask_price = std::numeric_limits<price>::max();
+      best_ask_qty = 0;
+      return;
+    }
+    if (l.get_side() == 'b' && l.get_price() == best_bid_price) {
+      for (std::reverse_iterator<depth_map::iterator> it =
+               std::make_reverse_iterator(d.find(l.get_price()));
+           it != d.rend(); ++it)
+        if (it->second.get_side() == l.get_side() &&
+            it->second.get_price() < best_bid_price) {
+          best_bid_price = it->second.get_price();
+          best_bid_qty = it->second.get_volume();
+          return;
+        }
+      best_bid_price = 0;
+      best_bid_qty = 0;
+      return;
     }
   }
-  return level1{};
 };
 
-depth::~depth() { elog(DEBUG1, "~depth"); }
+level1 depth::update(std::vector<level2> v) {
+  if(!v.empty())
+    episode = v[0].get_microtimestamp();
+  for (level2 &l : v) {
+    update_spread(l);
+    if (l.get_volume() > 0) 
+      d[l.get_price()] = std::move(l);
+    else 
+      d.erase(l.get_price());
+  }
+  return spread();
+};
+
+depth::depth()
+    : best_bid_price(0),
+      best_bid_qty(0),
+      best_ask_price(std::numeric_limits<price>::max()),
+      best_ask_qty(0) {};
+
+depth::~depth() { 
+#if ELOGS
+  elog(DEBUG1, "~depth"); 
+#endif
+}
+
 
 void *depth::operator new(size_t s) {
   return palloc(s);
