@@ -582,13 +582,18 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
 
 
 #' @export
-draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type='mid-price', cache=NULL, debug.query = getOption("obadiah.debug.query", FALSE), cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type='mid-price', frequency=NULL, cache=NULL, debug.query = getOption("obadiah.debug.query", FALSE), cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+  stopifnot(is.null(frequency) || is.numeric(frequency))
+  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
 
-  flog.debug(paste0("draws(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name="obadiah")
+  if(is.null(frequency))
+    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", shQuote(exchange), ", ", shQuote(pair),")" ), name="obadiah")
+  else
+    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", shQuote(exchange), ", ", shQuote(pair),",", frequency, ")" ), name="obadiah")
 
   tzone <- tz
 
@@ -599,23 +604,32 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, 
   before <- seconds(10)
 
   if(is.null(cache) || start.time > cache.bound)
-    draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw.pct, draw.type, debug.query)
-  else
-    if(end.time <= cache.bound )
-      draws <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query,
-                            function(conn, start.time, end.time, exchange, pair, debug.query) {
-                              .draws(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, debug.query)
-                              },
-                            .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct)))
-  else
-    draws <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query,
-                                function(conn, start.time, end.time, exchange, pair, debug.query) {
-                                  .draws(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type,  debug.query)
-                                },
-                                .leaf_cache(cache, exchange, pair, paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct))),
-                    .draws(conn, cache.bound, end.time, exchange, pair,minimal.draw.pct, draw.type, debug.query)
-    )
+    draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw.pct, draw.type, frequency, debug.query=debug.query)
+  else {
+    if(is.null(frequency)) {
+      cache_key <- paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct)
+      right <- FALSE
+    }
+    else {
+      cache_key <- paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct, '_', frequency)
+      right <- TRUE
+      if(frequency < 60)
+        end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
+      else
+        end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
+    }
+    loader <- function(conn, start.time, end.time, exchange, pair, debug.query) {
+      .draws(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, frequency,debug.query=debug.query)
+    }
 
+    if(end.time <= cache.bound )
+      draws <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query,loader,
+                            .leaf_cache(cache, exchange, pair, cache_key))
+    else
+      draws <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query,loader,.leaf_cache(cache, exchange, pair, cache_key)),
+                     loader(conn, cache.bound, end.time, exchange, pair, debug.query=debug.query)
+    )
+  }
   if(!empty(draws)) {
     # Assign timezone of start.time, if any, to timestamp column
     draws$timestamp <- with_tz(draws$timestamp, tzone)
@@ -628,22 +642,38 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, 
   draws
 }
 
-.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, debug.query = FALSE) {
-
-  query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\",
-                  get._in_milliseconds(\"draw.end\") AS \"draw.end\",
-                  \"start.price\",
-                  \"end.price\",
-                  \"draw.size\",
-                  \"draw.speed\"
-                  FROM get.draws(",
-                  shQuote(format(start.time, usetz=T)), ",",
-                  shQuote(format(end.time, usetz=T)), ",",
-                  shQuote(draw.type), ",",
-                  minimal.draw.pct, ",",
-                  "get.pair_id(",shQuote(pair),"), " ,
-                  "get.exchange_id(", shQuote(exchange), ") ",
-                  ") order by 1")
+.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, frequency = NULL,  debug.query = FALSE) {
+  if(is.null(frequency))
+    query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\",
+                    get._in_milliseconds(\"draw.end\") AS \"draw.end\",
+                    \"start.price\",
+                    \"end.price\",
+                    \"draw.size\",
+                    \"draw.speed\"
+                    FROM get.draws(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    shQuote(draw.type), ",",
+                    minimal.draw.pct, ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), ")",
+                    ") order by 1")
+  else
+    query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\",
+                    get._in_milliseconds(\"draw.end\") AS \"draw.end\",
+                    \"start.price\",
+                    \"end.price\",
+                    \"draw.size\",
+                    \"draw.speed\"
+                    FROM get.draws(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    shQuote(draw.type), ",",
+                    minimal.draw.pct, ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), "),",
+                    "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
+                    ") order by 1")
   if(debug.query) cat(query, "\n", file=stderr())
   draws <- DBI::dbGetQuery(conn, query)
   draws$timestamp <- as.POSIXct(as.numeric(draws$timestamp)/1000, origin="1970-01-01")

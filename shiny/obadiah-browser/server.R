@@ -232,7 +232,7 @@ server <- function(input, output, session) {
     if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading depth ...", {
-        obadiah::depth(con(), from.time, to.time, exchange, pair, frequency, debug.query=TRUE, cache=cache, tz=tz(tp))
+        obadiah::depth(con(), from.time, to.time, exchange, pair, frequency,cache=cache, tz=tz(tp))
         })
   })
 
@@ -255,12 +255,13 @@ server <- function(input, output, session) {
     pair <- pair()
 
     tp <- timePoint()
+    frequency <- period()$freq
     from.time <- tp-zoomWidth()/2
     to.time <- tp+zoomWidth()/2
-
+    if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading draws ...", {
-      obadiah::draws(con(), from.time, to.time, exchange, pair, minimal.draw(), input$showdraws, tz=tz(tp))
+      obadiah::draws(con(), from.time, to.time, exchange, pair, minimal.draw(), input$showdraws, frequency, tz=tz(tp))
     })
   })
 
