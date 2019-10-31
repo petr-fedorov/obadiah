@@ -10,6 +10,7 @@ data in the format suitable for visualization by
 
 You can browse the database online using **obadiah-browser** application
 available [here.](https://petr-fedorov.shinyapps.io/obadiah-browser/)
+![](README_files/obadiah-browser-demo.gif)
 
 To access the database programmatically one needs to get a signed SSL
 certificate as described
@@ -33,8 +34,8 @@ Currently the database contains data from the following exchanges:
 ``` r
 library(lubridate, quietly = T, warn.conflicts=F)
 
-start.time <- with_tz(ymd_hms('2019-05-13 17:56:00+03'), tz='Europe/Moscow')
-end.time <- with_tz(ymd_hms('2019-05-13 18:00:00+03'), tz='Europe/Moscow')
+start.time <- with_tz(ymd_hms('2019-10-26 04:30:00+03'), tz='Europe/Moscow')
+end.time <- with_tz(ymd_hms('2019-10-26 05:00:00+03'), tz='Europe/Moscow')
 exchange <- 'Bitfinex'
 pair <- 'BTCUSD'
 ```
