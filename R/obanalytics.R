@@ -582,7 +582,7 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
 
 
 #' @export
-draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type='mid-price', frequency=NULL, cache=NULL, debug.query = getOption("obadiah.debug.query", FALSE), cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE, debug.query = getOption("obadiah.debug.query", FALSE),  tz='UTC') {
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -602,34 +602,8 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, 
   end.time <- with_tz(end.time, tz='UTC')
 
   before <- seconds(10)
+  draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw.pct, draw.type, frequency, skip.crossed,debug.query=debug.query)
 
-  if(is.null(cache) || start.time > cache.bound)
-    draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw.pct, draw.type, frequency, debug.query=debug.query)
-  else {
-    if(is.null(frequency)) {
-      cache_key <- paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct)
-      right <- FALSE
-    }
-    else {
-      cache_key <- paste0("draws_",substr(draw.type,1,3),'_', minimal.draw.pct, '_', frequency)
-      right <- TRUE
-      if(frequency < 60)
-        end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
-      else
-        end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
-    }
-    loader <- function(conn, start.time, end.time, exchange, pair, debug.query) {
-      .draws(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, frequency,debug.query=debug.query)
-    }
-
-    if(end.time <= cache.bound )
-      draws <- .load_cached(conn, start.time - before, end.time, exchange, pair, debug.query,loader,
-                            .leaf_cache(cache, exchange, pair, cache_key))
-    else
-      draws <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, debug.query,loader,.leaf_cache(cache, exchange, pair, cache_key)),
-                     loader(conn, cache.bound, end.time, exchange, pair, debug.query=debug.query)
-    )
-  }
   if(!empty(draws)) {
     # Assign timezone of start.time, if any, to timestamp column
     draws$timestamp <- with_tz(draws$timestamp, tzone)
@@ -642,7 +616,7 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, 
   draws
 }
 
-.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, frequency = NULL,  debug.query = FALSE) {
+.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, draw.type, frequency = NULL, skip.crossed=TRUE, debug.query = FALSE) {
   if(is.null(frequency))
     query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\",
                     get._in_milliseconds(\"draw.end\") AS \"draw.end\",
@@ -656,7 +630,8 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, 
                     shQuote(draw.type), ",",
                     minimal.draw.pct, ",",
                     "get.pair_id(",shQuote(pair),"), " ,
-                    "get.exchange_id(", shQuote(exchange), ")",
+                    "get.exchange_id(", shQuote(exchange), ") , ",
+                    "p_skip_crossed :=", skip.crossed,
                     ") order by 1")
   else
     query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\",
@@ -672,7 +647,8 @@ draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, 
                     minimal.draw.pct, ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "),",
-                    "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
+                    "p_frequency :=", shQuote(paste0(frequency, " seconds ")), ", " ,
+                    "p_skip_crossed :=", skip.crossed,
                     ") order by 1")
   if(debug.query) cat(query, "\n", file=stderr())
   draws <- DBI::dbGetQuery(conn, query)
