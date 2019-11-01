@@ -1,7 +1,7 @@
 OBJS = obadiah_db.o spread.o 
-POSTGRES = /usr/pgsql-11-devel
+POSTGRES = /usr/pgsql-11
 TARGET=libobadiah_db.so
-CXXFLAGS = -Wall -std=c++14 -fPIC -g -I$(POSTGRES)/include/server -D ELOGS=0
+CXXFLAGS = -Wall -std=c++14 -fPIC -g -I$(POSTGRES)/include/server -D DEBUG_DEPTH=0 -D DEBUG_SPREAD=0
 
 $(TARGET):$(OBJS) 
 	g++ -shared  $(OBJS)  -o $(TARGET)

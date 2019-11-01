@@ -72,6 +72,13 @@ level2::level2(HeapTuple tuple, TupleDesc tupdesc) {
   p_impl = new level2_impl{tuple, tupdesc};
 };
 
+std::string level2::__str__() const {
+  if (p_impl)
+    return p_impl->__str__();
+  else
+    return std::string("level2(empty)");
+};
+
 level2_impl::level2_impl(HeapTuple tuple, TupleDesc tupdesc) {
   p = strtold(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "price")),
               nullptr);
@@ -86,12 +93,12 @@ level2_impl::level2_impl(HeapTuple tuple, TupleDesc tupdesc) {
   else
     ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
                     errmsg("Couldn't get microtimestamp %Lf %Lf %c", p, v, s)));
-#if ELOGS
+#if DEBUG_SPREAD
   elog(DEBUG3, "Created level2_impl from HeapTuple %s", __str__().c_str());
 #endif
 }
 level2_impl::~level2_impl() {
-#if ELOGS
+#if DEBUG_SPREAD
   elog(DEBUG3, "Deleted level2_impl %s", __str__().c_str());
 #endif
 };
@@ -172,25 +179,40 @@ HeapTuple level1::to_heap_tuple(AttInMetadata *attinmeta, int32 pair_id,
                                 int32 exchange_id) {
   char **values = (char **)palloc(7 * sizeof(char *));
   static const int BUFFER_SIZE = 128;
-  values[0] = (char *)palloc(BUFFER_SIZE * sizeof(char));
-  values[1] = (char *)palloc(BUFFER_SIZE * sizeof(char));
-  values[2] = (char *)palloc(BUFFER_SIZE * sizeof(char));
-  values[3] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+  if (best_bid_price > 0) {
+    values[0] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+    values[1] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+    snprintf(values[0], BUFFER_SIZE, "%.5Lf", best_bid_price);
+    snprintf(values[1], BUFFER_SIZE, "%.8Lf", best_bid_qty);
+  } else {
+    values[0] = nullptr;
+    values[1] = nullptr;
+  }
+  if (best_ask_price > 0) {
+    values[2] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+    values[3] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+    snprintf(values[2], BUFFER_SIZE, "%.5Lf", best_ask_price);
+    snprintf(values[3], BUFFER_SIZE, "%.8Lf", best_ask_qty);
+  } else {
+    values[2] = nullptr;
+    values[3] = nullptr;
+  }
   values[4] = (char *)palloc(BUFFER_SIZE * sizeof(char));
   values[5] = (char *)palloc(BUFFER_SIZE * sizeof(char));
   values[6] = (char *)palloc(BUFFER_SIZE * sizeof(char));
-  snprintf(values[0], BUFFER_SIZE, "%.5Lf", best_bid_price);
-  snprintf(values[1], BUFFER_SIZE, "%.8Lf", best_bid_qty);
-  snprintf(values[2], BUFFER_SIZE, "%.5Lf", best_ask_price);
-  snprintf(values[3], BUFFER_SIZE, "%.8Lf", best_ask_qty);
   snprintf(values[4], BUFFER_SIZE, "%s", timestamptz_to_str(microtimestamp));
   snprintf(values[5], BUFFER_SIZE, "%i", pair_id);
   snprintf(values[6], BUFFER_SIZE, "%i", exchange_id);
   HeapTuple tuple = BuildTupleFromCStrings(attinmeta, values);
-  pfree(values[0]);
-  pfree(values[1]);
-  pfree(values[2]);
-  pfree(values[3]);
+
+  if (best_bid_price > 0) {
+    pfree(values[0]);
+    pfree(values[1]);
+  }
+  if (best_ask_price > 0) {
+    pfree(values[2]);
+    pfree(values[3]);
+  }
   pfree(values[4]);
   pfree(values[5]);
   pfree(values[6]);
@@ -204,14 +226,14 @@ level2_episode::level2_episode(Datum start_time, Datum end_time, Datum pair_id,
   char nulls[5] = {' ', ' ', ' ', ' ', ' '};
   if (frequency == NULL_FREQ) nulls[4] = 'n';
 
-#if ELOGS
+#if DEBUG_SPREAD
   std::string p_start_time{timestamptz_to_str(DatumGetTimestampTz(start_time))};
   std::string p_end_time{timestamptz_to_str(DatumGetTimestampTz(end_time))};
   std::string p_frequency{frequency == NULL_FREQ ? "NULL" : "Not NULL"};
   elog(DEBUG1, "spread_change_by_episode(%s, %s, %i, %i, %s)",
        p_start_time.c_str(), p_end_time.c_str(), DatumGetInt32(pair_id),
        DatumGetInt32(exchange_id), p_frequency.c_str());
-#endif  // ELOGS
+#endif  // DEBUG_SPREAD
 
   Oid types[5];
   types[0] = TIMESTAMPTZOID;
@@ -267,7 +289,7 @@ std::vector<level2> level2_episode::next() {
       int64 episode_size = DatumGetInt64(value);
       std::vector<level2> result;
       result.reserve(episode_size);
-#if ELOGS
+#if DEBUG_SPREAD
       ereport(DEBUG1,
               (errmsg("episode microtimestamp=%s size=%lu",
                       SPI_getvalue(
@@ -308,73 +330,45 @@ std::vector<level2> level2_episode::initial() {
 }
 
 level1 depth::spread() {
+  price best_bid_price {-1}, best_ask_price {-1};
+  amount best_bid_qty {-1}, best_ask_qty {-1};
+
+  if(!bid.empty()) {
+     level2 & best_level = bid.rbegin()->second;
+     best_bid_price = best_level.get_price();
+     best_bid_qty = best_level.get_volume();
+  }
+
+  if(!ask.empty()) {
+     level2 & best_level = ask.begin()->second;
+     best_ask_price = best_level.get_price();
+     best_ask_qty = best_level.get_volume();
+  }
+
   return level1{best_bid_price, best_bid_qty, best_ask_price,  best_ask_qty, episode};
 }
 
-void depth::update_spread(level2 &l) {
-  if (l.get_volume() > 0) {
-    if (l.get_side() == 's' && l.get_price() <= best_ask_price) {
-      best_ask_price = l.get_price();
-      best_ask_qty = l.get_volume();
-      return;
-    }
-
-    if (l.get_side() == 'b' && l.get_price() >= best_bid_price) {
-      best_bid_price = l.get_price();
-      best_bid_qty = l.get_volume();
-      return;
-    }
-  } else {
-    if (l.get_side() == 's' && l.get_price() == best_ask_price) {
-      for (depth_map::iterator it = d.find(l.get_price()); it != d.end(); ++it)
-        if (it->second.get_side() == 's' &&
-            it->second.get_price() > best_ask_price) {
-          best_ask_price = it->second.get_price();
-          best_ask_qty = it->second.get_volume();
-          return;
-        }
-      best_ask_price = std::numeric_limits<price>::max();
-      best_ask_qty = 0;
-      return;
-    }
-    if (l.get_side() == 'b' && l.get_price() == best_bid_price) {
-      for (std::reverse_iterator<depth_map::iterator> it =
-               std::make_reverse_iterator(d.find(l.get_price()));
-           it != d.rend(); ++it)
-        if (it->second.get_side() == l.get_side() &&
-            it->second.get_price() < best_bid_price) {
-          best_bid_price = it->second.get_price();
-          best_bid_qty = it->second.get_volume();
-          return;
-        }
-      best_bid_price = 0;
-      best_bid_qty = 0;
-      return;
-    }
-  }
-};
 
 level1 depth::update(std::vector<level2> v) {
   if(!v.empty())
     episode = v[0].get_microtimestamp();
   for (level2 &l : v) {
-    update_spread(l);
     if (l.get_volume() > 0) 
-      d[l.get_price()] = std::move(l);
+      if(l.get_side() == 'b')
+        bid[l.get_price()] = std::move(l);
+      else
+        ask[l.get_price()] = std::move(l);
     else 
-      d.erase(l.get_price());
+      if(l.get_side() == 'b')
+        bid.erase(l.get_price());
+      else
+        ask.erase(l.get_price());
   }
   return spread();
 };
 
-depth::depth()
-    : best_bid_price(0),
-      best_bid_qty(0),
-      best_ask_price(std::numeric_limits<price>::max()),
-      best_ask_qty(0) {};
-
 depth::~depth() { 
-#if ELOGS
+#if DEBUG_SPREAD
   elog(DEBUG1, "~depth"); 
 #endif
 }

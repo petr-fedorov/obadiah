@@ -167,7 +167,7 @@ struct order_book {
       else
         level.ask = event->amount;
     }
-#if ELOGS
+#if DEBUG_DEPTH
     elog(DEBUG2, "get_price_level(%s) returns (bid %Lf,  ask %Lf)",
          price_str.c_str(), level.bid, level.ask);
 #endif
@@ -178,17 +178,17 @@ struct order_book {
   inline void append_level3_to_episode(level3 &event) {
     event.episode_seq_no = episode_seq_no++;
     episode.push_back(event);
-#if ELOGS
+#if DEBUG_DEPTH
     elog(DEBUG3, "Added to episode %s, episode.size() %lu",
          event.__str__().c_str(), episode.size());
-#endif  // ELOGS
+#endif  // DEBUG_DEPTH
 
     // level3 &inserted {by_order_id[event.order_id] = event};
     // by_price[event.price_str].insert(&inserted);
   }
 
   string end_episode() noexcept {
-#if ELOGS
+#if DEBUG_DEPTH
     elog(DEBUG2, "Ending episode %s", timestamptz_to_str(episode_ts));
     elog(DEBUG2, "get_price_level() before ...");
 #endif
@@ -205,7 +205,7 @@ struct order_book {
           changed_prices.insert(previous_event->price_str.c_str());
         }
         catch (...) {
-#if ELOGS
+#if DEBUG_DEPTH
           elog(DEBUG3, "No previous event for %s %lu %i",
                timestamptz_to_str(event.microtimestamp), event.order_id,
                event.event_no);
@@ -219,7 +219,7 @@ struct order_book {
       }
 
       if (previous_event) {
-#if ELOGS
+#if DEBUG_DEPTH
         elog(DEBUG3, "OB deleted %s %lu %i %s",
              timestamptz_to_str(previous_event->microtimestamp),
              previous_event->order_id, previous_event->event_no,
@@ -232,7 +232,7 @@ struct order_book {
         same_price_level3 &price_level = by_price[event.price_str];
         pair<same_price_level3::iterator, bool> result =
             price_level.insert(&(by_order_id[event.order_id] = event));
-#if ELOGS
+#if DEBUG_DEPTH
         if (!result.second) {
           elog(WARNING,
                "OB NOT added %s %lu %i %s. Events at the price_level: %lu",
@@ -251,7 +251,7 @@ struct order_book {
     }
 
     string depth_change_builder{"{"};
-#if ELOGS
+#if DEBUG_DEPTH
     elog(DEBUG2, "get_price_level() after ...");
 #endif
     const int BUFFER_SIZE = 50;
@@ -293,7 +293,7 @@ struct order_book {
 
     episode.clear();
     episode_seq_no = 0;
-#if ELOGS
+#if DEBUG_DEPTH
     elog(DEBUG1, "Ended episode %s", timestamptz_to_str(episode_ts));
     elog(DEBUG2, "Depth change: %s", depth_change_builder.c_str());
 #endif
@@ -344,13 +344,13 @@ Datum depth_change_by_episode(PG_FUNCTION_ARGS) {
                       errmsg(
                           "p_start_time, p_end_time, pair_id, exchange_id must "
                           "not be NULL")));
-#if ELOGS
+#if DEBUG_DEPTH
     string p_start_time{timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(0))};
     string p_end_time{timestamptz_to_str(PG_GETARG_TIMESTAMPTZ(1))};
     elog(DEBUG1, "depth_change_by_episode(%s, %s, %i, %i)",
          p_start_time.c_str(), p_end_time.c_str(), PG_GETARG_INT32(2),
          PG_GETARG_INT32(3));
-#endif  // ELOGS
+#endif  // DEBUG_DEPTH
     attinmeta = TupleDescGetAttInMetadata(tupdesc);
     funcctx->attinmeta = attinmeta;
 
@@ -478,9 +478,9 @@ Datum depth_change_by_episode(PG_FUNCTION_ARGS) {
     depth_change = current_depth->end_episode();
     episode_microtimestamp = current_depth->episode_ts;
     is_done = false;
-#if ELOGS
+#if DEBUG_DEPTH
     elog(DEBUG1, "The last episode ended");
-#endif  // ELOGS
+#endif  // DEBUG_DEPTH
   }
 
   if (!is_done) {
@@ -505,7 +505,7 @@ Datum depth_change_by_episode(PG_FUNCTION_ARGS) {
     strcpy(values[3], current_depth->get_precision().c_str());
     values[4] = (char *)palloc(sizeof(char) * (depth_change.size() + 1));
     strcpy(values[4], depth_change.c_str());
-#if ELOGS
+#if DEBUG_DEPTH
     elog(DEBUG2, "BuildTupleFromCStrings:  %s %s %s %s %s", values[0],
          values[1], values[2], values[3], values[4]);
 #endif
@@ -516,7 +516,7 @@ Datum depth_change_by_episode(PG_FUNCTION_ARGS) {
     SRF_RETURN_NEXT(funcctx, result);
   }
 
-#if ELOGS
+#if DEBUG_DEPTH
   elog(DEBUG1, "End!");
 #endif
   SPI_cursor_close(SPI_cursor_find("level3"));

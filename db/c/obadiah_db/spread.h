@@ -62,6 +62,7 @@ class level2 {
   char get_side();
 
   bool operator<(const level2 &) const;
+  std::string __str__() const;
 
  private:
 
@@ -120,7 +121,6 @@ class level2_episode {
 
 class depth {
  public:
-  depth();
   ~depth();
   level1 spread();
   level1 update(std::vector<level2>);
@@ -132,11 +132,8 @@ class depth {
   TimestampTz episode;
   using depth_map =
       std::map<price, level2, std::less<price>, obad::spi_allocator<std::pair<const price, level2>>>;
-  depth_map d;
-  price best_bid_price;
-  amount best_bid_qty;
-  price best_ask_price;
-  amount best_ask_qty;
+  depth_map bid;
+  depth_map ask;
 };
 }
 
