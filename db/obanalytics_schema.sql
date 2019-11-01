@@ -504,7 +504,7 @@ begin
 		' for each row execute procedure obanalytics.save_exchange_microtimestamp()';
 		
     i := i+1;
-	v_statements[i] := 'create index '||v_table_name||'_fkey_level3_price on'|| V_SCHEMA || v_table_name || '(price_microtimestamp, order_id, price_event_no)';
+	v_statements[i] := 'create index '||v_table_name||'_fkey_level3_price on '|| V_SCHEMA || v_table_name || '(price_microtimestamp, order_id, price_event_no)';
 
 	
 							
@@ -1146,48 +1146,6 @@ $$;
 ALTER FUNCTION obanalytics._order_book_after_episode(p_ob obanalytics.level3[], p_ep obanalytics.level3[], p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
--- Name: _order_book_after_episode_ff(integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics._order_book_after_episode_ff(p_state integer) RETURNS obanalytics.level3[]
-    LANGUAGE plpython2u
-    AS $$
-return [e for e in GD["ob"].output()]
-$$;
-
-
-ALTER FUNCTION obanalytics._order_book_after_episode_ff(p_state integer) OWNER TO "ob-analytics";
-
---
--- Name: _order_book_after_episode_st(integer, obanalytics.level3[], boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics._order_book_after_episode_st(p_state integer, p_episode obanalytics.level3[], p_check_takers boolean) RETURNS integer
-    LANGUAGE plpython2u
-    AS $$
-from obadiah_db.orderbook import OrderBook
-import os
-import logging
-# logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
-if p_state is None:
-	ts = p_episode[0]["microtimestamp"]
-	pair_id = p_episode[0]["pair_id"]
-	exchange_id = p_episode[0]["exchange_id"]
-	# logging.debug('Starts %s', ts)
-	GD["ob"] = OrderBook(plpy.execute("select ob.* from obanalytics.order_book( '{0}', {1}, {2}, false, true, {3} ) join unnest(ob) ob on true".format(ts, pair_id, exchange_id, p_check_takers)),
-						 False
-						)
-	internal_state = 1
-else:
-	internal_state = p_state + 1
-GD["ob"].update(p_episode)
-return internal_state
-$$;
-
-
-ALTER FUNCTION obanalytics._order_book_after_episode_st(p_state integer, p_episode obanalytics.level3[], p_check_takers boolean) OWNER TO "ob-analytics";
-
---
 -- Name: _periods_within_eras(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1237,7 +1195,6 @@ ALTER TABLE obanalytics.level1 OWNER TO "ob-analytics";
 CREATE FUNCTION obanalytics._spread_from_order_book(p_ts timestamp with time zone, p_order_book obanalytics.level3[]) RETURNS obanalytics.level1
     LANGUAGE sql IMMUTABLE
     AS $$
-
 with price_levels as (
 	select side,
 			price,
@@ -1249,7 +1206,7 @@ with price_levels as (
 			pair_id,
 			exchange_id
 	from unnest(p_order_book)
-	where is_maker
+	--where is_maker
 	group by exchange_id, pair_id,side, price
 )
 select b.price, b.qty, s.price, s.qty, p_ts, pair_id, exchange_id
@@ -1447,19 +1404,16 @@ CREATE FUNCTION obanalytics.depth_change_by_episode3(p_start_time timestamp with
 ALTER FUNCTION obanalytics.depth_change_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
--- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, interval, boolean, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_minimal_draw_pct numeric DEFAULT 0.0, p_minimal_draw_decline numeric DEFAULT 0.01, p_price_decimal_places integer DEFAULT 2) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, exchange_id smallint, pair_id smallint, draw_type text, draw_size numeric, minimal_draw numeric, exchange text, pair text)
+CREATE FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_frequency interval DEFAULT NULL::interval, p_skip_crossed boolean DEFAULT true, p_minimal_draw_pct numeric DEFAULT 0.0, p_minimal_draw_decline numeric DEFAULT 0.01, p_price_decimal_places integer DEFAULT 2) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, exchange_id smallint, pair_id smallint, draw_type text, draw_size numeric, minimal_draw numeric, exchange text, pair text)
     LANGUAGE sql STABLE
     AS $$ 
 
 with spread as (
 	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id 
-	from obanalytics.level1 
-	where exchange_id = p_exchange_id
-	  and pair_id = p_pair_id
-	  and microtimestamp between p_start_time and p_end_time
+	from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency, p_skip_crossed)
 ),
 base_draws as (
 	select spread.*,
@@ -1505,7 +1459,7 @@ order by draw_type, start_microtimestamp, end_microtimestamp desc, last_microtim
 $$;
 
 
-ALTER FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_minimal_draw_pct numeric, p_minimal_draw_decline numeric, p_price_decimal_places integer) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_frequency interval, p_skip_crossed boolean, p_minimal_draw_pct numeric, p_minimal_draw_decline numeric, p_price_decimal_places integer) OWNER TO "ob-analytics";
 
 --
 -- Name: drop_leaf_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1818,6 +1772,28 @@ $$;
 
 
 ALTER FUNCTION obanalytics.insert_level3_era(p_new_era timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: level1_continuous(timestamp with time zone, timestamp with time zone, integer, integer, interval, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level1_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_skip_crossed boolean DEFAULT true) RETURNS SETOF obanalytics.level1
+    LANGUAGE sql STABLE
+    AS $$-- NOTE:
+
+with periods as (
+	select * 
+	from obanalytics._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
+)
+select level1.*
+from periods join obanalytics.spread_by_episode3(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level1 on true 
+where not p_skip_crossed or (best_bid_price <= best_ask_price)
+  ;
+
+$$;
+
+
+ALTER FUNCTION obanalytics.level1_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_skip_crossed boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: level1_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2620,7 +2596,6 @@ ALTER FUNCTION obanalytics.save_exchange_microtimestamp() OWNER TO "ob-analytics
 CREATE FUNCTION obanalytics.spread_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean DEFAULT true, p_with_order_book boolean DEFAULT false) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, exchange_id smallint, order_book obanalytics.level3[])
     LANGUAGE sql STABLE
     AS $$
-
 -- ARGUMENTS
 --		p_start_time  - the start of the interval for the calculation of spreads
 --		p_end_time	  - the end of the interval
@@ -2631,7 +2606,7 @@ CREATE FUNCTION obanalytics.spread_by_episode(p_start_time timestamp with time z
 
 with spread as (
 	select (obanalytics._spread_from_order_book(ts, ob)).*, case  when p_with_order_book then ob else null end as ob
-	from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id)
+	from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers := false)
 )
 select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id, ob
 from (
@@ -2738,15 +2713,15 @@ $_$;
 ALTER FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: spread_by_episode3(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: spread_by_episode3(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level1
-    LANGUAGE c STRICT
+CREATE FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level1
+    LANGUAGE c
     AS '$libdir/libobadiah_db', 'spread_by_episode';
 
 
-ALTER FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
 -- Name: summary(text, text, timestamp with time zone, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2879,19 +2854,6 @@ CREATE AGGREGATE obanalytics.order_book_agg(event obanalytics.level3[], boolean)
 
 
 ALTER AGGREGATE obanalytics.order_book_agg(event obanalytics.level3[], boolean) OWNER TO "ob-analytics";
-
---
--- Name: order_book_agg2(obanalytics.level3[], boolean); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE AGGREGATE obanalytics.order_book_agg2(event obanalytics.level3[], boolean) (
-    SFUNC = obanalytics._order_book_after_episode_st,
-    STYPE = integer,
-    FINALFUNC = obanalytics._order_book_after_episode_ff
-);
-
-
-ALTER AGGREGATE obanalytics.order_book_agg2(event obanalytics.level3[], boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: restore_depth_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer); Type: AGGREGATE; Schema: obanalytics; Owner: ob-analytics

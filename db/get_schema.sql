@@ -206,7 +206,11 @@ CREATE FUNCTION get.depth(p_start_time timestamp with time zone, p_end_time time
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$with starting_depth as (
 	select period_start as microtimestamp, side, price, volume 
-	from (select period_start from obanalytics._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency) where previous_period_end is null ) p
+	from (select period_start 
+		  from obanalytics._periods_within_eras(p_start_time,
+												p_start_time + coalesce(p_frequency, '00:00:00.000001'::interval),
+												p_pair_id, p_exchange_id, p_frequency)
+		  where previous_period_end is null ) p
 	join lateral obanalytics.order_book( period_start,  p_pair_id,p_exchange_id, p_only_makers := false,
 											p_before :=true,		-- if period_start is an exact start of an era, 
 																	-- then this order book will be null - see comment below
@@ -268,21 +272,21 @@ $$;
 ALTER FUNCTION get.depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer) OWNER TO "ob-analytics";
 
 --
--- Name: draws(timestamp with time zone, timestamp with time zone, get.draw_type, numeric, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
+-- Name: draws(timestamp with time zone, timestamp with time zone, get.draw_type, numeric, integer, integer, interval, boolean); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_minimal_draw_pct numeric, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("timestamp" timestamp with time zone, "draw.end" timestamp with time zone, "start.price" numeric, "end.price" numeric, "draw.size" numeric, "draw.speed" numeric)
+CREATE FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_minimal_draw_pct numeric, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_skip_crossed boolean DEFAULT true) RETURNS TABLE("timestamp" timestamp with time zone, "draw.end" timestamp with time zone, "start.price" numeric, "end.price" numeric, "draw.size" numeric, "draw.speed" numeric)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
 	select start_microtimestamp, end_microtimestamp, start_price, end_price, draw_size,
 			round(draw_size/extract(epoch from end_microtimestamp-start_microtimestamp)::numeric, 2)
-	from obanalytics.draws_from_spread(	p_start_time, p_end_time, p_exchange_id, p_pair_id, p_draw_type::text,p_minimal_draw_pct);
+	from obanalytics.draws_from_spread(	p_start_time, p_end_time, p_exchange_id, p_pair_id, p_draw_type::text, p_frequency, p_skip_crossed, p_minimal_draw_pct);
 	
 $$;
 
 
-ALTER FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_minimal_draw_pct numeric, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_minimal_draw_pct numeric, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_skip_crossed boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: events(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
@@ -604,10 +608,10 @@ CREATE FUNCTION get.pair_id(p_pair text) RETURNS smallint
 ALTER FUNCTION get.pair_id(p_pair text) OWNER TO "ob-analytics";
 
 --
--- Name: spread(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
+-- Name: spread(timestamp with time zone, timestamp with time zone, integer, integer, interval, boolean); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
+CREATE FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_skip_crossed boolean DEFAULT true) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
     LANGUAGE sql SECURITY DEFINER
     AS $$-- ARGUMENTS
 --	See obanalytics.spread_by_episode()
@@ -615,15 +619,12 @@ CREATE FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time tim
 select * from get._validate_parameters('spread', p_start_time, p_end_time, p_pair_id, p_exchange_id);
 
 select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
-from obanalytics.spread_by_episode2(p_start_time, p_end_time, p_pair_id, p_exchange_id)
--- from obanalytics.level1 
-where microtimestamp >= p_start_time 
-  and microtimestamp < p_end_time
+from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency, p_skip_crossed)
 	
 $$;
 
 
-ALTER FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_skip_crossed boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: spread_by_interval(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics

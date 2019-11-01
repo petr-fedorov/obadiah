@@ -43,7 +43,7 @@ server <- function(input, output, session) {
   con <- (function() {
     dbObj <- NULL
     function() {
-      if(is.null(dbObj) || tryCatch(DBI::dbGetQuery(dbObj, "select false as result")$result, error = function(e) TRUE )) {
+      while(is.null(dbObj) || tryCatch(DBI::dbGetQuery(dbObj, "select false as result")$result, error = function(e) TRUE )) {
         dbObj <<- DBI::dbConnect(RPostgres::Postgres(),
                                  user=config$user,
                                  dbname=config$dbname,
@@ -69,6 +69,56 @@ server <- function(input, output, session) {
 
   cache <- new.env(parent=emptyenv())
   #cache <- NULL
+  pairs <- reactive({
+
+    exchange <- req(input$exchange)
+    query <- paste0("select available_pairs as pair from get.available_pairs(",
+                    "get.exchange_id(", shQuote(exchange), ")", ") order by 1" )
+
+    pairs <- RPostgres::dbGetQuery(con(), query)$pair
+    pair <- isolate(input$pair)
+
+    if(!pair %in% pairs ) {
+      updateSelectInput(session, "pair",choices=pairs)
+    }
+    else {
+      updateSelectInput(session, "pair",choices=pairs, selected=pair)
+    }
+
+    pairs
+
+  })
+
+  pair <- reactive({
+    pairs <- pairs()
+    pair <- input$pair
+    tp <- timePoint()
+
+    req(pair %in% pairs, tp )
+
+    query <- paste0("select s,e from get.available_period(",
+                    "get.exchange_id(", shQuote(isolate(input$exchange)), ") , ",
+                    "get.pair_id(", shQuote(pair), ")",
+                    ") order by 1" )
+    period <- RPostgres::dbGetQuery(con(), query)
+
+    if(tp < period[1,"s"] | tp > period[1,"e"]) {
+
+      if (tp > period[1,"e"])
+        tp <- with_tz(period[1,"e"] - isolate(zoomWidth())/2, isolate(input$tz))
+      else
+        tp <- with_tz(period[1,"s"] + isolate(zoomWidth())/2, isolate(input$tz))
+
+      updateDateInput(session, "date", value=date(tp), min=as_date(period[1,"s"]), max=as_date(period[1,"e"]))
+      updateSliderInput(session, "time.point.h", value=hour(tp))
+      updateSliderInput(session, "time.point.m", value=minute(tp))
+      updateSliderInput(session, "time.point.s", value=second(tp))
+      req(FALSE)
+    }
+    updateDateInput(session, "date", min=as_date(period[1,"s"]), max=as_date(period[1,"e"]))
+    pair
+  })
+
 
   query <- paste0("select available_exchanges as exchange from get.available_exchanges() order by 1" )
   exchanges <- RPostgres::dbGetQuery(con(), query)$exchange
@@ -105,55 +155,6 @@ server <- function(input, output, session) {
 
 
 
-  pairs <- reactive({
-
-    exchange <- input$exchange
-    query <- paste0("select available_pairs as pair from get.available_pairs(",
-                    "get.exchange_id(", shQuote(exchange), ")", ") order by 1" )
-
-    pairs <- RPostgres::dbGetQuery(con(), query)$pair
-    pair <- isolate(input$pair)
-
-    if(!pair %in% pairs ) {
-      updateSelectInput(session, "pair",choices=pairs)
-    }
-    else {
-      updateSelectInput(session, "pair",choices=pairs, selected=pair)
-    }
-
-    pairs
-
-  })
-
-  pair <- reactive({
-    pairs <- pairs()
-    pair <- input$pair
-    tp <- timePoint()
-
-    req(pair %in% pairs, tp )
-
-    query <- paste0("select s,e from get.available_period(",
-                     "get.exchange_id(", shQuote(isolate(input$exchange)), ") , ",
-                     "get.pair_id(", shQuote(pair), ")",
-                     ") order by 1" )
-    period <- RPostgres::dbGetQuery(con(), query)
-
-    if(tp < period[1,"s"] | tp > period[1,"e"]) {
-
-      if (tp > period[1,"e"])
-        tp <- with_tz(period[1,"e"] - isolate(zoomWidth())/2, isolate(input$tz))
-      else
-        tp <- with_tz(period[1,"s"] + isolate(zoomWidth())/2, isolate(input$tz))
-
-      updateDateInput(session, "date", value=date(tp), min=as_date(period[1,"s"]), max=as_date(period[1,"e"]))
-      updateSliderInput(session, "time.point.h", value=hour(tp))
-      updateSliderInput(session, "time.point.m", value=minute(tp))
-      updateSliderInput(session, "time.point.s", value=second(tp))
-      req(FALSE)
-    }
-    updateDateInput(session, "date", min=as_date(period[1,"s"]), max=as_date(period[1,"e"]))
-    pair
-  })
 
 
   values <- reactiveValues(res=NULL)
@@ -214,7 +215,7 @@ server <- function(input, output, session) {
   period <- reactive({
     req(values$res, input$freq)
     list(res=as.integer(values$res), freq=as.integer(input$freq))
-  }) %>% debounce(3000)
+  }) %>% debounce(2000)
 
 
 
@@ -261,7 +262,7 @@ server <- function(input, output, session) {
     if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading draws ...", {
-      obadiah::draws(con(), from.time, to.time, exchange, pair, minimal.draw(), input$showdraws, frequency, tz=tz(tp))
+      obadiah::draws(con(), from.time, to.time, exchange, pair, minimal.draw(), input$showdraws, frequency,  skip.crossed=input$skip.crossed, tz=tz(tp))
     })
   })
 

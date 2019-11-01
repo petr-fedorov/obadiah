@@ -24,7 +24,7 @@ fluidPage(
       wellPanel(
         h4("Instrument"),
         fluidRow(
-                column(6, selectInput("exchange", "Exchange", choices="bitfinex")),
+                column(6, selectInput("exchange", "Exchange", choices="")),
                 column(6, selectInput("pair", "Pair", choices=""))
                  )
       ),
