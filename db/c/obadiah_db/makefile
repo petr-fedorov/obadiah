@@ -19,7 +19,7 @@ spread.o: spread.h
 
 install: 
 	sudo cp $(TARGET) $(POSTGRES)/lib/
-	sudo ldconfig
+	sudo ldconfig -n $(POSTGRES)/lib/
 
 clean:
 	rm -f $(OBJS) $(BASE)*
