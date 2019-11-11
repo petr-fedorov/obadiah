@@ -94,6 +94,24 @@ CREATE TYPE obanalytics.level2_depth_summary_record AS (
 
 ALTER TYPE obanalytics.level2_depth_summary_record OWNER TO "ob-analytics";
 
+--
+-- Name: level2t; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TYPE obanalytics.level2t AS (
+	microtimestamp timestamp with time zone,
+	pair_id smallint,
+	exchange_id smallint,
+	"precision" character(2),
+	price numeric,
+	volume numeric,
+	side character(1),
+	bps_level integer
+);
+
+
+ALTER TYPE obanalytics.level2t OWNER TO "ob-analytics";
+
 SET default_tablespace = '';
 
 SET default_with_oids = false;
@@ -1393,15 +1411,15 @@ $_$;
 ALTER FUNCTION obanalytics.depth_change_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: depth_change_by_episode3(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: depth_change_by_episode4(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.depth_change_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2
+CREATE FUNCTION obanalytics.depth_change_by_episode4(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2t
     LANGUAGE c
-    AS '$libdir/libobadiah_db', 'depth_change_by_episode';
+    AS '$libdir/libobadiah_db.so.1', 'depth_change_by_episode4';
 
 
-ALTER FUNCTION obanalytics.depth_change_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.depth_change_by_episode4(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
 -- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, interval, boolean, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1832,7 +1850,7 @@ ALTER FUNCTION obanalytics.level1_update_level3_eras() OWNER TO "ob-analytics";
 -- Name: level2_continuous(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2
+CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2t
     LANGUAGE sql STABLE
     AS $$-- NOTE:
 --	When 'microtimestamp' in returned record 
@@ -1848,7 +1866,7 @@ with periods as (
 	from obanalytics._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
 ),
 starting_depth_change as (
-	select period_start, p_pair_id::smallint, p_exchange_id::smallint, 'r0', c
+	select period_start, p_pair_id::smallint, p_exchange_id::smallint, 'r0', (unnest(c)).*
 	from periods join obanalytics.order_book(previous_period_end, p_pair_id,p_exchange_id, false, false,false ) b on true 
 				 join obanalytics.order_book(period_start, p_pair_id,p_exchange_id, false, true, false ) a on true 
 				 join obanalytics._depth_change(b.ob, a.ob) c on true
@@ -1858,7 +1876,7 @@ select *
 from starting_depth_change
 union all
 select level2.*
-from periods join obanalytics.depth_change_by_episode3(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level2 on true 
+from periods join obanalytics.depth_change_by_episode4(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level2 on true 
 where microtimestamp >= period_start
   and microtimestamp <= period_end
   and level2.pair_id = p_pair_id
@@ -2718,7 +2736,7 @@ ALTER FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time z
 
 CREATE FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level1
     LANGUAGE c
-    AS '$libdir/libobadiah_db', 'spread_by_episode';
+    AS '$libdir/libobadiah_db.so.1', 'spread_by_episode';
 
 
 ALTER FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";

@@ -226,7 +226,6 @@ level2 as (
 									    p_pair_id,
 									    p_exchange_id,
 									  	p_frequency) level2
-		  join unnest(level2.depth_change) d on true
 	where p_depth_changes
 )
 select microtimestamp, price, volume, case side 	
