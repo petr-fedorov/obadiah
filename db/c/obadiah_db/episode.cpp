@@ -13,7 +13,7 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-#include "level3episode.h"
+#include "episode.h"
 #include <vector>
 #include "obadiah_db.h"
 
@@ -28,10 +28,10 @@ extern "C" {
 #endif  // __cplusplus
 
 namespace obad {
-const char *const level3_episode::CURSOR = "level3";
-const int level3_episode::SPI_CURSOR_FETCH_COUNT = 1000;
+const char *const episode::CURSOR = "level3";
+const int episode::SPI_CURSOR_FETCH_COUNT = 1000;
 
-level3_episode::~level3_episode() {
+episode::~episode() {
  SPI_connect();
  SPI_cursor_close(SPI_cursor_find(CURSOR));
  SPI_finish();
@@ -42,7 +42,7 @@ level3_episode::~level3_episode() {
 };
 
 std::vector<level3>
-level3_episode::initial(Datum start_time, Datum end_time, Datum pair_id,
+episode::initial(Datum start_time, Datum end_time, Datum pair_id,
                         Datum exchange_id, Datum frequency) {
  SPI_connect();
  events_deque = new (SPI_palloc(sizeof(level3_deque))) level3_deque;
@@ -104,7 +104,7 @@ level3_episode::initial(Datum start_time, Datum end_time, Datum pair_id,
 };
 
 std::vector<level3>
-level3_episode::next() {
+episode::next() {
  std::vector<level3> result{};
  TimestampTz current_episode = 0;
 
@@ -159,7 +159,7 @@ level3_episode::next() {
 };
 
 void
-level3_episode::done() {
+episode::done() {
  SPI_connect();
  Portal portal = SPI_cursor_find(CURSOR);
  if (portal) SPI_cursor_close(portal);

@@ -39,6 +39,25 @@ depth::spread() {
 }
 
 level1
+depth::update(obad::deque<obad::level2> *v) {
+ if (!v->empty()) episode = v->front().get_microtimestamp();
+ while(!v->empty()) {
+  level2 &l {v->front()};
+  if (l.get_volume() > 0)
+   if (l.get_side() == 'b')
+    bid[l.get_price()] = std::move(l);
+   else
+    ask[l.get_price()] = std::move(l);
+  else if (l.get_side() == 'b')
+   bid.erase(l.get_price());
+  else
+   ask.erase(l.get_price());
+  v->pop_front();
+ }
+ return spread();
+};
+
+level1
 depth::update(std::vector<level2> v) {
  if (!v.empty()) episode = v[0].get_microtimestamp();
  for (level2 &l : v) {

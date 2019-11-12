@@ -1416,7 +1416,7 @@ ALTER FUNCTION obanalytics.depth_change_by_episode2(p_start_time timestamp with 
 
 CREATE FUNCTION obanalytics.depth_change_by_episode4(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2t
     LANGUAGE c
-    AS '$libdir/libobadiah_db.so.1', 'depth_change_by_episode4';
+    AS '$libdir/libobadiah_db.so.1', 'depth_change_by_episode';
 
 
 ALTER FUNCTION obanalytics.depth_change_by_episode4(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";

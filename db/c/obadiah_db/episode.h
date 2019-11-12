@@ -30,10 +30,10 @@ extern "C" {
 
 namespace obad {
 
-class level3_episode : public postgres_heap {
+class episode : public postgres_heap {
 public:
- level3_episode() : events_deque{nullptr} {};
- ~level3_episode();
+ episode() : events_deque{nullptr} {};
+ ~episode();
  std::vector<level3> initial(Datum start_time, Datum end_time, Datum pair_id,
                              Datum exchange_id, Datum frequency);
  std::vector<level3> next();

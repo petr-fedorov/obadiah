@@ -50,16 +50,14 @@ class depth : public postgres_heap {
 public:
  ~depth();
  level1 spread();
+ level1 update(obad::deque<obad::level2> *); 
  level1 update(std::vector<level2>);
 
 private:
  void update_spread(level2&);
  TimestampTz episode;
- using depth_map =
-     std::map<price, level2, std::less<price>,
-              obad::spi_allocator<std::pair<const price, level2>>>;
- depth_map bid;
- depth_map ask;
+ obad::map<price, level2> bid;
+ obad::map<price, level2> ask;
 };
 
 }  // namespace obad
