@@ -53,6 +53,41 @@ CREATE TYPE obanalytics.draw_interim_price AS (
 ALTER TYPE obanalytics.draw_interim_price OWNER TO "ob-analytics";
 
 --
+-- Name: level1; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TYPE obanalytics.level1 AS (
+	best_bid_price numeric,
+	best_bid_qty numeric,
+	best_ask_price numeric,
+	best_ask_qty numeric,
+	microtimestamp timestamp with time zone,
+	pair_id smallint,
+	exchange_id smallint
+);
+
+
+ALTER TYPE obanalytics.level1 OWNER TO "ob-analytics";
+
+--
+-- Name: level2; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TYPE obanalytics.level2 AS (
+	microtimestamp timestamp with time zone,
+	pair_id smallint,
+	exchange_id smallint,
+	"precision" character(2),
+	price numeric,
+	volume numeric,
+	side character(1),
+	bps_level integer
+);
+
+
+ALTER TYPE obanalytics.level2 OWNER TO "ob-analytics";
+
+--
 -- Name: level2_depth_record; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -93,24 +128,6 @@ CREATE TYPE obanalytics.level2_depth_summary_record AS (
 
 
 ALTER TYPE obanalytics.level2_depth_summary_record OWNER TO "ob-analytics";
-
---
--- Name: level2t; Type: TYPE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TYPE obanalytics.level2t AS (
-	microtimestamp timestamp with time zone,
-	pair_id smallint,
-	exchange_id smallint,
-	"precision" character(2),
-	price numeric,
-	volume numeric,
-	side character(1),
-	bps_level integer
-);
-
-
-ALTER TYPE obanalytics.level2t OWNER TO "ob-analytics";
 
 SET default_tablespace = '';
 
@@ -202,102 +219,6 @@ ALTER TABLE obanalytics.matches OWNER TO "ob-analytics";
 
 COMMENT ON COLUMN obanalytics.matches.exchange_side IS 'Type of trade as reported by an exchange. Not null if different from ''trade_type''';
 
-
---
--- Name: _create_level1_partition(text, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics._create_level1_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean DEFAULT true) RETURNS void
-    LANGUAGE plpgsql SECURITY DEFINER
-    AS $$
-
-declare
-	i integer;
-	v_exchange_id smallint;
-	v_pair_id smallint;
-	v_from timestamptz;
-	v_to timestamptz;
-	
-	v_parent_table text;
-	
-	v_table_name text;
-	v_statement text;
-	v_statements text[];
-	V_SCHEMA constant text default 'obanalytics.';
-begin 
-
-	v_from := make_timestamptz(p_year, p_month, 1, 0, 0, 0);	-- will use the current timezone 
-	v_to := v_from + '1 month'::interval;
-	
-	select pair_id into strict v_pair_id
-	from obanalytics.pairs
-	where pair = upper(p_pair);
-	
-	select exchange_id into strict v_exchange_id
-	from obanalytics.exchanges
-	where exchange = lower(p_exchange);
-
-	
-	v_parent_table := 'level1';
-	v_table_name := v_parent_table || '_' || p_exchange;
-
-	i = 1;
-	v_statements[i] := 'create table if not exists ' || V_SCHEMA || v_table_name || ' partition of '|| V_SCHEMA ||v_parent_table||
-						' for values in ('|| v_exchange_id || ') partition by list ( pair_id )' ;
-
-	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
-
-	v_parent_table := v_table_name;
-	v_table_name := v_parent_table || '_' || lower(p_pair);
-	
-	i := i + 1;
-	v_statements[i] := 'create table if not exists '||V_SCHEMA || v_table_name || ' partition of '|| V_SCHEMA ||v_parent_table||
-						' for values in ('|| v_pair_id || ') partition by range (microtimestamp)';
-	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column pair_id set default ' || v_pair_id;
-
-	v_parent_table := v_table_name;
-	-- We need a shorter name for the leafs - we are confined by max_identifier_length 
-	v_table_name :=  'level1_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0') || p_year || lpad(p_month::text, 2, '0') ;
-	i := i + 1;
-	
-	v_statements[i] := 'create table if not exists '||V_SCHEMA ||v_table_name||' partition of '||V_SCHEMA ||v_parent_table||
-							' for values from ('||quote_literal(v_from::timestamptz)||') to (' ||quote_literal(v_to::timestamptz) || ')';
-							
-	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
-
-	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column pair_id set default ' || v_pair_id;
-
-	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column microtimestamp set statistics 1000 ';
-
-	v_statement := 	'alter table '|| V_SCHEMA || v_table_name || ' add constraint '  || v_table_name ;
-	
-	i := i + 1;
-	v_statements[i] := v_statement || '_pkey primary key (microtimestamp) ';  
-	
-	i := i+1;
-	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
-	
-							
-	foreach v_statement in array v_statements loop
-		if p_execute then 
-			raise log '%', v_statement;
-			execute v_statement;
-		else
-			raise debug '%', v_statement;
-		end if;		
-	end loop;		
-	return;
-end;
-
-$$;
-
-
-ALTER FUNCTION obanalytics._create_level1_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: _create_level2_partition(text, text, character, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -873,55 +794,6 @@ $$;
 ALTER FUNCTION obanalytics._depth_summary_after_depth_change(p_internal_state obanalytics.level2_depth_summary_internal_state, p_depth_change obanalytics.level2_depth_record[], p_microtimestamp timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_bps_step integer, p_max_bps_level integer) OWNER TO "ob-analytics";
 
 --
--- Name: _drop_leaf_level1_partition(text, text, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics._drop_leaf_level1_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean DEFAULT false) RETURNS void
-    LANGUAGE plpgsql SECURITY DEFINER
-    AS $$
-
-declare
-	i integer;
-	v_exchange_id smallint;
-	v_pair_id smallint;
-	
-	v_table_name text;
-	v_statement text;
-	v_statements text[];
-	V_SCHEMA constant text default 'obanalytics.';
-begin 
-
-	
-	select pair_id into strict v_pair_id
-	from obanalytics.pairs
-	where pair = upper(p_pair);
-	
-	select exchange_id into strict v_exchange_id
-	from obanalytics.exchanges
-	where exchange = lower(p_exchange);
-
-	v_table_name :=  'level1_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0') || p_year || lpad(p_month::text, 2, '0') ;
-	i := 1;
-	
-	v_statements[i] := 'drop table if exists '||V_SCHEMA ||v_table_name;
-							
-	foreach v_statement in array v_statements loop
-		if p_execute then 
-			raise log '%', v_statement;
-			execute v_statement;
-		else
-			raise debug '%', v_statement;
-		end if;		
-	end loop;		
-	return;
-end;
-
-$$;
-
-
-ALTER FUNCTION obanalytics._drop_leaf_level1_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean) OWNER TO "ob-analytics";
-
---
 -- Name: _drop_leaf_level2_partition(text, text, character, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1189,24 +1061,6 @@ $$;
 ALTER FUNCTION obanalytics._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
--- Name: level1; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1 (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    exchange_id smallint NOT NULL
-)
-PARTITION BY LIST (exchange_id);
-
-
-ALTER TABLE obanalytics.level1 OWNER TO "ob-analytics";
-
---
 -- Name: _spread_from_order_book(timestamp with time zone, obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1258,25 +1112,6 @@ $$;
 ALTER FUNCTION obanalytics.check_microtimestamp_change() OWNER TO "ob-analytics";
 
 --
--- Name: create_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.create_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) RETURNS void
-    LANGUAGE plpgsql SECURITY DEFINER
-    AS $$
-begin 
-	perform obanalytics._create_level1_partition(p_exchange, p_pair, p_year, p_month);
-	perform obanalytics._create_level2_partition(p_exchange, p_pair, 'r0', p_year, p_month);
-	perform obanalytics._create_level3_partition(p_exchange, 'b', p_pair, p_year, p_month);
-	perform obanalytics._create_level3_partition(p_exchange, 's', p_pair, p_year, p_month);
-	perform obanalytics._create_matches_partition(p_exchange, p_pair, p_year, p_month);
-end;
-$$;
-
-
-ALTER FUNCTION obanalytics.create_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
-
---
 -- Name: crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1310,26 +1145,21 @@ $$;
 ALTER FUNCTION obanalytics.crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: level2; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+-- Name: depth_change_by_episode_fast(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE TABLE obanalytics.level2 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    exchange_id smallint NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST (exchange_id);
+CREATE FUNCTION obanalytics.depth_change_by_episode_fast(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2
+    LANGUAGE c
+    AS '$libdir/libobadiah_db.so.1', 'depth_change_by_episode';
 
 
-ALTER TABLE obanalytics.level2 OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.depth_change_by_episode_fast(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
--- Name: depth_change_by_episode(timestamp with time zone, timestamp with time zone, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: depth_change_by_episode_slow(timestamp with time zone, timestamp with time zone, integer, integer, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean DEFAULT true) RETURNS SETOF obanalytics.level2
+CREATE FUNCTION obanalytics.depth_change_by_episode_slow(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean DEFAULT true) RETURNS SETOF obanalytics.level2
     LANGUAGE plpgsql STABLE
     AS $$-- ARGUMENTS
 --		p_start_time - the start of the interval for the calculation of depths
@@ -1353,8 +1183,8 @@ begin
 										 -- so we don't generate depth_change for the era start
 													 
 			return query 
-				select v_ob.ts, p_pair_id::smallint, p_exchange_id::smallint, 'r0'::character(2), coalesce(d, '{}')
-				from obanalytics._depth_change(v_ob_before.ob, v_ob.ob) d;
+				select v_ob.ts, p_pair_id::smallint, p_exchange_id::smallint,'r0'::character(2),  l2.*
+				from obanalytics._depth_change(v_ob_before.ob, v_ob.ob) d join unnest(d) l2 on true;
 		end if;
 		v_ob_before := v_ob;
 	end loop;			
@@ -1363,63 +1193,7 @@ end;
 $$;
 
 
-ALTER FUNCTION obanalytics.depth_change_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
-
---
--- Name: depth_change_by_episode2(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.depth_change_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level2
-    LANGUAGE plpython2u STABLE
-    AS $_$
-
-from obadiah_db.orderbook import OrderBook
-# import logging
-# logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
-
-def generator():
-	ob=OrderBook(False) 
-	ob.update(
-		plpy.execute(
-			plpy.prepare('''select ob.* 
-							from obanalytics.order_book( $1, $2, $3, false, true, $4 ) join unnest(ob) ob on true
-						 ''', ["timestamptz", "integer", "integer", "boolean"]),
-		[p_start_time, p_pair_id, p_exchange_id, False]))
-	for e in plpy.cursor(
-		plpy.prepare('''	with level3 as (
-					 			-- we take only the latest event per episode. In case an order was created and deleted within an episode it will be ignored completely ...
-								select distinct on (microtimestamp, order_id) *	
-								from obanalytics.level3
-								where microtimestamp between $1 and $2
-							  	  and pair_id = $3
-							   	  and exchange_id = $4
-								order by microtimestamp, order_id, event_no desc
-							)
-							select microtimestamp as ts, array_agg(level3) as episode
-							from level3
-							group by microtimestamp
-					 		order by microtimestamp
-					''',["timestamptz", "timestamptz", "integer", "integer"]),
-		[p_start_time, p_end_time, p_pair_id, p_exchange_id]):
-		
-		yield {"microtimestamp": e["ts"], "pair_id": p_pair_id, "exchange_id": p_exchange_id, "precision":'r0', "depth_change": ob.update(e["episode"])}
-return generator()
-
-$_$;
-
-
-ALTER FUNCTION obanalytics.depth_change_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
-
---
--- Name: depth_change_by_episode4(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.depth_change_by_episode4(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2t
-    LANGUAGE c
-    AS '$libdir/libobadiah_db.so.1', 'depth_change_by_episode';
-
-
-ALTER FUNCTION obanalytics.depth_change_by_episode4(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.depth_change_by_episode_slow(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, interval, boolean, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1478,26 +1252,6 @@ $$;
 
 
 ALTER FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_frequency interval, p_skip_crossed boolean, p_minimal_draw_pct numeric, p_minimal_draw_decline numeric, p_price_decimal_places integer) OWNER TO "ob-analytics";
-
---
--- Name: drop_leaf_partitions(text, text, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) RETURNS void
-    LANGUAGE plpgsql SECURITY DEFINER
-    AS $$
-begin 
-	perform obanalytics._drop_leaf_matches_partition(p_exchange, p_pair, p_year, p_month, true);
-	perform obanalytics._drop_leaf_level3_partition(p_exchange, 'b', p_pair, p_year, p_month, true);
-	perform obanalytics._drop_leaf_level3_partition(p_exchange, 's', p_pair, p_year, p_month, true);
-	perform obanalytics._drop_leaf_level2_partition(p_exchange, p_pair, 'p0', p_year, p_month, true);	
-	perform obanalytics._drop_leaf_level1_partition(p_exchange, p_pair, p_year, p_month, true);
-	
-end;
-$$;
-
-
-ALTER FUNCTION obanalytics.drop_leaf_partitions(p_exchange text, p_pair text, p_year integer, p_month integer) OWNER TO "ob-analytics";
 
 --
 -- Name: fix_crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1610,20 +1364,11 @@ CREATE TABLE obanalytics.level3_eras (
     era timestamp with time zone NOT NULL,
     pair_id smallint NOT NULL,
     exchange_id smallint NOT NULL,
-    level1 timestamp with time zone,
-    level2 timestamp with time zone,
     level3 timestamp with time zone
 );
 
 
 ALTER TABLE obanalytics.level3_eras OWNER TO "ob-analytics";
-
---
--- Name: COLUMN level3_eras.level1; Type: COMMENT; Schema: obanalytics; Owner: ob-analytics
---
-
-COMMENT ON COLUMN obanalytics.level3_eras.level1 IS 'A microtimestamp of the latest calculated level1 event in this era ';
-
 
 --
 -- Name: insert_level3_era(timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1804,7 +1549,7 @@ with periods as (
 	from obanalytics._periods_within_eras(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
 )
 select level1.*
-from periods join obanalytics.spread_by_episode3(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level1 on true 
+from periods join obanalytics.spread_by_episode_fast(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level1 on true 
 where not p_skip_crossed or (best_bid_price <= best_ask_price)
   ;
 
@@ -1814,43 +1559,10 @@ $$;
 ALTER FUNCTION obanalytics.level1_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_skip_crossed boolean) OWNER TO "ob-analytics";
 
 --
--- Name: level1_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.level1_update_level3_eras() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-begin 
-	with latest_events as (
-		select exchange_id, pair_id, max(microtimestamp) as latest
-		from inserted
-		group by exchange_id, pair_id
-	),
-	eras as (
-		select exchange_id, pair_id, latest, max(era) as era
-		from obanalytics.level3_eras join latest_events using (exchange_id, pair_id)
-		where era <= latest
-		group by exchange_id, pair_id, latest
-	)
-	update obanalytics.level3_eras
-	   set level1 = latest
-	from eras
-	where level3_eras.era = eras.era
-	  and level3_eras.exchange_id = eras.exchange_id
-	  and level3_eras.pair_id = eras.pair_id
-	  and (level1 is null or level1 < latest);
-	return null;
-end;
-$$;
-
-
-ALTER FUNCTION obanalytics.level1_update_level3_eras() OWNER TO "ob-analytics";
-
---
 -- Name: level2_continuous(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2t
+CREATE FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level2
     LANGUAGE sql STABLE
     AS $$-- NOTE:
 --	When 'microtimestamp' in returned record 
@@ -1876,7 +1588,7 @@ select *
 from starting_depth_change
 union all
 select level2.*
-from periods join obanalytics.depth_change_by_episode4(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level2 on true 
+from periods join obanalytics.depth_change_by_episode_fast(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level2 on true 
 where microtimestamp >= period_start
   and microtimestamp <= period_end
   and level2.pair_id = p_pair_id
@@ -1888,39 +1600,6 @@ $$;
 
 
 ALTER FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
-
---
--- Name: level2_update_level3_eras(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.level2_update_level3_eras() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-begin 
-	with latest_events as (
-		select exchange_id, pair_id, max(microtimestamp) as latest
-		from inserted
-		group by exchange_id, pair_id
-	),
-	eras as (
-		select exchange_id, pair_id, latest, max(era) as era
-		from obanalytics.level3_eras join latest_events using (exchange_id, pair_id)
-		where era <= latest
-		group by exchange_id, pair_id, latest
-	)
-	update obanalytics.level3_eras
-	   set level2 = latest
-	from eras
-	where level3_eras.era = eras.era
-	  and level3_eras.exchange_id = eras.exchange_id
-	  and level3_eras.pair_id = eras.pair_id
-	  and (level2 is null or level2 < latest);
-	return null;
-end;
-$$;
-
-
-ALTER FUNCTION obanalytics.level2_update_level3_eras() OWNER TO "ob-analytics";
 
 --
 -- Name: level3_incorporate_new_event(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2298,270 +1977,6 @@ $$;
 ALTER FUNCTION obanalytics.order_book_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
--- Name: pga_summarize(text, text, interval, timestamp with time zone, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval DEFAULT '00:15:00'::interval, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval) RETURNS TABLE(summarized text, pair text, exchange text, first_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, record_count integer)
-    LANGUAGE plpgsql
-    AS $$-- PARAMETERS:
---
---	p_max_interval	interval 		If NULL, summarize using all available data, subject to limitations, enforced by the other parameters.
--- 									If NOT NULL, then sum of all summarized intervals (for different eras, if more than one) will not exceed p_max_interval
---	p_ts_within_era	timestamptz		If NULL, summarize starting from the most recent level1 or level2 data (which is earlier) for all eras if more than one
---									If NOT NULL then summarize ONLY within the era p_ts_within_era belongs to
-
-declare 
-	v_current_timestamp timestamptz;
-	
-	v_first_era timestamptz;
-	v_last_era timestamptz;
-	
-	v_start timestamptz;
-	v_end timestamptz;
-	
-	v_pair_id obanalytics.pairs.pair_id%type;
-	v_exchange_id obanalytics.exchanges.exchange_id%type;
-	
-	e record;
-	
-begin 
-	v_current_timestamp := clock_timestamp();
-	
-	select pair_id into strict v_pair_id
-	from obanalytics.pairs 
-	where pairs.pair = upper(p_pair);
-	
-	select exchange_id into strict v_exchange_id
-	from obanalytics.exchanges
-	where exchanges.exchange = lower(p_exchange);
-	
-	begin
-
-		if p_ts_within_era is null then	-- we start from the latest era where level1 and level2 have already been calculated.
-										 -- If a new era has started this start point will ensure that we'll calculate remaining 
-										 -- level1 and level2 for the old era(s) as well as the new one(s)
-			select max(era) into v_first_era
-			from obanalytics.level3_eras 
-			where pair_id = v_pair_id
-			   and exchange_id = v_exchange_id
-			   and level1 is not null and level2 is not null;
-			   
-			if v_first_era is null then 
-				-- start from the very first era available
-				select min(era) into v_first_era
-				from obanalytics.level3_eras 
-				where pair_id = v_pair_id
-				  and exchange_id = v_exchange_id;
-
-			end if;
-			
-			v_last_era := 'infinity';	-- i.e. we'll summarize all eras after the first one
-
-		else
-
-			select max(era) into v_first_era
-			from obanalytics.level3_eras 
-			where pair_id = v_pair_id
-			   and exchange_id = v_exchange_id
-			   and p_ts_within_era >= era;
-			   
-			v_last_era := v_first_era;			   
-			
-		end if;
-
-	end;
-	
-	create temp table if not exists level1 (like obanalytics.level1) on commit delete rows;
-	create temp table if not exists level2 (like obanalytics.level2) on commit delete rows;
-	
-	raise debug 'v_first_era=%  v_last_era=%', v_first_era, v_last_era;
-	
-	for e in   select starts, ends, first_level1, first_level2
-				from (
-					select era as starts, case 
-											when lead(era) over (order by era) is not null then 
-												coalesce(level3, lead(era) over (order by era)  - '00:00:00.000001'::interval)
-											else
-												coalesce(level3 - p_delay, era)
-											end as ends,
-							coalesce(level1 + '00:00:00.000001'::interval, era) as first_level1,
-							coalesce(level2 + '00:00:00.000001'::interval, era) as first_level2
-					from obanalytics.level3_eras 
-					where pair_id = v_pair_id
-					  and exchange_id = v_exchange_id
-					  and level3 is not null
-				) a
-				where a.starts between v_first_era and v_last_era
-				order by starts loop
-		raise debug 'e.starts=%, e.ends=%', e.starts, e.ends;
-		e.starts :=  least(e.first_level1, e.first_level2);
-		e.ends := least(e.ends, e.starts + p_max_interval);
-		
-		raise debug 'pga_summarize(%, %) start: %, end: %, remaining interval: % ', p_exchange, p_pair, e.starts, e.ends, p_max_interval; 
-		
-		
-/*		The SQL statement works slower than PL/PGSQL code. But may be improved in the future ... 
-
-		with base as (
-			select (obanalytics._spread_from_order_book(ts, ob)).*, obanalytics.depth_change_agg(ob) over (order by ts) as depth_change 
-			from obanalytics.order_book_by_episode(e.starts, e.ends, v_pair_id, v_exchange_id)
-		),
-		insert_level2 as (
-			insert into obanalytics.level2 (microtimestamp, pair_id, exchange_id, precision,  depth_change)
-			select microtimestamp, pair_id, exchange_id, 'r0'::character(2), depth_change
-			from base
-			where depth_change is not null
-			  and microtimestamp > e.first_level2
-		)
-		insert into obanalytics.level1 (best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id)
-		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id
-		from (
-			select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id,
-					lag(best_bid_price) over w as p_best_bid_price, 
-					lag(best_bid_qty) over w as p_best_bid_qty,
-					lag(best_ask_price) over w as p_best_ask_price,
-					lag(best_ask_qty) over w as p_best_ask_qty
-			from base
-			window w as (order by microtimestamp)
-		) a
-		where microtimestamp > e.first_level1
-		  and (  best_bid_price is distinct from p_best_bid_price
-				 or best_bid_qty is distinct from p_best_bid_qty
-				 or best_ask_price is distinct from p_best_ask_price
-				 or best_ask_qty is distinct from p_best_ask_qty
-			   ); */
-		
-		declare
-			v_ob_before record;
-			v_ob record;
-			v_l1_before obanalytics.level1;
-			v_l1 obanalytics.level1;
-		begin
-
-				select ts, ob 
-				from obanalytics.order_book(e.starts, v_pair_id, v_exchange_id, p_only_makers := true, p_before := true) 
-				into v_ob_before;	-- so we are readyf for a depth_change generation for the very first episode greater or equal to e.starts
-				
-				select * into v_l1_before
-				from obanalytics.level1
-				where microtimestamp = e.first_level1
-				  and exchange_id = v_exchange_id
-				  and pair_id = v_pair_id;
-
-				for v_ob in select ts, ob from obanalytics.order_book_by_episode(e.starts, e.ends, v_pair_id, v_exchange_id) 
-				loop
-					if v_ob.ts > e.first_level1 then
-						select * into v_l1
-						from obanalytics._spread_from_order_book(v_ob.ts, v_ob.ob);
-						
-						if (v_l1_before.best_bid_price is distinct from v_l1.best_bid_price or
-						    v_l1_before.best_bid_qty  is distinct from v_l1.best_bid_qty or
-						    v_l1_before.best_ask_price is distinct from v_l1.best_ask_price or
-						    v_l1_before.best_ask_qty is distinct from v_l1.best_ask_qty )
-						then
-							-- Let's check whether v_l1 is empty ...
-							if v_l1.microtimestamp is not null then 
-								insert into level1
-								values (v_l1.*);
-							else	-- it is empty (i.e. no orders in the order book)
-								insert into level1 (microtimestamp, exchange_id, pair_id)
-								values (v_ob.ts, v_exchange_id, v_pair_id);
-							end if;
-							
-							v_l1_before := v_l1;
-							
-						end if;
-						
-					end if;
-					
-					if v_ob.ts > e.first_level2 then
-						if v_ob_before is not null then -- if e.starts equals to an era start then v_ob_before will be null 
-						
-							insert into level2
-							select v_ob.ts, v_pair_id::smallint, v_exchange_id::smallint, 'r0'::character(2), d 
-							from obanalytics._depth_change(v_ob_before.ob, v_ob.ob) d
-							where d is not null;
-							
-						end if;
-						
-					end if;
-					v_ob_before := v_ob;
-				end loop;			
-				
-				select 'level1', p_pair, p_exchange, min(microtimestamp), max(microtimestamp), count(*) 
-				from level1
-				group by exchange_id, pair_id
-				into summarized, pair, exchange, first_microtimestamp, last_microtimestamp, record_count;
-				return next;
-				
-				select 'level2', p_pair, p_exchange, min(microtimestamp), max(microtimestamp), count(*) 
-				from level2
-				group by exchange_id, pair_id
-				into summarized, pair, exchange, first_microtimestamp, last_microtimestamp, record_count;
-				return next;
-				
-				with deleted as (
-					delete from level1
-					returning level1.*
-				)
-				insert into obanalytics.level1
-				select * from deleted;
-				
-				with deleted as (
-					delete from level2
-					returning level2.*
-				)
-				insert into obanalytics.level2
-				select * from deleted;
-				
-		exception
-			when raise_exception then
-				declare
-					v_bad_episode timestamptz;
-					v_fixed integer;
-				begin
-					select substring(sqlerrm from 'Invalid taker event: ([0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1]) (2[0-3]|[01][0-9]):[0-5][0-9]:[0-5][0-9](.[0-9]+|)(\+|1)[0-2][0-4])')
-					into v_bad_episode;
-					
-					if v_bad_episode is not null then
-						raise log '% % %', sqlerrm, e.starts, e.ends;
-						select count(*) into v_fixed
-						from obanalytics.fix_crossed_books(v_bad_episode, e.ends, v_pair_id, v_exchange_id);
-						if v_fixed > 0 then 
-							raise log 'Inserted/updated % for invalid taker at % till %', v_fixed, v_bad_episode, e.ends;
-							exit;	-- We stop the summarization now. Next call this procedure will try to summarize this era again with the hope that the errors were fixed by the code above
-						else
-							-- We got stuck, so report an error!
-							raise exception 'STUCK: inserted/updated % for invalid taker at % till % e.ends', v_fixed, v_bad_episode, e.ends;
-						end if;
-					else 
-						raise exception '%', sqlerrm;	-- We caught an unexpected exception, re-throw it
-					end if;
-				end;
-		end;
-
-		if p_max_interval is not null then 
-			p_max_interval := greatest('00:00:00'::interval, p_max_interval - (e.ends - least(e.first_level1,  e.first_level2)));
-
-			if p_max_interval = '00:00:00'::interval then
-				raise debug 'p_max_interval is 0, exiting ... ';
-				exit;
-			end if;
-
-		end if;
-		
-	end loop;
-	
-	raise debug 'pga_summarize(%, %, %, %) exec time: %', p_exchange, p_pair, p_max_interval, p_ts_within_era, clock_timestamp() - v_current_timestamp;
-	return;
-end;
-
-$$;
-
-
-ALTER FUNCTION obanalytics.pga_summarize(p_exchange text, p_pair text, p_max_interval interval, p_ts_within_era timestamp with time zone, p_delay interval) OWNER TO "ob-analytics";
-
---
 -- Name: propagate_microtimestamp_change(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -2608,10 +2023,21 @@ $$;
 ALTER FUNCTION obanalytics.save_exchange_microtimestamp() OWNER TO "ob-analytics";
 
 --
--- Name: spread_by_episode(timestamp with time zone, timestamp with time zone, integer, integer, boolean, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: spread_by_episode_fast(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.spread_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean DEFAULT true, p_with_order_book boolean DEFAULT false) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, exchange_id smallint, order_book obanalytics.level3[])
+CREATE FUNCTION obanalytics.spread_by_episode_fast(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level1
+    LANGUAGE c
+    AS '$libdir/libobadiah_db.so.1', 'spread_by_episode';
+
+
+ALTER FUNCTION obanalytics.spread_by_episode_fast(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
+
+--
+-- Name: spread_by_episode_slow(timestamp with time zone, timestamp with time zone, integer, integer, boolean, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.spread_by_episode_slow(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean DEFAULT true, p_with_order_book boolean DEFAULT false) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, exchange_id smallint, order_book obanalytics.level3[])
     LANGUAGE sql STABLE
     AS $$
 -- ARGUMENTS
@@ -2648,98 +2074,7 @@ order by microtimestamp
 $$;
 
 
-ALTER FUNCTION obanalytics.spread_by_episode(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean, p_with_order_book boolean) OWNER TO "ob-analytics";
-
---
--- Name: spread_by_episode2(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(best_bid_price numeric, best_bid_qty numeric, best_ask_price numeric, best_ask_qty numeric, microtimestamp timestamp with time zone, pair_id smallint, exchange_id smallint, order_book obanalytics.level3[])
-    LANGUAGE plpython2u STABLE
-    AS $_$
-from obadiah_db.orderbook import OrderBook
-import logging
-logging.basicConfig(filename='log/obadiah_db.log',level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-def generator():
-	spread = None
-	for era in plpy.execute(
-					plpy.prepare('''
-								 with eras as (
-									 select era as era_start, coalesce(lead(era) over (order by era) - '00:00:00.000001'::interval, 'infinity') as era_end
-									 from obanalytics.level3_eras
-									 where pair_id = $3
-									   and exchange_id = $4
-								 )
-								 select greatest(era_start, $1) as start_time, least(era_end, $2) as end_time
-								 from eras
-								 where era_start <= $2
-								   and era_end >= $1
-						   ''', ["timestamptz","timestamptz", "integer", "integer"]),
-		[p_start_time, p_end_time, p_pair_id, p_exchange_id]):
-		logger.debug('Calculating spreads for %s - %s', era["start_time"],  era["end_time"])
-		ob=OrderBook(False) 
-		if spread is None:
-			r =	plpy.execute(
-					plpy.prepare('''select ts, ob
-									from obanalytics.order_book( $1, $2, $3, false, true, $4 )
-								 ''', ["timestamptz", "integer", "integer", "boolean"]),
-				[era["start_time"], p_pair_id, p_exchange_id, False])
-			if r[0]["ts"] is not None:
-				ob.update(r[0]["ob"])
-			spread = ob.spread()
-			spread["pair_id"] = p_pair_id
-			spread["exchange_id"] = p_exchange_id
-			spread["order_book"] = None
-
-			spread["best_bid_price"] = None 
-		
-		for e in plpy.cursor(
-			plpy.prepare('''	with level3 as (
-									-- we take only the latest event per episode. In case an order was created and deleted within an episode it will be ignored completely ...
-									select distinct on (microtimestamp, order_id) *	
-									from obanalytics.level3
-									where microtimestamp between $1 and $2
-									  and pair_id = $3
-									  and exchange_id = $4
-									order by microtimestamp, order_id, event_no desc
-								)
-								select microtimestamp as ts, array_agg(level3) as episode
-								from level3
-								group by microtimestamp
-								order by microtimestamp
-						''',["timestamptz", "timestamptz", "integer", "integer"]),
-			[era["start_time"], era["end_time"], p_pair_id, p_exchange_id]):
-			ob.update(e["episode"])
-			updated_spread = ob.spread()
-
-			if 	updated_spread["best_bid_price"] != spread["best_bid_price"] or\
-					updated_spread["best_ask_price"] != spread["best_ask_price"] or\
-					updated_spread["best_bid_qty"] != spread["best_bid_qty"] or\
-					updated_spread["best_ask_qty"] != spread["best_ask_qty"]:
-				updated_spread["microtimestamp"] = e["ts"]
-				updated_spread["pair_id"] = p_pair_id
-				updated_spread["exchange_id"] = p_exchange_id
-				updated_spread["order_book"] = None
-				spread = updated_spread
-				yield spread
-return generator()
-
-$_$;
-
-
-ALTER FUNCTION obanalytics.spread_by_episode2(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
-
---
--- Name: spread_by_episode3(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level1
-    LANGUAGE c
-    AS '$libdir/libobadiah_db.so.1', 'spread_by_episode';
-
-
-ALTER FUNCTION obanalytics.spread_by_episode3(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.spread_by_episode_slow(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_only_different boolean, p_with_order_book boolean) OWNER TO "ob-analytics";
 
 --
 -- Name: summary(text, text, timestamp with time zone, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -2896,770 +2231,6 @@ CREATE TABLE obanalytics.exchanges (
 
 
 ALTER TABLE obanalytics.exchanges OWNER TO "ob-analytics";
-
---
--- Name: level1_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitfinex (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL
-)
-PARTITION BY LIST (pair_id);
-ALTER TABLE ONLY obanalytics.level1 ATTACH PARTITION obanalytics.level1_bitfinex FOR VALUES IN ('1');
-
-
-ALTER TABLE obanalytics.level1_bitfinex OWNER TO "ob-analytics";
-
---
--- Name: level1_bitfinex_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitfinex_btcusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitfinex ATTACH PARTITION obanalytics.level1_bitfinex_btcusd FOR VALUES IN ('1');
-
-
-ALTER TABLE obanalytics.level1_bitfinex_btcusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitfinex_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitfinex_ltcusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitfinex ATTACH PARTITION obanalytics.level1_bitfinex_ltcusd FOR VALUES IN ('2');
-
-
-ALTER TABLE obanalytics.level1_bitfinex_ltcusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitfinex_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitfinex_ethusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitfinex ATTACH PARTITION obanalytics.level1_bitfinex_ethusd FOR VALUES IN ('3');
-
-
-ALTER TABLE obanalytics.level1_bitfinex_ethusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY LIST (pair_id);
-ALTER TABLE ONLY obanalytics.level1 ATTACH PARTITION obanalytics.level1_bitstamp FOR VALUES IN ('2');
-
-
-ALTER TABLE obanalytics.level1_bitstamp OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp_btcusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_btcusd FOR VALUES IN ('1');
-
-
-ALTER TABLE obanalytics.level1_bitstamp_btcusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp_ltcusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_ltcusd FOR VALUES IN ('2');
-
-
-ALTER TABLE obanalytics.level1_bitstamp_ltcusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp_ethusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_ethusd FOR VALUES IN ('3');
-
-
-ALTER TABLE obanalytics.level1_bitstamp_ethusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp_xrpusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 4 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_xrpusd FOR VALUES IN ('4');
-
-
-ALTER TABLE obanalytics.level1_bitstamp_xrpusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp_bchusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp_bchusd (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 5 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_bchusd FOR VALUES IN ('5');
-
-
-ALTER TABLE obanalytics.level1_bitstamp_bchusd OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp_btceur; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp_btceur (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 6 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_btceur FOR VALUES IN ('6');
-
-
-ALTER TABLE obanalytics.level1_bitstamp_btceur OWNER TO "ob-analytics";
-
---
--- Name: level1_bitstamp_ethbtc; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level1_bitstamp_ethbtc (
-    best_bid_price numeric,
-    best_bid_qty numeric,
-    best_ask_price numeric,
-    best_ask_qty numeric,
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 7 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level1_bitstamp ATTACH PARTITION obanalytics.level1_bitstamp_ethbtc FOR VALUES IN ('7');
-
-
-ALTER TABLE obanalytics.level1_bitstamp_ethbtc OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST (pair_id);
-ALTER TABLE ONLY obanalytics.level2 ATTACH PARTITION obanalytics.level2_bitfinex FOR VALUES IN ('1');
-
-
-ALTER TABLE obanalytics.level2_bitfinex OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_btcusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitfinex ATTACH PARTITION obanalytics.level2_bitfinex_btcusd FOR VALUES IN ('1');
-
-
-ALTER TABLE obanalytics.level2_bitfinex_btcusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_btcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_btcusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ATTACH PARTITION obanalytics.level2_bitfinex_btcusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitfinex_btcusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_btcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_btcusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd ATTACH PARTITION obanalytics.level2_bitfinex_btcusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitfinex_btcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitfinex_btcusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_ltcusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitfinex ATTACH PARTITION obanalytics.level2_bitfinex_ltcusd FOR VALUES IN ('2');
-
-
-ALTER TABLE obanalytics.level2_bitfinex_ltcusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_ltcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_ltcusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ATTACH PARTITION obanalytics.level2_bitfinex_ltcusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitfinex_ltcusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_ltcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_ltcusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd ATTACH PARTITION obanalytics.level2_bitfinex_ltcusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ltcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitfinex_ltcusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_ethusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitfinex ATTACH PARTITION obanalytics.level2_bitfinex_ethusd FOR VALUES IN ('3');
-
-
-ALTER TABLE obanalytics.level2_bitfinex_ethusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_ethusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_ethusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ATTACH PARTITION obanalytics.level2_bitfinex_ethusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitfinex_ethusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitfinex_ethusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitfinex_ethusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 1 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd ATTACH PARTITION obanalytics.level2_bitfinex_ethusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitfinex_ethusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitfinex_ethusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST (pair_id);
-ALTER TABLE ONLY obanalytics.level2 ATTACH PARTITION obanalytics.level2_bitstamp FOR VALUES IN ('2');
-
-
-ALTER TABLE obanalytics.level2_bitstamp OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_btcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_btcusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_btcusd FOR VALUES IN ('1');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_btcusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_btcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_btcusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd ATTACH PARTITION obanalytics.level2_bitstamp_btcusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_btcusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_btcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_btcusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 1 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd ATTACH PARTITION obanalytics.level2_bitstamp_btcusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitstamp_btcusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ltcusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ltcusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_ltcusd FOR VALUES IN ('2');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ltcusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ltcusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ltcusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd ATTACH PARTITION obanalytics.level2_bitstamp_ltcusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ltcusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ltcusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ltcusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 2 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd ATTACH PARTITION obanalytics.level2_bitstamp_ltcusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ltcusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ltcusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ethusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ethusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_ethusd FOR VALUES IN ('3');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ethusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ethusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ethusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd ATTACH PARTITION obanalytics.level2_bitstamp_ethusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ethusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ethusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ethusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 3 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd ATTACH PARTITION obanalytics.level2_bitstamp_ethusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ethusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_xrpusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_xrpusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 4 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_xrpusd FOR VALUES IN ('4');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_xrpusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_xrpusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_xrpusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 4 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd ATTACH PARTITION obanalytics.level2_bitstamp_xrpusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_xrpusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_xrpusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_xrpusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 4 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd ATTACH PARTITION obanalytics.level2_bitstamp_xrpusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitstamp_xrpusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitstamp_xrpusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_bchusd; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_bchusd (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 5 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_bchusd FOR VALUES IN ('5');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_bchusd OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_bchusd_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_bchusd_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 5 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd ATTACH PARTITION obanalytics.level2_bitstamp_bchusd_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_bchusd_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_bchusd_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_bchusd_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 5 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd ATTACH PARTITION obanalytics.level2_bitstamp_bchusd_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitstamp_bchusd_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitstamp_bchusd_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_btceur; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_btceur (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 6 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_btceur FOR VALUES IN ('6');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_btceur OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_btceur_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_btceur_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 6 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur ATTACH PARTITION obanalytics.level2_bitstamp_btceur_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_btceur_p0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_btceur_r0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_btceur_r0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 6 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'r0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur ATTACH PARTITION obanalytics.level2_bitstamp_btceur_r0 FOR VALUES IN ('r0');
-ALTER TABLE ONLY obanalytics.level2_bitstamp_btceur_r0 ALTER COLUMN microtimestamp SET STATISTICS 1000;
-
-
-ALTER TABLE obanalytics.level2_bitstamp_btceur_r0 OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ethbtc; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ethbtc (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 7 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY LIST ("precision");
-ALTER TABLE ONLY obanalytics.level2_bitstamp ATTACH PARTITION obanalytics.level2_bitstamp_ethbtc FOR VALUES IN ('7');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ethbtc OWNER TO "ob-analytics";
-
---
--- Name: level2_bitstamp_ethbtc_p0; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.level2_bitstamp_ethbtc_p0 (
-    microtimestamp timestamp with time zone NOT NULL,
-    pair_id smallint DEFAULT 7 NOT NULL,
-    exchange_id smallint DEFAULT 2 NOT NULL,
-    "precision" character(2) DEFAULT 'p0'::bpchar NOT NULL,
-    depth_change obanalytics.level2_depth_record[] NOT NULL
-)
-PARTITION BY RANGE (microtimestamp);
-ALTER TABLE ONLY obanalytics.level2_bitstamp_ethbtc ATTACH PARTITION obanalytics.level2_bitstamp_ethbtc_p0 FOR VALUES IN ('p0');
-
-
-ALTER TABLE obanalytics.level2_bitstamp_ethbtc_p0 OWNER TO "ob-analytics";
 
 --
 -- Name: level3_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
@@ -5544,20 +4115,6 @@ CREATE TRIGGER propagate_microtimestamp_change AFTER UPDATE OF microtimestamp ON
 --
 
 CREATE TRIGGER update_chain_after_delete AFTER DELETE ON obanalytics.level3 FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_update_chain_after_delete();
-
-
---
--- Name: level1 update_level3_eras; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TRIGGER update_level3_eras AFTER INSERT ON obanalytics.level1 REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE PROCEDURE obanalytics.level1_update_level3_eras();
-
-
---
--- Name: level2 update_level3_eras; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TRIGGER update_level3_eras AFTER INSERT ON obanalytics.level2 REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE PROCEDURE obanalytics.level2_update_level3_eras();
 
 
 --

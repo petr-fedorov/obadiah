@@ -177,19 +177,18 @@ ALTER FUNCTION get.available_period(p_exchange_id integer, p_pair_id integer) OW
 -- Name: data_overview(text, text, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.data_overview(p_exchange text DEFAULT NULL::text, p_pair text DEFAULT NULL::text, p_r integer DEFAULT NULL::integer) RETURNS TABLE(level2_delay interval, pair text, pair_id smallint, exchange text, exchange_id smallint, era timestamp with time zone, level3 timestamp with time zone, level2 timestamp with time zone, level1 timestamp with time zone)
+CREATE FUNCTION get.data_overview(p_exchange text DEFAULT NULL::text, p_pair text DEFAULT NULL::text, p_r integer DEFAULT NULL::integer) RETURNS TABLE(pair text, pair_id smallint, exchange text, exchange_id smallint, era timestamp with time zone, level3 timestamp with time zone)
     LANGUAGE sql
     AS $$
 with eras as (
-	select level3_eras, pair, exchange, era, level3, level2, level1, pair_id, exchange_id,
+	select level3_eras, pair, exchange, era, level3, pair_id, exchange_id,
 			row_number() over (partition by pair_id, exchange_id order by era desc) as r,
 			coalesce(lead(era) over (partition by pair_id, exchange_id order by era), 'infinity') as next_era
 	from obanalytics.level3_eras join obanalytics.exchanges using (exchange_id) join obanalytics.pairs using (pair_id)
 	where pair = coalesce(upper(p_pair), pair) 
 	  and exchange = coalesce(lower(p_exchange),exchange)
 )
-select coalesce(level3, era) - coalesce(level2, era),
-		pair, pair_id, exchange, exchange_id, era, level3, level2, level1
+select  pair, pair_id, exchange, exchange_id, era, level3
 from eras
 where r <= coalesce(p_r, r)
 order by era desc;
@@ -256,7 +255,10 @@ CREATE FUNCTION get.depth_summary(p_start_time timestamp with time zone, p_end_t
 with depth_summary as (
 	select microtimestamp, 
 			(unnest(obanalytics.depth_summary_agg(depth_change, microtimestamp, pair_id, exchange_id, p_bps_step, p_max_bps_level ) over (order by microtimestamp))).*
-	from obanalytics.level2_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id)
+	from (select  microtimestamp, pair_id, exchange_id, array_agg(row(price, volume, side, bps_level)::obanalytics.level2_depth_record) as depth_change
+		  from obanalytics.level2_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id) 
+		  group by 1,2,3
+		 ) a
 )
 select microtimestamp,
 		price, 
@@ -288,10 +290,10 @@ $$;
 ALTER FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_minimal_draw_pct numeric, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_skip_crossed boolean) OWNER TO "ob-analytics";
 
 --
--- Name: events(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: get; Owner: ob-analytics
+-- Name: events(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
-CREATE FUNCTION get.events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE("event.id" uuid, id bigint, "timestamp" timestamp with time zone, "exchange.timestamp" timestamp with time zone, price numeric, volume numeric, action text, direction text, fill numeric, "matching.event" uuid, type text, "aggressiveness.bps" numeric, event_no integer, is_aggressor boolean, is_created boolean, is_ever_resting boolean, is_ever_aggressor boolean, is_ever_filled boolean, is_deleted boolean, is_price_ever_changed boolean, best_bid_price numeric, best_ask_price numeric)
+CREATE FUNCTION get.events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS TABLE("event.id" uuid, id bigint, "timestamp" timestamp with time zone, "exchange.timestamp" timestamp with time zone, price numeric, volume numeric, action text, direction text, fill numeric, "matching.event" uuid, type text, "aggressiveness.bps" numeric, event_no integer, is_aggressor boolean, is_created boolean, is_ever_resting boolean, is_ever_aggressor boolean, is_ever_filled boolean, is_deleted boolean, is_price_ever_changed boolean, best_bid_price numeric, best_ask_price numeric)
     LANGUAGE sql STABLE SECURITY DEFINER
     AS $$
 
@@ -323,10 +325,7 @@ CREATE FUNCTION get.events(p_start_time timestamp with time zone, p_end_time tim
 	  spread_before as (
 		  select lead(microtimestamp) over (order by microtimestamp) as microtimestamp, 
 		  		  best_ask_price, best_bid_price
-		  from obanalytics.level1 
-		  where microtimestamp between p_start_time and p_end_time 
-		    and pair_id = p_pair_id
-		    and exchange_id = p_exchange_id
+		  from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
 		  ),
       active_events as (
 		select microtimestamp, order_id, event_no, next_microtimestamp = '-infinity' as is_deleted, side,price, amount, fill, pair_id, exchange_id, 
@@ -443,7 +442,7 @@ CREATE FUNCTION get.events(p_start_time timestamp with time zone, p_end_time tim
 $$;
 
 
-ALTER FUNCTION get.events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+ALTER FUNCTION get.events(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
 -- Name: events_intervals(integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
