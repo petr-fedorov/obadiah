@@ -1,0 +1,135 @@
+---
+title: "A dependency of the draw size distribution on the value of minimal.draw.pct parameter"
+author: "Petr Fedorov"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  start_time: 2019-08-01 00:00:00+03
+  end_time: 2019-09-01 00:00:00+03
+  exchange: bitstamp
+  pair: BTCUSD
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+library(lubridate)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(latex2exp)
+library(knitr)
+library(gsubfn)
+library(purrr)
+
+
+cache <- new.env(parent=emptyenv())
+options(digits.secs = 4, scipen=999)
+
+config <- config::get()
+con <- DBI::dbConnect(RPostgres::Postgres(), user=config$user,dbname=config$dbname, host=config$host,port=config$port, sslmode="require", sslrootcert=config$sslrootcert, sslcert=config$sslcert,sslkey=config$sslkey,bigint="numeric")
+
+
+default_source_hook <- knit_hooks$get('source')
+
+knit_hooks$set(source = function(x, options) {
+  x <- gsubfn(x = x, pattern = "params\\$`?([\\w_]+)`?", function(y) {
+    y <- get(y, params)
+    ifelse(is.character(y), paste0("'", y, "'"), y)
+  })
+  default_source_hook(x, options)
+})
+
+```
+
+
+# Introduction
+
+
+
+```{r  download-dataset-from-db, eval=FALSE, echo=FALSE}
+config <- config::get()
+data.load.con <- DBI::dbConnect(RPostgres::Postgres(), user=config$user,dbname=config$dbname, host=config$host,port=config$port, sslmode="require", sslrootcert=config$sslrootcert, sslcert=config$sslcert,sslkey=config$sslkey,bigint="numeric")
+
+minimal.draw.pcts <- seq(5, 85, 20)
+exchanges <- c("bitstamp", "bitfinex")
+pairs <- c("btcusd", "ethusd", "ltcusd")
+
+data.set.query <- map_dfr(minimal.draw.pcts,
+                          function(m.d.p){
+                            map_dfr(exchanges, function(exchange){
+                              map_dfr(pairs, ~ data.frame(minimal.draw.pct = m.d.p, exchange = factor(exchange,levels=exchanges), pair = factor(.x, levels=pairs)))
+                            })
+                          })
+data.set.query$start.time <- '2019-08-01 00:00:00+03'
+data.set.query$end.time <- '2019-09-01 00:00:00+03'
+data.set <- pmap_dfr(data.set.query, 
+                     .f = function(minimal.draw.pct, exchange, pair, start.time, end.time) {
+                       data.frame(minimal.draw.pct, exchange, pair)
+                       obadiah::draws(data.load.con, 
+                                      start.time,
+                                      end.time,
+                                      exchange,
+                                      pair,
+                                      draw.type = 'mid-price',
+                                      minimal.draw.pct = minimal.draw.pct,
+                                      tz='Europe/Moscow') %>%
+                         #select(draw.size) %>%
+                         mutate(draw.size=abs(draw.size)) %>%
+                         arrange(-draw.size) %>%
+                         mutate(r=row_number(), m.d.p=minimal.draw.pct) %>%
+                         mutate(r=r/max(r)) %>% 
+                         filter(draw.size >= 10) %>%
+                         mutate(exchange=exchange,pair=pair)
+                       })
+save(data.set.query, data.set, file="impact-of-minimal-draw-pct-data.bz2")
+DBI::dbDisconnect(data.load.con)
+```
+
+```{r , include=FALSE}
+load("impact-of-minimal-draw-pct-data.bz2")
+```
+
+
+
+```{r, eval=FALSE, include=FALSE}
+obadiah::plotDataAvailability(obadiah::intervals(con,data.set.query$start.time[1],data.set.query$end.time[1],'bitstamp','btcusd'))
+```
+
+
+
+```{r}
+e <- 'bitstamp'
+p <- 'ethusd'
+m.d.p <- 5
+cf <- coef(lm( log(r) ~  log(draw.size), data.set %>% filter(m.d.p == !!m.d.p & exchange == e & pair == p & draw.size > 17) ))
+
+ggplot(data=data.set %>% filter(m.d.p == !!m.d.p & exchange == e & pair == p), aes(x=log(draw.size), y=log(r), group=m.d.p, colour=as.character(m.d.p))) + geom_point(size=0.5) + scale_x_continuous(breaks=c(5, 10,30,50, 60, 80, 100,200, 300)) + geom_abline(slope = cf[2], intercept = cf[1]) + labs(title=paste0("gamma=", round(cf[2],2)))
+
+```
+
+
+
+
+```{r}
+gammas <- pmap_dfr(data.set.query, 
+                     .f = function(minimal.draw.pct, exchange, pair, start.time, end.time) {
+                       d <- data.set %>% filter(m.d.p == !!minimal.draw.pct & exchange == !!exchange & pair == !!pair & draw.size > 10) 
+                       t <- quantile(d$draw.size, 0.90)
+                       d <- d %>% filter(draw.size > t)
+                       data.frame(minimal.draw.pct = minimal.draw.pct, exchange = exchange, pair = pair, gamma= coef(lm( log(r) ~  log(draw.size), d))[2], threshould.draw=t)
+                     })
+
+ggplot(data=gammas,aes(x=minimal.draw.pct, y=gamma, group=paste0(exchange, "+", pair), colour=paste0(exchange, "+", pair))) + geom_line() + geom_point() + scale_x_continuous(breaks=unique(gammas$minimal.draw.pct))
+```
+
+
+
+```{r }
+
+ggplot(data=data.set %>% filter(draw.size > 10), aes(x=draw.size, y=r, group=paste0(exchange, "+", pair, "+", m.d.p), colour=as.character(m.d.p))) + geom_point(size=0.5) + scale_x_log10(breaks=c(5, 10,30,50, 60, 80, 100,200, 300)) + scale_y_log10() 
+
+```
+
