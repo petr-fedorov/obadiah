@@ -10,3 +10,4 @@
 ^db$
 ^bash$
 ^sample_config\.yml$
+^Meta$

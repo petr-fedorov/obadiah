@@ -28,5 +28,5 @@ Suggests: testthat,
     knitr,
     rmarkdown
 VignetteBuilder: knitr
-RoxygenNote: 6.1.1
 LinkingTo: Rcpp
+RoxygenNote: 7.0.0

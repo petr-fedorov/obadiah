@@ -97,3 +97,5 @@ config.yml
 docs/*_cache
 *.o
 *.d
+doc
+Meta

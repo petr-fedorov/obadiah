@@ -1,0 +1,140 @@
+---
+title: "Draws with a dynamic tolerance"
+author: "Petr Fedorov"
+date: "`r Sys.Date()`"
+output: 
+  bookdown::html_document2:
+    number_sections: TRUE
+vignette: >
+  %\VignetteIndexEntry{Draws with a dynamic tolerance}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+references:
+  - id: gerlach2019
+    title: Dissection of Bitcoin’s multiscale bubble history from January 2012 to February 2018
+    author: 
+      - family: Gerlach
+        given: J.C.
+      - family: Demos
+        given: G.
+      - family: Sornette
+        given: D.
+    issued:
+      year: 2019
+      month: 7
+    container-title: Royal Society Open Science
+    type: article-journal
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+
+library(tibble)
+library(ggplot2)
+library(latex2exp)
+
+```
+
+# $\epsilon$-draws: draws with a static tolerance
+
+Nowadays $\epsilon$-drawdowns and $\epsilon$-drawups are being acitvely used in the scientific literature and one of the most recent examples is the article (@gerlach2019). The description of $\epsilon$-drawdowns /$\epsilon$-drawups methodology that follows is based on the article. 
+
+Consider we are given a price series $P[t_i], \quad i=0,1, \ldots$ of some kind. For example, it could be the consecutive "best ask" prices of BTCUSD pair at some exchange.  $t_i$ deisgnates the moment when the price has changed (i.e. a new best order has arrived or the previous best order has been cancelled).
+We can calculate the discrete log-returns 
+$$
+\begin{equation} 
+r_i = \ln P[t_i] - \ln P[t_{i-1}], \quad i=1,2,\ldots (#eq:a1)
+\end{equation}
+$$
+
+The first time $t_{i_0}$ is defined as the beginning of a drawup (drawdown) if $r_1>0$($r_1 < 0$).
+Then, for each subsequent $t_{i_0+i} > t_{i_0}, \quad i=1,2,\ldots$, we calculate the cummulative return up to $t_{i_i}$ as 
+$$
+\begin{equation}
+p_{i_0,i} = \sum_{k=1}^i r_{i_k} = \ln P[t_{i_i}] - \ln P[t_{i_0}] (#eq:a2)
+\end{equation}
+$$
+
+At each time $t_{i_i}, \quad i=1,2,\ldots$ we need to check whether the current drawup (drawdown) phase is still active. We test this by calculating the largest deviation $\delta_{i_0,i}$ of the price trajectory from a previous maximum (minimum) 
+$$
+\begin{equation}
+\delta_{i_0,i} = \begin{cases} \max_{i_0 \leq k \leq i} \{p_{i_0,k}\} - p_{i_0,i} & \text{for drawups} \\  p_{i_0, i}  - \min_{i_0 \leq k \leq i} \{p_{i_k,i}\}& \text{for drawdowns} \end{cases} (#eq:a3)
+\end{equation}
+$$
+The procedure is stopped at time $i$ when the deviation exceeds a predefined tolerance $\epsilon$ 
+$$
+\begin{equation}
+\delta_{i_0,i} > \epsilon (#eq:a4)
+\end{equation}
+$$ The stopping tolerance quantifies how much the price is allowed to move in the direction opposite to the
+drawup/drawdown trend.
+When the procedure has been stopped, the end of the current drawup (drawdown) phase is determined as the time of the highest (lowest) price seen in the tested interval: 
+$$
+\begin{equation}
+i_1 = \begin{cases} \arg \max_{i_0 \leq k \leq i} \{p_{i_0,k}\} & \text{for drawups} \\ \arg \min_{i_0 \leq k \leq i} \{p_{i_0,k}\}& \text{for drawdowns} \end{cases} (#eq:a5)
+\end{equation}
+$$
+The $\epsilon$-drawup/drawdown procedure \@ref(eq:a5) is restarted at time $i_1$. The start of the next drawup/drawdown period will then be located at this time. By construction of $\delta$ and the stopping condition a drawup (respectively, drawdown) is always followed by a drawdown (respectively,drawup). The procedure is repeated until the full length of the analysed time series is represented as a sequence of drawups and drawdowns. The process is illustrated on figure \@ref(fig:epsilon-draws-example).
+
+
+```{r epsilon-draws-example, echo=FALSE, fig.align="center", fig.cap="Here the $\\epsilon$-draw methodology is illustrated for the case when the drawup stopped at time $t_{i_0+3}$ because   $\\delta_{i_0, 5}$ exceeded $\\epsilon$ and the drawdown then started. Note that the drawup didn't stop at time $t_{i_0+1}$ since the tolerance $\\epsilon$ was not exceeded."}
+eps.draws.data <- tibble(P=c(10, 13,12, 18, 16, 14), T= c(1,4, 5,6,7.5, 8), k=seq_along(T))
+eps.draws.horiz <- with(eps.draws.data, tibble(x=c(T[1], T[2], T[4],  T[6]), y=c(P[1], P[2], P[4], P[6]), xend=c(T[6]+2, T[2]+0.5,T[6]+2,  T[6]+2), yend=y))
+
+eps.draws.vert <- with(eps.draws.horiz, tibble(x=c(xend[2],xend[4], xend[4] ), y=c(!!y[1], !!y[4], !!y[1]), xend=c(xend[2], xend[4],xend[4]),yend=c(!!y[2], !!y[3], !!y[4]), t=c(TeX("$r_{i_0+1}$", output="character"), TeX("$\\delta_{i_0,5} > \\epsilon$",output="character"), TeX("$p_{i_0,5}$",output="character"))))
+eps.draws <- with(eps.draws.data, tibble(x=c(T[1], T[4]), y=c(P[1], P[4]), xend=c(T[4],T[6]), yend=c(P[4], P[6]), c=c("green", "red")))
+
+ggplot(eps.draws.data, aes(x=T, y=P)) + 
+  geom_point() + geom_line() + 
+  geom_segment(data=eps.draws.horiz, aes(x=x, y=y, xend=xend, yend=yend), size=0.2) +
+  geom_segment(data=eps.draws.vert, aes(x=x, y=y, xend=xend, yend=yend), arrow = arrow(ends="both",angle = 10, length = unit(0.5, "lines")), size=0.2) +
+  geom_text(data=eps.draws.vert, aes(x=x+0.1, y=(y+yend)/2, label=t, hjust=0), parse=TRUE) +
+  scale_x_continuous(TeX("$t_i$"),breaks=eps.draws.data$T, labels = c(TeX("$t_{i_0}$"),TeX("$t_{i_0+1}$"),TeX("$t_{i_0+2}$"),TeX("$t_{i_0+3} = t_{i_1}$"),TeX("$t_{i_0+4}$"),TeX("$t_{i_0+5}$") )) +
+  geom_segment(data=eps.draws, aes(x=x, y=y, xend=xend, yend=yend, colour=c), arrow = arrow(angle=10,length = unit(1, "lines"))) +
+  expand_limits(x=11) + 
+  scale_y_continuous(TeX("$\\ln P\\[t_i\\]$"), breaks=eps.draws.data$P, labels = c(TeX("$\\ln P\\[ t_{i_0}\\]$"),TeX("$\\ln P\\[t_{i_0+1}\\]$"),TeX("$\\ln P\\[t_{i_0+2}\\]$"),TeX("$\\ln P\\[t_{i_0+3}\\]$"),TeX("$\\ln P\\t_{i_0+4}\\]$"),TeX("$\\ln P\\[t_{i_0+5}\\]$") )) + 
+  scale_color_manual("Draw direction", values=c("red"="red", "green"="green"), labels=c("up", "down")) +
+  theme(legend.position = "top")
+
+  
+
+```
+
+
+# The drawback of $\epsilon$-draws methodology
+
+As the authors of (@gerlach2019) point out  it is difficult to single out  an appropriate $\epsilon$ value.  
+
+> Selections resulting in large values of the tolerance $\epsilon$ will tend to yield a coarse long-term
+sequence while small $\epsilon$-values result in more frequent interruption of a drawup or drawdown,
+yielding finer sequences.
+
+Thus in both cases it is not possible to get an intuitevely expected **mix** of large and small draws. Instead either all your draws are large (i.e. when $\epsilon$ is large) or small (when it is small). This is the drawback of $\epsilon$-draws methodology to be addressed by a dynamic $\epsilon$-draws.
+
+
+# A dynamic $\epsilon$-draws methodology
+
+In order to address the issue mentioned above, we need to adjust $\epsilon$ in formula \@ref(eq:a4) dynamically 
+$$
+\begin{equation}
+\epsilon = \begin{cases} \max_{i_0 \leq k \leq i} \{p_{i_0,k}\}\gamma_{i_0,i}  & \text{for drawups} \\  - \min_{i_0 \leq k \leq i} \{p_{i_k,i}\}\gamma_{i_0,i} & \text{for drawdowns} \end{cases} (#eq:d1) 
+\end{equation}
+$$
+First, note that $\epsilon$ in \@ref(eq:d1) is now directly proportional to the size of the latest draw, so the larger the draw the bigger must be the draw in the opposite direction to stop it.  
+
+Then $\gamma_{i_0,i}$ is calculates using the following formula
+$$
+\gamma_{i_0,i} = \frac{\gamma_0/100}{1 + \theta(t_{i_0+i} - t_{i_0})} 
+$$
+
+where $\gamma_0$ is the minimal draw percentage coefficient and $\theta$ is a time decay coefficient. Both $\gamma_0$ and $\theta$ are constants.
+
+If $\theta = 0$ then $\gamma_{i_0,i} = \gamma_0$. The draw will be stopped by the next draw which is no less in size than $\gamma_0$ percents of the current draw. 
+
+If $\theta > 0$ then $\gamma_{i_0,i}$ will decay with time giving a very large draw a better chance to stop. 
+
+
+# References
