@@ -28,10 +28,10 @@
 
 .dummy <- function() {}
 
-#' Securely connects to the OBADiah database
+#' Securely connects to the OBADiah database and initializes an internal cache for the data
 #'
 #' Establishes a secure TCP/IP connection to the OBADiah database and returns a connection object.
-#' The object is used to communicate with the database.
+#' The object is used to communicate with the database and to keep refereneces cached data
 #'
 #' @param sslcert path to the client's SSL certificate file, signed by OBADiah database owner
 #' @param sslkey path to the clients' SSL private key
@@ -39,26 +39,49 @@
 #' @param port port
 #' @param user user
 #' @param dbname name of PostgreSQL database
-#' @return the connection object as returned by DBI::dbConnect()
+#' @return the connection object
 #'
 #' @export
-connect <- function(sslcert, sslkey, host, port, user="obademo",  dbname="ob-analytics-prod") {
-  DBI::dbConnect(RPostgres::Postgres(),
-                 user=user,
-                 dbname=dbname,
-                 host=host,
-                 port=port,
-                 sslmode="require",
-                 sslrootcert=system.file('extdata/root.crt', package=packageName()),
-                 sslcert=sslcert,
-                 sslkey=sslkey)
+connect <- function(sslcert, sslkey, host, port, sslrootcert =system.file('extdata/root.crt', package=packageName()), user="obademo",  dbname="ob-analytics-prod") {
+
+  con <-new.env()
+
+  con$con <- (function() {
+    dbObj <- NULL
+    function() {
+      while(is.null(dbObj) || tryCatch(DBI::dbGetQuery(dbObj, "select false as result")$result, error = function(e) TRUE )) {
+        dbObj <<- DBI::dbConnect(RPostgres::Postgres(),
+                       user=user,
+                       dbname=dbname,
+                       host=host,
+                       port=port,
+                       sslmode="allow",
+                       sslrootcert=system.file('extdata/root.crt', package=packageName()),
+                       sslcert=sslcert,
+                       sslkey=sslkey,
+                       bigint="numeric")
+      }
+      dbObj
+    }
+  })()
+  class(con) <- c("connection", class(con))
+  con
+}
+
+#' @export
+#'
+disconnect <- function(con) {
+  DBI::dbDisconnect(con$con())
 }
 
 
 
 #' @export
-depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, cache=NULL, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz='UTC') {
 
+  cache=con
+  conn=con$con()
+  cache.bound = now(tz='UTC') - minutes(15)
 
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
@@ -108,8 +131,10 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
   if(!empty(depth)) {
     # Assign timezone of start.time, if any, to timestamp column
     depth$timestamp <- with_tz(depth$timestamp, tzone)
+    depth <- depth %>% arrange(timestamp, -price, side)
   }
-  depth %>% arrange(timestamp, -price, side)
+  class(depth) <- c("depth", class(depth))
+  depth
 }
 
 
@@ -168,9 +193,18 @@ depth <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, ca
 }
 
 
+
+
 #' @export
-depth2spread <- function(depth, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC') {
+spread <- function(x, ...) {
+  UseMethod("spread")
+}
+
+
+#' @export
+spread.depth <- function(depth, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC') {
   spread <- with(depth, spread_from_depth(timestamp, price, volume, side))
+
   if(!empty(spread)) {
     spread$timestamp <- with_tz(spread$timestamp, tz)
   }
@@ -178,19 +212,26 @@ depth2spread <- function(depth, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC'
     spread <- spread[complete.cases(spread), ]
   if(skip.crossed)
     spread <- spread %>% filter(best.bid.price <= best.ask.price)
+  class(spread) <- c("spread", class(spread))
   spread
 }
 
-
-
 #' @export
-spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL, cache=NULL, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+spread.connection <- function(con, start.time, end.time, exchange, pair, frequency=NULL, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC') {
+  # TODO Implement loading of starting spread, similar to loading of starting depth (i.e. not distorting cache) ###
+  cache=con
+  conn=con$con()
+  cache.bound = now(tz='UTC') - minutes(15)
+
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+  stopifnot(is.null(frequency) || is.numeric(frequency))
+  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
 
-  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name=packageName())
+  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),
+                    ", frequency := ", frequency, ", skip.crossed := ", skip.crossed, ", complete.cases :=", complete.cases ,")" ), name=packageName())
 
   tzone <- tz
 
@@ -199,109 +240,78 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
   end.time <- with_tz(end.time, tz='UTC')
 
 
-  if (is.null(by.interval)) {
-    from_rdbms <- .spread
-    spread_type <- "spread"
-    before <- seconds(10)
-
+  if (is.null(frequency)) {
+    cache_key <- "spread"
+    right <- FALSE
   }
   else {
-    stopifnot(inherits(by.interval, 'Duration'))
 
-    by.interval <- duration(round(as.numeric(by.interval)), 'seconds')
-
-    if(by.interval > seconds(60))
-      before <- by.interval
-    else
-      before <- seconds(round(60/as.integer(by.interval)+1)*as.integer(by.interval))
-
-    start.time <- round_date(start.time, 'second')
-    end.time <- round_date(end.time, 'second')
-
-
-
-    from_rdbms <- function(conn, start.time, end.time, exchange, pair) {
-      .spread_by_interval(conn, start.time, end.time, exchange, pair, by.interval=paste0(as.numeric(by.interval), ' seconds'))
+    if(frequency < 60) {
+      start.time <- floor_date(start.time,  paste0(frequency, " seconds"))
+      end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
     }
-    spread_type <- paste0("spread_by_",as.numeric(by.interval))
+    else {
+      start.time <- floor_date(start.time, paste0(frequency %/% 60, " minutes"))
+      end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
+    }
+
+    cache_key <- paste0("spread_",frequency)
+    right <- TRUE
   }
 
+  loader <- function(conn, start.time, end.time, exchange, pair) {
+    .spread(conn, start.time, end.time, exchange, pair, frequency)
+  }
 
-  pmap_dfr(tibble(pair, exchange), function(pair, exchange) {
+  spread <- pmap_dfr(tibble(pair, exchange), function(pair, exchange) {
 
     if(is.null(cache) || start.time > cache.bound) {
-      spread <- from_rdbms(conn, start.time - before, end.time, exchange, pair)
+      spread <- loader(conn, start.time, end.time, exchange, pair)
     }
     else {
       if(end.time <= cache.bound )
-        spread <- .load_cached(conn, start.time - before, end.time, exchange, pair, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type))
+        spread <- .load_cached(conn, start.time, end.time, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right)
       else
-        spread <- rbind(.load_cached(conn, start.time - before, cache.bound, exchange, pair, from_rdbms, .leaf_cache(cache, exchange, pair, spread_type) ),
-                        from_rdbms(conn, cache.bound, end.time, exchange, pair)
+        spread <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right),
+                        loader(conn, cache.bound, end.time, exchange, pair)
         )
     }
 
     if(!empty(spread)) {
-      # Assign timezone of start.time, if any, to timestamp column
-      spread$timestamp <- with_tz(spread$timestamp, tzone)
-      spread<- spread  %>%
-        arrange(timestamp) %>%
-        filter(lead(timestamp) > start.time & timestamp <= end.time) %>%
-        mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time),
-               pair=toupper(pair),
-               exchange=tolower(exchange)
-               )
-      if(!empty(spread)) {
-        last_spread <- tail(spread, 1)
-        if(last_spread$timestamp < end.time) {
-          last_spread$timestamp <- end.time
-          spread <- rbind(spread,last_spread)
-        }
-      }
+      spread$timestamp <- with_tz(spread$timestamp, tz)
     }
+    if(complete.cases)
+      spread <- spread[complete.cases(spread), ]
+    if(skip.crossed)
+      spread <- spread %>% filter(best.bid.price <= best.ask.price)
     spread
+
   })
-
-}
-
-.spread <- function(conn, start.time, end.time, exchange, pair) {
-
-  query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp,
-                  \"best.bid.price\",
-                  \"best.bid.volume\",
-                  \"best.ask.price\",
-                  \"best.ask.volume\"
-                  FROM get.spread(",
-                  shQuote(format(start.time, usetz=T)), ",",
-                  shQuote(format(end.time, usetz=T)), ",",
-                  "get.pair_id(",shQuote(pair),"), " ,
-                  "get.exchange_id(", shQuote(exchange), ") ",
-                  ") ORDER BY 1, timestamp desc")
-
-  flog.debug(query, name=packageName())
-  spread <- DBI::dbGetQuery(conn, query)
-  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
+  class(spread) <- c("spread", class(spread))
   spread
 }
 
-.spread_by_interval <- function(conn, start.time, end.time, exchange, pair, by.interval ) {
+.spread <- function(conn, start.time, end.time, exchange, pair, frequency) {
 
-  query <- paste0(" select distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp,",
-                  "\"best.bid.price\",
-                  \"best.bid.volume\",
-                  \"best.ask.price\",
-                  \"best.ask.volume\",
-                  \"era\"
-                  from get.spread_by_interval(",
-                  shQuote(format(start.time, usetz=T)), ",",
-                  shQuote(format(end.time, usetz=T)), ",",
-                  "get.pair_id(",shQuote(pair),"), " ,
-                  "get.exchange_id(", shQuote(exchange), "), ",
-                  shQuote(by.interval), "::interval",
-                  ") ",
-                  " where \"best.bid.price\" is not null or \"best.bid.volume\" is not null or ",
-                  " \"best.ask.price\" is not null or \"best.ask.volume\" is not null",
-                  " order by 1, timestamp desc")
+  if(is.null(frequency))
+
+    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+                    "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), ") ",
+                    ") ORDER BY 1, timestamp desc")
+  else
+    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+                    "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), "), ",
+                    "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
+                    ") ORDER BY 1, timestamp desc")
+
   flog.debug(query, name=packageName())
   spread <- DBI::dbGetQuery(conn, query)
   spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
@@ -312,7 +322,11 @@ spread <- function(conn, start.time, end.time, exchange, pair, by.interval=NULL,
 
 
 #' @export
-events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+events <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
+  cache=con
+  conn=con$con()
+  cache.bound = now(tz='UTC') - minutes(15)
+
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
@@ -380,7 +394,11 @@ events <- function(conn, start.time, end.time, exchange, pair, cache=NULL, cache
 }
 
 #' @export
-trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
+
+  cache=con
+  conn=con$con()
+  cache.bound = now(tz='UTC') - minutes(15)
 
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
@@ -432,13 +450,18 @@ trades <- function(conn, start.time, end.time, exchange, pair, cache=NULL, cache
 
 
 #' @export
-depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL, cache.bound = now(tz='UTC') - minutes(15), tz='UTC') {
+depth_summary <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, tz='UTC') {
+
+  cache=con
+  conn=con$con()
+  cache.bound = now(tz='UTC') - minutes(15)
+
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 
   stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
 
-  flog.debug(paste0("spread(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", exchange, ", ", pair,")" ), name=packageName())
+  flog.debug(paste0("depth_summary(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),")" ), name=packageName())
 
   tzone <- tz
 
@@ -448,15 +471,31 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL
 
 
   if(is.null(cache) || start.time > cache.bound)
-    ds <- .depth_summary(conn, start.time, end.time, exchange, pair)
-  else
-    if(end.time <= cache.bound )
-      ds <- .load_cached(conn, start.time, end.time, exchange, pair, .depth_summary, .leaf_cache(cache, exchange, pair, "depth_summary"))
-  else
-    ds <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, .trades, .leaf_cache(cache, exchange, pair, "depth_summary") ),
-                    .depth_summary(conn, cache.bound, end.time, exchange, pair)
-    )
+    ds <- .depth_summary(conn, start.time, end.time, exchange, pair, frequency)
+  else {
+    if(is.null(frequency)) {
+      cache_key <- "depth_summary"
+      right <- FALSE
+    }
+    else {
+      cache_key <- paste0("depth_summary",frequency)
+      right <- TRUE
+      if(frequency < 60)
+        end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
+      else
+        end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
+    }
+    loader <- function(conn, start.time, end.time, exchange, pair) {
+      .depth_summary(conn, start.time, end.time, exchange, pair, frequency)
+    }
 
+    if(end.time <= cache.bound )
+      ds <- .load_cached(conn, start.time, end.time, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right)
+    else
+      ds <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right ),
+                    loader(conn, cache.bound, end.time, exchange, pair)
+    )
+  }
   ds <- ds %>%
     filter(bps_level == 0) %>%
     select(-volume) %>%
@@ -485,30 +524,28 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL
 }
 
 
-.depth_summary <- function(conn, start.time, end.time, exchange, pair) {
-  query <- paste0(" with depth_summary as (
-                  	        select timestamp,
-                                   price,
-                                   volume,
-                                   side,
-                                   bps_level,
-                                   rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r
-                            from get.depth_summary(",
-                  shQuote(format(start.time, usetz=T)), ",",
-                  shQuote(format(end.time, usetz=T)), ",",
-                  "get.pair_id(",shQuote(pair),"), " ,
-                  "get.exchange_id(", shQuote(exchange), ") ",
-                  " ))
-                          select get._in_milliseconds(timestamp) as timestamp,
-                                 side,
-                                 bps_level,
-                                 price,
-                                 volume
-                          from depth_summary
-                          where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently
-                                    -- this is a workaround for the inability of R to handle microseconds in POSIXct
-
-                          order by 1, 2 desc")
+.depth_summary <- function(conn, start.time, end.time, exchange, pair, frequency) {
+  if(is.null(frequency))
+    query <- paste0(" with depth_summary as ( select timestamp, price, volume, side, bps_level, rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r ",
+                    " from get.depth_summary(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), ") ",
+                    " )) select get._in_milliseconds(timestamp) as timestamp, side,  bps_level, price, volume from depth_summary ",
+                    # this is a workaround for the inability of R to handle microseconds in POSIXct
+                    " where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently order by 1, 2 desc")
+  else
+    query <- paste0(" with depth_summary as ( select timestamp, price, volume, side, bps_level, rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r ",
+                    " from get.depth_summary(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), "), ",
+                    "p_frequency := ", shQuote(paste0(frequency, " seconds ")),
+                    " )) select get._in_milliseconds(timestamp) as timestamp, side,  bps_level, price, volume from depth_summary ",
+                    # this is a workaround for the inability of R to handle microseconds in POSIXct
+                    " where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently order by 1, 2 desc")
   flog.debug(query, name=packageName())
   df <- DBI::dbGetQuery(conn, query)
   df$timestamp <- as.POSIXct(as.numeric(df$timestamp)/1000, origin="1970-01-01")
@@ -518,7 +555,9 @@ depth_summary <- function(conn, start.time, end.time, exchange, pair, cache=NULL
 
 
 #' @export
-order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA, min.bid = NA, max.ask = NA, tz='UTC') {
+order_book <- function(con, tp, exchange, pair, max.levels = NA, bps.range = NA, min.bid = NA, max.ask = NA, tz='UTC') {
+
+  conn=con$con()
 
   if(is.character(tp)) start.time <- ymd_hms(start.time)
 
@@ -557,7 +596,9 @@ order_book <- function(conn, tp, exchange, pair, max.levels = NA, bps.range = NA
 
 
 #' @export
-export <- function(conn, start.time, end.time, exchange, pair, file = "events.csv") {
+export <- function(con, start.time, end.time, exchange, pair, file = "events.csv") {
+  conn=con$con()
+
   start.time <- format(start.time, usetz=T)
   end.time <- format(end.time, usetz=T)
 
@@ -574,7 +615,23 @@ export <- function(conn, start.time, end.time, exchange, pair, file = "events.cs
 
 
 #' @export
-draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, minimal.draw.size.bps=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
+draws <- function(x, ...) {
+  UseMethod("draws")
+}
+
+
+#' @export
+draws.spread <- function(spread, gamma_0, theta, draw.type='mid-price', tz='UTC') {
+  draws <- draws_from_spread(spread, gamma_0, theta, draw.type)
+  draws
+}
+
+
+#' @export
+draws.connection <- function(con, start.time, end.time, exchange, pair, minimal.draw.pct, minimal.draw.size.bps=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
+
+  conn=con$con()
+
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
 

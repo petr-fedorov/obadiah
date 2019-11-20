@@ -130,3 +130,15 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
                            Named("best.ask.volume")=best_ask_qtys);
 
 }
+
+// [[Rcpp::export]]
+DataFrame draws_from_spread(DataFrame spread, NumericVector gamma_0, NumericVector theta, CharacterVector draw_type) {
+  NumericVector timestamp(as<NumericVector>(spread["timestamp"]));
+
+  return Rcpp::DataFrame::create(Rcpp::Named("timestamp")=timestamp[0],
+                                 Rcpp::Named("draw.end")=timestamp[0],
+                                 Rcpp::Named("start.price")=0,
+                                 Rcpp::Named("end.price")=0,
+                                 Rcpp::Named("draw.size")=0,
+                                 Rcpp::Named("draw.speed")=0);
+}

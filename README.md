@@ -19,9 +19,9 @@ Afterwards it is possible to connect:
 
 ``` r
 config <- config::get()
-con <- DBI::dbConnect(RPostgres::Postgres(), user=config$user,dbname=config$dbname, host=config$host,
-                      port=config$port, sslmode="require", sslrootcert=config$sslrootcert,
-                      sslcert=config$sslcert,sslkey=config$sslkey,bigint="numeric")
+con <- obadiah::connect(user=config$user,dbname=config$dbname, host=config$host,
+                      port=config$port,  sslrootcert=config$sslrootcert,
+                      sslcert=config$sslcert,sslkey=config$sslkey)
 ```
 
 Having the connection established, one need to choose the exchange, pair

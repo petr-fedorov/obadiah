@@ -19,9 +19,24 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// draws_from_spread
+DataFrame draws_from_spread(DataFrame spread, NumericVector gamma_0, NumericVector theta, CharacterVector draw_type);
+RcppExport SEXP _obadiah_draws_from_spread(SEXP spreadSEXP, SEXP gamma_0SEXP, SEXP thetaSEXP, SEXP draw_typeSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< DataFrame >::type spread(spreadSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type gamma_0(gamma_0SEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type theta(thetaSEXP);
+    Rcpp::traits::input_parameter< CharacterVector >::type draw_type(draw_typeSEXP);
+    rcpp_result_gen = Rcpp::wrap(draws_from_spread(spread, gamma_0, theta, draw_type));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_obadiah_spread_from_depth", (DL_FUNC) &_obadiah_spread_from_depth, 4},
+    {"_obadiah_draws_from_spread", (DL_FUNC) &_obadiah_draws_from_spread, 4},
     {NULL, NULL, 0}
 };
 

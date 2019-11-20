@@ -2,10 +2,17 @@
 % Please edit documentation in R/obanalytics.R
 \name{connect}
 \alias{connect}
-\title{Securely connects to the OBADiah database}
+\title{Securely connects to the OBADiah database and initializes an internal cache for the data}
 \usage{
-connect(sslcert, sslkey, host, port, user = "obademo",
-  dbname = "ob-analytics-prod")
+connect(
+  sslcert,
+  sslkey,
+  host,
+  port,
+  sslrootcert = system.file("extdata/root.crt", package = packageName()),
+  user = "obademo",
+  dbname = "ob-analytics-prod"
+)
 }
 \arguments{
 \item{sslcert}{path to the client's SSL certificate file, signed by OBADiah database owner}
@@ -21,9 +28,9 @@ connect(sslcert, sslkey, host, port, user = "obademo",
 \item{dbname}{name of PostgreSQL database}
 }
 \value{
-the connection object as returned by DBI::dbConnect()
+the connection object
 }
 \description{
 Establishes a secure TCP/IP connection to the OBADiah database and returns a connection object.
-The object is used to communicate with the database.
+The object is used to communicate with the database and to keep refereneces cached data
 }

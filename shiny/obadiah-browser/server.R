@@ -40,42 +40,29 @@ get_time_format <- function(from.time, to.time ) {
 server <- function(input, output, session) {
 
 
-  con <- (function() {
-    dbObj <- NULL
-    function() {
-      while(is.null(dbObj) || tryCatch(DBI::dbGetQuery(dbObj, "select false as result")$result, error = function(e) TRUE )) {
-        dbObj <<- DBI::dbConnect(RPostgres::Postgres(),
-                                 user=config$user,
-                                 dbname=config$dbname,
-                                 host=config$host,
-                                 port=config$port,
-                                 sslmode="allow",
-                                 sslrootcert=config$sslrootcert,
-                                 sslcert=config$sslcert,
-                                 sslkey=config$sslkey,
-                                 bigint="numeric")
-      }
-      dbObj
-    }
-  })()
+  con <- obadiah::connect(user=config$user,
+                          dbname=config$dbname,
+                          host=config$host,
+                          port=config$port,
+                          sslcert=config$sslcert,
+                          sslkey=config$sslkey)
 
 
-  onSessionEnded(function() { DBI::dbDisconnect(con())})
 
-  DBI::dbExecute(con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
+  onSessionEnded(function() { obadiah::disconnect(con)})
+
+  DBI::dbExecute(con$con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
   #futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
   #futile.logger::flog.appender(futile.logger::appender.file('obadiah.log'), name='obadiah')
 
-  cache <- new.env(parent=emptyenv())
-  #cache <- NULL
   pairs <- reactive({
 
     exchange <- req(input$exchange)
     query <- paste0("select available_pairs as pair from get.available_pairs(",
                     "get.exchange_id(", shQuote(exchange), ")", ") order by 1" )
 
-    pairs <- RPostgres::dbGetQuery(con(), query)$pair
+    pairs <- RPostgres::dbGetQuery(con$con(), query)$pair
     pair <- isolate(input$pair)
 
     if(!pair %in% pairs ) {
@@ -100,7 +87,7 @@ server <- function(input, output, session) {
                     "get.exchange_id(", shQuote(isolate(input$exchange)), ") , ",
                     "get.pair_id(", shQuote(pair), ")",
                     ") order by 1" )
-    period <- RPostgres::dbGetQuery(con(), query)
+    period <- RPostgres::dbGetQuery(con$con(), query)
 
     if(tp < period[1,"s"] | tp > period[1,"e"]) {
 
@@ -121,7 +108,7 @@ server <- function(input, output, session) {
 
 
   query <- paste0("select available_exchanges as exchange from get.available_exchanges() order by 1" )
-  exchanges <- RPostgres::dbGetQuery(con(), query)$exchange
+  exchanges <- RPostgres::dbGetQuery(con$con(), query)$exchange
   updateSelectInput(session, "exchange",choices=exchanges)
 
   process_dblclick <- function(raw_input) {
@@ -233,7 +220,7 @@ server <- function(input, output, session) {
     if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading depth ...", {
-        obadiah::depth(con(), from.time, to.time, exchange, pair, frequency,cache=cache, tz=tz(tp))
+        obadiah::depth(con, from.time, to.time, exchange, pair, frequency, tz=tz(tp))
         })
   })
 
@@ -262,7 +249,7 @@ server <- function(input, output, session) {
     if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading draws ...", {
-      obadiah::draws(con(), from.time, to.time, exchange, pair, minimal.draw(), input$showdraws, frequency,  skip.crossed=input$skip.crossed, tz=tz(tp))
+      obadiah::draws(con, from.time, to.time, exchange, pair, minimal.draw(),0, input$showdraws, frequency,  skip.crossed=input$skip.crossed, tz=tz(tp))
     })
   })
 
@@ -290,9 +277,9 @@ server <- function(input, output, session) {
     #
     #
     # withProgress(message="loading spread...", {
-    #     obadiah::spread(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
+    #     obadiah::spread(con, from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
     #   })
-    obadiah::depth2spread(depth(), skip.crossed=input$skip.crossed, tz=tz(tp))
+    obadiah::spread(depth(), skip.crossed=input$skip.crossed, tz=tz(tp))
   })
 
   trades <- reactive( {
@@ -306,7 +293,7 @@ server <- function(input, output, session) {
 
 
     withProgress(message="loading trades ...", {
-      obadiah::trades(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
+      obadiah::trades(con, from.time, to.time, exchange, pair, tz=tz(tp))
     })
   })
 
@@ -321,14 +308,16 @@ server <- function(input, output, session) {
 
 
     withProgress(message="loading events ...", {
-      obadiah::events(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
+      obadiah::events(con, from.time, to.time, exchange, pair, tz=tz(tp))
     })
 
   })
 
+
   depth.summary <- reactive( {
 
     tp <- timePoint()
+    frequency <- period()$freq
 
     from.time <- tp-zoomWidth()/2
     to.time <- tp+zoomWidth()/2
@@ -336,9 +325,10 @@ server <- function(input, output, session) {
 
     exchange <- isolate(input$exchange)
     pair <- pair()
+    if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading liquidity percentiles ...", {
-      obadiah::depth_summary(con(), from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
+      obadiah::depth_summary(con, from.time, to.time, exchange, pair,frequency, tz=tz(tp))
     })
   })
 
@@ -370,7 +360,7 @@ server <- function(input, output, session) {
 
 
     order.book.data <- withProgress(message="loading order book ...", {
-      obadiah::order_book(con(), tp, exchange, pair, bps.range=100, tz=tz(tp) )
+      obadiah::order_book(con, tp, exchange, pair, bps.range=100, tz=tz(tp) )
     })
     if(!autoPvRange()) {
       bids <- order.book.data$bids
