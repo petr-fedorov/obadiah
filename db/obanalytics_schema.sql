@@ -17,8 +17,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 11.5
--- Dumped by pg_dump version 11.5
+-- Dumped from database version 11.6
+-- Dumped by pg_dump version 11.6
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -1205,7 +1205,8 @@ CREATE FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time z
 
 with spread as (
 	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id 
-	from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency, p_skip_crossed)
+	from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
+	where not p_skip_crossed or (best_bid_price <= best_ask_price)
 ),
 base_draws as (
 	select spread.*,
@@ -1537,10 +1538,10 @@ $$;
 ALTER FUNCTION obanalytics.insert_level3_era(p_new_era timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
 
 --
--- Name: level1_continuous(timestamp with time zone, timestamp with time zone, integer, integer, interval, boolean); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+-- Name: level1_continuous(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics.level1_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval, p_skip_crossed boolean DEFAULT true) RETURNS SETOF obanalytics.level1
+CREATE FUNCTION obanalytics.level1_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS SETOF obanalytics.level1
     LANGUAGE sql STABLE
     AS $$-- NOTE:
 
@@ -1550,13 +1551,12 @@ with periods as (
 )
 select level1.*
 from periods join obanalytics.spread_by_episode_fast(period_start, period_end, p_pair_id, p_exchange_id, p_frequency) level1 on true 
-where not p_skip_crossed or (best_bid_price <= best_ask_price)
   ;
 
 $$;
 
 
-ALTER FUNCTION obanalytics.level1_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_skip_crossed boolean) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics.level1_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
 -- Name: level2_continuous(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics

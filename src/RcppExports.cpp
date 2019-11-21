@@ -20,16 +20,16 @@ BEGIN_RCPP
 END_RCPP
 }
 // draws_from_spread
-DataFrame draws_from_spread(DataFrame spread, NumericVector gamma_0, NumericVector theta, CharacterVector draw_type);
-RcppExport SEXP _obadiah_draws_from_spread(SEXP spreadSEXP, SEXP gamma_0SEXP, SEXP thetaSEXP, SEXP draw_typeSEXP) {
+DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, NumericVector gamma_0, NumericVector theta);
+RcppExport SEXP _obadiah_draws_from_spread(SEXP timestampSEXP, SEXP priceSEXP, SEXP gamma_0SEXP, SEXP thetaSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< DataFrame >::type spread(spreadSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type timestamp(timestampSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type price(priceSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type gamma_0(gamma_0SEXP);
     Rcpp::traits::input_parameter< NumericVector >::type theta(thetaSEXP);
-    Rcpp::traits::input_parameter< CharacterVector >::type draw_type(draw_typeSEXP);
-    rcpp_result_gen = Rcpp::wrap(draws_from_spread(spread, gamma_0, theta, draw_type));
+    rcpp_result_gen = Rcpp::wrap(draws_from_spread(timestamp, price, gamma_0, theta));
     return rcpp_result_gen;
 END_RCPP
 }

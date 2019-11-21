@@ -5,7 +5,7 @@ spread_from_depth <- function(timestamp, price, volume, side) {
     .Call('_obadiah_spread_from_depth', PACKAGE = 'obadiah', timestamp, price, volume, side)
 }
 
-draws_from_spread <- function(spread, gamma_0, theta, draw_type) {
-    .Call('_obadiah_draws_from_spread', PACKAGE = 'obadiah', spread, gamma_0, theta, draw_type)
+draws_from_spread <- function(timestamp, price, gamma_0, theta) {
+    .Call('_obadiah_draws_from_spread', PACKAGE = 'obadiah', timestamp, price, gamma_0, theta)
 }
 

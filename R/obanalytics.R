@@ -622,7 +622,16 @@ draws <- function(x, ...) {
 
 #' @export
 draws.spread <- function(spread, gamma_0, theta, draw.type='mid-price', tz='UTC') {
-  draws <- draws_from_spread(spread, gamma_0, theta, draw.type)
+  draws <- draws_from_spread(spread$timestamp,switch(draw.type,
+                                           "mid-price"=with(spread, (best.bid.price + best.ask.price))/2,
+                                           "bid"=spread$best.bid.price,
+                                           "ask"=spread$best.ask.price),
+                             gamma_0, theta)
+  if(!empty(draws)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    draws$timestamp <- with_tz(as.POSIXct(draws$timestamp, origin="1970-01-01"), tzone)
+    draws$draw.end <- with_tz(as.POSIXct(draws$draw.end, origin="1970-01-01"), tzone)
+  }
   draws
 }
 
@@ -703,7 +712,9 @@ draws.connection <- function(con, start.time, end.time, exchange, pair, minimal.
 
 
 #' @export
-intervals <- function(conn, start.time=NULL, end.time=NULL, exchange = NULL, pair = NULL, tz='UTC') {
+intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair = NULL, tz='UTC') {
+  conn=con$con()
+
 
   if(!is.null(start.time)) {
     if(is.character(start.time)) start.time <- ymd_hms(start.time)

@@ -1,5 +1,7 @@
 #include <Rcpp.h>
 #include<map>
+#include <cmath>
+#include <limits>
 #include "log.h"
 
 using namespace Rcpp;
@@ -131,14 +133,100 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
 
 }
 
-// [[Rcpp::export]]
-DataFrame draws_from_spread(DataFrame spread, NumericVector gamma_0, NumericVector theta, CharacterVector draw_type) {
-  NumericVector timestamp(as<NumericVector>(spread["timestamp"]));
+struct point {
+  double timestamp;
+  double price;
+};
 
-  return Rcpp::DataFrame::create(Rcpp::Named("timestamp")=timestamp[0],
-                                 Rcpp::Named("draw.end")=timestamp[0],
-                                 Rcpp::Named("start.price")=0,
-                                 Rcpp::Named("end.price")=0,
-                                 Rcpp::Named("draw.size")=0,
-                                 Rcpp::Named("draw.speed")=0);
+ostream& operator << (ostream& stream, point & p) {
+  stream << "timestamp: " << Datetime(p.timestamp) << " price: " << p.price;
+  return stream;
+}
+
+
+// [[Rcpp::export]]
+DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, NumericVector gamma_0, NumericVector theta) {
+
+#if DEBUG
+  FILELog::ReportingLevel() = ldebug3;
+  FILE* log_fd = fopen( "draws_from_spread.log", "w" );
+  Output2FILE::Stream() = log_fd;
+#endif
+
+
+  point s {timestamp[0],price[0]},  // draw (s)tart
+        tp {timestamp[1],price[1]}, // (t)urning (p)oint
+        e {timestamp[1],price[1]};  // draw (e)nd
+
+  std::vector<double> draw_timestamp,
+                      draw_end,
+                      draw_start_price,
+                      draw_end_price,
+                      draw_size,
+                      draw_speed;
+
+
+  for(R_xlen_t i = 1; i <= timestamp.length(); ++i) {
+    if(std::fabs(price[i] - tp.price) > 10*std::numeric_limits<double>::epsilon()) {
+      if( (tp.price > s.price && price[i] > tp.price) ||
+          (tp.price < s.price && price[i] < tp.price) ) { // extend the draw and set the new turning point
+        tp.price = price[i];
+        tp.timestamp = timestamp[i];
+        e.price = price[i];
+        e.timestamp = timestamp[i];
+#if DEBUG
+        L_(ldebug3) << "The current draw extended in the same direction " << e;
+#endif
+
+      }
+      else {  // check whether the current draw has ended and the new draw is to be started
+        double gamma = 0.01*gamma_0[0]/(1 + theta[0]*(tp.timestamp - s.timestamp));
+        if( std::fabs(price[i] - tp.price) >= std::fabs(tp.price - s.price)*gamma ){
+          // the turn after the latest turning point has exceeded threshould, so the new draw will start FROM THE TURNING POINT (i.e. in the past)
+          // and the current draw will be returned
+#if DEBUG
+          L_(ldebug3) << "The current draw ended " << e;
+#endif
+
+          draw_timestamp.push_back(s.timestamp);
+          draw_end.push_back(e.timestamp);
+          draw_start_price.push_back(s.price);
+          draw_end_price.push_back(e.price);
+          double d_sz = std::round(1000000*(e.price - s.price)/s.price)/100,
+                 d_sp = std::round(100*d_sz/(e.timestamp - s.timestamp))/100;
+
+          draw_size.push_back(d_sz);
+          draw_speed.push_back(d_sp);
+          s = tp;
+          e.timestamp = timestamp[i];
+          e.price = price[i];
+          tp = e;
+        }
+        else {  // the current draw has not ended yet, just extend it ...
+#if DEBUG
+          L_(ldebug3) << "The current draw has not ended yet " << e;
+#endif
+          e.price = price[i];
+          e.timestamp = timestamp[i];
+        }
+      }
+    }
+    else {  // price hasn't changed, so just extend the current draw
+
+#if DEBUG
+      L_(ldebug3) << "Price hasn't changed" << e;
+#endif
+
+      e.price = price[i];
+      e.timestamp = timestamp[i];
+    }
+
+  }
+
+  return Rcpp::DataFrame::create(Rcpp::Named("timestamp")=draw_timestamp,
+                                 Rcpp::Named("draw.end")=draw_end,
+                                 Rcpp::Named("start.price")=draw_start_price,
+                                 Rcpp::Named("end.price")=draw_end_price,
+                                 Rcpp::Named("draw.size")=draw_size,
+                                 Rcpp::Named("draw.speed")=draw_speed);
 }
