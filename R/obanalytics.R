@@ -622,6 +622,7 @@ draws <- function(x, ...) {
 
 #' @export
 draws.spread <- function(spread, gamma_0, theta, draw.type='mid-price', tz='UTC') {
+  spread <- spread %>% arrange(timestamp)
   draws <- draws_from_spread(spread$timestamp,switch(draw.type,
                                            "mid-price"=with(spread, (best.bid.price + best.ask.price))/2,
                                            "bid"=spread$best.bid.price,
@@ -637,7 +638,7 @@ draws.spread <- function(spread, gamma_0, theta, draw.type='mid-price', tz='UTC'
 
 
 #' @export
-draws.connection <- function(con, start.time, end.time, exchange, pair, minimal.draw.pct, minimal.draw.size.bps=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
+draws.connection <- function(con, start.time, end.time, exchange, pair, gamma_0, theta=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
 
   conn=con$con()
 
@@ -659,24 +660,19 @@ draws.connection <- function(con, start.time, end.time, exchange, pair, minimal.
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
 
-  before <- seconds(10)
-  draws <- .draws(conn, start.time - before, end.time,  exchange, pair, minimal.draw.pct, minimal.draw.size.bps, draw.type, frequency, skip.crossed)
+  draws <- .draws(conn, start.time, end.time,  exchange, pair, gamma_0, theta, draw.type, frequency, skip.crossed)
 
   if(!empty(draws)) {
     # Assign timezone of start.time, if any, to timestamp column
     draws$timestamp <- with_tz(draws$timestamp, tzone)
     draws$draw.end <- with_tz(draws$draw.end, tzone)
     draws<- draws  %>%
-       arrange(timestamp) %>%
-       filter((lead(timestamp) > start.time | is.na(lead(timestamp))) & timestamp <= end.time) %>%
-       mutate(timestamp=if_else(timestamp > start.time, timestamp, start.time ))
+       arrange(timestamp)
   }
   draws
 }
 
-.draws <- function(conn, start.time, end.time, exchange, pair, minimal.draw.pct, minimal.draw.size.bps, draw.type, frequency = NULL, skip.crossed=TRUE) {
-  if(is.null(minimal.draw.size.bps))
-    minimal.draw.size.bps <- "NULL"
+.draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, draw.type, frequency = NULL, skip.crossed=TRUE) {
 
   if(is.null(frequency))
     query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\", get._in_milliseconds(\"draw.end\") AS \"draw.end\", \"start.price\",",
@@ -684,11 +680,11 @@ draws.connection <- function(con, start.time, end.time, exchange, pair, minimal.
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     shQuote(draw.type), ",",
-                    minimal.draw.pct, ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), ") , ",
-                    "p_skip_crossed :=", skip.crossed, ",",
-                    "p_minimal_draw_size_bps := ",  minimal.draw.size.bps,
+                    "p_gamma_0 := ", gamma_0, ",",
+                    "p_theta := ",  theta, ",",
+                    "p_skip_crossed :=", skip.crossed,
                     ") order by 1")
   else
     query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\", get._in_milliseconds(\"draw.end\") AS \"draw.end\", \"start.price\",",
@@ -696,12 +692,12 @@ draws.connection <- function(con, start.time, end.time, exchange, pair, minimal.
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     shQuote(draw.type), ",",
-                    minimal.draw.pct, ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "),",
+                    "p_gamma_0 := ", gamma_0, ",",
+                    "p_theta := ",  theta, ",",
                     "p_frequency :=", shQuote(paste0(frequency, " seconds ")), ", " ,
-                    "p_skip_crossed :=", skip.crossed,",",
-                    "p_minimal_draw_size_bps := ",  minimal.draw.size.bps,
+                    "p_skip_crossed :=", skip.crossed,
                     ") order by 1")
   flog.debug(query, name=packageName())
   draws <- DBI::dbGetQuery(conn, query)

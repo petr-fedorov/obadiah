@@ -578,10 +578,11 @@ ALTER FUNCTION obanalytics._create_matches_partition(p_exchange text, p_pair tex
 -- Name: _create_or_extend_draw(obanalytics.draw_interim_price[], timestamp with time zone, numeric, numeric, numeric); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
-CREATE FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_minimal_draw numeric, p_minimal_draw_decline numeric) RETURNS obanalytics.draw_interim_price[]
+CREATE FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_gamma_0 numeric, p_theta numeric) RETURNS obanalytics.draw_interim_price[]
     LANGUAGE plpgsql
     AS $$declare 
 	ONE_PCT constant numeric := 0.01;	-- one percent
+	p_gamma numeric;
 begin 
 	if p_draw is null then	
 		-- p_draw[1] - the current draw start
@@ -600,10 +601,10 @@ begin
 					raise debug '%, % - the current draw extended', p_microtimestamp, p_price;
 					
 			else	-- check whether the current draw ended and new draw is to be started
-				-- the magical formula below for p_minimal_draw ensures that the turning point will not be too far away
-				p_minimal_draw := ONE_PCT*p_minimal_draw/(1 + p_minimal_draw_decline*extract(epoch from p_draw[2].microtimestamp - p_draw[1].microtimestamp));
-				raise debug 'p_minimal draw %', p_minimal_draw;
-				if abs(p_price - p_draw[2].price)>= abs(p_draw[2].price - p_draw[1].price)*p_minimal_draw then -- the turn after the curent draw exceeded  the minmal draw too so start new draw FROM THE TURNING POINT (i.e. in the past)
+				-- the magical formula below for p_gamma_0 ensures that the turning point will not be too far away
+				p_gamma := ONE_PCT*p_gamma_0/(1 + p_theta*extract(epoch from p_draw[2].microtimestamp - p_draw[1].microtimestamp));
+				raise debug 'p_minimal draw %', p_gamma_0;
+				if abs(p_price - p_draw[2].price)>= abs(p_draw[2].price - p_draw[1].price)*p_gamma then -- the turn after the curent draw exceeded  the minmal draw too so start new draw FROM THE TURNING POINT (i.e. in the past)
 					raise debug '%, % - TURNING POINT: the draw % - % completed', p_microtimestamp, p_price, p_draw[1].microtimestamp, p_draw[2].microtimestamp;
 					p_draw := array[p_draw[2],
 									row(p_microtimestamp, p_price)::obanalytics.draw_interim_price,
@@ -621,7 +622,7 @@ end;
 $$;
 
 
-ALTER FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_minimal_draw numeric, p_minimal_draw_decline numeric) OWNER TO "ob-analytics";
+ALTER FUNCTION obanalytics._create_or_extend_draw(p_draw obanalytics.draw_interim_price[], p_microtimestamp timestamp with time zone, p_price numeric, p_gamma_0 numeric, p_theta numeric) OWNER TO "ob-analytics";
 
 --
 -- Name: _depth_after_depth_change(obanalytics.level2_depth_record[], obanalytics.level2_depth_record[], timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -1061,6 +1062,63 @@ $$;
 ALTER FUNCTION obanalytics._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
+-- Name: _spread_from_depth(obanalytics.level2[]); Type: FUNCTION; Schema: obanalytics; Owner: postgres
+--
+
+CREATE FUNCTION obanalytics._spread_from_depth(p_depth obanalytics.level2[]) RETURNS obanalytics.level1
+    LANGUAGE sql IMMUTABLE
+    AS $$
+with price_levels as (
+	select side,
+			price,
+			volume as qty, 
+			case side
+					when 's' then price is not distinct from min(price) filter (where side = 's') over ()
+					when 'b' then price is not distinct from max(price) filter (where side = 'b') over ()
+			end as is_best,
+			pair_id,
+			exchange_id,
+			microtimestamp
+	from unnest(p_depth)
+)
+select b.price, b.qty, s.price, s.qty, microtimestamp, pair_id, exchange_id
+from (select * from price_levels where side = 'b' and is_best) b full join 
+	  (select * from price_levels where side = 's' and is_best) s using (microtimestamp, exchange_id, pair_id);
+
+$$;
+
+
+ALTER FUNCTION obanalytics._spread_from_depth(p_depth obanalytics.level2[]) OWNER TO postgres;
+
+--
+-- Name: _spread_from_depth(timestamp with time zone, obanalytics.level2[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._spread_from_depth(p_ts timestamp with time zone, p_depth obanalytics.level2[]) RETURNS obanalytics.level1
+    LANGUAGE sql IMMUTABLE
+    AS $$
+with price_levels as (
+	select side,
+			price,
+			volume as qty, 
+			case side
+					when 's' then price is not distinct from min(price) filter (where side = 's') over ()
+					when 'b' then price is not distinct from max(price) filter (where side = 'b') over ()
+			end as is_best,
+			pair_id,
+			exchange_id
+	from unnest(p_depth)
+)
+select b.price, b.qty, s.price, s.qty, p_ts, pair_id, exchange_id
+from (select * from price_levels where side = 'b' and is_best) b full join 
+	  (select * from price_levels where side = 's' and is_best) s using (exchange_id, pair_id);
+
+$$;
+
+
+ALTER FUNCTION obanalytics._spread_from_depth(p_ts timestamp with time zone, p_depth obanalytics.level2[]) OWNER TO "ob-analytics";
+
+--
 -- Name: _spread_from_order_book(timestamp with time zone, obanalytics.level3[]); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1194,65 +1252,6 @@ $$;
 
 
 ALTER FUNCTION obanalytics.depth_change_by_episode_slow(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
-
---
--- Name: draws_from_spread(timestamp with time zone, timestamp with time zone, integer, integer, text, interval, boolean, numeric, numeric, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_frequency interval DEFAULT NULL::interval, p_skip_crossed boolean DEFAULT true, p_minimal_draw_pct numeric DEFAULT 0.0, p_minimal_draw_decline numeric DEFAULT 0.01, p_price_decimal_places integer DEFAULT 2) RETURNS TABLE(start_microtimestamp timestamp with time zone, end_microtimestamp timestamp with time zone, last_microtimestamp timestamp with time zone, start_price numeric, end_price numeric, last_price numeric, exchange_id smallint, pair_id smallint, draw_type text, draw_size numeric, minimal_draw numeric, exchange text, pair text)
-    LANGUAGE sql STABLE
-    AS $$ 
-
-with spread as (
-	select microtimestamp, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, pair_id 
-	from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
-	where not p_skip_crossed or (best_bid_price <= best_ask_price)
-),
-base_draws as (
-	select spread.*,
-			obanalytics.draw_agg(microtimestamp,
-								 case p_draw_type 
-								 	when 'bid' then round(best_bid_price, p_price_decimal_places)
-								    when 'ask' then round(best_ask_price, p_price_decimal_places)
-								    when 'mid-price' then round((best_bid_price + best_ask_price)/2, p_price_decimal_places)
-								 end,
-								 p_minimal_draw_pct, p_minimal_draw_decline) over w as draw, 
-			p_draw_type as draw_type
-	from spread
-	window w as (order by microtimestamp)
-),
-draws as (
-	select draw[1].microtimestamp as start_microtimestamp, 
-			draw[1].price as start_price, 
-			draw[2].microtimestamp as end_microtimestamp,
-			draw[2].price as end_price,
-			draw[3].microtimestamp as last_microtimestamp,
-			draw[3].price as last_price,
-			draw_type
-	from base_draws
-)
-select distinct on (start_microtimestamp, draw_type )
-					 start_microtimestamp, 
-					 last_value(end_microtimestamp) over w as end_microtimestamp,
-					 last_microtimestamp,
-					 start_price, 
-					 last_value(end_price) over w as end_price,
-					 last_price,
-					 p_exchange_id::smallint, 
-					 p_pair_id::smallint,
-					 draw_type,
-					 round((end_price - start_price)/start_price * 10000.0, 2),
-					 p_minimal_draw_pct,
-					 (select exchange from obanalytics.exchanges where exchange_id = p_exchange_id),
-					 (select pair from obanalytics.pairs where pair_id = p_pair_id)
-from draws
-window w as ( partition by start_microtimestamp, draw_type order by end_microtimestamp )
-order by draw_type, start_microtimestamp, end_microtimestamp desc, last_microtimestamp desc	
-
-$$;
-
-
-ALTER FUNCTION obanalytics.draws_from_spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_exchange_id integer, p_pair_id integer, p_draw_type text, p_frequency interval, p_skip_crossed boolean, p_minimal_draw_pct numeric, p_minimal_draw_decline numeric, p_price_decimal_places integer) OWNER TO "ob-analytics";
 
 --
 -- Name: fix_crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics

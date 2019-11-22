@@ -133,15 +133,55 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
 
 }
 
-struct point {
-  double timestamp;
-  double price;
-};
 
+struct point {
+  long double timestamp;
+  long double price;
+  const bool operator != (const point &e) {
+    return (std::fabs(timestamp - e.timestamp) > 10*std::numeric_limits<double>::epsilon() ||
+            std::fabs(price - e.price) > 10*std::numeric_limits<double>::epsilon());
+  }
+};
 ostream& operator << (ostream& stream, point & p) {
   stream << "timestamp: " << Datetime(p.timestamp) << " price: " << p.price;
   return stream;
 }
+
+
+
+struct draws {
+  std::vector<long double> draw_timestamp,
+                           draw_end,
+                            draw_start_price,
+  draw_end_price,
+  draw_size,
+  draw_speed;
+
+  inline void add(point &s, point &e) {
+    if(std::fabs(s.timestamp - e.timestamp) > std::numeric_limits<double>::epsilon()) {
+#if DEBUG
+      L_(ldebug3) << "Added draw s: " << s << " e: " << e;
+#endif
+      draw_timestamp.push_back(s.timestamp);
+      draw_end.push_back(e.timestamp);
+      draw_start_price.push_back(s.price);
+      draw_end_price.push_back(e.price);
+      long double d_sz = std::round(1000000*(e.price - s.price)/s.price)/100,
+        d_sp = std::round(100*d_sz/(e.timestamp - s.timestamp))/100;
+
+      draw_size.push_back(d_sz);
+      draw_speed.push_back(d_sp);
+
+    }
+    else {
+#if DEBUG
+      L_(ldebug3) << "Skipped zero-length draw s: " << s << " e: " << e;
+#endif
+
+    }
+  }
+
+};
 
 
 // [[Rcpp::export]]
@@ -155,18 +195,20 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 
 
   point s {timestamp[0],price[0]},  // draw (s)tart
-        tp {timestamp[1],price[1]}, // (t)urning (p)oint
-        e {timestamp[1],price[1]};  // draw (e)nd
+        tp {timestamp[0],price[0]}, // (t)urning (p)oint
+        e {timestamp[0],price[0]};  // draw (e)nd
 
-  std::vector<double> draw_timestamp,
-                      draw_end,
-                      draw_start_price,
-                      draw_end_price,
-                      draw_size,
-                      draw_speed;
+  draws d;
+
+#if DEBUG
+  L_(ldebug3) << "The first draw started " << s;
+#endif
 
 
-  for(R_xlen_t i = 1; i <= timestamp.length(); ++i) {
+  for(R_xlen_t i = 1; i < timestamp.length(); ++i) {
+#if DEBUG
+    L_(ldebug3) << "Timestamp " << Datetime(timestamp[i]) << " price " << price[i];
+#endif
     if(std::fabs(price[i] - tp.price) > 10*std::numeric_limits<double>::epsilon()) {
       if( (tp.price > s.price && price[i] > tp.price) ||
           (tp.price < s.price && price[i] < tp.price) ) { // extend the draw and set the new turning point
@@ -180,24 +222,20 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 
       }
       else {  // check whether the current draw has ended and the new draw is to be started
-        double gamma = 0.01*gamma_0[0]/(1 + theta[0]*(tp.timestamp - s.timestamp));
-        if( std::fabs(price[i] - tp.price) >= std::fabs(tp.price - s.price)*gamma ){
+        long double gamma = 0.01*gamma_0[0]/(1 + theta[0]*(tp.timestamp - s.timestamp));
+#if DEBUG
+        L_(ldebug3) << "gamma " << gamma << " epsilon " <<  std::fabs(tp.price - s.price)*gamma << " delta " << std::fabs(price[i] - tp.price) << " diff " << std::fabs(price[i] - tp.price) - std::fabs(tp.price - s.price)*gamma;
+#endif
+        if( std::fabs(price[i] - tp.price) - std::fabs(tp.price - s.price)*gamma > -0.000001 ){ // -0.000001 is from empirical observation that prices may have no more than 5 decimal digits
           // the turn after the latest turning point has exceeded threshould, so the new draw will start FROM THE TURNING POINT (i.e. in the past)
           // and the current draw will be returned
+
+          d.add(s, tp);
+          s = tp;
 #if DEBUG
-          L_(ldebug3) << "The current draw ended " << e;
+          L_(ldebug3) << "The new draw started " << s;
 #endif
 
-          draw_timestamp.push_back(s.timestamp);
-          draw_end.push_back(e.timestamp);
-          draw_start_price.push_back(s.price);
-          draw_end_price.push_back(e.price);
-          double d_sz = std::round(1000000*(e.price - s.price)/s.price)/100,
-                 d_sp = std::round(100*d_sz/(e.timestamp - s.timestamp))/100;
-
-          draw_size.push_back(d_sz);
-          draw_speed.push_back(d_sp);
-          s = tp;
           e.timestamp = timestamp[i];
           e.price = price[i];
           tp = e;
@@ -213,20 +251,23 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
     }
     else {  // price hasn't changed, so just extend the current draw
 
-#if DEBUG
-      L_(ldebug3) << "Price hasn't changed" << e;
-#endif
-
       e.price = price[i];
       e.timestamp = timestamp[i];
+
+#if DEBUG
+      L_(ldebug3) << "Price hasn't changed " << e;
+#endif
+
     }
 
   }
+  if (s != e)
+    d.add(s,tp);
 
-  return Rcpp::DataFrame::create(Rcpp::Named("timestamp")=draw_timestamp,
-                                 Rcpp::Named("draw.end")=draw_end,
-                                 Rcpp::Named("start.price")=draw_start_price,
-                                 Rcpp::Named("end.price")=draw_end_price,
-                                 Rcpp::Named("draw.size")=draw_size,
-                                 Rcpp::Named("draw.speed")=draw_speed);
+  return Rcpp::DataFrame::create(Rcpp::Named("timestamp")=d.draw_timestamp,
+                                 Rcpp::Named("draw.end")=d.draw_end,
+                                 Rcpp::Named("start.price")=d.draw_start_price,
+                                 Rcpp::Named("end.price")=d.draw_end_price,
+                                 Rcpp::Named("draw.size")=d.draw_size,
+                                 Rcpp::Named("draw.speed")=d.draw_speed);
 }
