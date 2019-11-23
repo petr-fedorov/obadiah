@@ -675,18 +675,42 @@ CREATE FUNCTION get.pair_id(p_pair text) RETURNS smallint
 ALTER FUNCTION get.pair_id(p_pair text) OWNER TO "ob-analytics";
 
 --
+-- Name: spread(timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get.spread(p_start_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
+    LANGUAGE sql SECURITY DEFINER
+    AS $$
+
+-- ARGUMENTS
+--	See obanalytics.spread_by_episode()
+
+with starting_spread as (
+	select (obanalytics._spread_from_depth(array_agg(d))).*
+	from get._starting_depth(p_start_time, p_pair_id, p_exchange_id, p_frequency) d
+)	
+select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
+from starting_spread;	
+$$;
+
+
+ALTER FUNCTION get.spread(p_start_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
+
+--
 -- Name: spread(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
 CREATE FUNCTION get.spread(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval DEFAULT NULL::interval) RETURNS TABLE("best.bid.price" numeric, "best.bid.volume" numeric, "best.ask.price" numeric, "best.ask.volume" numeric, "timestamp" timestamp with time zone)
     LANGUAGE sql SECURITY DEFINER
-    AS $$-- ARGUMENTS
+    AS $$
+
+-- ARGUMENTS
 --	See obanalytics.spread_by_episode()
 
 select * from get._validate_parameters('spread', p_start_time, p_end_time, p_pair_id, p_exchange_id);
 
 select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp
-from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
+from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency);
 	
 $$;
 

@@ -42,7 +42,7 @@
 #' @return the connection object
 #'
 #' @export
-connect <- function(sslcert, sslkey, host, port, sslrootcert =system.file('extdata/root.crt', package=packageName()), user="obademo",  dbname="ob-analytics-prod") {
+connect <- function(host, port, sslcert=NULL, sslkey=NULL, sslrootcert =system.file('extdata/root.crt', package=packageName()), user="obademo",  dbname="ob-analytics-prod") {
 
   con <-new.env()
 
@@ -131,7 +131,7 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
   if(!empty(depth)) {
     # Assign timezone of start.time, if any, to timestamp column
     depth$timestamp <- with_tz(depth$timestamp, tzone)
-    depth <- depth %>% arrange(timestamp, -price, side)
+    depth <- depth %>% arrange(precise_timestamp, -price, side)
   }
   class(depth) <- c("depth", class(depth))
   depth
@@ -147,20 +147,20 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
 
 .depth_changes <- function(conn, start.time, end.time, exchange, pair, frequency = NULL)   {
   if(is.null(frequency))
-    query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,price, volume, side FROM get.depth(",
+    query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
-                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
+                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 5, 2 DESC")
   else
-    query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,price, volume, side FROM get.depth(",
+    query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_frequency :=", shQuote(paste0(frequency, " seconds ")), ",",
-                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
+                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 5, 2 DESC")
   flog.debug(query, name=packageName())
   depth <- DBI::dbGetQuery(conn, query)
   if(!empty(depth)) {
@@ -173,18 +173,18 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
 
 .starting_depth <- function(conn, start.time, exchange, pair, frequency)   {
   if(is.null(frequency))
-    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp, price, volume, side FROM get.depth(",
+    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp, price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
                     shQuote(format(start.time,usetz=T)), ", NULL, ",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
-                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
+                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 5, 2 DESC")
   else
-    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp, price, volume, side FROM get.depth(",
+    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp, price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
                     shQuote(format(start.time,usetz=T)), ", NULL, ",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_frequency := ", shQuote(paste0(frequency, " seconds ")), ", ",
-                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
+                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 5,2 DESC")
   flog.debug(query, name=packageName())
   depth <- DBI::dbGetQuery(conn, query)
   depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
@@ -265,6 +265,8 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
 
   spread <- pmap_dfr(tibble(pair, exchange), function(pair, exchange) {
 
+    starting_spread <- .starting_spread(conn, start.time, exchange, pair, frequency)
+
     if(is.null(cache) || start.time > cache.bound) {
       spread <- loader(conn, start.time, end.time, exchange, pair)
     }
@@ -276,6 +278,7 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
                         loader(conn, cache.bound, end.time, exchange, pair)
         )
     }
+    spread <- rbind(starting_spread, spread)
 
     if(!empty(spread)) {
       spread$timestamp <- with_tz(spread$timestamp, tz)
@@ -290,6 +293,34 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
   class(spread) <- c("spread", class(spread))
   spread
 }
+
+.starting_spread <- function(conn, start.time, exchange, pair, frequency) {
+
+  if(is.null(frequency))
+
+    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+                    "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), ") ",
+                    ") ORDER BY 1, timestamp desc")
+  else
+    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+                    "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), "), ",
+                    "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
+                    ") ORDER BY 1, timestamp desc")
+
+  flog.debug(query, name=packageName())
+  spread <- DBI::dbGetQuery(conn, query)
+  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
+  spread
+}
+
+
+
 
 .spread <- function(conn, start.time, end.time, exchange, pair, frequency) {
 

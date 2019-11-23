@@ -38,11 +38,11 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
   NumericVector best_ask_prices(0);
   NumericVector best_ask_qtys(0);
 
-  for(int i=0; i < timestamp.size(); i++) {
-    if(timestamp[i] > episode) {
+  for(int i=0; i <= timestamp.size(); i++) {
+    if(i == timestamp.size() || timestamp[i] > episode) {
 
 #if DEBUG
-      L_(ldebug3) << "Process episode " << Datetime(episode);
+      L_(ldebug3) << "Updating spread after episode " << Datetime(episode);
 #endif
 
       bool is_changed = false;
@@ -58,7 +58,7 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
           is_changed = true;
         }
 #if DEBUG
-        L_(ldebug3) << "BID Current price: " << bids.rbegin()->first << " Best price: " << best_bid_price << " Current qty: " << bids.rbegin()->second << " Best qty: " << best_bid_qty;
+        L_(ldebug3) << " BID Current price: " << bids.rbegin()->first << " Best price: " << best_bid_price << " Current qty: " << bids.rbegin()->second << " Best qty: " << best_bid_qty;
 #endif
       }
       else {
@@ -106,11 +106,14 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
         }
 
 #if DEBUG
-        L_(ldebug3) << "Spread Timestamp:" << Datetime(episode) << "BID P: " << best_bid_price << " Q: " << best_bid_qty << "ASK P: " << best_ask_price << " Q: " << best_ask_qty;
+        L_(ldebug3) << "Produced spread change record - timestamp:" << Datetime(episode) << "BID P: " << best_bid_price << " Q: " << best_bid_qty << "ASK P: " << best_ask_price << " Q: " << best_ask_qty;
 #endif
       }
 
-      episode = timestamp[i];
+      if( i < timestamp.size())
+        episode = timestamp[i];
+      else
+        break;  // We are done!
     }
     if(side[i] == "bid") {
       if(volume[i] > 0.0)
