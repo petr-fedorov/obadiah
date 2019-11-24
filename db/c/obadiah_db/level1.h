@@ -63,10 +63,10 @@ struct level1 {
  HeapTuple to_heap_tuple(AttInMetadata *, int32, int32);
 
  bool operator==(const level1 &c) {
-  return (best_bid_price == c.best_bid_price) &&
-         (best_bid_qty == c.best_bid_qty) &&
-         (best_ask_price == c.best_ask_price) &&
-         (best_ask_qty == c.best_ask_qty);
+  return prices_are_equal(best_bid_price, c.best_bid_price) &&
+         amounts_are_equal(best_bid_qty, c.best_bid_qty) &&
+         prices_are_equal(best_ask_price, c.best_ask_price) &&
+         amounts_are_equal(best_ask_qty, c.best_ask_qty);
  };
  bool operator!=(const level1 &c) { return !(*this == c); };
 };

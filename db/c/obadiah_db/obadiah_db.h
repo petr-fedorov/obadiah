@@ -16,11 +16,23 @@
 #ifndef OBADIAH_H
 #define OBADIAH_H
 
+#include <cmath>
 #include <sstream>
 namespace obad {
 static constexpr long unsigned NULL_FREQ = 0;
 using price = long double;
 using amount = long double;
+
+static constexpr double MINIMAL_PRICE_CHANGE = 1.e-5;
+inline bool
+prices_are_equal(price a, price b) {
+ return std::fabs(a - b) < MINIMAL_PRICE_CHANGE;
+}
+static constexpr double MINIMAL_AMOUNT_CHANGE = 1.e-12;
+inline bool
+amounts_are_equal(amount a, amount b) {
+ return std::fabs(a - b) < MINIMAL_AMOUNT_CHANGE;
+}
 template <typename T>
 std::string
 to_string(const T& value) {
