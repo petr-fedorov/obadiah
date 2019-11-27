@@ -14,15 +14,14 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 
-#' @import magrittr
 #' @importFrom lubridate with_tz ymd_hms seconds ceiling_date floor_date now minutes duration round_date
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
 #' @importFrom zoo na.locf
-#' @importFrom reshape2 dcast melt
 #' @importFrom magrittr  %>%
 #' @importFrom purrr pmap_dfr
 #' @importFrom tibble tibble
+#' @import data.table
 #' @useDynLib obadiah
 
 
@@ -212,7 +211,7 @@ spread.depth <- function(depth, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC'
     spread <- spread[complete.cases(spread), ]
   if(skip.crossed)
     spread <- spread %>% filter(best.bid.price <= best.ask.price)
-  class(spread) <- c("spread", class(spread))
+  data.table::setDT(spread)
   spread
 }
 
@@ -281,7 +280,11 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
     spread <- rbind(starting_spread, spread)
 
     if(!empty(spread)) {
-      spread$timestamp <- with_tz(spread$timestamp, tz)
+      spread <- spread %>%
+        mutate(timestamp=with_tz(spread$timestamp, tz),
+               pair=pair,
+               exchange=exchange)
+
     }
     if(complete.cases)
       spread <- spread[complete.cases(spread), ]
@@ -290,7 +293,7 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
     spread
 
   })
-  class(spread) <- c("spread", class(spread))
+  data.table::setDT(spread)
   spread
 }
 
@@ -652,24 +655,37 @@ draws <- function(x, ...) {
 
 
 #' @export
-draws.spread <- function(spread, gamma_0, theta, draw.type='mid-price', tz='UTC') {
-  spread <- spread %>% arrange(timestamp)
-  draws <- draws_from_spread(spread$timestamp,switch(draw.type,
-                                           "mid-price"=with(spread, (best.bid.price + best.ask.price))/2,
-                                           "bid"=spread$best.bid.price,
-                                           "ask"=spread$best.ask.price),
-                             gamma_0, theta)
-  if(!empty(draws)) {
-    # Assign timezone of start.time, if any, to timestamp column
-    draws$timestamp <- with_tz(as.POSIXct(draws$timestamp, origin="1970-01-01"), tzone)
-    draws$draw.end <- with_tz(as.POSIXct(draws$draw.end, origin="1970-01-01"), tzone)
-  }
-  draws
+#' @method draws data.table
+draws.data.table <- function(spread.changes, gamma_0, theta, draw.type='mid-price', tz='UTC') {
+
+  if('pair' %in% colnames(spread.changes))
+    result <- spread.changes[, draws_from_spread(timestamp,
+                                                 switch(draw.type,
+                                                        "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                        "bid"=best.bid.price,
+                                                        "ask"=best.ask.price
+                                                 ),
+                                                 gamma_0,
+                                                 theta), by=.(pair, exchange) ]
+  else
+    result <- spread.changes[, draws_from_spread(timestamp,
+                                       switch(draw.type,
+                                              "mid-price"=(best.bid.price + best.ask.price)/2,
+                                              "bid"=best.bid.price,
+                                              "ask"=best.ask.price
+                                       ),
+                                       gamma_0,
+                                       theta)]
+  cols <- c("timestamp", "draw.end")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz="Europe/Moscow"), .SDcols=cols ]
+  result
 }
 
 
+
+
 #' @export
-draws.connection <- function(con, start.time, end.time, exchange, pair, gamma_0, theta=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
+draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_0, theta=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
 
   conn=con$con()
 
@@ -681,9 +697,9 @@ draws.connection <- function(con, start.time, end.time, exchange, pair, gamma_0,
   stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
 
   if(is.null(frequency))
-    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", shQuote(exchange), ", ", shQuote(pair),")" ), name=packageName())
+    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", paste0("c(", paste0(shQuote(exchanges), collapse=","),")"), ", ", paste0("c(", paste0(shQuote(pairs), collapse=","),")"),")" ), name=packageName())
   else
-    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", shQuote(exchange), ", ", shQuote(pair),",", frequency, ")" ), name=packageName())
+    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", paste0("c(", paste0(shQuote(exchanges), collapse=","),")"), ", ", paste0("c(", paste0(shQuote(pairs), collapse=","),")"), ",", frequency, ")" ), name=packageName())
 
   tzone <- tz
 
@@ -691,17 +707,20 @@ draws.connection <- function(con, start.time, end.time, exchange, pair, gamma_0,
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
 
-  draws <- .draws(conn, start.time, end.time,  exchange, pair, gamma_0, theta, draw.type, frequency, skip.crossed)
-
-  if(!empty(draws)) {
-    # Assign timezone of start.time, if any, to timestamp column
-    draws$timestamp <- with_tz(draws$timestamp, tzone)
-    draws$draw.end <- with_tz(draws$draw.end, tzone)
-    draws<- draws  %>%
-       arrange(timestamp)
+  pmap_dfr(expand.grid(exchange=exchanges, pair=pairs, stringsAsFactors=FALSE),
+           function(exchange, pair) {
+             draws <- .draws(conn, start.time, end.time,  exchange, pair, gamma_0, theta, draw.type, frequency, skip.crossed)
+             if(!empty(draws)) {
+               # Assign timezone of start.time, if any, to timestamp column
+               draws$timestamp <- with_tz(draws$timestamp, tzone)
+               draws$draw.end <- with_tz(draws$draw.end, tzone)
+               draws<- draws  %>%
+                 mutate(pair=pair, exchange=exchange)
+               }
+             draws
+             }
+  )
   }
-  draws
-}
 
 .draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, draw.type, frequency = NULL, skip.crossed=TRUE) {
 

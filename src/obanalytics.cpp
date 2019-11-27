@@ -163,7 +163,7 @@ struct draws {
   inline void add(point &s, point &e) {
     if(std::fabs(s.timestamp - e.timestamp) > std::numeric_limits<double>::epsilon()) {
 #if DEBUG
-      L_(ldebug3) << "Added draw s: " << s << " e: " << e;
+      L_(ldebug3) << "NEW DRAW s: " << s << " e: " << e;
 #endif
       draw_timestamp.push_back(s.timestamp);
       draw_end.push_back(e.timestamp);
@@ -204,15 +204,18 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
   draws d;
 
 #if DEBUG
-  L_(ldebug3) << "The first draw started " << s;
+  L_(ldebug3) << "START " << s;
+  L_(ldebug3) << "TuP " << tp;
+  L_(ldebug3) << "END " << e;
+
 #endif
 
 
   for(R_xlen_t i = 1; i < timestamp.length(); ++i) {
 #if DEBUG
-    L_(ldebug3) << "Timestamp " << Datetime(timestamp[i]) << " price " << price[i];
+    L_(ldebug3) << "NEXT SPREAD " << Datetime(timestamp[i]) << " " << price[i];
 #endif
-    if(std::fabs(price[i] - tp.price) > 10*std::numeric_limits<double>::epsilon()) {
+    if(std::fabs(price[i] - tp.price)/std::fmax(price[i],tp.price) > std::numeric_limits<double>::epsilon()) {
       if( (tp.price > s.price && price[i] > tp.price) ||
           (tp.price < s.price && price[i] < tp.price) ) { // extend the draw and set the new turning point
         tp.price = price[i];
@@ -220,35 +223,50 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
         e.price = price[i];
         e.timestamp = timestamp[i];
 #if DEBUG
-        L_(ldebug3) << "The current draw extended in the same direction " << e;
+        L_(ldebug3) << "EXTENDED TuP";
+        L_(ldebug3) << "START " << s;
+        L_(ldebug3) << "TuP " << tp;
+        L_(ldebug3) << "END " << e;
+
 #endif
 
       }
       else {  // check whether the current draw has ended and the new draw is to be started
         long double gamma = 0.01*gamma_0[0]/(1 + theta[0]*(tp.timestamp - s.timestamp));
-#if DEBUG
-        L_(ldebug3) << "gamma " << gamma << " epsilon " <<  std::fabs(tp.price - s.price)*gamma << " delta " << std::fabs(price[i] - tp.price) << " diff " << std::fabs(price[i] - tp.price) - std::fabs(tp.price - s.price)*gamma;
-#endif
-        if( std::fabs(price[i] - tp.price) - std::fabs(tp.price - s.price)*gamma > -0.000001 ){ // -0.000001 is from empirical observation that prices may have no more than 5 decimal digits
+
+        if( std::fabs(price[i] - tp.price)/tp.price - std::fabs(tp.price - s.price)*gamma/s.price > -0.000001 ){ // -0.000001 is from empirical observation that prices may have no more than 5 decimal digits
           // the turn after the latest turning point has exceeded threshould, so the new draw will start FROM THE TURNING POINT (i.e. in the past)
           // and the current draw will be returned
 
           d.add(s, tp);
           s = tp;
-#if DEBUG
-          L_(ldebug3) << "The new draw started " << s;
-#endif
 
           e.timestamp = timestamp[i];
           e.price = price[i];
           tp = e;
+
+#if DEBUG
+          L_(ldebug3) << "STARTING NEW DRAW";
+          L_(ldebug3) << "START " << s;
+          L_(ldebug3) << "TuP " << tp;
+          L_(ldebug3) << "END " << e;
+
+#endif
+
+
         }
         else {  // the current draw has not ended yet, just extend it ...
-#if DEBUG
-          L_(ldebug3) << "The current draw has not ended yet " << e;
-#endif
+
           e.price = price[i];
           e.timestamp = timestamp[i];
+#if DEBUG
+          L_(ldebug3) << "EXTENDED END";
+          L_(ldebug3) << "START " << s;
+          L_(ldebug3) << "TuP " << tp;
+          L_(ldebug3) << "END " << e;
+
+#endif
+
         }
       }
     }
@@ -256,9 +274,12 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 
       e.price = price[i];
       e.timestamp = timestamp[i];
-
 #if DEBUG
-      L_(ldebug3) << "Price hasn't changed " << e;
+      L_(ldebug3) << "EXTENDED END (price not changed)";
+      L_(ldebug3) << "START " << s;
+      L_(ldebug3) << "TuP " << tp;
+      L_(ldebug3) << "END " << e;
+
 #endif
 
     }

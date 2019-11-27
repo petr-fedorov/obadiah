@@ -5,23 +5,23 @@
 \title{Securely connects to the OBADiah database and initializes an internal cache for the data}
 \usage{
 connect(
-  sslcert,
-  sslkey,
   host,
   port,
+  sslcert = NULL,
+  sslkey = NULL,
   sslrootcert = system.file("extdata/root.crt", package = packageName()),
   user = "obademo",
   dbname = "ob-analytics-prod"
 )
 }
 \arguments{
-\item{sslcert}{path to the client's SSL certificate file, signed by OBADiah database owner}
-
-\item{sslkey}{path to the clients' SSL private key}
-
 \item{host}{name or IP address of the PostgreSQL server running the OBADiah database}
 
 \item{port}{port}
+
+\item{sslcert}{path to the client's SSL certificate file, signed by OBADiah database owner}
+
+\item{sslkey}{path to the clients' SSL private key}
 
 \item{user}{user}
 

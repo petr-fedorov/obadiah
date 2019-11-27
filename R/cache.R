@@ -42,7 +42,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
 
 .cache_leaf_key <- function(start.time, end.time) {
-  stopifnot(inherits(start.time, "POSIXct"), inherits(end.time, "POSIXct"))
+  stopifnot(inherits(start.time, "POSIXt"), inherits(end.time, "POSIXt"))
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
   fmt <- "%Y%m%d_%H%M%S%z"
