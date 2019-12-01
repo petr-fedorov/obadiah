@@ -336,8 +336,7 @@ ALTER FUNCTION obanalytics._create_level2_partition(p_exchange text, p_pair text
 
 CREATE FUNCTION obanalytics._create_level3_partition(p_exchange text, p_side character, p_pair text, p_year integer, p_month integer, p_execute boolean DEFAULT true) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
-    AS $$
-declare
+    AS $$declare
 	i integer;
 	v_exchange_id smallint;
 	v_pair_id smallint;
@@ -404,46 +403,46 @@ begin
 	v_table_name :=  'level3_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0')|| p_side || p_year || lpad(p_month::text, 2, '0') ;
 	i := i + 1;
 	
-	v_statements[i] := 'create table if not exists '||V_SCHEMA ||v_table_name||' partition of '||V_SCHEMA ||v_parent_table||
+	v_statements[i] := 'create table if not exists data.' ||v_table_name||' partition of '||V_SCHEMA ||v_parent_table||
 							' for values from ('||quote_literal(v_from::timestamptz)||') to (' ||quote_literal(v_to::timestamptz) || ')';
 							
 	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
+	v_statements[i] := 'alter table data.' || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
 
 	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column side set default ' || quote_literal(p_side);
+	v_statements[i] := 'alter table data.' || v_table_name || ' alter column side set default ' || quote_literal(p_side);
 
 	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column pair_id set default ' || v_pair_id;
+	v_statements[i] := 'alter table data.' || v_table_name || ' alter column pair_id set default ' || v_pair_id;
 
-	v_statement := 	'alter table '|| V_SCHEMA || v_table_name || ' add constraint '  || v_table_name ;
+	v_statement := 	'alter table data.' || v_table_name || ' add constraint '  || v_table_name ;
 	
 	i := i + 1;
 	v_statements[i] := v_statement || '_pkey primary key (microtimestamp, order_id, event_no) ';  
 	
 	i := i + 1;
-	v_statements[i] := v_statement || '_fkey_level3_next foreign key (next_microtimestamp, order_id, next_event_no) references '||V_SCHEMA ||v_table_name ||
+	v_statements[i] := v_statement || '_fkey_level3_next foreign key (next_microtimestamp, order_id, next_event_no) references data.'||v_table_name ||
 							' match simple on update cascade on delete no action deferrable initially deferred';
 	i := i + 1;
-	v_statements[i] := v_statement || '_fkey_level3_price foreign key (price_microtimestamp, order_id, price_event_no) references '||V_SCHEMA ||v_table_name ||
+	v_statements[i] := v_statement || '_fkey_level3_price foreign key (price_microtimestamp, order_id, price_event_no) references data.'||v_table_name ||
 							' match simple on update cascade on delete no action deferrable initially deferred';
 
 	i := i+1;
 	v_statements[i] := v_statement || '_unique_next unique (next_microtimestamp, order_id, next_event_no) deferrable initially deferred';
 	
 	i := i+1;
-	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
+	v_statements[i] := 'alter table data.' || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
 	
 	i := i+1;
-	v_statements[i] := 'create trigger '||v_table_name||'_ba_incorporate_new_event before insert on '||V_SCHEMA||v_table_name||
+	v_statements[i] := 'create trigger '||v_table_name||'_ba_incorporate_new_event before insert on data.'||v_table_name||
 		' for each row execute procedure obanalytics.level3_incorporate_new_event()';
 
 	i := i+1;
-	v_statements[i] := 'create trigger '||v_table_name||'_bz_save_exchange_microtimestamp before update of microtimestamp on '||V_SCHEMA||v_table_name||
+	v_statements[i] := 'create trigger '||v_table_name||'_bz_save_exchange_microtimestamp before update of microtimestamp on data.'||v_table_name||
 		' for each row execute procedure obanalytics.save_exchange_microtimestamp()';
 		
     i := i+1;
-	v_statements[i] := 'create index '||v_table_name||'_fkey_level3_price on '|| V_SCHEMA || v_table_name || '(price_microtimestamp, order_id, price_event_no)';
+	v_statements[i] := 'create index '||v_table_name||'_fkey_level3_price on data.'|| v_table_name || '(price_microtimestamp, order_id, price_event_no)';
 
 	
 							
@@ -470,7 +469,6 @@ ALTER FUNCTION obanalytics._create_level3_partition(p_exchange text, p_side char
 CREATE FUNCTION obanalytics._create_matches_partition(p_exchange text, p_pair text, p_year integer, p_month integer, p_execute boolean DEFAULT true) RETURNS void
     LANGUAGE plpgsql SECURITY DEFINER
     AS $$
-
 declare
 	i integer;
 	v_exchange_id smallint;
@@ -526,21 +524,21 @@ begin
 	v_table_name :=  'matches_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0') || p_year || lpad(p_month::text, 2, '0') ;
 	i := i + 1;
 	
-	v_statements[i] := 'create table if not exists '||V_SCHEMA ||v_table_name||' partition of '||V_SCHEMA ||v_parent_table||
+	v_statements[i] := 'create table if not exists data.'||v_table_name||' partition of '||V_SCHEMA ||v_parent_table||
 							' for values from ('||quote_literal(v_from::timestamptz)||') to (' ||quote_literal(v_to::timestamptz) || ')';
 							
 							
 	i := i + 1;
-	v_statements[i] := 'create trigger '||v_table_name||'_bz_save_exchange_microtimestamp before update of microtimestamp on '||V_SCHEMA||v_table_name||
+	v_statements[i] := 'create trigger '||v_table_name||'_bz_save_exchange_microtimestamp before update of microtimestamp on data.'||v_table_name||
 		' for each row execute procedure obanalytics.save_exchange_microtimestamp()';
 	
 	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
+	v_statements[i] := 'alter table data.' || v_table_name || ' alter column exchange_id set default ' || v_exchange_id;
 
 	i := i+1;
-	v_statements[i] := 'alter table ' || V_SCHEMA || v_table_name || ' alter column pair_id set default ' || v_pair_id;
+	v_statements[i] := 'alter table data.' || v_table_name || ' alter column pair_id set default ' || v_pair_id;
 	
-	v_statement := 	'alter table '|| V_SCHEMA || v_table_name || ' add constraint '  || v_table_name ;
+	v_statement := 	'alter table data.' || v_table_name || ' add constraint '  || v_table_name ;
 
 	i := i+1;
 	v_statements[i] := v_statement || '_unique_order_ids_combination unique (buy_order_id, sell_order_id) ';
@@ -549,15 +547,15 @@ begin
 	v_sell_orders_table :=  'level3_' || lpad(v_exchange_id::text, 2,'0') || lpad(v_pair_id::text, 3,'0') || 's' ||  p_year || lpad(p_month::text, 2, '0') ;	
 
 	i := i + 1;
-	v_statements[i] := v_statement || '_fkey_level3_buys  foreign key (buy_event_no, microtimestamp, buy_order_id) references '||V_SCHEMA ||v_buy_orders_table ||
+	v_statements[i] := v_statement || '_fkey_level3_buys  foreign key (buy_event_no, microtimestamp, buy_order_id) references data.'||v_buy_orders_table ||
 							'(event_no, microtimestamp, order_id) match simple on update cascade on delete no action deferrable initially deferred';
 							
 	i := i + 1;
-	v_statements[i] := v_statement || '_fkey_level3_sells  foreign key (sell_event_no, microtimestamp, sell_order_id) references '||V_SCHEMA ||v_sell_orders_table ||
+	v_statements[i] := v_statement || '_fkey_level3_sells  foreign key (sell_event_no, microtimestamp, sell_order_id) references data.' ||v_sell_orders_table ||
 							'(event_no, microtimestamp, order_id) match simple on update cascade on delete no action deferrable initially deferred';
 
 	i := i+1;
-	v_statements[i] := 'alter table '|| V_SCHEMA || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
+	v_statements[i] := 'alter table data.' || v_table_name || ' set ( autovacuum_vacuum_scale_factor= 0.0 , autovacuum_vacuum_threshold = 10000)';
 	
 
 	foreach v_statement in array v_statements loop
@@ -604,7 +602,7 @@ begin
 				-- the magical formula below for p_gamma_0 ensures that the turning point will not be too far away
 				p_gamma := ONE_PCT*p_gamma_0/(1 + p_theta*extract(epoch from p_draw[2].microtimestamp - p_draw[1].microtimestamp));
 				raise debug 'p_minimal draw %', p_gamma_0;
-				if abs(p_price - p_draw[2].price)>= abs(p_draw[2].price - p_draw[1].price)*p_gamma then -- the turn after the curent draw exceeded  the minmal draw too so start new draw FROM THE TURNING POINT (i.e. in the past)
+				if abs(log(p_price) - log(p_draw[2].price)) >= abs(log(p_draw[2].price) -  log(p_draw[1].price))*p_gamma then -- the turn after the curent draw exceeded  the minmal draw too so start new draw FROM THE TURNING POINT (i.e. in the past)
 					raise debug '%, % - TURNING POINT: the draw % - % completed', p_microtimestamp, p_price, p_draw[1].microtimestamp, p_draw[2].microtimestamp;
 					p_draw := array[p_draw[2],
 									row(p_microtimestamp, p_price)::obanalytics.draw_interim_price,
@@ -2220,18 +2218,6 @@ CREATE AGGREGATE obanalytics.restore_depth_agg(obanalytics.level2_depth_record[]
 ALTER AGGREGATE obanalytics.restore_depth_agg(obanalytics.level2_depth_record[], timestamp with time zone, integer, integer) OWNER TO "ob-analytics";
 
 --
--- Name: exchanges; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE TABLE obanalytics.exchanges (
-    exchange_id smallint NOT NULL,
-    exchange text NOT NULL
-);
-
-
-ALTER TABLE obanalytics.exchanges OWNER TO "ob-analytics";
-
---
 -- Name: level3_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -3379,38 +3365,6 @@ ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ALTER COLUMN microtimestam
 ALTER TABLE obanalytics.level3_bitstamp_btceur_s OWNER TO "ob-analytics";
 
 --
--- Name: level3_eras_bitfinex; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE VIEW obanalytics.level3_eras_bitfinex AS
- SELECT level3_eras.era,
-    level3_eras.pair_id,
-    level3_eras.exchange_id
-   FROM obanalytics.level3_eras
-  WHERE (level3_eras.exchange_id = ( SELECT exchanges.exchange_id
-           FROM obanalytics.exchanges
-          WHERE (exchanges.exchange = 'bitfinex'::text)));
-
-
-ALTER TABLE obanalytics.level3_eras_bitfinex OWNER TO "ob-analytics";
-
---
--- Name: level3_eras_bitstamp; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
---
-
-CREATE VIEW obanalytics.level3_eras_bitstamp AS
- SELECT level3_eras.era,
-    level3_eras.pair_id,
-    level3_eras.exchange_id
-   FROM obanalytics.level3_eras
-  WHERE (level3_eras.exchange_id = ( SELECT exchanges.exchange_id
-           FROM obanalytics.exchanges
-          WHERE (exchanges.exchange = 'bitstamp'::text)));
-
-
-ALTER TABLE obanalytics.level3_eras_bitstamp OWNER TO "ob-analytics";
-
---
 -- Name: matches_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -3745,6 +3699,50 @@ ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.match
 
 
 ALTER TABLE obanalytics.matches_bitstamp_btceur OWNER TO "ob-analytics";
+
+--
+-- Name: exchanges; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.exchanges (
+    exchange_id smallint NOT NULL,
+    exchange text NOT NULL
+);
+
+
+ALTER TABLE obanalytics.exchanges OWNER TO "ob-analytics";
+
+--
+-- Name: level3_eras_bitfinex; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE VIEW obanalytics.level3_eras_bitfinex AS
+ SELECT level3_eras.era,
+    level3_eras.pair_id,
+    level3_eras.exchange_id
+   FROM obanalytics.level3_eras
+  WHERE (level3_eras.exchange_id = ( SELECT exchanges.exchange_id
+           FROM obanalytics.exchanges
+          WHERE (exchanges.exchange = 'bitfinex'::text)));
+
+
+ALTER TABLE obanalytics.level3_eras_bitfinex OWNER TO "ob-analytics";
+
+--
+-- Name: level3_eras_bitstamp; Type: VIEW; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE VIEW obanalytics.level3_eras_bitstamp AS
+ SELECT level3_eras.era,
+    level3_eras.pair_id,
+    level3_eras.exchange_id
+   FROM obanalytics.level3_eras
+  WHERE (level3_eras.exchange_id = ( SELECT exchanges.exchange_id
+           FROM obanalytics.exchanges
+          WHERE (exchanges.exchange = 'bitstamp'::text)));
+
+
+ALTER TABLE obanalytics.level3_eras_bitstamp OWNER TO "ob-analytics";
 
 --
 -- Name: pairs; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
