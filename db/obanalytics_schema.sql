@@ -1186,25 +1186,29 @@ CREATE FUNCTION obanalytics.crossed_books(p_start_time timestamp with time zone,
     LANGUAGE sql STABLE
     AS $$
 
-with base_order_books as (
-	select ts, exists (select * from unnest(ob) where not is_maker) as is_crossed
-	from  obanalytics.order_book_by_episode(p_start_time, p_end_time + 
-											make_interval(
-												secs := parameters.max_microtimestamp_change()),	-- next_uncrossed may be few seconds beyond p_end_time
-											p_pair_id, p_exchange_id, false) ob					-- if we dont' find it, merge_crossed_books() will stuck 
-																								-- i.e. will not be able to fix an invalid taker event
-	),
-order_books as (
-	select ts, is_crossed, 
-	coalesce(max(ts) filter (where not is_crossed) over (order by ts), p_start_time - '00:00:00.000001'::interval ) as previous_uncrossed,
-	min(ts) filter (where not is_crossed) over (order by ts desc) as next_uncrossed,
-	min(ts) filter (where is_crossed) over (order by ts) as first_crossed
-	from base_order_books 
+
+
+with spread_periods as (
+	select min(microtimestamp) as period_start, max(microtimestamp) as period_end, g % 2 = 1 as crossed
+	from (
+		select *, sum(t) over (order by microtimestamp) as g
+		from (
+			select * , coalesce(not ((lag(best_bid_price) over(order by microtimestamp) > lag(best_ask_price ) over (order by microtimestamp)) = (best_bid_price > best_ask_price)),best_bid_price > best_ask_price)::integer as t
+			from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id)
+		) a
+	) a
+	group by g
+	order by g
+),
+spread_periods_chain as (
+	select *,lag(period_end) over w as previous_end, lead(period_start) over w as next_start
+	from spread_periods
+	window w as (order by period_start)
 )
-select distinct previous_uncrossed, first_crossed, next_uncrossed, p_pair_id::smallint, p_exchange_id::smallint
-from order_books
-where is_crossed 
-  and previous_uncrossed < p_end_time
+select previous_end, period_start, next_start, p_pair_id::smallint, p_exchange_id::smallint
+from spread_periods_chain
+where crossed 
+  and previous_end < p_end_time
 ;  
 $$;
 
@@ -1275,87 +1279,90 @@ CREATE FUNCTION obanalytics.fix_crossed_books(p_start_time timestamp with time z
 
 declare 
 	v_current_timestamp timestamptz;
+	v_something_was_fixed boolean default true;
+	v_crossed timestamptz;
 	
 begin 
 	v_current_timestamp := clock_timestamp();
 	raise debug 'Started fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
+	v_crossed := p_start_time;
 	
-	-- Merge crossed books to the next taker's event if it is exists (i.e. next_microtimestamp is not -infinity)
-	return query 		
-		with takers as (
-			select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, next_microtimestamp, next_event_no
-			from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
-			join unnest(ob) as ob on true
-			where not is_maker
-			  and next_microtimestamp > '-infinity'
-			  and next_microtimestamp <= microtimestamp + make_interval(secs := parameters.max_microtimestamp_change())
-			order by microtimestamp, order_id, event_no,
-					  ts	-- we need the earliest ts where order book became crossed			
-		),
-		merge_intervals as (	-- there may be several takers, so first we need to understand which episodes to merge. 
-								-- the algorithm has been adapted from here: https://wiki.postgresql.org/wiki/Range_aggregation
-			select min(microtimestamp) as microtimestamp, max(next_microtimestamp) as next_microtimestamp 
-			from (
-				select microtimestamp, order_id, next_microtimestamp, next_event_no, last(interval_start) over (order by microtimestamp) as interval_start
-				from (
-					select microtimestamp, order_id, next_microtimestamp, next_event_no,
-							case when microtimestamp < coalesce(max(next_microtimestamp) over (order by microtimestamp rows between unbounded preceding and 1 preceding), microtimestamp) then null
-									else microtimestamp end 
-							as interval_start
-					from takers		
-				) takers
-			) merge_intervals
-			group by interval_start
-		)
-		select merge_episodes.*
-		from merge_intervals join obanalytics.merge_episodes(microtimestamp, next_microtimestamp, p_pair_id, p_exchange_id) on true;
-	
-	raise debug 'Merged crossed books to the next takers event - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
-	
-	-- Fix eternal crossed orders, which should have been removed by an exchange, but weren't for some reasons
-	return query 
-		insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
-		select distinct on (microtimestamp, order_id)  ts, order_id, 
-				null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
-				side, price, amount, fill, '-infinity',
-				null as next_event_no,
-				pair_id, exchange_id, null as local_timestamp,
-				null as price_microtimestamp, 
-				null as price_event_no
-		from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
-		join unnest(ob) ob on true 
-		where is_crossed and next_microtimestamp = 'infinity'
-		order by microtimestamp, order_id,
-				  ts	-- we need the earliest ts where order book became crossed
-		returning level3.*;
+	while (v_something_was_fixed) loop
+		v_something_was_fixed := false;
 		
-	raise debug 'Fixed eternal crossed orders - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
-	
-	
-	-- Fix eternal takers, which should have been removed by an exchange, but weren't for some reasons
-	return query 
-		insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
-		select distinct on (microtimestamp, order_id)  ts, order_id, 
-				null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
-				side, price, amount, fill, '-infinity',
-				null as next_event_no,
-				pair_id, exchange_id, null as local_timestamp,
-				null as price_microtimestamp, 
-				null as price_event_no
-		from obanalytics.order_book_by_episode(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_check_takers :=false) 
-		join unnest(ob) ob on true 
-		where not is_maker and next_microtimestamp = 'infinity'
-		order by microtimestamp, order_id,
-				  ts	-- we need the earliest ts where order book became crossed
-		returning level3.*;
-		
-	raise debug 'Fixed eternal takers  - fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
-	
-	
+		for v_crossed in select first_crossed from obanalytics.crossed_books(v_crossed, p_end_time, p_pair_id, p_exchange_id) loop
+																			 
+			-- Fix eternal crossed orders, which should have been removed by an exchange, but weren't for some reasons
+			return query 
+				insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
+				select distinct on (microtimestamp, order_id)  ts, order_id, 
+						null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
+						side, price, amount, fill, '-infinity',
+						null as next_event_no,
+						pair_id, exchange_id, null as local_timestamp,
+						null as price_microtimestamp, 
+						null as price_event_no
+				from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false) 
+					  join unnest(ob) as ob on true
+				where is_crossed and next_microtimestamp = 'infinity'
+				returning level3.*;
+																			 
+			if found then 
+				v_something_was_fixed := true;
+				raise debug 'Fixed eternal crossed orders - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
+				exit;
+			end if;
+
+			-- Fix eternal takers, which should have been removed by an exchange, but weren't for some reasons
+			return query 
+				insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
+				select distinct on (microtimestamp, order_id)  ts, order_id, 
+						null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
+						side, price, amount, fill, '-infinity',
+						null as next_event_no,
+						pair_id, exchange_id, null as local_timestamp,
+						null as price_microtimestamp, 
+						null as price_event_no
+				from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false) 
+					  join unnest(ob) as ob on true
+				where not is_maker and next_microtimestamp = 'infinity'
+				returning level3.*;
+
+			if found then 
+				v_something_was_fixed := true;
+				raise debug 'Fixed eternal takers  - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
+				exit;
+			end if;
+			
+			
+			-- Merge crossed books to the next taker's event if it is exists (i.e. next_microtimestamp is not -infinity)
+			return query 		
+				with takers as (
+					select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, next_microtimestamp, next_event_no
+					from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false)
+						  join unnest(ob) as ob on true
+					where not is_maker
+					  and next_microtimestamp > '-infinity'
+					  and next_microtimestamp <= microtimestamp + make_interval(secs := parameters.max_microtimestamp_change())
+				),
+				merge_intervals as (	-- there may be several takers, so first we need to understand which episodes to merge. 
+					select v_crossed as microtimestamp, max(next_microtimestamp) as next_microtimestamp 
+					from takers
+				)
+				select merge_episodes.*
+				from merge_intervals join obanalytics.merge_episodes(microtimestamp, next_microtimestamp, p_pair_id, p_exchange_id) on true;
+																			 
+			if found then 
+				v_something_was_fixed := true;
+				raise debug 'Merged crossed books to the next taker event - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
+				exit;
+			end if;
+			
+		end loop;
+	end loop;
+																			 
 	-- Finally, try to merge remaining episodes producing crossed order books
 	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id); 
-	
-
 	raise debug 'fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
 end;
