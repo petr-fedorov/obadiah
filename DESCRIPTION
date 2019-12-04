@@ -23,7 +23,9 @@ Imports:
     lubridate,
     futile.logger,
     purrr,
-    tibble
+    tibble,
+    ggplot2,
+    data.table
 Suggests: testthat,
     knitr,
     rmarkdown

@@ -11,7 +11,8 @@ connect(
   sslkey = NULL,
   sslrootcert = system.file("extdata/root.crt", package = packageName()),
   user = "obademo",
-  dbname = "ob-analytics-prod"
+  dbname = "ob-analytics-prod",
+  use.cache = TRUE
 )
 }
 \arguments{
@@ -23,9 +24,13 @@ connect(
 
 \item{sslkey}{path to the clients' SSL private key}
 
+\item{sslrootcert}{path to the clients' SSL root certificate}
+
 \item{user}{user}
 
 \item{dbname}{name of PostgreSQL database}
+
+\item{use.cache}{if TRUE, the downloaded data will be cached on the client-side}
 }
 \value{
 the connection object

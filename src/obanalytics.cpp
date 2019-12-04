@@ -138,22 +138,24 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
 
 
 struct point {
-  long double timestamp;
-  long double price;
+  double timestamp;
+  double log_price;
+  double orig_price;
+
   const bool operator != (const point &e) {
-    return (std::fabs(timestamp - e.timestamp) > 10*std::numeric_limits<double>::epsilon() ||
-            std::fabs(price - e.price) > 10*std::numeric_limits<double>::epsilon());
+    return (std::fabs(timestamp - e.timestamp) > std::numeric_limits<double>::epsilon() ||
+            std::fabs(log_price - e.log_price) > std::numeric_limits<double>::epsilon());
   }
 };
 ostream& operator << (ostream& stream, point & p) {
-  stream << "timestamp: " << Datetime(p.timestamp) << " price: " << p.price;
+  stream << "timestamp: " << Datetime(p.timestamp) << " price: " << p.orig_price;
   return stream;
 }
 
 
 
 struct draws {
-  std::vector<long double> draw_timestamp,
+  std::vector<double> draw_timestamp,
                            draw_end,
                             draw_start_price,
   draw_end_price,
@@ -167,9 +169,9 @@ struct draws {
 #endif
       draw_timestamp.push_back(s.timestamp);
       draw_end.push_back(e.timestamp);
-      draw_start_price.push_back(s.price);
-      draw_end_price.push_back(e.price);
-      long double d_sz = std::round(1000000*(e.price - s.price)/s.price)/100,
+      draw_start_price.push_back(s.orig_price);
+      draw_end_price.push_back(e.orig_price);
+      long double d_sz = std::round(1000000*(e.orig_price - s.orig_price)/s.orig_price)/100,
         d_sp = std::round(100*d_sz/(e.timestamp - s.timestamp))/100;
 
       draw_size.push_back(d_sz);
@@ -197,9 +199,9 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 #endif
 
 
-  point s {timestamp[0],price[0]},  // draw (s)tart
-        tp {timestamp[0],price[0]}, // (t)urning (p)oint
-        e {timestamp[0],price[0]};  // draw (e)nd
+  point s {timestamp[0],std::log(price[0]), price[0]},  // draw (s)tart
+        tp {timestamp[0],std::log(price[0]), price[0]}, // (t)urning (p)oint
+        e {timestamp[0],std::log(price[0]), price[0]};  // draw (e)nd
 
   draws d;
 
@@ -215,12 +217,17 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 #if DEBUG
     L_(ldebug3) << "NEXT SPREAD " << Datetime(timestamp[i]) << " " << price[i];
 #endif
-    if(std::fabs(price[i] - tp.price)/std::fmax(price[i],tp.price) > std::numeric_limits<double>::epsilon()) {
-      if( (tp.price > s.price && price[i] > tp.price) ||
-          (tp.price < s.price && price[i] < tp.price) ) { // extend the draw and set the new turning point
-        tp.price = price[i];
+    double log_price_i = std::log(price[i]);
+
+    if(std::fabs(log_price_i - tp.log_price) > std::numeric_limits<double>::epsilon()) {
+      if( (tp.log_price > s.log_price && log_price_i > tp.log_price) ||
+          (tp.log_price < s.log_price && log_price_i < tp.log_price) ) { // extend the draw and set the new turning point
+        tp.log_price = log_price_i;
+        tp.orig_price = price[i];
         tp.timestamp = timestamp[i];
-        e.price = price[i];
+
+        e.log_price = log_price_i;
+        e.orig_price = price[i];
         e.timestamp = timestamp[i];
 #if DEBUG
         L_(ldebug3) << "EXTENDED TuP";
@@ -232,9 +239,9 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 
       }
       else {  // check whether the current draw has ended and the new draw is to be started
-        long double gamma = 0.01*gamma_0[0]/(1 + theta[0]*(tp.timestamp - s.timestamp));
+        double gamma = 0.01*gamma_0[0]/(1 + theta[0]*(tp.timestamp - s.timestamp));
 
-        if( std::fabs(price[i] - tp.price)/tp.price - std::fabs(tp.price - s.price)*gamma/s.price > -0.000001 ){ // -0.000001 is from empirical observation that prices may have no more than 5 decimal digits
+        if( std::fabs(log_price_i - tp.log_price) >= std::fabs(tp.log_price - s.log_price)*gamma ){
           // the turn after the latest turning point has exceeded threshould, so the new draw will start FROM THE TURNING POINT (i.e. in the past)
           // and the current draw will be returned
 
@@ -242,7 +249,9 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
           s = tp;
 
           e.timestamp = timestamp[i];
-          e.price = price[i];
+          e.log_price = log_price_i;
+          e.orig_price = price[i];
+
           tp = e;
 
 #if DEBUG
@@ -257,7 +266,8 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
         }
         else {  // the current draw has not ended yet, just extend it ...
 
-          e.price = price[i];
+          e.log_price = log_price_i;
+          e.orig_price = price[i];
           e.timestamp = timestamp[i];
 #if DEBUG
           L_(ldebug3) << "EXTENDED END";
@@ -272,7 +282,8 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
     }
     else {  // price hasn't changed, so just extend the current draw
 
-      e.price = price[i];
+      e.log_price = log_price_i;
+      e.orig_price = price[i];
       e.timestamp = timestamp[i];
 #if DEBUG
       L_(ldebug3) << "EXTENDED END (price not changed)";

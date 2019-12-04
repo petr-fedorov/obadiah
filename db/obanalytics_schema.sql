@@ -1147,6 +1147,17 @@ $$;
 ALTER FUNCTION obanalytics._spread_from_order_book(p_ts timestamp with time zone, p_order_book obanalytics.level3[]) OWNER TO "ob-analytics";
 
 --
+-- Name: _to_microseconds(timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._to_microseconds(p_timestamptz timestamp with time zone) RETURNS bigint
+    LANGUAGE c
+    AS '$libdir/libobadiah_db.so.1', 'to_microseconds';
+
+
+ALTER FUNCTION obanalytics._to_microseconds(p_timestamptz timestamp with time zone) OWNER TO "ob-analytics";
+
+--
 -- Name: check_microtimestamp_change(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 

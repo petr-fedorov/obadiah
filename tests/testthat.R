@@ -1,4 +1,4 @@
 library(testthat)
-library(obanalyticsdb)
+library(obadiah)
 
-test_check("obanalyticsdb")
+test_check("obadiah")
