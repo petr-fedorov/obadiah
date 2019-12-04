@@ -1,4 +1,4 @@
-SRC = $(wildcard *.cpp) 
+SRC = $(wildcard *.cpp)
 OBJS = $(SRC:.cpp=.o)
 DEPS = $(SRC:.cpp=.d)
 POSTGRES = /usr/pgsql-11
