@@ -37,6 +37,7 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(depth_change_by_episode);
 PG_FUNCTION_INFO_V1(spread_by_episode);
+PG_FUNCTION_INFO_V1(to_microseconds);
 
 #ifdef __cplusplus
 }
@@ -277,4 +278,8 @@ spread_by_episode(PG_FUNCTION_ARGS) {
 
 }
 
-
+Datum
+to_microseconds(PG_FUNCTION_ARGS) {
+ Timestamp arg = PG_GETARG_TIMESTAMP(0);
+ PG_RETURN_INT64(arg);
+}

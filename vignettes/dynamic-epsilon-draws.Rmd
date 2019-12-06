@@ -130,7 +130,7 @@ $$
 \gamma_{i_0,i} = \frac{\gamma_0/100}{1 + \theta(t_{i_0+i} - t_{i_0})} 
 $$
 
-where $\gamma_0$ is the minimal draw percentage coefficient and $\theta$ is a time decay coefficient. Both $\gamma_0$ and $\theta$ are constants.
+where $\gamma_0$ is the initial gamma coefficient and $\theta$ is a time decay coefficient. Both $\gamma_0$ and $\theta$ are constants.
 
 If $\theta = 0$ then $\gamma_{i_0,i} = \gamma_0$. The draw will be stopped by the next draw which is no less in size than $\gamma_0$ percents of the current draw. 
 

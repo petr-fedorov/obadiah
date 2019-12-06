@@ -1870,13 +1870,14 @@ ALTER FUNCTION bitstamp.pga_match(p_pair text, p_ts_within_era timestamp with ti
 
 CREATE FUNCTION bitstamp.pga_transfer(p_pair text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT NULL::interval) RETURNS integer
     LANGUAGE plpgsql
-    AS $$
-declare
+    AS $$declare
 	v_era_start timestamptz;
 	v_next_era_start timestamptz;
 	
 	v_period_start timestamptz;
 	v_period_end timestamptz;
+	
+	v_last_level3 timestamptz;
 	
 	v_month_start timestamptz;
 	v_month_end timestamptz;
@@ -1940,17 +1941,35 @@ begin
 	-- obanalytics.level3 partitions boundaries are set in Europe/Moscow time zone
 	if date_part('month', v_period_start) = date_part('month', v_period_end) then
 		raise debug 'v_period_start: %, v_period_end: %,  v_remove_era: %', v_period_start, v_period_end, v_remove_era;
+		
+		select level3 into strict v_last_level3
+		from obanalytics.level3_eras
+		where era = v_era_start
+		  and pair_id = v_pair_id
+		  and exchange_id = v_exchange_id;
+		
 		perform bitstamp.move_events(v_period_start, v_period_end, v_pair_id);
 		perform bitstamp.move_trades(v_period_start, v_period_end, v_pair_id);
+		
+		perform obanalytics.fix_crossed_books(v_last_level3, v_period_end, v_pair_id, v_exchange_id);
+
 	else
 		v_month_start := v_period_start;
 		v_month_end := date_trunc('month', v_period_start + '1 month'::interval)  - '00:00:00.000001'::interval;
 		
 		while v_month_start <= v_period_end loop
 			raise log 'Move by month: v_month_start: %, v_month_end: %,  pair: %', v_month_start, v_month_end, p_pair;
-			
+
+			select level3 into strict v_last_level3
+			from obanalytics.level3_eras
+			where era = v_era_start
+			  and pair_id = v_pair_id
+			  and exchange_id = v_exchange_id;
+
 			perform bitstamp.move_events(v_month_start, v_month_end, v_pair_id);
 			perform bitstamp.move_trades(v_month_start, v_month_end, v_pair_id);
+			
+			perform obanalytics.fix_crossed_books(v_last_level3, v_period_end, v_pair_id, v_exchange_id);
 			
 			if date_trunc('month', v_month_start + '1 month'::interval) <= v_period_end then 
 				-- there will be next month/next era, so prepare for it

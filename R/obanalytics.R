@@ -32,18 +32,21 @@
 #' Establishes a secure TCP/IP connection to the OBADiah database and returns a connection object.
 #' The object is used to communicate with the database and to keep refereneces cached data
 #'
-#' @param sslcert path to the client's SSL certificate file, signed by OBADiah database owner
-#' @param sslkey path to the clients' SSL private key
 #' @param host name or IP address of the PostgreSQL server running the OBADiah database
 #' @param port port
+#' @param sslcert path to the client's SSL certificate file, signed by OBADiah database owner
+#' @param sslkey path to the clients' SSL private key
+#' @param sslrootcert path to the clients' SSL root certificate
 #' @param user user
 #' @param dbname name of PostgreSQL database
+#' @param use.cache if TRUE, the downloaded data will be cached on the client-side
 #' @return the connection object
 #'
 #' @export
-connect <- function(host, port, sslcert=NULL, sslkey=NULL, sslrootcert =system.file('extdata/root.crt', package=packageName()), user="obademo",  dbname="ob-analytics-prod") {
+connect <- function(host, port, sslcert=NULL, sslkey=NULL, sslrootcert =system.file('extdata/root.crt', package=packageName()), user="obademo",  dbname="ob-analytics-prod", use.cache = TRUE) {
 
   con <-new.env()
+  con$use.cache <- use.cache
 
   con$con <- (function() {
     dbObj <- NULL
@@ -73,12 +76,22 @@ disconnect <- function(con) {
   DBI::dbDisconnect(con$con())
 }
 
+#' @export
+getQuery <- function(x, ...) {
+  UseMethod("getQuery")
+}
+
+getQuery.default <- function(con, query) {
+  DBI::dbGetQuery(con, query)
+}
+
+
 
 
 #' @export
 depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz='UTC') {
 
-  cache=con
+  if(con$use.cache) cache = con else cache=NULL
   conn=con$con()
   cache.bound = now(tz='UTC') - minutes(15)
 
@@ -127,12 +140,7 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
   }
   depth <- rbind(starting_depth, depth_changes)
 
-  if(!empty(depth)) {
-    # Assign timezone of start.time, if any, to timestamp column
-    depth$timestamp <- with_tz(depth$timestamp, tzone)
-    depth <- depth %>% arrange(precise_timestamp, -price, side)
-  }
-  class(depth) <- c("depth", class(depth))
+  depth [ ,c("timestamp", "pair", "exchange") := .(with_tz(timestamp, tzone), pair, exchange)]
   depth
 }
 
@@ -146,48 +154,46 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
 
 .depth_changes <- function(conn, start.time, end.time, exchange, pair, frequency = NULL)   {
   if(is.null(frequency))
-    query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
+    query <- paste0(" SELECT timestamp, price, volume, side  FROM get.depth(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
-                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 5, 2 DESC")
+                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
   else
-    query <- paste0(" SELECT get._in_milliseconds(timestamp) AS timestamp,price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
+    query <- paste0(" SELECT timestamp,price, volume, side  FROM get.depth(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_frequency :=", shQuote(paste0(frequency, " seconds ")), ",",
-                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 5, 2 DESC")
+                    "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
   flog.debug(query, name=packageName())
-  depth <- DBI::dbGetQuery(conn, query)
-  if(!empty(depth)) {
-    depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
-    depth$side <- factor(depth$side, c("bid", "ask"))
-  }
+  depth <- getQuery(conn, query)
+  setDT(depth)
+  depth[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
   depth
 }
 
 
 .starting_depth <- function(conn, start.time, exchange, pair, frequency)   {
   if(is.null(frequency))
-    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp, price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
+    query <- paste0("SELECT timestamp, price, volume, side FROM get.depth(",
                     shQuote(format(start.time,usetz=T)), ", NULL, ",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
-                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 5, 2 DESC")
+                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
   else
-    query <- paste0("SELECT get._in_milliseconds(timestamp) AS timestamp, price, volume, side, extract(epoch from timestamp) - 1546300800 as precise_timestamp FROM get.depth(",
+    query <- paste0("SELECT timestamp, price, volume, side FROM get.depth(",
                     shQuote(format(start.time,usetz=T)), ", NULL, ",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_frequency := ", shQuote(paste0(frequency, " seconds ")), ", ",
-                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 5,2 DESC")
+                    "p_starting_depth := true, p_depth_changes := false) ORDER BY 1,2 DESC")
   flog.debug(query, name=packageName())
-  depth <- DBI::dbGetQuery(conn, query)
-  depth$timestamp <- as.POSIXct(as.numeric(depth$timestamp)/1000, origin="1970-01-01")
-  depth$side <- factor(depth$side, c("bid", "ask"))
+  depth <- getQuery(conn, query)
+  setDT(depth)
+  depth[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
   depth
 }
 
@@ -201,24 +207,24 @@ spread <- function(x, ...) {
 
 
 #' @export
-spread.depth <- function(depth, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC') {
+spread.data.table <- function(depth, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC') {
   spread <- with(depth, spread_from_depth(timestamp, price, volume, side))
+  data.table::setDT(spread)
 
-  if(!empty(spread)) {
-    spread$timestamp <- with_tz(spread$timestamp, tz)
-  }
   if(complete.cases)
     spread <- spread[complete.cases(spread), ]
+
   if(skip.crossed)
-    spread <- spread %>% filter(best.bid.price <= best.ask.price)
-  data.table::setDT(spread)
+    spread <- spread[best.bid.price <= best.ask.price, ]
+
+  spread[, c("timestamp", "pair", "exchange") := .(with_tz(timestamp, tz), depth$pair[1], depth$exchange[1]) ]
   spread
 }
 
 #' @export
 spread.connection <- function(con, start.time, end.time, exchange, pair, frequency=NULL, skip.crossed=TRUE, complete.cases=TRUE, tz='UTC') {
   # TODO Implement loading of starting spread, similar to loading of starting depth (i.e. not distorting cache) ###
-  cache=con
+  if(con$use.cache) cache = con else cache=NULL
   conn=con$con()
   cache.bound = now(tz='UTC') - minutes(15)
 
@@ -246,11 +252,11 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
   else {
 
     if(frequency < 60) {
-      start.time <- floor_date(start.time,  paste0(frequency, " seconds"))
+      #start.time <- floor_date(start.time,  paste0(frequency, " seconds"))
       end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
     }
     else {
-      start.time <- floor_date(start.time, paste0(frequency %/% 60, " minutes"))
+      #start.time <- floor_date(start.time, paste0(frequency %/% 60, " minutes"))
       end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
     }
 
@@ -301,24 +307,27 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
 
   if(is.null(frequency))
 
-    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT timestamp, \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), ") ",
-                    ") ORDER BY 1, timestamp desc")
+                    ")")
   else
-    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT timestamp, \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
-                    ") ORDER BY 1, timestamp desc")
+                    ")")
 
   flog.debug(query, name=packageName())
   spread <- DBI::dbGetQuery(conn, query)
-  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
+  setDT(spread)
+  if(nrow(spread) > 0) {
+    spread[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
+  }
   spread
 }
 
@@ -329,26 +338,29 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
 
   if(is.null(frequency))
 
-    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT timestamp, \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), ") ",
-                    ") ORDER BY 1, timestamp desc")
+                    ") order by 1")
   else
-    query <- paste0(" SELECT distinct on (get._in_milliseconds(timestamp) )	get._in_milliseconds(timestamp) AS timestamp, \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT timestamp, \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
-                    ") ORDER BY 1, timestamp desc")
+                    ") order by 1")
 
   flog.debug(query, name=packageName())
   spread <- DBI::dbGetQuery(conn, query)
-  spread$timestamp <- as.POSIXct(as.numeric(spread$timestamp)/1000, origin="1970-01-01")
+  setDT(spread)
+  if(nrow(spread) > 0) {
+    spread[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
+  }
   spread
 }
 
@@ -357,7 +369,7 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
 
 #' @export
 events <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
-  cache=con
+  if(con$use.cache) cache = con else cache=NULL
   conn=con$con()
   cache.bound = now(tz='UTC') - minutes(15)
 
@@ -401,7 +413,7 @@ events <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
 
   query <- paste0(" SELECT 	\"event.id\",
                   \"id\"::numeric,
-                  get._in_milliseconds(timestamp) AS timestamp,
+                  timestamp,
                   \"exchange.timestamp\",
                   price,
                   volume,
@@ -419,18 +431,24 @@ events <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
                   ")")
   flog.debug(query, name=packageName())
   events <- DBI::dbGetQuery(conn, query)
-  events$action <- factor(events$action, c("created", "changed", "deleted"))
-  events$direction <- factor(events$direction, c("bid", "ask"))
-  events$type <- factor(events$type, c("market", "market-limit", "pacman", "flashed-limit",
-                                       "resting-limit", "unknown"))
-  events$timestamp <- as.POSIXct(as.numeric(events$timestamp)/1000, origin="1970-01-01")
+  setDT(events)
+  events[, c("timestamp",
+             "exchange.timestamp",
+             "action", "direction",
+             "type") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01"),
+                          as.POSIXct(exchange.timestamp/1000000.0, origin="2000-01-01"),
+                          factor(action, c("created", "changed", "deleted")),
+                          factor(direction, c("bid", "ask")),
+                          factor(type, c("market", "market-limit", "pacman",
+                                         "flashed-limit","resting-limit", "unknown"))
+                          ) ]
   events
 }
 
 #' @export
 trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
 
-  cache=con
+  if(con$use.cache) cache = con else cache=NULL
   conn=con$con()
   cache.bound = now(tz='UTC') - minutes(15)
 
@@ -467,7 +485,7 @@ trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
 
 .trades <- function(conn, start.time, end.time, exchange, pair) {
 
-  query <- paste0(" SELECT 	get._in_milliseconds(timestamp) AS timestamp, price, volume, direction, \"maker.event.id\", \"taker.event.id\",",
+  query <- paste0(" SELECT 	timestamp, price, volume, direction, \"maker.event.id\", \"taker.event.id\",",
                   " maker::numeric, taker::numeric, \"exchange.trade.id\" FROM get.trades(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
@@ -476,9 +494,9 @@ trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
                   ") ORDER BY timestamp")
   flog.debug(query, name=packageName())
   trades <- DBI::dbGetQuery(conn, query)
-  trades$timestamp <- as.POSIXct(as.numeric(trades$timestamp)/1000, origin="1970-01-01")
-  trades$direction <- factor(trades$direction, c("buy", "sell"))
 
+  setDT(trades)
+  trades[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
   trades
 }
 
@@ -486,7 +504,7 @@ trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
 #' @export
 depth_summary <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, tz='UTC') {
 
-  cache=con
+  if(con$use.cache) cache = con else cache=NULL
   conn=con$con()
   cache.bound = now(tz='UTC') - minutes(15)
 
@@ -656,28 +674,52 @@ draws <- function(x, ...) {
 
 #' @export
 #' @method draws data.table
-draws.data.table <- function(spread.changes, gamma_0, theta, draw.type='mid-price', tz='UTC') {
+draws.data.table <- function(spread.changes, gamma_0, theta, draw.type='mid-price', skip.crossed = TRUE, tz='UTC') {
 
   if('pair' %in% colnames(spread.changes))
-    result <- spread.changes[, draws_from_spread(timestamp,
-                                                 switch(draw.type,
-                                                        "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                        "bid"=best.bid.price,
-                                                        "ask"=best.ask.price
-                                                 ),
-                                                 gamma_0,
-                                                 theta), by=.(pair, exchange) ]
-  else
-    result <- spread.changes[, draws_from_spread(timestamp,
-                                       switch(draw.type,
-                                              "mid-price"=(best.bid.price + best.ask.price)/2,
-                                              "bid"=best.bid.price,
-                                              "ask"=best.ask.price
-                                       ),
-                                       gamma_0,
-                                       theta)]
+    if(skip.crossed)
+      result <- spread.changes[best.bid.price <= best.ask.price, draws_from_spread(timestamp,
+                                                   switch(draw.type,
+                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                          "bid"=best.bid.price,
+                                                          "ask"=best.ask.price
+                                                   ),
+                                                   gamma_0,
+                                                   theta), by=.(pair, exchange) ]
+    else
+      result <- spread.changes[, draws_from_spread(timestamp,
+                                                   switch(draw.type,
+                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                          "bid"=best.bid.price,
+                                                          "ask"=best.ask.price
+                                                   ),
+                                                   gamma_0,
+                                                   theta), by=.(pair, exchange) ]
+
+  else {
+    if(skip.crossed)
+      result <- spread.changes[best.bid.price <= best.ask.price, draws_from_spread(timestamp,
+                                         switch(draw.type,
+                                                "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                "bid"=best.bid.price,
+                                                "ask"=best.ask.price
+                                         ),
+                                         gamma_0,
+                                         theta),]
+    else
+      result <- spread.changes[, draws_from_spread(timestamp,
+                                                   switch(draw.type,
+                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                          "bid"=best.bid.price,
+                                                          "ask"=best.ask.price
+                                                   ),
+                                                   gamma_0,
+                                                   theta),]
+    setDT(result)
+  }
   cols <- c("timestamp", "draw.end")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz="Europe/Moscow"), .SDcols=cols ]
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  setcolorder(result, c("timestamp","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
   result
 }
 
@@ -707,25 +749,32 @@ draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
 
-  pmap_dfr(expand.grid(exchange=exchanges, pair=pairs, stringsAsFactors=FALSE),
-           function(exchange, pair) {
-             draws <- .draws(conn, start.time, end.time,  exchange, pair, gamma_0, theta, draw.type, frequency, skip.crossed)
-             if(!empty(draws)) {
-               # Assign timezone of start.time, if any, to timestamp column
-               draws$timestamp <- with_tz(draws$timestamp, tzone)
-               draws$draw.end <- with_tz(draws$draw.end, tzone)
-               draws<- draws  %>%
-                 mutate(pair=pair, exchange=exchange)
-               }
-             draws
-             }
+
+  result <- rbindlist(lapply(
+    do.call(c,
+            lapply(exchanges,
+                   function(e) {
+                     lapply(pairs, function(p) list(exchange=e, pair=p) )
+                   }
+                   )
+            ),
+    function(i) {
+      draws <- .draws(conn, start.time, end.time,  i$exchange, i$pair, gamma_0, theta, draw.type, frequency, skip.crossed)
+      if(nrow(draws) > 0) {
+        draws[, c("timestamp","draw.end","pair", "exchange") := .( with_tz(timestamp, tzone), with_tz(draw.end, tzone), ..i$pair, ..i$exchange)]
+      }
+      draws
+    }
+    )
   )
-  }
+  setcolorder(result, c("timestamp","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
+  result
+}
 
 .draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, draw.type, frequency = NULL, skip.crossed=TRUE) {
 
   if(is.null(frequency))
-    query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\", get._in_milliseconds(\"draw.end\") AS \"draw.end\", \"start.price\",",
+    query <- paste0(" select timestamp, \"draw.end\", \"start.price\",",
                     "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
@@ -737,7 +786,7 @@ draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_
                     "p_skip_crossed :=", skip.crossed,
                     ") order by 1")
   else
-    query <- paste0(" select get._in_milliseconds(\"timestamp\") AS \"timestamp\", get._in_milliseconds(\"draw.end\") AS \"draw.end\", \"start.price\",",
+    query <- paste0(" select \"timestamp\", \"draw.end\", \"start.price\",",
                     "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
@@ -751,8 +800,12 @@ draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_
                     ") order by 1")
   flog.debug(query, name=packageName())
   draws <- DBI::dbGetQuery(conn, query)
-  draws$timestamp <- as.POSIXct(as.numeric(draws$timestamp)/1000, origin="1970-01-01")
-  draws$draw.end <- as.POSIXct(as.numeric(draws$draw.end)/1000, origin="1970-01-01")
+  setDT(draws)
+
+  if(nrow(draws) > 0) {
+    draws[, c("timestamp", "draw.end") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01"),
+                                        as.POSIXct(draw.end/1000000.0, origin="2000-01-01")) ]
+  }
   draws
 }
 

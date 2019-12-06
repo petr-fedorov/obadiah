@@ -35,7 +35,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
       ungroup()
   }
   else
-    data.frame()
+    data.table()
 }
 
 
@@ -78,7 +78,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
     if(!empty(data)) {
       flog.debug('added to cache: %s - %s ', format(start.time), format(end.time), name=packageName())
       cache[[.cache_leaf_key(start.time, end.time)]] <- data
-      cache$periods <- rbind(cache$periods, data.frame(s=start.time, e=end.time))
+      cache$periods <- rbind(cache$periods, data.table(s=start.time, e=end.time))
     }
     else
       flog.debug('query %s - %s returned no data', format(start.time), format(end.time), name=packageName())
@@ -94,7 +94,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
 
       i <- 1
 
-      new.cache.entry <- data.frame()
+      new.cache.entry <- data.table()
 
       while (current.time < end.time ) {
         flog.debug('current.time = %s', format(current.time), name=packageName())
@@ -144,7 +144,7 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
       }
       if(!empty(new.cache.entry)) {
         cache[[.cache_leaf_key(start.time, end.time)]] <- new.cache.entry
-        cache$periods <- rbind(cache$periods, data.frame(s=start.time, e=end.time))
+        cache$periods <- rbind(cache$periods, data.table(s=start.time, e=end.time))
         flog.debug('added to cache %s - %s', format(start.time), format(end.time), name=packageName())
       }
       else {
@@ -182,11 +182,11 @@ getCachedPeriods <- function(cache, exchange, pair, type) {
         data <- cached_data %>%  filter(timestamp >= start.time & timestamp < end.time)
     }
     else
-      data <- data.frame()
+      data <- data.table()
 
   }
   else
-    data <- data.frame()
+    data <- data.table()
 
   if(empty(data))
     flog.debug('requested data are not found in the cache: %s %s', format(start.time), format(end.time), name=packageName())
