@@ -53,7 +53,8 @@ server <- function(input, output, session) {
 
   DBI::dbExecute(con$con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
-  #futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+  futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+  futile.logger::flog.appender(futile.logger::appender.console(), name='obadiah')
   #futile.logger::flog.appender(futile.logger::appender.file('obadiah.log'), name='obadiah')
 
   pairs <- reactive({
@@ -192,11 +193,15 @@ server <- function(input, output, session) {
     )  %>% debounce(2000)
 
 
-  minimal.draw <- reactive({
-    req(input$minimal.draw)
-    input$minimal.draw
+  gamma_0 <- reactive({
+    req(input$gamma_0)
+    input$gamma_0
   }) %>% debounce(2000)
 
+  theta <- reactive({
+    req(input$theta)
+    input$theta/10000.0
+  }) %>% debounce(2000)
 
 
   period <- reactive({
@@ -249,7 +254,7 @@ server <- function(input, output, session) {
     if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading draws ...", {
-      obadiah::draws(con, from.time, to.time, exchange, pair, minimal.draw(),0, input$showdraws, frequency,  skip.crossed=input$skip.crossed, tz=tz(tp))
+      obadiah::draws(spread(), gamma_0(),theta(), input$showdraws, skip.crossed=input$skip.crossed, tz=tz(tp))
     })
   })
 
@@ -518,8 +523,14 @@ server <- function(input, output, session) {
 
 
       spread <- spread()
-      price.from <- 0.995*min(spread$best.bid.price)
-      price.to <- 1.005*max(spread$best.ask.price)
+      if(nrow(spread) > 0) {
+        price.from <- 0.995*min(spread$best.bid.price)
+        price.to <- 1.005*max(spread$best.ask.price)
+      }
+      else {
+        price.from <- min(depth$price)
+        price.to <- max(depth$price)
+      }
 
       if (input$showdraws != 'N') draws <- draws()
 
@@ -672,45 +683,4 @@ server <- function(input, output, session) {
     })
   })
 
-  # trades tab
-  output$trades.out <- renderDataTable({
-    trades <- trades()
-    tp <- timePoint()
-    width.seconds <- zoomWidth()
-    from.time <- tp-width.seconds/2
-    to.time <- tp+width.seconds/2
-    trades <- trades[trades$timestamp >= from.time
-                   & trades$timestamp <= to.time, ]
-    trades$timestamp <- format(trades$timestamp, "%H:%M:%OS", tz=tz(tp), usetz=T)
-    trades$volume <- trades$volume
-    trades
-  }, options=list(pageLength=20, searchHighlight=T, order=list(list(0, "asc")),
-                  rowCallback = I('function(row, data) {
-                                     $("td", row).css("background",
-                                         data[3]=="sell"?"#7C0A02":"#191970");
-                                   }')))
-
-  # events tab
-  output$events.out <- renderDataTable({
-    events <- events()
-    tp <- timePoint()
-    width.seconds <- zoomWidth()
-    from.time <- tp-width.seconds/2
-    to.time <- tp+width.seconds/2
-    events <- events[events$timestamp >= from.time
-                     & events$timestamp <= to.time, ]
-    events$timestamp <- format(events$timestamp, "%H:%M:%OS", tz=tz(tp), usetz=T)
-    events$exchange.timestamp <- format(events$exchange.timestamp, "%H:%M:%OS", tz=tz(tp), usetz=T)
-    events$volume <- events$volume
-    events$fill <- events$fill
-    colnames(events) <- c("event.id", "id", "ts", "ex.ts", "price", "vol",
-                          "action", "dir", "fill", "match", "type", "agg")
-    events$agg <- round(events$agg, 2)
-    events$fill <- with(events, ifelse(fill == 0, NA, fill))
-    events
-  }, options=list(pageLength=20, searchHighlight=T, order=list(list(2, "asc")),
-                  rowCallback = I('function(row, data) {
-                                     $("td", row).css("background",
-                                         data[7]=="ask"?"#7C0A02":"#191970");
-                                   }')))
 }
