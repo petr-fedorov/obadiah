@@ -156,7 +156,8 @@ fluidPage(
                                                  checkboxInput("skip.crossed","Skip crossed", TRUE))),
                              column(2, wellPanel(radioButtons("showdraws", label="Show draws", choices=c("None"='N', "Mid price"='mid-price', "Asks"='ask', "Bids"='bid'),
                                                               selected='N', inline=F),
-                                                 numericInput("minimal.draw", label="Min. draw (pct)", value=30))
+                                                 numericInput("gamma_0", label="Initial gamma(x100)", value=30),
+                                                 numericInput("theta", label="Gamma time decay(x10000) ", value=25))
                                     ),
                              column(3, wellPanel(checkboxGroupInput("showtrades",label="Show trades", choices=list("Buys"="buy", "Sells"="sell", "With exchange.trade.id only"="with.ids.only"), inline=F))),
                              column(2, wellPanel(checkboxGroupInput("showdepth",label="Show depth", choices=list("Resting orders"="ro", "Relative price"="lr", "Liquidity percentiles (slow)" ="lp" )))),
@@ -201,12 +202,6 @@ fluidPage(
                             tags$h3("Asks"),
                             hr(),
                             tableOutput("ob.asks.out"))))),
-        tabPanel("Trades",
-                 wellPanel(
-                   dataTableOutput(outputId="trades.out"))),
-        tabPanel("Events",
-                 wellPanel(
-                   dataTableOutput(outputId="events.out"))),
         tabPanel("About",
                  wellPanel(
                    h1("About"),
@@ -218,7 +213,7 @@ fluidPage(
                      "- an R package created to explore and visualise
                       microstructure data and ", tags$b(a("OBADiah",
                       href="https://github.com/petr-fedorov/obadiah")),
-                     " - database & utilities developed using PostgreSQL, Python and R ",
+                     " - database & utilities developed using PostgreSQL, Python, R and C++ ",
                      " to store, cleanse and render large volumes of microstructure data for exploration"),
                    br(),
                    p("Copyright", HTML("&copy;"), "2015, Phil Stubbings."),
