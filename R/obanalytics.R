@@ -496,9 +496,7 @@ trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
   trades <- DBI::dbGetQuery(conn, query)
 
   setDT(trades)
-  if(nrow(trades) > 0) {
-    trades[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
-  }
+  trades[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
   trades
 }
 

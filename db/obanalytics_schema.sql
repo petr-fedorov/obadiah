@@ -1617,6 +1617,48 @@ $$;
 ALTER FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
+-- Name: level3_eras_delete(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level3_eras_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_next_era timestamptz;
+	v_row_count bigint;
+begin
+	select coalesce(min(era), 'infinity') into v_next_era
+	from obanalytics.level3_eras
+	where era > old.era
+	  and pair_id = old.pair_id
+	  and exchange_id = old.exchange_id;
+	
+	delete from obanalytics.matches 
+	where microtimestamp >= old.era 
+	  and microtimestamp < v_next_era
+	  and pair_id = old.pair_id
+	  and exchange_id = old.exchange_id;
+	  
+	get diagnostics v_row_count = row_count;
+	raise notice 'Deleted % rows from obanalytics.matches where microtimestamp >= %  and < % pair_id % exchange_id %', v_row_count,  old.era, v_next_era, old.pair_id, old.exchange_id;
+	  
+	delete from obanalytics.level3
+	where microtimestamp >= old.era 
+	  and microtimestamp < v_next_era
+	  and pair_id = old.pair_id
+	  and exchange_id = old.exchange_id;
+	  
+	get diagnostics v_row_count = row_count;
+	raise notice 'Deleted % rows from obanalytics.level3 where microtimestamp >= %  and < % pair_id % exchange_id %', v_row_count,  old.era, v_next_era, old.pair_id, old.exchange_id;
+	
+	return null;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.level3_eras_delete() OWNER TO "ob-analytics";
+
+--
 -- Name: level3_incorporate_new_event(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1706,14 +1748,15 @@ ALTER FUNCTION obanalytics.level3_incorporate_new_event() OWNER TO "ob-analytics
 
 CREATE FUNCTION obanalytics.level3_update_chain_after_delete() RETURNS trigger
     LANGUAGE plpgsql
-    AS $$declare
-	v_previous_event obanalytics.level3%rowtype;
+    AS $$
 begin 
+	-- update previous event, if any
+	
 	if old.event_no > 1 then
 	
 		update obanalytics.level3
-		   set next_microtimestamp = case when isfinite(old.next_microtimestamp) then old.next_microtimestamp else 'infinity' end,
-		       next_event_no = case when isfinite(old.next_microtimestamp) then old.next_event_no else null end
+		   set next_microtimestamp = 'infinity',
+		       next_event_no = null
 		where exchange_id = old.exchange_id
 		  and pair_id = old.pair_id
 		  and microtimestamp between (	select max(era)
@@ -1722,24 +1765,21 @@ begin
 									  	   and pair_id = old.pair_id
 									       and era <= old.microtimestamp ) and old.microtimestamp
 		  and order_id = old.order_id										   
-		  and event_no = old.event_no - 1
-		returning level3.* into v_previous_event;
+		  and event_no = old.event_no - 1;
 	 		
 	end if;
 	
-	-- NOT READY: need to update price_microtimestamp recursively!!!
+	-- delete next event, if any
 	
 	if isfinite(old.next_microtimestamp) then
-		update obanalytics.level3
-		   set price_microtimestamp = v_previous_event.price_microtimestamp,
-		       price_event_no = v_previous_event.price_event_no
+	
+		raise debug 'Cascade delete of %, %, % e % p %', old.next_microtimestamp, old.order_id, old.next_event_no, old.exchange_id, old.pair_id;
+		delete from  obanalytics.level3
 		where exchange_id = old.exchange_id
 		  and pair_id = old.pair_id
 		  and microtimestamp = old.next_microtimestamp
 		  and order_id = old.order_id										   
-		  and event_no = old.next_event_no
-		  and price_microtimestamp = old.microtimestamp
-		  and price_event_no = old.event_no;
+		  and event_no = old.next_event_no;
 	end if;
 	return old;
 end;$$;
@@ -1786,8 +1826,7 @@ ALTER FUNCTION obanalytics.level3_update_level3_eras() OWNER TO "ob-analytics";
 
 CREATE FUNCTION obanalytics.merge_crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3
     LANGUAGE plpgsql
-    AS $$
-declare 
+    AS $$declare 
 	crossed_books record;
 	v_execution_start_time timestamp with time zone;
 begin
@@ -1798,7 +1837,11 @@ begin
 		if crossed_books.next_uncrossed is null then 
 			raise exception 'Unable to find next uncrossed order book:  previous_uncrossed=%, pair_id=%, exchange_id=%', crossed_books.previous_uncrossed, p_pair_id, p_exchange_id;
 		end if;
-		return query select * from obanalytics.merge_episodes(crossed_books.first_crossed, crossed_books.next_uncrossed, p_pair_id, p_exchange_id);
+		if crossed_books.first_crossed +  make_interval(secs := parameters.max_microtimestamp_change()) >= crossed_books.next_uncrossed then
+			return query select * from obanalytics.merge_episodes(crossed_books.first_crossed, crossed_books.next_uncrossed, p_pair_id, p_exchange_id);
+		else
+			raise exception 'Interval from % to % exceeds maximum allowed interval %', crossed_books.first_crossed, crossed_books.next_uncrossed, make_interval(secs := parameters.max_microtimestamp_change());
+		end if;
 	end loop;
 	raise debug 'merge_crossed_books() exec time: %', clock_timestamp() - v_execution_start_time;	
 end;	
@@ -4116,6 +4159,13 @@ ALTER INDEX obanalytics.level3_bitstamp_xrpusd_pair_id_side_microtimestamp_order
 --
 
 CREATE CONSTRAINT TRIGGER check_microtimestamp_change AFTER UPDATE OF microtimestamp ON obanalytics.level3 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE PROCEDURE obanalytics.check_microtimestamp_change();
+
+
+--
+-- Name: level3_eras delete_level3_matches; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER delete_level3_matches AFTER DELETE ON obanalytics.level3_eras FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_eras_delete();
 
 
 --
