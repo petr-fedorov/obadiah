@@ -62,6 +62,32 @@ COMMENT ON FUNCTION parameters.max_microtimestamp_change() IS 'A row-level trigg
 
 
 --
+-- Name: max_microtimestamp_change(integer, integer); Type: FUNCTION; Schema: parameters; Owner: ob-analytics
+--
+
+CREATE FUNCTION parameters.max_microtimestamp_change(p_pair_id integer, p_exchange_id integer) RETURNS integer
+    LANGUAGE plpgsql LEAKPROOF PARALLEL SAFE
+    AS $$begin
+ case 
+ 	when p_pair_id = 6 and p_exchange_id = 2 then
+		return 22; -- Bitstamp 4435127512 BTCEUR 2019-12-10 00:05:16.121599+03
+	else
+		return 5;
+ end case;
+end; 
+$$;
+
+
+ALTER FUNCTION parameters.max_microtimestamp_change(p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: FUNCTION max_microtimestamp_change(p_pair_id integer, p_exchange_id integer); Type: COMMENT; Schema: parameters; Owner: ob-analytics
+--
+
+COMMENT ON FUNCTION parameters.max_microtimestamp_change(p_pair_id integer, p_exchange_id integer) IS 'A row-level trigger will not allow to change microtimestamp if the previous value is more seconds away than returned by this function';
+
+
+--
 -- PostgreSQL database dump complete
 --
 

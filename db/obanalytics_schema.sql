@@ -1165,7 +1165,7 @@ CREATE FUNCTION obanalytics.check_microtimestamp_change() RETURNS trigger
     LANGUAGE plpgsql
     AS $$ 
 BEGIN
-	if  new.microtimestamp > old.microtimestamp + make_interval(secs := parameters.max_microtimestamp_change()) or
+	if  new.microtimestamp > old.microtimestamp + make_interval(secs := parameters.max_microtimestamp_change(old.pair_id, old.exchange_id)) or
 		new.microtimestamp < old.microtimestamp then	
 		raise exception 'An attempt to move % % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, old.exchange_id, new.microtimestamp;
 	end if;
@@ -1343,7 +1343,7 @@ begin
 						  join unnest(ob) as ob on true
 					where not is_maker
 					  and next_microtimestamp > '-infinity'
-					  and next_microtimestamp <= microtimestamp + make_interval(secs := parameters.max_microtimestamp_change())
+					  and next_microtimestamp <= microtimestamp + make_interval(secs := parameters.max_microtimestamp_change(p_pair_id, p_exchange_id))
 				),
 				merge_intervals as (	-- there may be several takers, so first we need to understand which episodes to merge. 
 					select v_crossed as microtimestamp, max(next_microtimestamp) as next_microtimestamp 
@@ -1837,7 +1837,7 @@ begin
 		if crossed_books.next_uncrossed is null then 
 			raise exception 'Unable to find next uncrossed order book:  previous_uncrossed=%, pair_id=%, exchange_id=%', crossed_books.previous_uncrossed, p_pair_id, p_exchange_id;
 		end if;
-		if crossed_books.first_crossed +  make_interval(secs := parameters.max_microtimestamp_change()) >= crossed_books.next_uncrossed then
+		if crossed_books.first_crossed +  make_interval(secs := parameters.max_microtimestamp_change(p_pair_id, p_exchange_id)) >= crossed_books.next_uncrossed then
 			return query select * from obanalytics.merge_episodes(crossed_books.first_crossed, crossed_books.next_uncrossed, p_pair_id, p_exchange_id);
 		else
 			raise exception 'Interval from % to % exceeds maximum allowed interval %', crossed_books.first_crossed, crossed_books.next_uncrossed, make_interval(secs := parameters.max_microtimestamp_change());

@@ -530,7 +530,7 @@ CREATE FUNCTION bitstamp.check_microtimestamp_change() RETURNS trigger
     AS $$ 
 BEGIN
 
-	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change() then	
+	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change(new.pair_id, 2) then	
 		raise exception 'An attempt to move % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, new.microtimestamp;
 	end if;
 	return null;

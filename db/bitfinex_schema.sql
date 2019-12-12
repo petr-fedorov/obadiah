@@ -734,6 +734,7 @@ begin
 		raise debug 'updated v_events_end to % (p_max_interval is exceeded)', v_events_end;
 	end if;	
 	perform bitfinex.capture_transient_raw_book_events(v_events_start, v_events_end, p_pair);
+	perform obanalytics.fix_crossed_books(v_events_start, v_events_end, v_pair_id, v_exchange_id);
 	return 0;
 end;
 $$;
