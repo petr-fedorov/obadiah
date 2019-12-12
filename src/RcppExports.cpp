@@ -5,6 +5,22 @@
 
 using namespace Rcpp;
 
+// DrawsFromSpread
+DataFrame DrawsFromSpread(NumericVector timestamp, NumericVector price, NumericVector min_draw_size_threshold, NumericVector max_draw_duration_threshold, NumericVector draw_size_tolerance, NumericVector price_change_threshold);
+RcppExport SEXP _obadiah_DrawsFromSpread(SEXP timestampSEXP, SEXP priceSEXP, SEXP min_draw_size_thresholdSEXP, SEXP max_draw_duration_thresholdSEXP, SEXP draw_size_toleranceSEXP, SEXP price_change_thresholdSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< NumericVector >::type timestamp(timestampSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type price(priceSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type min_draw_size_threshold(min_draw_size_thresholdSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type max_draw_duration_threshold(max_draw_duration_thresholdSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type draw_size_tolerance(draw_size_toleranceSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type price_change_threshold(price_change_thresholdSEXP);
+    rcpp_result_gen = Rcpp::wrap(DrawsFromSpread(timestamp, price, min_draw_size_threshold, max_draw_duration_threshold, draw_size_tolerance, price_change_threshold));
+    return rcpp_result_gen;
+END_RCPP
+}
 // spread_from_depth
 DataFrame spread_from_depth(DatetimeVector timestamp, NumericVector price, NumericVector volume, CharacterVector side);
 RcppExport SEXP _obadiah_spread_from_depth(SEXP timestampSEXP, SEXP priceSEXP, SEXP volumeSEXP, SEXP sideSEXP) {
@@ -34,9 +50,13 @@ BEGIN_RCPP
 END_RCPP
 }
 
+RcppExport SEXP run_testthat_tests();
+
 static const R_CallMethodDef CallEntries[] = {
+    {"_obadiah_DrawsFromSpread", (DL_FUNC) &_obadiah_DrawsFromSpread, 6},
     {"_obadiah_spread_from_depth", (DL_FUNC) &_obadiah_spread_from_depth, 4},
     {"_obadiah_draws_from_spread", (DL_FUNC) &_obadiah_draws_from_spread, 4},
+    {"run_testthat_tests", (DL_FUNC) &run_testthat_tests, 0},
     {NULL, NULL, 0}
 };
 

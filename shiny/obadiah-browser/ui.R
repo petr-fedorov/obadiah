@@ -156,8 +156,13 @@ fluidPage(
                                                  checkboxInput("skip.crossed","Skip crossed", TRUE))),
                              column(2, wellPanel(radioButtons("showdraws", label="Show draws", choices=c("None"='N', "Mid price"='mid-price', "Asks"='ask', "Bids"='bid'),
                                                               selected='N', inline=F),
-                                                 numericInput("gamma_0", label="Initial gamma(x100)", value=30),
-                                                 numericInput("theta", label="Gamma time decay(x10000) ", value=25))
+                                                 #numericInput("gamma_0", label="Initial gamma(x100)", value=30),
+                                                 #numericInput("theta", label="Gamma time decay(x10000) ", value=25)
+                                                 numericInput("min.draw.size", label="min.draw.size", value=0.001),
+                                                 numericInput("max.draw.duration", label="max.draw.duration", value=60),
+                                                 numericInput("draw.size.tolerance", label="draw.size.tolerance", value=0.5),
+                                                 numericInput("price.change.threshold", label="price.change.threshold", value=0.02)
+                                                 )
                                     ),
                              column(3, wellPanel(checkboxGroupInput("showtrades",label="Show trades", choices=list("Buys"="buy", "Sells"="sell", "With exchange.trade.id only"="with.ids.only"), inline=F))),
                              column(2, wellPanel(checkboxGroupInput("showdepth",label="Show depth", choices=list("Resting orders"="ro", "Relative price"="lr", "Liquidity percentiles (slow)" ="lp" )))),

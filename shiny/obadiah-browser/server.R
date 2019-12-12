@@ -53,8 +53,8 @@ server <- function(input, output, session) {
 
   DBI::dbExecute(con$con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
-  futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
-  futile.logger::flog.appender(futile.logger::appender.console(), name='obadiah')
+  #futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+  #futile.logger::flog.appender(futile.logger::appender.console(), name='obadiah')
   #futile.logger::flog.appender(futile.logger::appender.file('obadiah.log'), name='obadiah')
 
   pairs <- reactive({
@@ -254,7 +254,8 @@ server <- function(input, output, session) {
     if (frequency == 0) frequency <- NULL
 
     withProgress(message="loading draws ...", {
-      obadiah::draws(spread(), gamma_0(),theta(), input$showdraws, skip.crossed=input$skip.crossed, tz=tz(tp))
+      obadiah::draws(spread(),price.source=input$showdraws,min.draw.size=input$min.draw.size, max.draw.duration=input$max.draw.duration,
+                     draw.size.tolerance=input$draw.size.tolerance, price.change.threshold=input$price.change.threshold, skip.crossed=input$skip.crossed, tz=tz(tp))
     })
   })
 

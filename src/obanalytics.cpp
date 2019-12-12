@@ -8,14 +8,12 @@ using namespace Rcpp;
 using namespace std;
 
 
-#define DEBUG 0
-
 // [[Rcpp::export]]
 DataFrame spread_from_depth(DatetimeVector timestamp,
                       NumericVector price, NumericVector volume, CharacterVector side) {
 
 
-#if DEBUG
+#ifndef NDEBUG
   FILELog::ReportingLevel() = ldebug3;
   FILE* log_fd = fopen( "spread_from_depth.log", "w" );
   Output2FILE::Stream() = log_fd;
@@ -41,7 +39,7 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
   for(int i=0; i <= timestamp.size(); i++) {
     if(i == timestamp.size() || timestamp[i] > episode) {
 
-#if DEBUG
+#ifndef NDEBUG
       L_(ldebug3) << "Updating spread after episode " << Datetime(episode);
 #endif
 
@@ -57,7 +55,7 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
           best_bid_qty = bids.rbegin()->second;
           is_changed = true;
         }
-#if DEBUG
+#ifndef NDEBUG
         L_(ldebug3) << " BID Current price: " << bids.rbegin()->first << " Best price: " << best_bid_price << " Current qty: " << bids.rbegin()->second << " Best qty: " << best_bid_qty;
 #endif
       }
@@ -76,7 +74,7 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
           best_ask_qty = asks.begin()->second;
           is_changed = true;
         }
-#if DEBUG
+#ifndef NDEBUG
         L_(ldebug3) << "ASK Current price: " << asks.begin()->first << " Best price: " << best_ask_price << " Current qty: " << asks.begin()->second << " Best qty: " << best_ask_qty;
 #endif
       }
@@ -105,7 +103,7 @@ DataFrame spread_from_depth(DatetimeVector timestamp,
           best_ask_qtys.push_back(R_NaN);
         }
 
-#if DEBUG
+#ifndef NDEBUG
         L_(ldebug3) << "Produced spread change record - timestamp:" << Datetime(episode) << "BID P: " << best_bid_price << " Q: " << best_bid_qty << "ASK P: " << best_ask_price << " Q: " << best_ask_qty;
 #endif
       }
@@ -164,7 +162,7 @@ struct draws {
 
   inline void add(point &s, point &e) {
     if(std::fabs(s.timestamp - e.timestamp) > std::numeric_limits<double>::epsilon()) {
-#if DEBUG
+#ifndef NDEBUG
       L_(ldebug3) << "NEW DRAW s: " << s << " e: " << e;
 #endif
       draw_timestamp.push_back(s.timestamp);
@@ -179,7 +177,7 @@ struct draws {
 
     }
     else {
-#if DEBUG
+#ifndef NDEBUG
       L_(ldebug3) << "Skipped zero-length draw s: " << s << " e: " << e;
 #endif
 
@@ -192,7 +190,7 @@ struct draws {
 // [[Rcpp::export]]
 DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, NumericVector gamma_0, NumericVector theta) {
 
-#if DEBUG
+#ifndef NDEBUG
   FILELog::ReportingLevel() = ldebug3;
   FILE* log_fd = fopen( "draws_from_spread.log", "w" );
   Output2FILE::Stream() = log_fd;
@@ -205,7 +203,7 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 
   draws d;
 
-#if DEBUG
+#ifndef NDEBUG
   L_(ldebug3) << "START " << s;
   L_(ldebug3) << "TuP " << tp;
   L_(ldebug3) << "END " << e;
@@ -214,7 +212,7 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 
 
   for(R_xlen_t i = 1; i < timestamp.length(); ++i) {
-#if DEBUG
+#ifndef NDEBUG
     L_(ldebug3) << "NEXT SPREAD " << Datetime(timestamp[i]) << " " << price[i];
 #endif
     double log_price_i = std::log(price[i]);
@@ -229,7 +227,7 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
         e.log_price = log_price_i;
         e.orig_price = price[i];
         e.timestamp = timestamp[i];
-#if DEBUG
+#ifndef NDEBUG
         L_(ldebug3) << "EXTENDED TuP";
         L_(ldebug3) << "START " << s;
         L_(ldebug3) << "TuP " << tp;
@@ -254,7 +252,7 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
 
           tp = e;
 
-#if DEBUG
+#ifndef NDEBUG
           L_(ldebug3) << "STARTING NEW DRAW";
           L_(ldebug3) << "START " << s;
           L_(ldebug3) << "TuP " << tp;
@@ -269,7 +267,7 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
           e.log_price = log_price_i;
           e.orig_price = price[i];
           e.timestamp = timestamp[i];
-#if DEBUG
+#ifndef NDEBUG
           L_(ldebug3) << "EXTENDED END";
           L_(ldebug3) << "START " << s;
           L_(ldebug3) << "TuP " << tp;
@@ -285,7 +283,7 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
       e.log_price = log_price_i;
       e.orig_price = price[i];
       e.timestamp = timestamp[i];
-#if DEBUG
+#ifndef NDEBUG
       L_(ldebug3) << "EXTENDED END (price not changed)";
       L_(ldebug3) << "START " << s;
       L_(ldebug3) << "TuP " << tp;

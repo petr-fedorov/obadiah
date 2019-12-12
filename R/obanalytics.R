@@ -22,7 +22,7 @@
 #' @importFrom purrr pmap_dfr
 #' @importFrom tibble tibble
 #' @import data.table
-#' @useDynLib obadiah
+#' @useDynLib obadiah, .registration = TRUE
 
 
 .dummy <- function() {}
@@ -701,47 +701,48 @@ draws <- function(x, ...) {
 
 #' @export
 #' @method draws data.table
-draws.data.table <- function(spread.changes, gamma_0, theta, draw.type='mid-price', skip.crossed = TRUE, tz='UTC') {
+draws.data.table <- function(spread.changes, price.source=c('mid-price', 'bid', 'ask'), skip.crossed = TRUE, gamma_0=NULL, theta=NULL, min.draw.size=NULL, max.draw.duration=NULL,
+                             draw.size.tolerance=NULL, price.change.threshold=NULL, tz='UTC') {
+
+  price.source <- match.arg(price.source)
+
+  calculate <- if(!is.null(gamma_0) && !is.null(theta) ) function(timestamp, price) draws_from_spread(timestamp, price, gamma_0, theta)
+  else {
+    stopifnot(!is.null(min.draw.size) &&!is.null(max.draw.duration) && !is.null(draw.size.tolerance) && !is.null(price.change.threshold))
+    function(timestamp, price) DrawsFromSpread(timestamp, price, min.draw.size, max.draw.duration, draw.size.tolerance, price.change.threshold)
+  }
 
   if('pair' %in% colnames(spread.changes))
     if(skip.crossed)
-      result <- spread.changes[best.bid.price <= best.ask.price, draws_from_spread(timestamp,
-                                                   switch(draw.type,
+      result <- spread.changes[best.bid.price <= best.ask.price, calculate(timestamp,
+                                                   switch(price.source,
                                                           "mid-price"=(best.bid.price + best.ask.price)/2,
                                                           "bid"=best.bid.price,
                                                           "ask"=best.ask.price
-                                                   ),
-                                                   gamma_0,
-                                                   theta), by=.(pair, exchange) ]
+                                                   )), by=.(pair, exchange) ]
     else
       result <- spread.changes[, draws_from_spread(timestamp,
-                                                   switch(draw.type,
+                                                   switch(price.source,
                                                           "mid-price"=(best.bid.price + best.ask.price)/2,
                                                           "bid"=best.bid.price,
                                                           "ask"=best.ask.price
-                                                   ),
-                                                   gamma_0,
-                                                   theta), by=.(pair, exchange) ]
+                                                   )), by=.(pair, exchange) ]
 
   else {
     if(skip.crossed)
       result <- spread.changes[best.bid.price <= best.ask.price, draws_from_spread(timestamp,
-                                         switch(draw.type,
+                                         switch(price.source,
                                                 "mid-price"=(best.bid.price + best.ask.price)/2,
                                                 "bid"=best.bid.price,
                                                 "ask"=best.ask.price
-                                         ),
-                                         gamma_0,
-                                         theta),]
+                                         )),]
     else
       result <- spread.changes[, draws_from_spread(timestamp,
-                                                   switch(draw.type,
+                                                   switch(price.source,
                                                           "mid-price"=(best.bid.price + best.ask.price)/2,
                                                           "bid"=best.bid.price,
                                                           "ask"=best.ask.price
-                                                   ),
-                                                   gamma_0,
-                                                   theta),]
+                                                   )),]
     setDT(result)
   }
   cols <- c("timestamp", "draw.end")
@@ -754,7 +755,7 @@ draws.data.table <- function(spread.changes, gamma_0, theta, draw.type='mid-pric
 
 
 #' @export
-draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_0, theta=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
+draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_0, theta=0, price.source='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
 
   conn=con$con()
 
@@ -786,7 +787,7 @@ draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_
                    )
             ),
     function(i) {
-      draws <- .draws(conn, start.time, end.time,  i$exchange, i$pair, gamma_0, theta, draw.type, frequency, skip.crossed)
+      draws <- .draws(conn, start.time, end.time,  i$exchange, i$pair, gamma_0, theta, price.source, frequency, skip.crossed)
       if(nrow(draws) > 0) {
         draws[, c("timestamp","draw.end","pair", "exchange") := .( with_tz(timestamp, tzone), with_tz(draw.end, tzone), ..i$pair, ..i$exchange)]
       }
@@ -798,14 +799,14 @@ draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_
   result
 }
 
-.draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, draw.type, frequency = NULL, skip.crossed=TRUE) {
+.draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, price.source, frequency = NULL, skip.crossed=TRUE) {
 
   if(is.null(frequency))
     query <- paste0(" select timestamp, \"draw.end\", \"start.price\",",
                     "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
-                    shQuote(draw.type), ",",
+                    shQuote(price.source), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), ") , ",
                     "p_gamma_0 := ", gamma_0, ",",
@@ -817,7 +818,7 @@ draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_
                     "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
-                    shQuote(draw.type), ",",
+                    shQuote(price.source), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "),",
                     "p_gamma_0 := ", gamma_0, ",",

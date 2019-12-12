@@ -30,5 +30,5 @@ Suggests: testthat,
     knitr,
     rmarkdown
 VignetteBuilder: knitr
-LinkingTo: Rcpp
+LinkingTo: Rcpp, testthat
 RoxygenNote: 7.0.2
