@@ -16,23 +16,23 @@
 #include "draw.h"
 #include "log.h"
 
-context("Test CasualDraw") {
+context("Test Type2Draw") {
  FILELog::ReportingLevel() = ldebug3;
  FILE* log_fd = fopen("test_obadiah_cpp.log", "a");
  Output2FILE::Stream() = log_fd;
 
- double min_draw_size_threshold = 0.01;    //
- double max_draw_duration_threshold = 60;  //
- double draw_size_tolerance = 0.5;         //
- double price_change_threshold = 0.01;
+ double min_draw = 0.01;    //
+ double duration = 60;  //
+ double tolerance = 0.5;         //
+ double max_draw = 0.01;
  double timestamp[] = {0, 10, 20};
  double price[] = {100, 110, 90};
- obadiah::CasualDraw current_draw{timestamp[0],
+ obadiah::Type2Draw current_draw{timestamp[0],
                                   price[0],
-                                  min_draw_size_threshold,
-                                  max_draw_duration_threshold,
-                                  draw_size_tolerance,
-                                  price_change_threshold};
+                                  min_draw,
+                                  duration,
+                                  tolerance,
+                                  max_draw};
  test_that(
      "a price change tolerance is not exceeded when direction of the draw has "
      "changed") {

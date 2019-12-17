@@ -693,35 +693,49 @@ export <- function(con, start.time, end.time, exchange, pair, file = "events.csv
 }
 
 
+#' Calculates draws from a time series of spread changes
+#'
+#' There are several types of draws to be calculated
+#'
+#'
 #' @export
-draws <- function(x, ...) {
-  UseMethod("draws")
+draws <- function(x, price.source=c('mid-price', 'bid', 'ask'), draw.type=c("T1", "T2"), tz='UTC', ...) {
+  draw.type <- match.arg(draw.type)
+  class(x) <- paste(class(x), draw.type, sep=".")
+  UseMethod("draws", x)
 }
 
 
+#' @rdname draws
 #' @export
-#' @method draws data.table
-draws.data.table <- function(spread.changes, price.source=c('mid-price', 'bid', 'ask'), skip.crossed = TRUE, gamma_0=NULL, theta=NULL, min.draw.size=NULL, max.draw.duration=NULL,
-                             draw.size.tolerance=NULL, price.change.threshold=NULL, tz='UTC') {
+draws.data.table.T1 <- function(spread.changes, price.source, draw.type="T1", tz,  p1, ...) {
 
-  price.source <- match.arg(price.source)
+}
 
-  calculate <- if(!is.null(gamma_0) && !is.null(theta) ) function(timestamp, price) draws_from_spread(timestamp, price, gamma_0, theta)
-  else {
-    stopifnot(!is.null(min.draw.size) &&!is.null(max.draw.duration) && !is.null(draw.size.tolerance) && !is.null(price.change.threshold))
-    function(timestamp, price) DrawsFromSpread(timestamp, price, min.draw.size, max.draw.duration, draw.size.tolerance, price.change.threshold)
-  }
+
+
+#' @rdname draws
+#' @description Type T2 draws calculates draws as follows.
+#' @details For T2 draws, \code{min.draw} is a minimal price change when a draw becomes an unlimited duration draw. If not achieved before \code{duration}, the draw is terminated and the new one is started.
+#' \code{tolerance} provides an initial value of the effective tolerance. When the price moves in the opposite direction from the latest draw's extrema exceedes the effective tolerance,
+#' the curren draw is terminated at the extrema and the new draw is started from the extrema. The effective tolerance changes from the initial tolerance till zero as draw size increases till \code{max.draw}
+#'
+#' @param spread.changes spread.changes produced
+#' @param min.draw an approximate minimum draw size
+#' @param duration a draw duration in seconds
+#' @param tolerance a maximum value of the price change in the opposite direction which does not terminate the current draw
+#' @param max.draw an approximate maximum draw size
+#' @method draws data.table.T2
+#' @export
+draws.data.table.T2 <- function(spread.changes, price.source, draw.type="T2", tz,  min.draw, duration, tolerance, max.draw) {
+
+#  gamma_0=NULL, theta=NULL, min.draw.size=NULL, max.draw.duration=NULL
+  #draw.size.tolerance=NULL, price.change.threshold=NULL
+
+  calculate <- function(timestamp, price) DrawsFromSpread(timestamp, price, 2,  list(min.draw=min.draw, duration=duration, tolerance=tolerance, max.draw=max.draw))
 
   if('pair' %in% colnames(spread.changes))
-    if(skip.crossed)
-      result <- spread.changes[best.bid.price <= best.ask.price, calculate(timestamp,
-                                                   switch(price.source,
-                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                          "bid"=best.bid.price,
-                                                          "ask"=best.ask.price
-                                                   )), by=.(pair, exchange) ]
-    else
-      result <- spread.changes[, draws_from_spread(timestamp,
+      result <- spread.changes[, calculate(timestamp,
                                                    switch(price.source,
                                                           "mid-price"=(best.bid.price + best.ask.price)/2,
                                                           "bid"=best.bid.price,
@@ -729,15 +743,7 @@ draws.data.table <- function(spread.changes, price.source=c('mid-price', 'bid', 
                                                    )), by=.(pair, exchange) ]
 
   else {
-    if(skip.crossed)
-      result <- spread.changes[best.bid.price <= best.ask.price, draws_from_spread(timestamp,
-                                         switch(price.source,
-                                                "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                "bid"=best.bid.price,
-                                                "ask"=best.ask.price
-                                         )),]
-    else
-      result <- spread.changes[, draws_from_spread(timestamp,
+      result <- spread.changes[, calculate(timestamp,
                                                    switch(price.source,
                                                           "mid-price"=(best.bid.price + best.ask.price)/2,
                                                           "bid"=best.bid.price,
@@ -753,9 +759,10 @@ draws.data.table <- function(spread.changes, price.source=c('mid-price', 'bid', 
 
 
 
-
+#' @rdname draws
+#' @param con a connection object as returned by \code{\link{connect}}
 #' @export
-draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_0, theta=0, price.source='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
+draws.connection.T1 <- function(con, price.source='mid-price', draw.type="T1",tz='UTC', start.time, end.time, exchanges, pairs, gamma_0, theta=0, frequency=NULL, skip.crossed=TRUE) {
 
   conn=con$con()
 

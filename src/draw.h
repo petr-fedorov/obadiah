@@ -31,6 +31,7 @@ public:
  Draw(double timestamp, double price)
      : s_{timestamp, price}, tp_{timestamp, price}, e_{timestamp, price} {};
  virtual ~Draw(){};
+ virtual void process_spreads(Rcpp::NumericVector timestamp, Rcpp::NumericVector price);
  virtual void extend(double next_timestamp, double next_price);
  virtual void SaveAndStartNew() = 0;
  virtual bool IsCompleted() const = 0;
@@ -67,55 +68,64 @@ protected:
  Table output_table_;
 };
 
-class CasualDraw : public Draw {
+class Type2Draw : public Draw {
 public:
- CasualDraw(double starting_timestamp, double starting_price,
-            double min_draw_size_threshold, double max_draw_duration_threshold,
-            double draw_size_tolerance, double price_change_threshold)
+ Type2Draw(double starting_timestamp, double starting_price,
+           double min_draw, double duration,
+           double tolerance, double max_draw)
      : Draw(starting_timestamp, starting_price),
-       min_draw_size_threshold_(min_draw_size_threshold),
-       max_draw_duration_threshold_(max_draw_duration_threshold),
-       draw_size_tolerance_(draw_size_tolerance),
-       price_change_threshold_(price_change_threshold),
+       min_draw_(min_draw),
+       duration_(duration),
+       tolerance_(tolerance),
+       max_draw_(max_draw),
        previous_draw_size_(0.0) {
 #ifndef NDEBUG
-  L_(ldebug3) << "New CasualDraw: " << *this;
+  L_(ldebug3) << "New Type2Draw: " << *this;
 #endif
  };
 
- ~CasualDraw() {
+ ~Type2Draw() {
 #ifndef NDEBUG
-  L_(ldebug3) << "Deleted CasualDraw: " << *this;
+  L_(ldebug3) << "Deleted Type2Draw: " << *this;
 #endif
  };
 
  void SaveAndStartNew();
  bool IsCompleted() const;
  Rcpp::DataFrame get_table();
- friend std::ostream& operator<<(std::ostream& stream, CasualDraw& p);
+ friend std::ostream& operator<<(std::ostream& stream, Type2Draw& p);
 
  inline bool IsDrawDurationExceeded() const {
-  return e_.timestamp - s_.timestamp > max_draw_duration_threshold_;
+  return e_.timestamp - s_.timestamp > duration_;
+ };
+
+ inline double current_tolerance() const {
+  double x = std::fabs(tp_.log_price - s_.log_price);
+  return tolerance_ /
+         (1 + std::exp((x - max_draw_ / 2) * 10 /
+                       max_draw_));
  };
 
  inline bool IsDrawSizeToleranceExceeded() const {
   return std::fabs(e_.log_price - tp_.log_price) >
-         previous_draw_size_ * draw_size_tolerance_;
+         std::fabs(tp_.log_price - s_.log_price) *
+             current_tolerance();
  };
 
  inline bool IsPriceChangeThresholdExceeded() const {
-  return std::fabs(e_.log_price - tp_.log_price) > price_change_threshold_;
+  return false;
+  // return std::fabs(e_.log_price - tp_.log_price) > max_draw_;
  };
 
  inline bool IsMinDrawSizeAchieved() const {
-  return std::fabs(e_.log_price - s_.log_price) >= min_draw_size_threshold_;
+  return std::fabs(e_.log_price - s_.log_price) >= min_draw_;
  };
 
 private:
- const double min_draw_size_threshold_;
- const double max_draw_duration_threshold_;
- const double draw_size_tolerance_;
- const double price_change_threshold_;
+ const double min_draw_;
+ const double duration_;
+ const double tolerance_;
+ const double max_draw_;
 
  double previous_draw_size_;
 };

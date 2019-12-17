@@ -21,6 +21,18 @@
 namespace obadiah {
 
 void
+Draw::process_spreads(Rcpp::NumericVector timestamp, Rcpp::NumericVector price) {
+ for (R_xlen_t i = 1; i < timestamp.length(); ++i) {
+#ifndef NDEBUG
+  L_(ldebug3) << "NEXT SPREAD " << Datetime(timestamp[i]) << " " << price[i];
+#endif
+  extend(timestamp[i], price[i]);
+  if (IsCompleted()) SaveAndStartNew();
+ }
+ SaveAndStartNew();
+};
+
+void
 Draw::extend(double next_timestamp, double next_price) {
  e_.timestamp = next_timestamp;
  e_.orig_price = next_price;
@@ -52,7 +64,7 @@ operator<<(std::ostream& stream, Draw::DrawPoint& p) {
 }
 
 std::ostream&
-operator<<(std::ostream& stream, CasualDraw& p) {
+operator<<(std::ostream& stream, Type2Draw& p) {
  stream << " timestamp: " << Rcpp::Datetime(p.s_.timestamp)
         << " end: " << Rcpp::Datetime(p.e_.timestamp)
         << " start price: " << p.s_.orig_price
@@ -66,32 +78,32 @@ operator<<(std::ostream& stream, CasualDraw& p) {
 };
 
 bool
-CasualDraw::IsCompleted() const {
- return IsDrawDurationExceeded() ||
+Type2Draw::IsCompleted() const {
+ return (IsDrawDurationExceeded() && !IsMinDrawSizeAchieved()) ||
         (IsMinDrawSizeAchieved() &&
          (IsDrawSizeToleranceExceeded() || IsPriceChangeThresholdExceeded()));
 }
 
 void
-CasualDraw::SaveAndStartNew() {
+Type2Draw::SaveAndStartNew() {
 #ifndef NDEBUG
  L_(ldebug3) << "SAVED DRAW " << *this;
 #endif
  previous_draw_size_ = std::fabs(e_.log_price - s_.log_price);
 
  output_table_.timestamp.push_back(s_.timestamp);
- output_table_.end.push_back(e_.timestamp);
+ output_table_.end.push_back(tp_.timestamp);
  output_table_.start_price.push_back(s_.orig_price);
- output_table_.end_price.push_back(e_.orig_price);
- long double d_sz = std::round(1000000 * (e_.orig_price - s_.orig_price) /
+ output_table_.end_price.push_back(tp_.orig_price);
+ long double d_sz = std::round(1000000 * (tp_.orig_price - s_.orig_price) /
                                s_.orig_price) /
                     100,
              d_sp =
-                 std::round(100 * d_sz / (e_.timestamp - s_.timestamp)) / 100;
+                 std::round(100 * d_sz / (tp_.timestamp - s_.timestamp)) / 100;
 
  output_table_.size.push_back(d_sz);
  output_table_.speed.push_back(d_sp);
- s_ = e_;
+ s_ = tp_;
  tp_ = e_;
 #ifndef NDEBUG
  L_(ldebug3) << "STARTED NEW DRAW" << *this;
@@ -99,7 +111,7 @@ CasualDraw::SaveAndStartNew() {
 }
 
 Rcpp::DataFrame
-CasualDraw::get_table() {
+Type2Draw::get_table() {
  return Rcpp::DataFrame::create(
      Rcpp::Named("timestamp") = output_table_.timestamp,
      Rcpp::Named("draw.end") = output_table_.end,
@@ -116,30 +128,27 @@ using namespace std;
 // [[Rcpp::export]]
 DataFrame
 DrawsFromSpread(NumericVector timestamp, NumericVector price,
-                NumericVector min_draw_size_threshold,
-                NumericVector max_draw_duration_threshold,
-                NumericVector draw_size_tolerance,
-                NumericVector price_change_threshold) {
+                IntegerVector draw_type, List params) {
 #ifndef NDEBUG
  FILELog::ReportingLevel() = ldebug3;
  FILE* log_fd = fopen("DrawsFromSpread.log", "w");
  Output2FILE::Stream() = log_fd;
 #endif
 
- obadiah::Draw* current_draw =
-     new obadiah::CasualDraw{timestamp[0],
-                             price[0],
-                             min_draw_size_threshold[0],
-                             max_draw_duration_threshold[0],
-                             draw_size_tolerance[0],
-                             price_change_threshold[0]};
- for (R_xlen_t i = 1; i < timestamp.length(); ++i) {
-#ifndef NDEBUG
-  L_(ldebug3) << "NEXT SPREAD " << Datetime(timestamp[i]) << " " << price[i];
-#endif
-  current_draw->extend(timestamp[i], price[i]);
-  if (current_draw->IsCompleted()) current_draw->SaveAndStartNew();
- }
- current_draw->SaveAndStartNew();
- return current_draw->get_table();
+ obadiah::Draw* draw;
+ switch (draw_type[0]) {
+  case 2:
+   draw = new obadiah::Type2Draw{timestamp[0],
+                                 price[0],
+                                 as<double>(params["min.draw"]),
+                                 as<double>(params["duration"]),
+                                 as<double>(params["tolerance"]),
+                                 as<double>(params["max.draw"])};
+   break;
+  default:
+   Rf_error("Unknown draw.type");
+   break;
+ };
+ draw->process_spreads(timestamp, price);
+ return draw->get_table();
 }
