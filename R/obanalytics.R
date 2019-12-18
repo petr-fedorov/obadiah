@@ -17,7 +17,6 @@
 #' @importFrom lubridate with_tz ymd_hms seconds ceiling_date floor_date now minutes duration round_date
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
-#' @importFrom zoo na.locf
 #' @importFrom magrittr  %>%
 #' @importFrom purrr pmap_dfr
 #' @importFrom tibble tibble
@@ -751,9 +750,9 @@ draws.data.table.T2 <- function(spread.changes, price.source, draw.type="T2", tz
                                                    )),]
     setDT(result)
   }
-  cols <- c("timestamp", "draw.end")
+  cols <- c("draw.start", "draw.end")
   result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  setcolorder(result, c("timestamp","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
+  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
   result
 }
 
@@ -796,20 +795,20 @@ draws.connection.T1 <- function(con, price.source='mid-price', draw.type="T1",tz
     function(i) {
       draws <- .draws(conn, start.time, end.time,  i$exchange, i$pair, gamma_0, theta, price.source, frequency, skip.crossed)
       if(nrow(draws) > 0) {
-        draws[, c("timestamp","draw.end","pair", "exchange") := .( with_tz(timestamp, tzone), with_tz(draw.end, tzone), ..i$pair, ..i$exchange)]
+        draws[, c("draw.start","draw.end","pair", "exchange") := .( with_tz(draw.start, tzone), with_tz(draw.end, tzone), ..i$pair, ..i$exchange)]
       }
       draws
     }
     )
   )
-  setcolorder(result, c("timestamp","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
+  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
   result
 }
 
 .draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, price.source, frequency = NULL, skip.crossed=TRUE) {
 
   if(is.null(frequency))
-    query <- paste0(" select timestamp, \"draw.end\", \"start.price\",",
+    query <- paste0(" select timestamp as \"draw.start\", \"draw.end\", \"start.price\",",
                     "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
@@ -821,7 +820,7 @@ draws.connection.T1 <- function(con, price.source='mid-price', draw.type="T1",tz
                     "p_skip_crossed :=", skip.crossed,
                     ") order by 1")
   else
-    query <- paste0(" select \"timestamp\", \"draw.end\", \"start.price\",",
+    query <- paste0(" select \"timestamp\" as \"draw.start\", \"draw.end\", \"start.price\",",
                     "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
@@ -838,7 +837,7 @@ draws.connection.T1 <- function(con, price.source='mid-price', draw.type="T1",tz
   setDT(draws)
 
   if(nrow(draws) > 0) {
-    draws[, c("timestamp", "draw.end") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01"),
+    draws[, c("draw.start", "draw.end") := .(as.POSIXct(draw.start/1000000.0, origin="2000-01-01"),
                                         as.POSIXct(draw.end/1000000.0, origin="2000-01-01")) ]
   }
   draws

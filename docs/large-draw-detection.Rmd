@@ -1,0 +1,123 @@
+---
+title: "A detection of large draws"
+author: "Petr Fedorov"
+date: "08 12 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(ggplot2)
+library(data.table)
+library(lubridate)
+library(latex2exp)
+#futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+```
+
+## Reference Set I
+
+
+```{r connect-to-database, eval=FALSE}
+con <- obadiah::connect("192.168.3.5", "5432")
+```
+
+```{r include=FALSE}
+load("large-draw-detection.gz2")
+```
+
+
+```{r}
+start.time <- "2019-12-01 00:00:00+03"
+end.time <- "2019-12-31 23:59:59+03"
+pair <- 'btcusd'
+exchange <- 'bitstamp'
+```
+
+
+```{r message=FALSE, warning=FALSE}
+spread <- obadiah::spread(con,start.time, end.time ,exchange, pair, tz='Europe/Moscow')
+```
+
+```{r eval=FALSE, include=FALSE}
+save(con, file="large-draw-detection.gz2")
+```
+
+
+```{r}
+s <- spread[, 
+       mid.price := (best.bid.price + best.ask.price)/2 
+       ][ 
+         best.ask.price - best.bid.price < 100, # remove outliers due to single-sided order book 
+       ]
+
+```
+
+
+```{r}
+ref.draws <- fread(text=
+  "ref.draw.start, ref.draw.end, exchange, pair
+   2019-12-04 23:51:45.065510+03, 2019-12-04 23:54:53.731950+03,bitstamp,btcusd
+   2019-12-04 23:59:54.966359+03, 2019-12-05 00:01:41.881455+03,bitstamp,btcusd
+   2019-12-05 07:40:01.470402+03, 2019-12-05 07:40:49.050225+03,bitstamp,btcusd	
+   2019-12-05 07:40:49.050225+03, 2019-12-05 07:41:31.348919+03,bitstamp,btcusd	
+   2019-12-05 07:42:13.331718+03, 2019-12-05 07:44:08.965451+03,bitstamp,btcusd	
+   2019-12-10 04:15:57.583578+03, 2019-12-10 04:17:49.947396+03,bitstamp,btcusd
+   2019-12-17 16:44:21.821795+03, 2019-12-17 16:45:11.100572+03,bitstamp,btcusd
+   2019-12-17 16:45:32.414602+03, 2019-12-17 16:46:15.819507+03,bitstamp,btcusd
+   2019-12-18 02:09:18.176475+03, 2019-12-18 02:10:39.408296+03,bitstamp,btcusd		
+  ")
+ref.draws[, c("ref.draw.start", "ref.draw.end") := .(ymd_hms(ref.draw.start, tz="Europe/Moscow", quiet=TRUE), ymd_hms(ref.draw.end, tz="Europe/Moscow", quiet=TRUE) )]
+
+ref.draws[, c("ref.start.price", "ref.end.price") := .(s[abs(timestamp - ref.draw.start) < 0.000001, mid.price], s[abs(timestamp - ref.draw.end) < 0.000001, mid.price] ),by=.(ref.draw.start, ref.draw.end, pair, exchange)]
+
+
+ref.spreads <- ref.draws[,
+          s[timestamp >= ref.draw.start - minutes(1) & timestamp <=  ref.draw.end + minutes(1),
+               .(timestamp,price=log(mid.price) - log(ref.start.price))],
+               #.(timestamp,price=mid.price)],
+          by=.(ref.draw.end)]
+
+```
+
+
+
+```{r, fig.height=10, fig.width=10}
+ggplot(ref.spreads,
+       aes(x=timestamp, y=price), group=e) + 
+  geom_point(size=0.1) + 
+  geom_line() + 
+  geom_segment(aes(x=ref.draw.start, xend=ref.draw.end, y=0.0, yend=log(ref.end.price)-log(ref.start.price)),ref.draws, color="red",
+  #geom_segment(aes(x=ref.draw.start, xend=ref.draw.end, y=ref.start.price, yend=ref.end.price),ref.draws, color="red",
+  arrow=arrow(angle=20, length=unit(0.05, "npc"))) + 
+  facet_wrap(vars(as.character(ref.draw.end)), scales="free", ncol=3) + labs(y="Log relative price (draw start == 0.0)", x="Timestamp, GMT+3", title="Reference Set I: 9 draws of BTCUSD mid-price at Bitstamp")
+
+```
+
+
+
+```{r, fig.height=10, fig.width=10}
+
+min.draw <- 0.002
+duration <- 30
+tolerance <- 0.6
+max.draw <- 0.08
+
+d <- obadiah::draws(s, price.source = 'mid-price', draw.type="T2",  min.draw=min.draw, duration=duration,
+                             tolerance=tolerance, max.draw=max.draw, tz="Europe/Moscow")
+t2.draws <- ref.draws[, d[draw.start >= ref.draw.start - minutes(1) & draw.end <= ref.draw.end + minutes(1), ], by=.(ref.draw.end, ref.start.price)]
+
+ggplot(ref.spreads,
+       aes(x=timestamp, y=price), group=e) + 
+  geom_point(size=0.1) + 
+  geom_line() + 
+  geom_segment(aes(x=ref.draw.start, xend=ref.draw.end, y=0.0, yend=log(ref.end.price)-log(ref.start.price)),ref.draws, color="red",
+  #geom_segment(aes(x=ref.draw.start, xend=ref.draw.end, y=ref.start.price, yend=ref.end.price),ref.draws, color="red",
+  arrow=arrow(angle=20, length=unit(0.05, "npc"))) + 
+  geom_segment(aes(x=draw.start, xend=draw.end, y=log(start.price)-log(ref.start.price), yend=log(end.price)-log(ref.start.price)),t2.draws, color="blue") +
+  facet_wrap(vars(as.character(ref.draw.end)), scales="free", ncol=3) + labs(y="Log relative price (draw start == 0.0)", x="Timestamp, GMT+3", title="Reference Set I: Type 2 draws vs reference", subtitle=paste0("Parameters: min.draw=", min.draw, " duration=", duration, " tolerance=", tolerance, " max.draw=", max.draw))
+
+```
+
+
+
+

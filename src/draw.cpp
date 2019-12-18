@@ -113,7 +113,7 @@ Type2Draw::SaveAndStartNew() {
 Rcpp::DataFrame
 Type2Draw::get_table() {
  return Rcpp::DataFrame::create(
-     Rcpp::Named("timestamp") = output_table_.timestamp,
+     Rcpp::Named("draw.start") = output_table_.timestamp,
      Rcpp::Named("draw.end") = output_table_.end,
      Rcpp::Named("start.price") = output_table_.start_price,
      Rcpp::Named("end.price") = output_table_.end_price,
