@@ -297,7 +297,7 @@ DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, Numeri
   if (s != e)
     d.add(s,tp);
 
-  return Rcpp::DataFrame::create(Rcpp::Named("timestamp")=d.draw_timestamp,
+  return Rcpp::DataFrame::create(Rcpp::Named("draw.start")=d.draw_timestamp,
                                  Rcpp::Named("draw.end")=d.draw_end,
                                  Rcpp::Named("start.price")=d.draw_start_price,
                                  Rcpp::Named("end.price")=d.draw_end_price,

@@ -47,9 +47,9 @@ test_that('Bitfinex, ethusd, a full short era, all data',{
   theta <- 0
 
   d_cpp <- obadiah::draws(spread, gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, gamma_0 = gamma_0, theta = theta)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, gamma_0 = gamma_0, theta = theta)
 
-  cols <- c("timestamp", "draw.end")
+  cols <- c("draw.start", "draw.end")
 
   expect_equal(d_cpp[, ..cols],d_sql[, ..cols], info = paste0("gamma_0=", gamma_0, " theta=", theta))
 
@@ -58,20 +58,20 @@ test_that('Bitfinex, ethusd, a full short era, all data',{
   theta <- 0.0025
 
   d_cpp <- obadiah::draws(spread, gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, gamma_0 = gamma_0, theta = theta)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, gamma_0 = gamma_0, theta = theta)
 
   expect_equal(d_cpp[, ..cols], d_sql[, ..cols], info = paste0("gamma_0=", gamma_0, " theta=", theta))
 
   # bid
   d_cpp <- obadiah::draws(spread, price.source = 'bid', gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, price.source = 'bid', gamma_0 = gamma_0, theta = theta)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, price.source = 'bid', gamma_0 = gamma_0, theta = theta)
 
   expect_equal(d_cpp[, ..cols], d_sql[, ..cols], info = paste0("gamma_0=", gamma_0, " theta=", theta))
 
 
   # ask
   d_cpp <- obadiah::draws(spread, price.source = 'ask', gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, price.source = 'ask', gamma_0 = gamma_0, theta = theta)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, price.source = 'ask', gamma_0 = gamma_0, theta = theta)
 
 
   obadiah::disconnect(db)
@@ -101,9 +101,9 @@ test_that('Bitfinex, ethusd, a full short era, 10 seconds',{
   theta <- 0
 
   d_cpp <- obadiah::draws(spread, gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, gamma_0 = gamma_0, theta = theta, frequency=frequency)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, gamma_0 = gamma_0, theta = theta, frequency=frequency)
 
-  cols <- c("timestamp", "draw.end")
+  cols <- c("draw.start", "draw.end")
 
   expect_equal(d_cpp[, ..cols],d_sql[, ..cols], info = paste0("gamma_0=", gamma_0, " theta=", theta))
 
@@ -113,20 +113,20 @@ test_that('Bitfinex, ethusd, a full short era, 10 seconds',{
 
   # mid-price
   d_cpp <- obadiah::draws(spread, gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, gamma_0 = gamma_0, theta = theta, frequency=frequency)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, gamma_0 = gamma_0, theta = theta, frequency=frequency)
 
   expect_equal(d_cpp[, ..cols], d_sql[, ..cols], info = paste0("gamma_0=", gamma_0, " theta=", theta))
 
   # bid
   d_cpp <- obadiah::draws(spread, price.source = 'bid', gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, price.source = 'bid', gamma_0 = gamma_0, theta = theta, frequency=frequency)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, price.source = 'bid', gamma_0 = gamma_0, theta = theta, frequency=frequency)
 
   expect_equal(d_cpp[, ..cols], d_sql[, ..cols], info = paste0("gamma_0=", gamma_0, " theta=", theta))
 
 
   # ask
   d_cpp <- obadiah::draws(spread, price.source = 'ask', gamma_0 = gamma_0, theta = theta)
-  d_sql <- obadiah::draws(db, start.time, end.time, exchange, pair, price.source = 'ask', gamma_0 = gamma_0, theta = theta, frequency=frequency)
+  d_sql <- obadiah::draws(db, start.time=start.time, end.time=end.time, exchange=exchange, pair=pair, price.source = 'ask', gamma_0 = gamma_0, theta = theta, frequency=frequency)
 
   expect_equal(d_cpp[, ..cols], d_sql[, ..cols], info = paste0("gamma_0=", gamma_0, " theta=", theta))
 

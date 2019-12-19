@@ -700,15 +700,39 @@ export <- function(con, start.time, end.time, exchange, pair, file = "events.csv
 #' @export
 draws <- function(x, price.source=c('mid-price', 'bid', 'ask'), draw.type=c("T1", "T2"), tz='UTC', ...) {
   draw.type <- match.arg(draw.type)
-  class(x) <- paste(class(x), draw.type, sep=".")
-  UseMethod("draws", x)
+  s <-list()
+  class(s) <- paste(class(x), draw.type, sep=".")
+  UseMethod("draws", s)
 }
 
 
 #' @rdname draws
 #' @export
-draws.data.table.T1 <- function(spread.changes, price.source, draw.type="T1", tz,  p1, ...) {
+draws.data.table.T1 <- function(spread.changes, price.source='mid-price', draw.type="T1", tz="UTC",  gamma_0, theta ) {
 
+  calculate <- function(timestamp, price) draws_from_spread(timestamp, price, gamma_0, theta)
+
+  if('pair' %in% colnames(spread.changes))
+    result <- spread.changes[, calculate(timestamp,
+                                         switch(price.source,
+                                                "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                "bid"=best.bid.price,
+                                                "ask"=best.ask.price
+                                         )), by=.(pair, exchange) ]
+
+  else {
+    result <- spread.changes[, calculate(timestamp,
+                                         switch(price.source,
+                                                "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                "bid"=best.bid.price,
+                                                "ask"=best.ask.price
+                                         )),]
+    setDT(result)
+  }
+  cols <- c("draw.start", "draw.end")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
+  result
 }
 
 
@@ -726,7 +750,7 @@ draws.data.table.T1 <- function(spread.changes, price.source, draw.type="T1", tz
 #' @param max.draw an approximate maximum draw size
 #' @method draws data.table.T2
 #' @export
-draws.data.table.T2 <- function(spread.changes, price.source, draw.type="T2", tz,  min.draw, duration, tolerance, max.draw) {
+draws.data.table.T2 <- function(spread.changes, price.source='mid-price', draw.type="T2", tz,  min.draw, duration, tolerance, max.draw) {
 
 #  gamma_0=NULL, theta=NULL, min.draw.size=NULL, max.draw.duration=NULL
   #draw.size.tolerance=NULL, price.change.threshold=NULL
