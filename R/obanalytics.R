@@ -698,7 +698,7 @@ export <- function(con, start.time, end.time, exchange, pair, file = "events.csv
 #'
 #'
 #' @export
-draws <- function(x, price.source=c('mid-price', 'bid', 'ask'), draw.type=c("T1", "T2"), tz='UTC', ...) {
+draws <- function(x, price.source=c('mid-price', 'bid', 'ask'), draw.type=c("T1", "T2", "T3"), tz='UTC', ...) {
   draw.type <- match.arg(draw.type)
   s <-list()
   class(s) <- paste(class(x), draw.type, sep=".")
@@ -772,6 +772,37 @@ draws.data.table.T2 <- function(spread.changes, price.source='mid-price', draw.t
                                                           "bid"=best.bid.price,
                                                           "ask"=best.ask.price
                                                    )),]
+    setDT(result)
+  }
+  cols <- c("draw.start", "draw.end")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
+  result
+}
+
+
+
+
+#' @export
+draws.data.table.T3 <- function(spread.changes, price.source='mid-price', draw.type="T2", tz,  transaction.costs, discount.rate) {
+
+  calculate <- function(timestamp, price) DrawsFromSpread(timestamp, price, 3,  list(transaction.costs=transaction.costs, discount.rate=discount.rate))
+
+  if('pair' %in% colnames(spread.changes))
+    result <- spread.changes[, calculate(timestamp,
+                                         switch(price.source,
+                                                "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                "bid"=best.bid.price,
+                                                "ask"=best.ask.price
+                                         )), by=.(pair, exchange) ]
+
+  else {
+    result <- spread.changes[, calculate(timestamp,
+                                         switch(price.source,
+                                                "mid-price"=(best.bid.price + best.ask.price)/2,
+                                                "bid"=best.bid.price,
+                                                "ask"=best.ask.price
+                                         )),]
     setDT(result)
   }
   cols <- c("draw.start", "draw.end")

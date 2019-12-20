@@ -31,11 +31,12 @@ public:
  Draw(double timestamp, double price)
      : s_{timestamp, price}, tp_{timestamp, price}, e_{timestamp, price} {};
  virtual ~Draw(){};
- virtual void process_spreads(Rcpp::NumericVector timestamp, Rcpp::NumericVector price);
+ virtual void process_spreads(Rcpp::NumericVector timestamp,
+                              Rcpp::NumericVector price);
  virtual void extend(double next_timestamp, double next_price);
  virtual void SaveAndStartNew() = 0;
  virtual bool IsCompleted() const = 0;
- virtual Rcpp::DataFrame get_table() = 0;
+ virtual Rcpp::DataFrame get_table();
 
 protected:
  struct Table {
@@ -70,9 +71,8 @@ protected:
 
 class Type2Draw : public Draw {
 public:
- Type2Draw(double starting_timestamp, double starting_price,
-           double min_draw, double duration,
-           double tolerance, double max_draw)
+ Type2Draw(double starting_timestamp, double starting_price, double min_draw,
+           double duration, double tolerance, double max_draw)
      : Draw(starting_timestamp, starting_price),
        min_draw_(min_draw),
        duration_(duration),
@@ -92,7 +92,6 @@ public:
 
  void SaveAndStartNew();
  bool IsCompleted() const;
- Rcpp::DataFrame get_table();
  friend std::ostream& operator<<(std::ostream& stream, Type2Draw& p);
 
  inline bool IsDrawDurationExceeded() const {
@@ -101,15 +100,12 @@ public:
 
  inline double current_tolerance() const {
   double x = std::fabs(tp_.log_price - s_.log_price);
-  return tolerance_ /
-         (1 + std::exp((x - max_draw_ / 2) * 10 /
-                       max_draw_));
+  return tolerance_ / (1 + std::exp((x - max_draw_ / 2) * 10 / max_draw_));
  };
 
  inline bool IsDrawSizeToleranceExceeded() const {
   return std::fabs(e_.log_price - tp_.log_price) >
-         std::fabs(tp_.log_price - s_.log_price) *
-             current_tolerance();
+         std::fabs(tp_.log_price - s_.log_price) * current_tolerance();
  };
 
  inline bool IsPriceChangeThresholdExceeded() const {
@@ -128,6 +124,20 @@ private:
  const double max_draw_;
 
  double previous_draw_size_;
+};
+
+class Type3Draw : public Draw {
+public:
+ Type3Draw(double transaction_costs, double discount_rate)
+     : Draw(0,0), transaction_costs_(transaction_costs),
+       discount_(std::log(1 + discount_rate)){};
+ void process_spreads(Rcpp::NumericVector, Rcpp::NumericVector);
+ void SaveAndStartNew() {};
+ bool IsCompleted() const { return false; };
+
+private:
+ double transaction_costs_;
+ double discount_;
 };
 }  // namespace obadiah
 #endif
