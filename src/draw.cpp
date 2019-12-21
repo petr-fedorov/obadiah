@@ -186,43 +186,33 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
   decisions[i].max_revenue =
       decisions[i + 1].max_revenue;  // i.e. if we do not open any position
 
-  for (R_xlen_t j = i + 1; j < timestamp.length(); ++j) {
-   double costs =
-       transaction_costs_ + discount_ * (timestamp[j] - timestamp[i]);
+  bool check_long = true;
+  bool check_short = true;
 
-   if (log_price[j] >
-       log_price[i] + costs) {  // long could be a feasible option at time i
-    if (decisions[j].max_revenue + log_price[j] - log_price[i] - costs >
-        decisions[i].max_revenue) {
-     decisions[i].max_revenue =
-         decisions[j].max_revenue + log_price[j] - log_price[i] - costs;
+  for (R_xlen_t j = i + 1; (check_long || check_short) && j < timestamp.length(); ++j) {
+
+   double price_change = log_price[j] - log_price[i];
+   double j_max_revenue = decisions[j].max_revenue - transaction_costs_ - discount_ * (timestamp[j] - timestamp[i]);
+
+   if(price_change >0) {
+    if(check_long && decisions[i].max_revenue < j_max_revenue + price_change) {
+     decisions[i].max_revenue = j_max_revenue + price_change;
      decisions[i].direction = 1;
      decisions[i].entry = i;
      decisions[i].exit = j;
     }
-   } else if (log_price[i] >
-              log_price[j] +
-                  costs) {  // short could be a feasible option at time i
-    if (decisions[j].max_revenue + log_price[i] - log_price[j] - costs >
-        decisions[i].max_revenue) {
-     decisions[i].max_revenue =
-         decisions[j].max_revenue + log_price[i] - log_price[j] - costs;
+   }
+   else {
+    if(check_short && decisions[i].max_revenue < j_max_revenue - price_change) {
+     decisions[i].max_revenue = j_max_revenue - price_change;
      decisions[i].direction = -1;
      decisions[i].entry = i;
      decisions[i].exit = j;
     }
    }
 
-   if (decisions[j].max_price_ahead - log_price[i] < transaction_costs_ &&
-       log_price[i] - decisions[j].min_price_ahead < transaction_costs_) {
-#ifndef NDEBUG
-    L_(ldebug3) << "BREAK at timestamp " << Rcpp::Datetime(timestamp[j]) <<
-     std::fixed << std::setprecision(2) << " price: " << std::exp(log_price[i]) <<
-     " max ahead: " << std::exp(decisions[j].max_price_ahead) <<
-     " min ahead: " << std::exp(decisions[j].min_price_ahead);
-#endif
-    break;
-   }
+   if(decisions[j].max_price_ahead - log_price[i] < transaction_costs_) check_long = false;
+   if(log_price[i] - decisions[j].min_price_ahead < transaction_costs_) check_short = false;
   }
  }
 #ifndef NDEBUG
