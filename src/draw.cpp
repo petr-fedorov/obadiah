@@ -20,6 +20,12 @@
 
 namespace obadiah {
 
+template <typename T>
+int
+sgn(T val) {
+ return (T(0) < val) - (val < T(0));
+}
+
 void
 Draw::process_spreads(Rcpp::NumericVector timestamp,
                       Rcpp::NumericVector price) {
@@ -125,13 +131,13 @@ Draw::get_table() {
 
 struct Decision {
  Decision()
-     : max_revenue(0),
+     : draw_revenue(0),
        direction(0),
        entry(0),
        exit(0),
        max_price_ahead(0),
        min_price_ahead(0){};
- double max_revenue;
+ double draw_revenue;
  double direction;  // -1, 0, 1;
  R_xlen_t entry;
  R_xlen_t exit;
@@ -145,10 +151,6 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
  std::vector<Decision> decisions(timestamp.length());
  std::vector<double> log_price(timestamp.length());
 
-#ifndef NDEBUG
- L_(ldebug3) << "decisions size()" << decisions.size();
-#endif
-
  for (R_xlen_t i = 0; i < timestamp.length(); i++)
   log_price[i] = std::log(price[i]);
 
@@ -159,8 +161,9 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
 
  for (R_xlen_t i = timestamp.length() - 2; i >= 0; --i) {
 #ifndef NDEBUG
-  L_(ldebug3) << "SPREAD: timestamp " << Rcpp::Datetime(timestamp[i])
-              << " price " << price[i];
+  L_(ldebug3) << "SPREAD: i: " << i
+              << " timestamp[i]: " << Rcpp::Datetime(timestamp[i])
+              << " price[i]: " << price[i] << " log_price[i]: " << log_price[i];
 #endif
   if (log_price[i + 1] > decisions[i + 1].max_price_ahead) {
    decisions[i].max_price_ahead = log_price[i + 1];
@@ -177,50 +180,74 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
   decisions[i].max_price_ahead -= discount_ * (timestamp[i + 1] - timestamp[i]);
   decisions[i].min_price_ahead += discount_ * (timestamp[i + 1] - timestamp[i]);
 
-#ifndef NDEBUG
-  L_(ldebug3) << "AHEAD Max:  " << std::fixed << std::setprecision(2)
-              << std::exp(decisions[i].max_price_ahead)
-              << " Min: " << std::exp(decisions[i].min_price_ahead);
-#endif
+  bool stop{false};
 
-  decisions[i].max_revenue =
-      decisions[i + 1].max_revenue;  // i.e. if we do not open any position
-
-  bool check_long = true;
-  bool check_short = true;
-
-  for (R_xlen_t j = i + 1; (check_long || check_short) && j < timestamp.length(); ++j) {
-
+  for (R_xlen_t j = i + 1; !stop && j < timestamp.length(); ++j) {
    double price_change = log_price[j] - log_price[i];
-   double j_max_revenue = decisions[j].max_revenue - transaction_costs_ - discount_ * (timestamp[j] - timestamp[i]);
+   double time_costs = discount_ * (timestamp[j] - timestamp[i]);
 
-   if(price_change >0) {
-    if(check_long && decisions[i].max_revenue < j_max_revenue + price_change) {
-     decisions[i].max_revenue = j_max_revenue + price_change;
-     decisions[i].direction = 1;
-     decisions[i].entry = i;
-     decisions[i].exit = j;
+   if (decisions[j].direction) {
+    stop = true;
+    if ((sgn(price_change) == sgn(decisions[j].direction)) &&
+        (std::fabs(price_change) > time_costs)) {
+     decisions[i].direction = decisions[j].direction;
+     decisions[i].exit = decisions[j].exit;
+
+     decisions[i].max_price_ahead =
+         log_price[i] + (decisions[i].direction == 1 ? transaction_costs_ : 0);
+     decisions[i].min_price_ahead =
+         log_price[i] - (decisions[i].direction == -1 ? transaction_costs_ : 0);
+
+#ifndef NDEBUG
+     L_(ldebug3) << "EXTENDED DRAW: [" << j << "," << decisions[j].exit
+                 << "] to [" << i << "," << decisions[i].exit << "]"
+                 << "[ " << Rcpp::Datetime(timestamp[i]) << ", "
+                 << Rcpp::Datetime(timestamp[decisions[j].exit]) << "] "
+                 << " max_price_ahead: " << decisions[i].max_price_ahead
+                 << " min_price_ahead: " << decisions[i].min_price_ahead;
+#endif
+     decisions[j].direction = 0;
+     decisions[j].draw_revenue = 0;
+     decisions[j].exit = 0;
+     break;
     }
    }
-   else {
-    if(check_short && decisions[i].max_revenue < j_max_revenue - price_change) {
-     decisions[i].max_revenue = j_max_revenue - price_change;
-     decisions[i].direction = -1;
-     decisions[i].entry = i;
-     decisions[i].exit = j;
-    }
-   }
+   if ((std::fabs(price_change) > time_costs + transaction_costs_) &&
+       (std::fabs(price_change) - time_costs > decisions[i].draw_revenue)) {
+#ifndef NDEBUG
+    if(!decisions[i].direction)
+     L_(ldebug3) << "CREATED DRAW: [" << i << "," << j << "]";
+    else
+     L_(ldebug3) << "REPLACED DRAW: [" << i << "," << j << "]";
+#endif
+    decisions[i].direction = sgn(price_change);
 
-   if(decisions[j].max_price_ahead - log_price[i] < transaction_costs_) check_long = false;
-   if(log_price[i] - decisions[j].min_price_ahead < transaction_costs_) check_short = false;
+    // note that we are saving/comparing a time-cost adjusted draw revenue
+    // time_costs will be different for different values of j
+    decisions[i].draw_revenue = std::fabs(price_change) - time_costs;
+    decisions[i].exit = j;
+   }
+   if ((decisions[j].max_price_ahead - log_price[i] < transaction_costs_) &&
+       (log_price[i] - decisions[j].min_price_ahead < transaction_costs_)) {
+    stop = true;
+   }
+#ifndef NDEBUG
+   if (stop) {
+    L_(ldebug3) << "STOPPED j: " << j
+                << " timestamp[j]: " << Rcpp::Datetime(timestamp[j])
+                << " price[j]: " << price[j]
+                << " log_price[j]: " << log_price[j]
+                << " time_costs: " << time_costs;
+   };
+#endif
   }
  }
 #ifndef NDEBUG
  L_(ldebug3) << "OUTPUT";
 #endif
  for (R_xlen_t i = 0; i < timestamp.length();) {
-  if (decisions[i].direction != 0) {
-   R_xlen_t entry = decisions[i].entry;
+  if (decisions[i].direction) {
+   R_xlen_t entry = i;
    R_xlen_t exit = decisions[i].exit;
    i = exit;
 
