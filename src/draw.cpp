@@ -188,15 +188,19 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
 
    if (decisions[j].direction) {
     stop = true;
-    if ((sgn(price_change) == sgn(decisions[j].direction)) &&
-        (std::fabs(price_change) > time_costs)) {
+    if ((sgn(price_change) == sgn(decisions[j].direction) ||
+         !sgn(price_change)) &&
+        (std::fabs(price_change) >= time_costs)) {
      decisions[i].direction = decisions[j].direction;
      decisions[i].exit = decisions[j].exit;
 
-     decisions[i].max_price_ahead =
-         log_price[i] + (decisions[i].direction == 1 ? transaction_costs_ : 0);
-     decisions[i].min_price_ahead =
-         log_price[i] - (decisions[i].direction == -1 ? transaction_costs_ : 0);
+     if (decisions[i].direction == 1) {
+      decisions[i].max_price_ahead = log_price[i] + transaction_costs_;
+      decisions[i].min_price_ahead = log_price[i];
+     } else {
+      decisions[i].max_price_ahead = log_price[i];
+      decisions[i].min_price_ahead = log_price[i] - transaction_costs_;
+     }
 
 #ifndef NDEBUG
      L_(ldebug3) << "EXTENDED DRAW: [" << j << "," << decisions[j].exit
@@ -215,7 +219,7 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
    if ((std::fabs(price_change) > time_costs + transaction_costs_) &&
        (std::fabs(price_change) - time_costs > decisions[i].draw_revenue)) {
 #ifndef NDEBUG
-    if(!decisions[i].direction)
+    if (!decisions[i].direction)
      L_(ldebug3) << "CREATED DRAW: [" << i << "," << j << "]";
     else
      L_(ldebug3) << "REPLACED DRAW: [" << i << "," << j << "]";
@@ -227,8 +231,9 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
     decisions[i].draw_revenue = std::fabs(price_change) - time_costs;
     decisions[i].exit = j;
    }
-   if ((decisions[j].max_price_ahead - log_price[i] < transaction_costs_) &&
-       (log_price[i] - decisions[j].min_price_ahead < transaction_costs_)) {
+
+   if ((log_price[i] + transaction_costs_ > decisions[j].max_price_ahead) &&
+       (log_price[i] - transaction_costs_ < decisions[j].min_price_ahead)) {
     stop = true;
    }
 #ifndef NDEBUG
@@ -237,7 +242,9 @@ Type3Draw::process_spreads(Rcpp::NumericVector timestamp,
                 << " timestamp[j]: " << Rcpp::Datetime(timestamp[j])
                 << " price[j]: " << price[j]
                 << " log_price[j]: " << log_price[j]
-                << " time_costs: " << time_costs;
+                << " time_costs: " << time_costs
+                << " min_ahead: " << decisions[j].min_price_ahead
+                << " max_ahead: " << decisions[j].max_price_ahead;
    };
 #endif
   }
