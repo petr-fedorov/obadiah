@@ -179,7 +179,7 @@ TradingStrategy::DiscoverNextPosition() {
 //      L_(ldebug3) << "S es_: " << es_ << " bid: " << bid
 //                  << " Cms() - Int(): " << Commission() - Interest(bid, es_);
 #endif
-     if (es_ - bid > Commission() - Interest(bid, es_)) {
+     if (bid - es_ > Commission() - Interest(bid, es_)) {
       assert(el_.p == 0);
 #ifndef NDEBUG
       L_(ldebug3) << "S* ss_: " << ss_ << " es_:" << es_
