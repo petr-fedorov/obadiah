@@ -5,17 +5,28 @@
 
 using namespace Rcpp;
 
-// DrawsFromSpread
-DataFrame DrawsFromSpread(NumericVector timestamp, NumericVector price, IntegerVector draw_type, List params);
-RcppExport SEXP _obadiah_DrawsFromSpread(SEXP timestampSEXP, SEXP priceSEXP, SEXP draw_typeSEXP, SEXP paramsSEXP) {
+// CalculateTradingPeriod
+DataFrame CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume);
+RcppExport SEXP _obadiah_CalculateTradingPeriod(SEXP depth_changesSEXP, SEXP volumeSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< NumericVector >::type timestamp(timestampSEXP);
-    Rcpp::traits::input_parameter< NumericVector >::type price(priceSEXP);
-    Rcpp::traits::input_parameter< IntegerVector >::type draw_type(draw_typeSEXP);
-    Rcpp::traits::input_parameter< List >::type params(paramsSEXP);
-    rcpp_result_gen = Rcpp::wrap(DrawsFromSpread(timestamp, price, draw_type, params));
+    Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type volume(volumeSEXP);
+    rcpp_result_gen = Rcpp::wrap(CalculateTradingPeriod(depth_changes, volume));
+    return rcpp_result_gen;
+END_RCPP
+}
+// DiscoverPositions
+DataFrame DiscoverPositions(DataFrame computed_trading_period, NumericVector phi, NumericVector rho);
+RcppExport SEXP _obadiah_DiscoverPositions(SEXP computed_trading_periodSEXP, SEXP phiSEXP, SEXP rhoSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< DataFrame >::type computed_trading_period(computed_trading_periodSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type phi(phiSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type rho(rhoSEXP);
+    rcpp_result_gen = Rcpp::wrap(DiscoverPositions(computed_trading_period, phi, rho));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -33,27 +44,13 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// draws_from_spread
-DataFrame draws_from_spread(NumericVector timestamp, NumericVector price, NumericVector gamma_0, NumericVector theta);
-RcppExport SEXP _obadiah_draws_from_spread(SEXP timestampSEXP, SEXP priceSEXP, SEXP gamma_0SEXP, SEXP thetaSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< NumericVector >::type timestamp(timestampSEXP);
-    Rcpp::traits::input_parameter< NumericVector >::type price(priceSEXP);
-    Rcpp::traits::input_parameter< NumericVector >::type gamma_0(gamma_0SEXP);
-    Rcpp::traits::input_parameter< NumericVector >::type theta(thetaSEXP);
-    rcpp_result_gen = Rcpp::wrap(draws_from_spread(timestamp, price, gamma_0, theta));
-    return rcpp_result_gen;
-END_RCPP
-}
 
 RcppExport SEXP run_testthat_tests();
 
 static const R_CallMethodDef CallEntries[] = {
-    {"_obadiah_DrawsFromSpread", (DL_FUNC) &_obadiah_DrawsFromSpread, 4},
+    {"_obadiah_CalculateTradingPeriod", (DL_FUNC) &_obadiah_CalculateTradingPeriod, 2},
+    {"_obadiah_DiscoverPositions", (DL_FUNC) &_obadiah_DiscoverPositions, 3},
     {"_obadiah_spread_from_depth", (DL_FUNC) &_obadiah_spread_from_depth, 4},
-    {"_obadiah_draws_from_spread", (DL_FUNC) &_obadiah_draws_from_spread, 4},
     {"run_testthat_tests", (DL_FUNC) &run_testthat_tests, 0},
     {NULL, NULL, 0}
 };

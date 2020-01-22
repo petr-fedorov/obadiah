@@ -20,43 +20,29 @@
 #include "log.h"
 
 namespace obadiah {
-TradingStrategy::TradingStrategy(TradingPeriod* period, double phi, double rho)
+TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
+                                 double rho)
     : rho_(rho),
       phi_(phi),
+      is_all_processed_(false),
       trading_period_(period),
       sl_(0, 0),
       el_(0, 0),
       ss_(0, 0),
       es_(0, 0) {
- if (trading_period_->IsNextAvailable()) {
-  Spread c = trading_period_->next();
-
-  sl_.p = c.a;
+ BidAskSpread c;
+ if (*trading_period_ >> c) {
+  sl_.p = c.p_ask;
   sl_.t = c.t;
 
-  ss_.p = c.b;
+  ss_.p = c.p_bid;
   ss_.t = c.t;
  }
 };
 
 std::ostream&
-operator<<(std::ostream& stream, Spread& p) {
- using namespace std::chrono;
- duration<double> d(p.t);
- std::time_t t = d.count();
- stream << "t: " << std::put_time(std::localtime(&t), "%T") << "."
-        << duration_cast<microseconds>(d).count() % 1000000 << " b: " << p.b
-        << " a: " << p.a;
- return stream;
-}
-
-std::ostream&
 operator<<(std::ostream& stream, InstantPrice& price) {
- using namespace std::chrono;
- duration<double> d(price.t);
- std::time_t t = d.count();
- stream << "t: " << std::put_time(std::localtime(&t), "%T") << "."
-        << duration_cast<microseconds>(d).count() % 1000000
+ stream << "t: " << static_cast<char *>(price.t)
         << " p: " << price.p;
  return stream;
 };
@@ -67,12 +53,14 @@ operator<<(std::ostream& stream, Position& position) {
  return stream;
 };
 
-Position
-TradingStrategy::DiscoverNextPosition() {
- while (trading_period_->IsNextAvailable()) {
-  Spread c = trading_period_->next();
-  InstantPrice bid(c.b, c.t);
-  InstantPrice ask(c.a, c.t);
+TradingStrategy::operator bool() { return !is_all_processed_; }
+
+ObjectStream<Position>&
+TradingStrategy::operator>>(Position& p) {
+ BidAskSpread c;
+ while (*trading_period_ >> c) {
+  InstantPrice bid(c.p_bid, c.t);
+  InstantPrice ask(c.p_ask, c.t);
 
   if (!el_.p && !es_.p) {  // No position discovered yet
    if (bid - sl_ > Interest(bid, sl_) + Commission()) {
@@ -122,7 +110,8 @@ TradingStrategy::DiscoverNextPosition() {
 #ifndef NDEBUG
      L_(ldebug3) << "L* sl_: " << sl_ << " el_:" << el_;
 #endif
-     Position p(sl_, el_);
+     p.s = sl_;
+     p.e = el_;
      es_ = ask;
      sl_ = ask;
 
@@ -130,19 +119,22 @@ TradingStrategy::DiscoverNextPosition() {
 #ifndef NDEBUG
      L_(ldebug3) << "S(L) ss_:" << ss_ << " es_(sl_):" << es_;
 #endif
-     return p;
-    } else {  // Could we close the previous long and start a new one?
-     if (el_ - ask > Commission() - Interest(ask, el_)) {
+     return *this;
+    } else {  // Could we close the previous long and start a new one
+              // profitably?
+     if (Interest(ask, el_) > Commission() - (el_ - ask)) {
       assert(es_.p == 0);
 #ifndef NDEBUG
       L_(ldebug3) << "L* sl_: " << sl_ << " el_:" << el_ << " ask: " << ask
-                  << " el_ - ask: " << el_ - ask
-                  << " Comm() - Int(): " << Commission() - Interest(ask, el_);
+                  << " Interest(): " << Interest(ask, el_)
+                  << " Commission - (el_ - ask): "
+                  << Commission() - (el_ - ask);
 #endif
-      Position p(sl_, el_);
+      p.s = sl_;
+      p.e = el_;
       sl_ = ask;
       el_.p = 0;
-      return p;
+      return *this;
      }
     }
    }
@@ -165,7 +157,8 @@ TradingStrategy::DiscoverNextPosition() {
 #ifndef NDEBUG
      L_(ldebug3) << "S* ss_: " << ss_ << " es_:" << es_;
 #endif
-     Position p(ss_, es_);
+     p.s = ss_;
+     p.e = es_;
      el_ = bid;
      ss_ = bid;
 
@@ -173,45 +166,48 @@ TradingStrategy::DiscoverNextPosition() {
 #ifndef NDEBUG
      L_(ldebug3) << "L(S) " << sl_ << " " << el_;
 #endif
-     return p;
-    } else {  // Could we close the previous short and start a new one?
-#ifndef NDEBUG
-//      L_(ldebug3) << "S es_: " << es_ << " bid: " << bid
-//                  << " Cms() - Int(): " << Commission() - Interest(bid, es_);
-#endif
-     if (bid - es_ > Commission() - Interest(bid, es_)) {
+     return *this;
+    } else {  // Could we close the previous short and start a new one
+              // profitably?
+
+     if (Interest(bid, es_) > Commission() - (bid - es_)) {
       assert(el_.p == 0);
 #ifndef NDEBUG
       L_(ldebug3) << "S* ss_: " << ss_ << " es_:" << es_
-                  << " es_ - bid: " << bid - es_
-                  << " Comm() - Int(): " << Commission() - Interest(bid, es_);
+                  << " Interest(): " << Interest(bid, es_)
+                  << " Commission - (bid - es_): "
+                  << Commission() - (bid - es_);
 #endif
-      Position p(ss_, es_);
+      p.s = ss_;
+      p.e = es_;
       ss_ = bid;
       es_.p = 0;
-      return p;
+      return *this;
      }
     }
    }
   }
  }
- if (!el_.p && !es_.p)  // No position discovered yet
-  throw NoPositionDiscovered();
- else {
+ if (!el_.p && !es_.p) {  // No position discovered yet
+  is_all_processed_ = true;
+  return *this;
+ } else {
   if (el_.p) {
 #ifndef NDEBUG
    L_(ldebug3) << "L* sl_: " << sl_ << " el_:" << el_;
 #endif
-   Position p(sl_, el_);
+   p.s = sl_;
+   p.e = el_;
    el_.p = 0;
-   return p;
+   return *this;
   } else {
 #ifndef NDEBUG
    L_(ldebug3) << "S* ss_: " << ss_ << " es_:" << es_;
 #endif
-   Position p(ss_, es_);
+   p.s = ss_;
+   p.e = es_;
    es_.p = 0;
-   return p;
+   return *this;
   }
  }
 }

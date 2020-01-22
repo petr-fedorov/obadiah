@@ -692,213 +692,6 @@ export <- function(con, start.time, end.time, exchange, pair, file = "events.csv
 }
 
 
-#' Calculates draws from a time series of spread changes
-#'
-#' There are several types of draws to be calculated
-#'
-#'
-#' @export
-draws <- function(x, price.source=c('mid-price', 'bid', 'ask'), draw.type=c("T1", "T2", "T3"), tz='UTC', ...) {
-  draw.type <- match.arg(draw.type)
-  s <-list()
-  class(s) <- paste(class(x), draw.type, sep=".")
-  UseMethod("draws", s)
-}
-
-
-#' @rdname draws
-#' @export
-draws.data.table.T1 <- function(spread.changes, price.source='mid-price', draw.type="T1", tz="UTC",  gamma_0, theta ) {
-
-  calculate <- function(timestamp, price) draws_from_spread(timestamp, price, gamma_0, theta)
-
-  if('pair' %in% colnames(spread.changes))
-    result <- spread.changes[, calculate(timestamp,
-                                         switch(price.source,
-                                                "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                "bid"=best.bid.price,
-                                                "ask"=best.ask.price
-                                         )), by=.(pair, exchange) ]
-
-  else {
-    result <- spread.changes[, calculate(timestamp,
-                                         switch(price.source,
-                                                "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                "bid"=best.bid.price,
-                                                "ask"=best.ask.price
-                                         )),]
-    setDT(result)
-  }
-  cols <- c("draw.start", "draw.end")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
-  result
-}
-
-
-
-#' @rdname draws
-#' @description Type T2 draws calculates draws as follows.
-#' @details For T2 draws, \code{min.draw} is a minimal price change when a draw becomes an unlimited duration draw. If not achieved before \code{duration}, the draw is terminated and the new one is started.
-#' \code{tolerance} provides an initial value of the effective tolerance. When the price moves in the opposite direction from the latest draw's extrema exceedes the effective tolerance,
-#' the curren draw is terminated at the extrema and the new draw is started from the extrema. The effective tolerance changes from the initial tolerance till zero as draw size increases till \code{max.draw}
-#'
-#' @param spread.changes spread.changes produced
-#' @param min.draw an approximate minimum draw size
-#' @param duration a draw duration in seconds
-#' @param tolerance a maximum value of the price change in the opposite direction which does not terminate the current draw
-#' @param max.draw an approximate maximum draw size
-#' @method draws data.table.T2
-#' @export
-draws.data.table.T2 <- function(spread.changes, price.source='mid-price', draw.type="T2", tz,  min.draw, duration, tolerance, max.draw) {
-
-#  gamma_0=NULL, theta=NULL, min.draw.size=NULL, max.draw.duration=NULL
-  #draw.size.tolerance=NULL, price.change.threshold=NULL
-
-  calculate <- function(timestamp, price) DrawsFromSpread(timestamp, price, 2,  list(min.draw=min.draw, duration=duration, tolerance=tolerance, max.draw=max.draw))
-
-  if('pair' %in% colnames(spread.changes))
-      result <- spread.changes[, calculate(timestamp,
-                                                   switch(price.source,
-                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                          "bid"=best.bid.price,
-                                                          "ask"=best.ask.price
-                                                   )), by=.(pair, exchange) ]
-
-  else {
-      result <- spread.changes[, calculate(timestamp,
-                                                   switch(price.source,
-                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                          "bid"=best.bid.price,
-                                                          "ask"=best.ask.price
-                                                   )),]
-    setDT(result)
-  }
-  cols <- c("draw.start", "draw.end")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
-  result
-}
-
-
-
-
-#' @export
-draws.data.table.T3 <- function(spread.changes, price.source='mid-price', draw.type="T2", tz,  transaction.costs, discount.rate) {
-
-  calculate <- function(timestamp, price) DrawsFromSpread(timestamp, price, 3,  list(transaction.costs=transaction.costs, discount.rate=discount.rate))
-
-  if('pair' %in% colnames(spread.changes))
-    result <- spread.changes[, calculate(timestamp,
-                                         switch(price.source,
-                                                "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                "bid"=best.bid.price,
-                                                "ask"=best.ask.price
-                                         )), by=.(pair, exchange) ]
-
-  else {
-    result <- spread.changes[, calculate(timestamp,
-                                         switch(price.source,
-                                                "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                "bid"=best.bid.price,
-                                                "ask"=best.ask.price
-                                         )),]
-    setDT(result)
-  }
-  cols <- c("draw.start", "draw.end")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
-  result
-}
-
-
-
-#' @rdname draws
-#' @param con a connection object as returned by \code{\link{connect}}
-#' @export
-draws.connection.T1 <- function(con, price.source='mid-price', draw.type="T1",tz='UTC', start.time, end.time, exchanges, pairs, gamma_0, theta=0, frequency=NULL, skip.crossed=TRUE) {
-
-  conn=con$con()
-
-  if(is.character(start.time)) start.time <- ymd_hms(start.time)
-  if(is.character(end.time)) end.time <- ymd_hms(end.time)
-
-  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
-  stopifnot(is.null(frequency) || is.numeric(frequency))
-  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
-
-  if(is.null(frequency))
-    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", paste0("c(", paste0(shQuote(exchanges), collapse=","),")"), ", ", paste0("c(", paste0(shQuote(pairs), collapse=","),")"),")" ), name=packageName())
-  else
-    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", paste0("c(", paste0(shQuote(exchanges), collapse=","),")"), ", ", paste0("c(", paste0(shQuote(pairs), collapse=","),")"), ",", frequency, ")" ), name=packageName())
-
-  tzone <- tz
-
-  # Convert to UTC, so internally only UTC is used
-  start.time <- with_tz(start.time, tz='UTC')
-  end.time <- with_tz(end.time, tz='UTC')
-
-
-  result <- rbindlist(lapply(
-    do.call(c,
-            lapply(exchanges,
-                   function(e) {
-                     lapply(pairs, function(p) list(exchange=e, pair=p) )
-                   }
-                   )
-            ),
-    function(i) {
-      draws <- .draws(conn, start.time, end.time,  i$exchange, i$pair, gamma_0, theta, price.source, frequency, skip.crossed)
-      if(nrow(draws) > 0) {
-        draws[, c("draw.start","draw.end","pair", "exchange") := .( with_tz(draw.start, tzone), with_tz(draw.end, tzone), ..i$pair, ..i$exchange)]
-      }
-      draws
-    }
-    )
-  )
-  setcolorder(result, c("draw.start","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
-  result
-}
-
-.draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, price.source, frequency = NULL, skip.crossed=TRUE) {
-
-  if(is.null(frequency))
-    query <- paste0(" select timestamp as \"draw.start\", \"draw.end\", \"start.price\",",
-                    "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
-                    shQuote(format(start.time, usetz=T)), ",",
-                    shQuote(format(end.time, usetz=T)), ",",
-                    shQuote(price.source), ",",
-                    "get.pair_id(",shQuote(pair),"), " ,
-                    "get.exchange_id(", shQuote(exchange), ") , ",
-                    "p_gamma_0 := ", gamma_0, ",",
-                    "p_theta := ",  theta, ",",
-                    "p_skip_crossed :=", skip.crossed,
-                    ") order by 1")
-  else
-    query <- paste0(" select \"timestamp\" as \"draw.start\", \"draw.end\", \"start.price\",",
-                    "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
-                    shQuote(format(start.time, usetz=T)), ",",
-                    shQuote(format(end.time, usetz=T)), ",",
-                    shQuote(price.source), ",",
-                    "get.pair_id(",shQuote(pair),"), " ,
-                    "get.exchange_id(", shQuote(exchange), "),",
-                    "p_gamma_0 := ", gamma_0, ",",
-                    "p_theta := ",  theta, ",",
-                    "p_frequency :=", shQuote(paste0(frequency, " seconds ")), ", " ,
-                    "p_skip_crossed :=", skip.crossed,
-                    ") order by 1")
-  flog.debug(query, name=packageName())
-  draws <- DBI::dbGetQuery(conn, query)
-  setDT(draws)
-
-  if(nrow(draws) > 0) {
-    draws[, c("draw.start", "draw.end") := .(as.POSIXct(draw.start/1000000.0, origin="2000-01-01"),
-                                        as.POSIXct(draw.end/1000000.0, origin="2000-01-01")) ]
-  }
-  draws
-}
-
-
 #' @export
 intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair = NULL, tz='UTC') {
   conn=con$con()
@@ -966,4 +759,49 @@ intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair
     intervals
   } )
 
+}
+
+
+
+
+#' @export
+trading.period <- function(x, ...) {
+  UseMethod("trading.period",x)
+}
+
+#' @export
+trading.period.data.table <- function(depth_changes, volume, tz="UTC") {
+  result <- CalculateTradingPeriod(depth_changes, volume)
+  setDT(result)
+  cols <- c("timestamp")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result
+}
+
+
+
+
+#' Calculates the maximum profit trading strategy for the given time series of spreads
+#'
+#' The maximum profit
+#'
+#'
+#' @export
+trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), tz="UTC") {
+  mode <- match.arg(mode)
+
+  if( mode == "bid-ask")
+    result <- DiscoverPositions(trading.period, phi, rho)
+  else {
+    mid.price <- (trading.period$best.bid.price + trading.period$best.ask.price)/2
+    result <- DiscoverPositions(trading.period, phi, rho)
+  }
+
+  setDT(result)
+  cols <- c("opened.at", "closed.at")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
+  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
+  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
+  result
 }
