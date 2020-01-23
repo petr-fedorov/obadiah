@@ -654,8 +654,7 @@ ALTER FUNCTION bitfinex.match_price_and_sum_of_fill_exact(p_start_time timestamp
 
 CREATE FUNCTION bitfinex.pga_capture_transient(p_pair text, p_delay interval DEFAULT '00:02:00'::interval, p_max_interval interval DEFAULT '04:00:00'::interval) RETURNS integer
     LANGUAGE plpgsql
-    AS $$
-declare
+    AS $$declare
 	v_events_start timestamptz;
 	v_events_end timestamptz;
 	v_trades_end timestamptz;
@@ -734,7 +733,7 @@ begin
 		raise debug 'updated v_events_end to % (p_max_interval is exceeded)', v_events_end;
 	end if;	
 	perform bitfinex.capture_transient_raw_book_events(v_events_start, v_events_end, p_pair);
-	perform obanalytics.fix_crossed_books(v_events_start, v_events_end, v_pair_id, v_exchange_id);
+	-- perform obanalytics.fix_crossed_books(v_events_start, v_events_end, v_pair_id, v_exchange_id);
 	return 0;
 end;
 $$;

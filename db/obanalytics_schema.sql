@@ -1060,6 +1060,56 @@ $$;
 ALTER FUNCTION obanalytics._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
+-- Name: _recreate_level3_triggers(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._recreate_level3_triggers() RETURNS void
+    LANGUAGE sql
+    AS $$
+-- NOTE: This function is a workaround for https://www.postgresql.org/message-id/6b3f0646-ba8c-b3a9-c62d-1c6651a1920f%40phystech.edu
+-- 		 Need to be run after addition of a new partition table to the  obanalytics.level3 hierarchy
+
+lock obanalytics.level3 in share row exclusive mode;
+
+-- obanalytics.level3
+
+DROP TRIGGER check_microtimestamp_change ON obanalytics.level3;
+CREATE CONSTRAINT TRIGGER check_microtimestamp_change
+    AFTER UPDATE OF microtimestamp
+    ON obanalytics.level3
+    DEFERRABLE INITIALLY DEFERRED    FOR EACH ROW
+    EXECUTE PROCEDURE obanalytics.check_microtimestamp_change();
+
+DROP TRIGGER propagate_microtimestamp_change ON obanalytics.level3;
+CREATE TRIGGER propagate_microtimestamp_change
+    AFTER UPDATE OF microtimestamp
+    ON obanalytics.level3
+    FOR EACH ROW
+    WHEN ((old.exchange_id = 2))
+    EXECUTE PROCEDURE obanalytics.propagate_microtimestamp_change();
+	
+DROP TRIGGER update_chain_after_delete ON obanalytics.level3;	
+CREATE TRIGGER update_chain_after_delete
+    AFTER DELETE
+    ON obanalytics.level3
+    FOR EACH ROW
+    EXECUTE PROCEDURE obanalytics.level3_update_chain_after_delete();
+	
+-- obanalytics.level3_bitstamp
+
+DROP TRIGGER check_after_insert ON obanalytics.level3_bitstamp;	
+CREATE TRIGGER check_after_insert
+    AFTER INSERT
+    ON obanalytics.level3_bitstamp
+    FOR EACH ROW
+    EXECUTE PROCEDURE obanalytics.level3_bitstamp_check_after_insert();
+
+$$;
+
+
+ALTER FUNCTION obanalytics._recreate_level3_triggers() OWNER TO "ob-analytics";
+
+--
 -- Name: _spread_from_depth(obanalytics.level2[]); Type: FUNCTION; Schema: obanalytics; Owner: postgres
 --
 

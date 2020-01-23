@@ -71,6 +71,12 @@ CREATE FUNCTION parameters.max_microtimestamp_change(p_pair_id integer, p_exchan
  case 
  	when p_pair_id = 6 and p_exchange_id = 2 then
 		return 22; -- Bitstamp 4435127512 BTCEUR 2019-12-10 00:05:16.121599+03
+	when p_pair_id = 4 and p_exchange_id = 2 then
+	   return 45; -- Bitstamp 4574784906  2020-01-16 06:22:12.063079+03
+	when p_pair_id = 2 and p_exchange_id = 2 then
+	   return 20; -- Bitstamp 4579473224 2020-01-17 06:13:17.439674+03
+	when p_pair_id = 1 and p_exchange_id = 2 then
+	   return 23; -- Bitstamp 4579480432 2020-01-17 06:16:24.075482+03
 	else
 		return 5;
  end case;
