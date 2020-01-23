@@ -530,7 +530,7 @@ CREATE FUNCTION bitstamp.check_microtimestamp_change() RETURNS trigger
     AS $$ 
 BEGIN
 
-	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change() then	
+	if abs(extract(epoch from new.microtimestamp - old.microtimestamp)) > parameters.max_microtimestamp_change(new.pair_id, 2) then	
 		raise exception 'An attempt to move % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, new.microtimestamp;
 	end if;
 	return null;
@@ -1649,8 +1649,7 @@ COMMENT ON FUNCTION bitstamp.pga_capture_transient(p_pair text) IS 'This functio
 CREATE FUNCTION bitstamp.pga_cleanse(p_pair text DEFAULT 'BTCUSD'::text, p_ts_within_era timestamp with time zone DEFAULT NULL::timestamp with time zone) RETURNS SETOF bitstamp.live_orders
     LANGUAGE plpgsql
     SET work_mem TO '4GB'
-    AS $$
-declare 
+    AS $$declare 
 	v_current_timestamp timestamptz;
 	v_start timestamptz;
 	v_end timestamptz;
@@ -1662,11 +1661,11 @@ declare
 begin 
 	v_current_timestamp := current_timestamp;
 	
-	select pair_id into v_pair_id
+	select pair_id into strict v_pair_id
 	from bitstamp.pairs 
 	where pair = p_pair;
 	
-	select era_starts, era_ends into v_start, v_end
+	select era_starts, era_ends into strict v_start, v_end
 	from (
 		select era as era_starts,
 				coalesce(lead(era) over (order by era), 'infinity'::timestamptz) - '00:00:00.000001'::interval as era_ends
@@ -1676,6 +1675,8 @@ begin
 	where coalesce(p_ts_within_era,  ( select max(era) 
 										 from bitstamp.live_orders_eras 
 										 where pair_id = v_pair_id ) ) between era_starts and era_ends;
+										 
+	raise debug 'v_start=%, v_end=%', v_start, v_end;
 
 	return query select * from bitstamp.find_and_repair_missing_fill(v_start, p_pair);																	   
 	return query select * from bitstamp.fix_aggressor_creation_order(v_start, v_end, v_pair_id);

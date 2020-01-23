@@ -1060,6 +1060,56 @@ $$;
 ALTER FUNCTION obanalytics._periods_within_eras(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
+-- Name: _recreate_level3_triggers(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics._recreate_level3_triggers() RETURNS void
+    LANGUAGE sql
+    AS $$
+-- NOTE: This function is a workaround for https://www.postgresql.org/message-id/6b3f0646-ba8c-b3a9-c62d-1c6651a1920f%40phystech.edu
+-- 		 Need to be run after addition of a new partition table to the  obanalytics.level3 hierarchy
+
+lock obanalytics.level3 in share row exclusive mode;
+
+-- obanalytics.level3
+
+DROP TRIGGER check_microtimestamp_change ON obanalytics.level3;
+CREATE CONSTRAINT TRIGGER check_microtimestamp_change
+    AFTER UPDATE OF microtimestamp
+    ON obanalytics.level3
+    DEFERRABLE INITIALLY DEFERRED    FOR EACH ROW
+    EXECUTE PROCEDURE obanalytics.check_microtimestamp_change();
+
+DROP TRIGGER propagate_microtimestamp_change ON obanalytics.level3;
+CREATE TRIGGER propagate_microtimestamp_change
+    AFTER UPDATE OF microtimestamp
+    ON obanalytics.level3
+    FOR EACH ROW
+    WHEN ((old.exchange_id = 2))
+    EXECUTE PROCEDURE obanalytics.propagate_microtimestamp_change();
+	
+DROP TRIGGER update_chain_after_delete ON obanalytics.level3;	
+CREATE TRIGGER update_chain_after_delete
+    AFTER DELETE
+    ON obanalytics.level3
+    FOR EACH ROW
+    EXECUTE PROCEDURE obanalytics.level3_update_chain_after_delete();
+	
+-- obanalytics.level3_bitstamp
+
+DROP TRIGGER check_after_insert ON obanalytics.level3_bitstamp;	
+CREATE TRIGGER check_after_insert
+    AFTER INSERT
+    ON obanalytics.level3_bitstamp
+    FOR EACH ROW
+    EXECUTE PROCEDURE obanalytics.level3_bitstamp_check_after_insert();
+
+$$;
+
+
+ALTER FUNCTION obanalytics._recreate_level3_triggers() OWNER TO "ob-analytics";
+
+--
 -- Name: _spread_from_depth(obanalytics.level2[]); Type: FUNCTION; Schema: obanalytics; Owner: postgres
 --
 
@@ -1165,7 +1215,7 @@ CREATE FUNCTION obanalytics.check_microtimestamp_change() RETURNS trigger
     LANGUAGE plpgsql
     AS $$ 
 BEGIN
-	if  new.microtimestamp > old.microtimestamp + make_interval(secs := parameters.max_microtimestamp_change()) or
+	if  new.microtimestamp > old.microtimestamp + make_interval(secs := parameters.max_microtimestamp_change(old.pair_id, old.exchange_id)) or
 		new.microtimestamp < old.microtimestamp then	
 		raise exception 'An attempt to move % % % % % to % is blocked', old.microtimestamp, old.order_id, old.event_no, old.pair_id, old.exchange_id, new.microtimestamp;
 	end if;
@@ -1183,18 +1233,23 @@ ALTER FUNCTION obanalytics.check_microtimestamp_change() OWNER TO "ob-analytics"
 --
 
 CREATE FUNCTION obanalytics.crossed_books(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS TABLE(previous_uncrossed timestamp with time zone, first_crossed timestamp with time zone, next_uncrossed timestamp with time zone, pair_id smallint, exchange_id smallint)
-    LANGUAGE sql STABLE
+    LANGUAGE sql
     AS $$
 
 
-
-with spread_periods as (
+with level1 as (
+	select coalesce(best_bid_price, best_ask_price) as best_bid_price,
+			coalesce(best_ask_price, best_bid_price) as best_ask_price,
+			microtimestamp
+	from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id)
+),
+spread_periods as (
 	select min(microtimestamp) as period_start, max(microtimestamp) as period_end, g % 2 = 1 as crossed
 	from (
 		select *, sum(t) over (order by microtimestamp) as g
 		from (
 			select * , coalesce(not ((lag(best_bid_price) over(order by microtimestamp) > lag(best_ask_price ) over (order by microtimestamp)) = (best_bid_price > best_ask_price)),best_bid_price > best_ask_price)::integer as t
-			from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id)
+			from level1
 		) a
 	) a
 	group by g
@@ -1208,7 +1263,7 @@ spread_periods_chain as (
 select previous_end, period_start, next_start, p_pair_id::smallint, p_exchange_id::smallint
 from spread_periods_chain
 where crossed 
-  and previous_end < p_end_time
+  and coalesce(previous_end, period_start) < p_end_time
 ;  
 $$;
 
@@ -1267,6 +1322,31 @@ $$;
 ALTER FUNCTION obanalytics.depth_change_by_episode_slow(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_check_takers boolean) OWNER TO "ob-analytics";
 
 --
+-- Name: fix_crossed_books(timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.fix_crossed_books(p_ts_within_era timestamp with time zone, p_pair_id integer, p_exchange_id integer) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_era_start timestamptz;
+	v_era_end timestamptz;
+begin
+
+	select era, level3 into strict v_era_start, v_era_end
+	from obanalytics.level3_eras
+	where p_ts_within_era between era and level3
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id;
+	return query
+	select * from obanalytics.fix_crossed_books(v_era_start, v_era_end, p_pair_id, p_exchange_id);
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.fix_crossed_books(p_ts_within_era timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
 -- Name: fix_crossed_books(timestamp with time zone, timestamp with time zone, integer, integer); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1281,88 +1361,107 @@ declare
 	v_current_timestamp timestamptz;
 	v_something_was_fixed boolean default true;
 	v_crossed timestamptz;
+	v_start timestamptz;
+	v_end timestamptz;
+	v_processing_interval interval default '30 minutes';
 	
 begin 
 	v_current_timestamp := clock_timestamp();
 	raise debug 'Started fix_crossed_books(%, %, %, %)', p_start_time, p_end_time, p_pair_id, p_exchange_id;
 	v_crossed := p_start_time;
+	v_start := p_start_time;
+	v_end := p_start_time + v_processing_interval;
 	
-	while (v_something_was_fixed) loop
-		v_something_was_fixed := false;
-		
-		for v_crossed in select first_crossed from obanalytics.crossed_books(v_crossed, p_end_time, p_pair_id, p_exchange_id) loop
-																			 
-			-- Fix eternal crossed orders, which should have been removed by an exchange, but weren't for some reasons
-			return query 
-				insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
-				select distinct on (microtimestamp, order_id)  ts, order_id, 
-						null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
-						side, price, amount, fill, '-infinity',
-						null as next_event_no,
-						pair_id, exchange_id, null as local_timestamp,
-						null as price_microtimestamp, 
-						null as price_event_no
-				from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false) 
-					  join unnest(ob) as ob on true
-				where is_crossed and next_microtimestamp = 'infinity'
-				returning level3.*;
-																			 
-			if found then 
-				v_something_was_fixed := true;
-				raise debug 'Fixed eternal crossed orders - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
-				exit;
-			end if;
+	if v_end > p_end_time then
+		v_end := p_end_time;
+	end if;
+	
+	while v_end <= p_end_time and v_crossed < p_end_time loop
+		raise debug 'Processing period: % - % ', v_crossed, v_end;
+		while (v_something_was_fixed) loop
+			v_something_was_fixed := false;
 
-			-- Fix eternal takers, which should have been removed by an exchange, but weren't for some reasons
-			return query 
-				insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
-				select distinct on (microtimestamp, order_id)  ts, order_id, 
-						null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
-						side, price, amount, fill, '-infinity',
-						null as next_event_no,
-						pair_id, exchange_id, null as local_timestamp,
-						null as price_microtimestamp, 
-						null as price_event_no
-				from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false) 
-					  join unnest(ob) as ob on true
-				where not is_maker and next_microtimestamp = 'infinity'
-				returning level3.*;
+			for v_crossed in select first_crossed from obanalytics.crossed_books(v_crossed, v_end, p_pair_id, p_exchange_id) loop
 
-			if found then 
-				v_something_was_fixed := true;
-				raise debug 'Fixed eternal takers  - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
-				exit;
-			end if;
-			
-			
-			-- Merge crossed books to the next taker's event if it is exists (i.e. next_microtimestamp is not -infinity)
-			return query 		
-				with takers as (
-					select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, next_microtimestamp, next_event_no
-					from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false)
+				-- Fix eternal takers, which should have been removed by an exchange, but weren't for some reasons
+				return query 
+					insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
+					select distinct on (microtimestamp, order_id)  ts, order_id, 
+							null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
+							side, price, amount, fill, '-infinity',
+							null as next_event_no,
+							pair_id, exchange_id, null as local_timestamp,
+							null as price_microtimestamp, 
+							null as price_event_no
+					from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false) 
 						  join unnest(ob) as ob on true
-					where not is_maker
-					  and next_microtimestamp > '-infinity'
-					  and next_microtimestamp <= microtimestamp + make_interval(secs := parameters.max_microtimestamp_change())
-				),
-				merge_intervals as (	-- there may be several takers, so first we need to understand which episodes to merge. 
-					select v_crossed as microtimestamp, max(next_microtimestamp) as next_microtimestamp 
-					from takers
-				)
-				select merge_episodes.*
-				from merge_intervals join obanalytics.merge_episodes(microtimestamp, next_microtimestamp, p_pair_id, p_exchange_id) on true;
-																			 
-			if found then 
-				v_something_was_fixed := true;
-				raise debug 'Merged crossed books to the next taker event - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
-				exit;
-			end if;
-			
+					where not is_maker and next_microtimestamp = 'infinity'
+					returning level3.*;
+
+				if found then 
+					v_something_was_fixed := true;
+					raise debug 'Fixed eternal takers  - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
+					exit;
+				end if;
+
+
+				-- Merge crossed books to the next taker's event if it is exists (i.e. next_microtimestamp is not -infinity)
+				return query 		
+					with takers as (
+						select distinct  on (microtimestamp, order_id, event_no) microtimestamp, order_id, next_microtimestamp, next_event_no
+						from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false)
+							  join unnest(ob) as ob on true
+						where not is_maker
+						  and next_microtimestamp > '-infinity'
+						  and next_microtimestamp <= microtimestamp + make_interval(secs := parameters.max_microtimestamp_change(p_pair_id, p_exchange_id))
+					),
+					merge_intervals as (	-- there may be several takers, so first we need to understand which episodes to merge. 
+						select v_crossed as microtimestamp, max(next_microtimestamp) as next_microtimestamp 
+						from takers
+					)
+					select merge_episodes.*
+					from merge_intervals join obanalytics.merge_episodes(microtimestamp, next_microtimestamp, p_pair_id, p_exchange_id) on true;
+
+				if found then 
+					v_something_was_fixed := true;
+					raise debug 'Merged crossed books to the next taker event - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
+					exit;
+				end if;
+				
+				-- Fix eternal crossed orders, which should have been removed by an exchange, but weren't for some reasons
+				-- Note that we do not check amounts here. Taker could have small amount to remove all makers 
+				
+				return query 
+					insert into obanalytics.level3 (microtimestamp, order_id, event_no, side, price, amount, fill, next_microtimestamp, next_event_no, pair_id, exchange_id, local_timestamp, price_microtimestamp, price_event_no)
+					select distinct on (microtimestamp, order_id)  ts, order_id, 
+							null as event_no, -- null here (as well as any null below) should case before row trigger to fire and to update the previous event 
+							side, price, amount, fill, '-infinity',
+							null as next_event_no,
+							pair_id, exchange_id, null as local_timestamp,
+							null as price_microtimestamp, 
+							null as price_event_no
+					from obanalytics.order_book(v_crossed, p_pair_id, p_exchange_id, false, false, false) 
+						  join unnest(ob) as ob on true
+					where is_crossed and next_microtimestamp = 'infinity'
+					returning level3.*; 
+
+				if found then 
+					v_something_was_fixed := true;
+					raise debug 'Fixed eternal crossed orders - fix_crossed_books(%, %, %)', v_crossed, p_pair_id, p_exchange_id;
+					exit;
+				end if;
+			end loop;
 		end loop;
-	end loop;
-																			 
-	-- Finally, try to merge remaining episodes producing crossed order books
-	return query select * from obanalytics.merge_crossed_books(p_start_time, p_end_time, p_pair_id, p_exchange_id); 
+		-- Finally, try to merge remaining episodes producing crossed order books
+		return query select * from obanalytics.merge_crossed_books(v_start, v_end, p_pair_id, p_exchange_id); 
+		v_crossed := v_end;
+		v_start := v_end;
+		v_something_was_fixed := true;
+		v_end := v_end +  v_processing_interval;
+		if v_end > p_end_time then
+			v_end := p_end_time;
+		end if;
+	end loop;																			 
 	raise debug 'fix_crossed_books() exec time: %', clock_timestamp() - v_current_timestamp;
 	return;
 end;
@@ -1617,6 +1716,54 @@ $$;
 ALTER FUNCTION obanalytics.level2_continuous(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval) OWNER TO "ob-analytics";
 
 --
+-- Name: level3_bitstamp_check_after_insert(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.level3_bitstamp_check_after_insert() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$declare
+	v_era_start timestamptz;
+	v_era_end timestamptz;
+	
+	v_microtimestamp timestamptz;
+	v_order_id bigint;
+	v_event_no integer;
+	
+begin
+	
+	select max(era) into v_era_start
+	from obanalytics.level3_eras
+	where pair_id = new.pair_id
+	  and exchange_id = new.exchange_id
+	  and era <= new.microtimestamp;
+	  
+	select coalesce(min(era) - '1 microsecond'::interval, 'infinity') into v_era_end
+	from obanalytics.level3_eras
+	where pair_id = new.pair_id
+	  and exchange_id = new.exchange_id
+	  and era > new.microtimestamp;
+	  
+	select microtimestamp, order_id, event_no into v_microtimestamp, v_order_id, v_event_no
+	from obanalytics.level3
+	where microtimestamp between v_era_start and v_era_end
+   	  and pair_id = new.pair_id
+	  and exchange_id = new.exchange_id
+	  and order_id = new.order_id
+	  and new.microtimestamp > microtimestamp 
+	  and new.microtimestamp < next_microtimestamp
+	limit 1;
+	
+	if found then 
+		raise exception 'New % % % % % overlaps with % % %', new.microtimestamp, new.order_id, new.event_no, new.pair_id, new.exchange_id, v_microtimestamp, v_order_id, v_event_no;
+	end if;
+	return null;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.level3_bitstamp_check_after_insert() OWNER TO "ob-analytics";
+
+--
 -- Name: level3_eras_delete(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -1664,21 +1811,20 @@ ALTER FUNCTION obanalytics.level3_eras_delete() OWNER TO "ob-analytics";
 
 CREATE FUNCTION obanalytics.level3_incorporate_new_event() RETURNS trigger
     LANGUAGE plpgsql
-    AS $$
-
-declare
+    AS $$declare
 	v_era timestamptz;
 	v_amount numeric;
 	
 	v_event obanalytics.level3;
 	
 begin
-	  
+
 	if new.price_microtimestamp is null or new.event_no is null then 
 		raise debug 'Will process  %, %', new.microtimestamp, new.order_id;
 	-- The values of the above two columns depend on the previous event for the order_id if any and are mandatory (not null). 
 	-- They have to be set by either an inserter of the record (more effective) or by this trigger
 		begin
+		
 			select max(era) into v_era
 			from obanalytics.level3_eras
 			where pair_id = new.pair_id
@@ -1748,8 +1894,7 @@ ALTER FUNCTION obanalytics.level3_incorporate_new_event() OWNER TO "ob-analytics
 
 CREATE FUNCTION obanalytics.level3_update_chain_after_delete() RETURNS trigger
     LANGUAGE plpgsql
-    AS $$
-begin 
+    AS $$begin 
 	-- update previous event, if any
 	
 	if old.event_no > 1 then
@@ -1765,7 +1910,8 @@ begin
 									  	   and pair_id = old.pair_id
 									       and era <= old.microtimestamp ) and old.microtimestamp
 		  and order_id = old.order_id										   
-		  and event_no = old.event_no - 1;
+		  and next_microtimestamp = old.microtimestamp
+		  and next_event_no = old.event_no;
 	 		
 	end if;
 	
@@ -1837,7 +1983,7 @@ begin
 		if crossed_books.next_uncrossed is null then 
 			raise exception 'Unable to find next uncrossed order book:  previous_uncrossed=%, pair_id=%, exchange_id=%', crossed_books.previous_uncrossed, p_pair_id, p_exchange_id;
 		end if;
-		if crossed_books.first_crossed +  make_interval(secs := parameters.max_microtimestamp_change()) >= crossed_books.next_uncrossed then
+		if crossed_books.first_crossed +  make_interval(secs := parameters.max_microtimestamp_change(p_pair_id, p_exchange_id)) >= crossed_books.next_uncrossed then
 			return query select * from obanalytics.merge_episodes(crossed_books.first_crossed, crossed_books.next_uncrossed, p_pair_id, p_exchange_id);
 		else
 			raise exception 'Interval from % to % exceeds maximum allowed interval %', crossed_books.first_crossed, crossed_books.next_uncrossed, make_interval(secs := parameters.max_microtimestamp_change());
@@ -2055,6 +2201,281 @@ $$;
 
 
 ALTER FUNCTION obanalytics.propagate_microtimestamp_change() OWNER TO "ob-analytics";
+
+--
+-- Name: qty_level3_fix_duplicate_order_events(integer, integer, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.qty_level3_fix_duplicate_order_events(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+
+-- NOTE: This function fixes only the most obvious errors. The remaining errors need to be fixed manually!
+
+declare
+	v_era_start timestamptz;
+	v_era_end timestamptz;
+begin
+
+	select era, level3 into strict v_era_start, v_era_end
+	from obanalytics.level3_eras
+	where p_ts_within_era between era and level3
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id;
+
+	
+	return query
+	with level3 as (
+		select * 
+		from obanalytics.level3 
+		where microtimestamp between v_era_start and v_era_end
+		  and pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+	),
+	order_ids as (
+		select distinct order_id
+		from level3 o
+		group by order_id, event_no
+		having count(*) > 1
+	)
+	delete 	from obanalytics.level3 
+	where microtimestamp between v_era_start and v_era_end
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and event_no = 1
+	  and next_microtimestamp = 'infinity'
+	  and order_id in (select * from order_ids)
+	returning level3.*;
+	
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.qty_level3_fix_duplicate_order_events(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: qty_level3_fix_eternals(integer, integer, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.qty_level3_fix_eternals(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_era_start timestamptz;
+	v_era_end timestamptz;
+begin
+
+	select era, level3 into strict v_era_start, v_era_end
+	from obanalytics.level3_eras
+	where p_ts_within_era between era and level3
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id;
+
+	return query
+	with level3 as (
+		select * 
+		from obanalytics.level3 
+		where microtimestamp between v_era_start and v_era_end
+		  and pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+	),
+	orphans as (
+		select microtimestamp, order_id, event_no
+		from level3 o 
+		where event_no > 1
+		  and not exists ( select * 
+						  	from level3 i 
+						  	where next_microtimestamp = o.microtimestamp 
+						  	  and i.order_id = o.order_id 
+						  	  and next_event_no = o.event_no ) -- orphan
+	),
+	reconnect_eternals as (	-- reconnect eternal events to the appropriate existing next
+		update obanalytics.level3
+		set next_microtimestamp = orphans.microtimestamp,
+		    next_event_no = orphans.event_no
+		from orphans
+		where level3.microtimestamp between v_era_start and v_era_end
+		  and pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+		  and next_microtimestamp = 'infinity'
+		  and level3.event_no = orphans.event_no - 1
+		  and level3.order_id = orphans.order_id
+		returning level3.*
+	)
+	select *
+	from reconnect_eternals
+	order by order_id, event_no, microtimestamp;
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.qty_level3_fix_eternals(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: qty_level3_fix_premature_deletes(integer, integer, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.qty_level3_fix_premature_deletes(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_era_start timestamptz;
+	v_era_end timestamptz;
+begin
+
+	select era, level3 into strict v_era_start, v_era_end
+	from obanalytics.level3_eras
+	where p_ts_within_era between era and level3
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id;
+
+	return query
+	with level3 as (
+		select * 
+		from obanalytics.level3 
+		where microtimestamp between v_era_start and v_era_end
+		  and pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+	),
+	generated_deletes as (	
+		select microtimestamp as g_microtimestamp, order_id, event_no
+		from level3 o
+		where next_microtimestamp = '-infinity'
+		  and local_timestamp is null -- order_delete events which were produced by us, not buy exchange
+	),
+	exchange_next as (
+		select microtimestamp as e_microtimestamp, order_id, event_no, g_microtimestamp
+		from level3 o join generated_deletes using (order_id, event_no)
+		where local_timestamp is not null  -- next events which were produced by exchange, with the same order_id, event_no
+		  and not exists (select * 
+						  	from level3 i 
+						  	where next_microtimestamp = o.microtimestamp 
+						  	  and i.order_id = o.order_id 
+						  	  and next_event_no = o.event_no ) -- orphan
+	),
+	reconnect_chain as (	-- reconnect event to exchange_deletes instead of generated_deletes
+		update obanalytics.level3
+		set next_microtimestamp = e_microtimestamp
+		from exchange_next
+		where microtimestamp between v_era_start and v_era_end
+		  and pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+		  and next_microtimestamp = exchange_next.g_microtimestamp
+		  and level3.order_id = exchange_next.order_id
+		  and next_event_no = exchange_next.event_no
+		returning level3.*
+	)
+	select *
+	from reconnect_chain
+	order by order_id, event_no, microtimestamp;
+	
+	return query 
+	delete from obanalytics.level3 o 
+	where  microtimestamp between v_era_start and v_era_end
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id
+	  and next_microtimestamp = '-infinity'
+	  and local_timestamp is null  -- order_delete events which were produced by us
+	  and not exists (select * 
+					 	from obanalytics.level3 i 
+						where	microtimestamp between v_era_start and v_era_end
+	  					  and pair_id = p_pair_id
+	  					  and exchange_id = p_exchange_id
+					  	  and next_microtimestamp = o.microtimestamp 
+						  and i.order_id = o.order_id 
+						  and next_event_no = o.event_no ) -- orphan
+	returning o.*;					  
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.qty_level3_fix_premature_deletes(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: qty_level3_show_duplicate_order_events(integer, integer, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.qty_level3_show_duplicate_order_events(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_era_start timestamptz;
+	v_era_end timestamptz;
+begin
+
+	select era, level3 into strict v_era_start, v_era_end
+	from obanalytics.level3_eras
+	where p_ts_within_era between era and level3
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id;
+
+	return query
+	with level3 as (
+		select * 
+		from obanalytics.level3 
+		where microtimestamp between v_era_start and v_era_end
+		  and pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+	),
+	order_ids as (
+		select distinct order_id
+		from level3 o
+		group by order_id, event_no
+		having count(*) > 1
+	)
+	select *
+	from level3
+	where order_id in (select * from order_ids )
+	order by order_id, event_no, microtimestamp;
+	
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.qty_level3_show_duplicate_order_events(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
+
+--
+-- Name: qty_level3_show_invalid_chains(integer, integer, timestamp with time zone); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE FUNCTION obanalytics.qty_level3_show_invalid_chains(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) RETURNS SETOF obanalytics.level3
+    LANGUAGE plpgsql
+    AS $$
+declare
+	v_era_start timestamptz;
+	v_era_end timestamptz;
+begin
+
+	select era, level3 into strict v_era_start, v_era_end
+	from obanalytics.level3_eras
+	where p_ts_within_era between era and level3
+	  and pair_id = p_pair_id
+	  and exchange_id = p_exchange_id;
+
+	return query
+	with level3 as (
+		select * 
+		from obanalytics.level3 
+		where microtimestamp between v_era_start and v_era_end
+		  and pair_id = p_pair_id
+		  and exchange_id = p_exchange_id
+	),
+	order_ids as (
+		select distinct order_id
+		from level3 o
+		where event_no > 1
+		  and not exists (select * from level3 i where next_microtimestamp = o.microtimestamp and  i.order_id = o.order_id and next_event_no = o.event_no )
+	)
+	select *
+	from level3
+	where order_id in (select * from order_ids )
+	order by order_id, event_no, microtimestamp;
+	
+end;
+$$;
+
+
+ALTER FUNCTION obanalytics.qty_level3_show_invalid_chains(p_pair_id integer, p_exchange_id integer, p_ts_within_era timestamp with time zone) OWNER TO "ob-analytics";
 
 --
 -- Name: save_exchange_microtimestamp(); Type: FUNCTION; Schema: obanalytics; Owner: ob-analytics
@@ -4152,6 +4573,13 @@ ALTER INDEX obanalytics.level3_bitstamp_pair_id_side_microtimestamp_order_id_eve
 --
 
 ALTER INDEX obanalytics.level3_bitstamp_xrpusd_pair_id_side_microtimestamp_order_id_key ATTACH PARTITION obanalytics.level3_bitstamp_xrpusd_s_pair_id_side_microtimestamp_order__key;
+
+
+--
+-- Name: level3_bitstamp check_after_insert; Type: TRIGGER; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TRIGGER check_after_insert AFTER INSERT ON obanalytics.level3_bitstamp FOR EACH ROW EXECUTE PROCEDURE obanalytics.level3_bitstamp_check_after_insert();
 
 
 --
