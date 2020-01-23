@@ -79,6 +79,7 @@ class ObjectStream {
 public:
  virtual explicit operator bool() = 0;
  virtual ObjectStream<O>& operator>>(O&) = 0;
+ virtual ~ObjectStream() {};
 };
 
 template <template <typename> class Allocator,
@@ -105,7 +106,7 @@ public:
  explicit operator bool();
  TradingPeriod<Allocator, T>& operator>>(BidAskSpread&);
 
-private:
+protected:
  bool ProcessNextEpisode();
 
  OrderBook<Allocator, T> ob_;
@@ -127,7 +128,7 @@ template <template <typename> class Allocator, typename T>
 OrderBook<Allocator, T>&
 OrderBook<Allocator, T>::operator<<(const Level2& next_depth) {
  latest_timestamp_ = next_depth.t;
- std::map<double, double>* side;
+ std::map<Price, Volume, std::less<Price>, Allocator<T>>* side;
  switch (next_depth.s) {
   case Side::kBid:
    side = &bids_;
