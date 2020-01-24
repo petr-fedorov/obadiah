@@ -326,7 +326,7 @@ DepthChangesStream::DepthChangesStream(Datum p_start_time, Datum p_end_time,
  if (p_frequency == obad::NULL_FREQ) nulls[4] = 'n';
 
  SPI_cursor_open_with_args(kCursorName, R"QUERY(
-        select timestamp::double precision/1000000.0 + 1546300800 as timestamp,
+        select timestamp::double precision/1000000.0 + 946684800 as timestamp,
                price, volume, side 
         from get.depth($1, $2, $3, $4, $5);)QUERY",
                            5, types, values, nulls, true, 0);
@@ -462,7 +462,7 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
   values[1] = (char *)palloc(BUFFER_SIZE * sizeof(char));
   values[2] = (char *)palloc(BUFFER_SIZE * sizeof(char));
 
-  snprintf(values[0], BUFFER_SIZE, "%s", timestamptz_to_str(output.t));
+  snprintf(values[0], BUFFER_SIZE, "%s", static_cast<char *>(output.t));
   snprintf(values[1], BUFFER_SIZE, "%.5f", output.p_bid);
   snprintf(values[2], BUFFER_SIZE, "%.5f", output.p_ask);
 
