@@ -67,6 +67,8 @@ private:
 
  InstantPrice ss_;  // start short
  InstantPrice es_;  // end short
+
+ src::severity_logger<SeverityLevel> lg;
 };
 
 }  // namespace obadiah

@@ -3,11 +3,42 @@
 #include <cstring>
 #include <limits>
 #include <map>
-#include "log.h"
+
+#define BOOST_LOG_DYN_LINK 1
+#include <boost/log/core.hpp>
+#include <boost/log/expressions.hpp>
+#include <boost/log/sinks/text_file_backend.hpp>
+#include <boost/log/sources/record_ostream.hpp>
+#include <boost/log/sources/severity_logger.hpp>
+#include <boost/log/utility/setup/common_attributes.hpp>
+#include <boost/log/utility/setup/file.hpp>
 #include "position_discovery.h"
+
+namespace logging = boost::log;
+namespace src = boost::log::sources;
+namespace sinks = boost::log::sinks;
+namespace keywords = boost::log::keywords;
 
 using namespace Rcpp;
 using namespace std;
+
+#define START_LOGGING(f, s)                                                    \
+ using sink_t = sinks::synchronous_sink<sinks::text_file_backend>;             \
+ boost::shared_ptr<sink_t> g_file_sink = logging::add_file_log(                \
+     keywords::file_name = #f, keywords::format = "[%TimeStamp%]: %Message%"); \
+ logging::core::get()->set_filter(severity >= obadiah::SeverityLevel::s);      \
+ src::severity_logger<obadiah::SeverityLevel> lg
+
+#define FINISH_LOGGING                           \
+ logging::core::get()->remove_sink(g_file_sink); \
+ g_file_sink.reset()
+
+__attribute__((constructor)) void
+init() {
+ logging::add_common_attributes();
+}
+
+BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::SeverityLevel)
 
 class DepthChangesStream : public obadiah::ObjectStream<obadiah::Level2> {
 public:
@@ -24,38 +55,35 @@ public:
        !std::strcmp(as<CharacterVector>(depth_changes_["side"])[j_ - 1], "ask")
            ? obadiah::Side::kAsk
            : obadiah::Side::kBid;
-#ifndef NDEBUG
-   L_(ldebug3) << "j_-1=" << j_ - 1 << " " << static_cast<char*>(dc);
-#endif
+   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG5)
+       << "j_-1=" << j_ - 1 << " " << static_cast<char*>(dc);
   }
   return *this;
- };
+ }
 
 private:
  DataFrame depth_changes_;
  R_xlen_t j_;
+ src::severity_logger<obadiah::SeverityLevel> lg;
 };
 
 // [[Rcpp::export]]
 DataFrame
 CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume) {
-#ifndef NDEBUG
- FILELog::ReportingLevel() = ldebug2;
- FILE* log_fd = fopen("CalculateTradingPeriod.log", "w");
- Output2FILE::Stream() = log_fd;
-#endif
+ START_LOGGING(CalculateTradingPeriod.log, INFO);
+
  DepthChangesStream dc{depth_changes};
  obadiah::TradingPeriod<std::allocator> trading_period{&dc, as<double>(volume)};
  std::vector<double> timestamp, bid_price, bid_volume, ask_price, ask_volume;
  obadiah::BidAskSpread output;
  while (trading_period >> output) {
-#ifndef NDEBUG
-  L_(ldebug3) << static_cast<char*>(output);
-#endif
+  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG4)
+      << static_cast<char*>(output);
   timestamp.push_back(output.t.t);
   bid_price.push_back(output.p_bid);
   ask_price.push_back(output.p_ask);
  }
+ FINISH_LOGGING;
 
  return Rcpp::DataFrame::create(Rcpp::Named("timestamp") = timestamp,
                                 Rcpp::Named("bid.price") = bid_price,
@@ -76,9 +104,7 @@ public:
    s.t = timestamp_[j_ - 1];
    s.p_bid = bid_[j_ - 1];
    s.p_ask = ask_[j_ - 1];
-#ifndef NDEBUG
-   L_(ldebug3) << static_cast<char*>(s);
-#endif
+   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG5) << static_cast<char*>(s);
   }
   return *this;
  }
@@ -88,17 +114,14 @@ private:
  NumericVector bid_;
  NumericVector ask_;
  R_xlen_t j_;
+ src::severity_logger<obadiah::SeverityLevel> lg;
 };
 
 // [[Rcpp::export]]
 DataFrame
 DiscoverPositions(DataFrame computed_trading_period, NumericVector phi,
                   NumericVector rho) {
-#ifndef NDEBUG
- FILELog::ReportingLevel() = ldebug3;
- FILE* log_fd = fopen("DiscoverPositions.log", "w");
- Output2FILE::Stream() = log_fd;
-#endif
+ START_LOGGING(DiscoverPositions.log, DEBUG3);
 
  TradingPeriod trading_period(computed_trading_period);
  obadiah::TradingStrategy trading_strategy(&trading_period, phi[0], rho[0]);
@@ -106,9 +129,7 @@ DiscoverPositions(DataFrame computed_trading_period, NumericVector phi,
      rate;
  obadiah::Position p;
  while (trading_strategy >> p) {
-#ifndef NDEBUG
-  L_(ldebug3) << p;
-#endif
+  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG3) << p;
   opened_at.push_back(p.s.t);
   open_price.push_back(p.s.p);
   closed_at.push_back(p.e.t);
@@ -117,6 +138,7 @@ DiscoverPositions(DataFrame computed_trading_period, NumericVector phi,
                                      : std::log(p.e.p) - std::log(p.s.p));
   rate.push_back(std::exp(log_return.back() / (p.e.t - p.s.t)) - 1);
  }
+ FINISH_LOGGING;
  return Rcpp::DataFrame::create(Rcpp::Named("opened.at") = opened_at,
                                 Rcpp::Named("open.price") = open_price,
                                 Rcpp::Named("closed.at") = closed_at,
@@ -129,11 +151,7 @@ DiscoverPositions(DataFrame computed_trading_period, NumericVector phi,
 DataFrame
 spread_from_depth(DatetimeVector timestamp, NumericVector price,
                   NumericVector volume, CharacterVector side) {
-#ifndef NDEBUG
- FILELog::ReportingLevel() = ldebug3;
- FILE* log_fd = fopen("spread_from_depth.log", "w");
- Output2FILE::Stream() = log_fd;
-#endif
+ START_LOGGING(spread_from_depth.log, INFO);
 
  double episode = timestamp[0];
  double best_bid_price = 0, best_bid_qty = 0, best_ask_price = 0,
@@ -150,9 +168,7 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
 
  for (int i = 0; i <= timestamp.size(); i++) {
   if (i == timestamp.size() || timestamp[i] > episode) {
-#ifndef NDEBUG
-   L_(ldebug3) << "Updating spread after episode " << Datetime(episode);
-#endif
+   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG3) << "Updating spread after episode " << Datetime(episode);
 
    bool is_changed = false;
 
@@ -166,12 +182,10 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
      best_bid_qty = bids.rbegin()->second;
      is_changed = true;
     }
-#ifndef NDEBUG
-    L_(ldebug3) << " BID Current price: " << bids.rbegin()->first
+    BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG3) << " BID Current price: " << bids.rbegin()->first
                 << " Best price: " << best_bid_price
                 << " Current qty: " << bids.rbegin()->second
                 << " Best qty: " << best_bid_qty;
-#endif
    } else {
     if (best_bid_price > 0) {
      best_bid_price = 0;
@@ -188,12 +202,10 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
      best_ask_qty = asks.begin()->second;
      is_changed = true;
     }
-#ifndef NDEBUG
-    L_(ldebug3) << "ASK Current price: " << asks.begin()->first
+    BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG3) << "ASK Current price: " << asks.begin()->first
                 << " Best price: " << best_ask_price
                 << " Current qty: " << asks.begin()->second
                 << " Best qty: " << best_ask_qty;
-#endif
    } else {
     if (best_ask_price > 0) {
      best_ask_price = 0;
@@ -217,12 +229,10 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
      best_ask_qtys.push_back(R_NaN);
     }
 
-#ifndef NDEBUG
-    L_(ldebug3) << "Produced spread change record - timestamp:"
+    BOOST_LOG_SEV(lg, obadiah::SeverityLevel::DEBUG3) << "Produced spread change record - timestamp:"
                 << Datetime(episode) << "BID P: " << best_bid_price
                 << " Q: " << best_bid_qty << "ASK P: " << best_ask_price
                 << " Q: " << best_ask_qty;
-#endif
    }
 
    if (i < timestamp.size())
@@ -242,6 +252,7 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
     asks.erase(price[i]);
   }
  }
+ FINISH_LOGGING;
  return DataFrame::create(Named("timestamp") = as<DatetimeVector>(timestamp_s),
                           Named("best.bid.price") = best_bid_prices,
                           Named("best.bid.volume") = best_bid_qtys,
@@ -267,33 +278,3 @@ operator<<(ostream& stream, point& p) {
  return stream;
 }
 
-struct draws {
- std::vector<double> draw_timestamp, draw_end, draw_start_price, draw_end_price,
-     draw_size, draw_speed;
-
- inline void add(point& s, point& e) {
-  if (std::fabs(s.timestamp - e.timestamp) >
-      std::numeric_limits<double>::epsilon()) {
-#ifndef NDEBUG
-   L_(ldebug3) << "NEW DRAW s: " << s << " e: " << e;
-#endif
-   draw_timestamp.push_back(s.timestamp);
-   draw_end.push_back(e.timestamp);
-   draw_start_price.push_back(s.orig_price);
-   draw_end_price.push_back(e.orig_price);
-   long double d_sz = std::round(1000000 * (e.orig_price - s.orig_price) /
-                                 s.orig_price) /
-                      100,
-               d_sp =
-                   std::round(100 * d_sz / (e.timestamp - s.timestamp)) / 100;
-
-   draw_size.push_back(d_sz);
-   draw_speed.push_back(d_sp);
-
-  } else {
-#ifndef NDEBUG
-   L_(ldebug3) << "Skipped zero-length draw s: " << s << " e: " << e;
-#endif
-  }
- }
-};

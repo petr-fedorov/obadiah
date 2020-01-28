@@ -15,11 +15,30 @@
 
 #ifndef OBADIAH_BASE_H
 #define OBADIAH_BASE_H
+#include <boost/log/sources/severity_feature.hpp>
+#include <boost/log/sources/severity_logger.hpp>
 #include <cmath>
-#include <ostream>
 #include <map>
-#include "log.h"
+#include <ostream>
+
+namespace logging = boost::log;
+namespace src = boost::log::sources;
+namespace sinks = boost::log::sinks;
+namespace keywords = boost::log::keywords;
 namespace obadiah {
+
+enum SeverityLevel {
+ DEBUG5 = -6,
+ DEBUG4 = -5,
+ DEBUG3 = -4,
+ DEBUG2 = -3,
+ DEBUG1 = -2,
+ LOG = -1,
+ INFO = 0,
+ NOTICE = 1,
+ WARNING = 2,
+ EXCEPTION = 3
+};
 
 struct Timestamp {
  Timestamp() : t(0){};
@@ -79,7 +98,7 @@ class ObjectStream {
 public:
  virtual explicit operator bool() = 0;
  virtual ObjectStream<O>& operator>>(O&) = 0;
- virtual ~ObjectStream() {};
+ virtual ~ObjectStream(){};
 };
 
 template <template <typename> class Allocator,
@@ -115,6 +134,8 @@ protected:
  Level2 unprocessed_;
  BidAskSpread current_;
  bool is_failed_;
+
+ src::severity_logger<SeverityLevel> lg;
 };
 
 template <template <typename> class Allocator, typename T>
@@ -245,20 +266,14 @@ TradingPeriod<Allocator, T>&
 TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
  if (!is_failed_) {
   to_be_returned = current_;
-#ifndef NDEBUG
-  L_(ldebug2) << "Previous=" << static_cast<char*>(current_);
-#endif
+  BOOST_LOG_SEV(lg, DEBUG2) << "Previous=" << static_cast<char*>(current_);
   while (ProcessNextEpisode()) {
    current_ = ob_.GetBidAskSpread(volume_);
-#ifndef NDEBUG
-   L_(ldebug2) << "Current=" << static_cast<char*>(current_) << ob_;
-#endif
+   BOOST_LOG_SEV(lg, DEBUG2) << "Current=" << static_cast<char*>(current_) << ob_;
    if (current_ != to_be_returned) break;
   }
   if (current_ != to_be_returned) {
-#ifndef NDEBUG
-   L_(ldebug2) << "Returned=" << static_cast<char*>(current_);
-#endif
+   BOOST_LOG_SEV(lg, DEBUG2) << "Returned=" << static_cast<char*>(current_);
    to_be_returned = current_;
   } else
    is_failed_ = true;

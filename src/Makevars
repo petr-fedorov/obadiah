@@ -1,1 +1,3 @@
-# PKG_CPPFLAGS=-UNDEBUG
+#PKG_CPPFLAGS=-UNDEBUG
+PKG_LIBS=-lpthread -lboost_log -lboost_log_setup -lboost_thread
+#PKG_CXXFLAGS=-O0

@@ -35,7 +35,7 @@ BidAskSpread::operator char *() {
  const size_t kBufferSize = 100;
  static char buffer[kBufferSize];
  snprintf(buffer, kBufferSize,
-          "TM t: %s bid: %.5lf ask: %.5lf",
+          "BAS t: %s bid: %.5lf ask: %.5lf",
           static_cast<char *>(t), p_bid, p_ask);
  return buffer;
 }
