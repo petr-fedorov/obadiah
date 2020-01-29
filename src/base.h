@@ -20,6 +20,8 @@
 #include <cmath>
 #include <map>
 #include <ostream>
+#include <string>
+#include <unordered_map>
 
 namespace logging = boost::log;
 namespace src = boost::log::sources;
@@ -27,7 +29,7 @@ namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
 namespace obadiah {
 
-enum SeverityLevel {
+enum class SeverityLevel {
  DEBUG5 = -6,
  DEBUG4 = -5,
  DEBUG3 = -4,
@@ -39,6 +41,9 @@ enum SeverityLevel {
  WARNING = 2,
  EXCEPTION = 3
 };
+
+SeverityLevel
+GetSeverityLevel(const std::string s);
 
 struct Timestamp {
  Timestamp() : t(0){};
@@ -266,14 +271,15 @@ TradingPeriod<Allocator, T>&
 TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
  if (!is_failed_) {
   to_be_returned = current_;
-  BOOST_LOG_SEV(lg, DEBUG2) << "Previous=" << static_cast<char*>(current_);
+  BOOST_LOG_SEV(lg, SeverityLevel::DEBUG2) << "Previous=" << static_cast<char*>(current_);
   while (ProcessNextEpisode()) {
    current_ = ob_.GetBidAskSpread(volume_);
-   BOOST_LOG_SEV(lg, DEBUG2) << "Current=" << static_cast<char*>(current_) << ob_;
+   BOOST_LOG_SEV(lg, SeverityLevel::DEBUG2)
+       << "Current=" << static_cast<char*>(current_) << ob_;
    if (current_ != to_be_returned) break;
   }
   if (current_ != to_be_returned) {
-   BOOST_LOG_SEV(lg, DEBUG2) << "Returned=" << static_cast<char*>(current_);
+   BOOST_LOG_SEV(lg, SeverityLevel::DEBUG2) << "Returned=" << static_cast<char*>(current_);
    to_be_returned = current_;
   } else
    is_failed_ = true;

@@ -21,6 +21,7 @@
 #' @importFrom purrr pmap_dfr
 #' @importFrom tibble tibble
 #' @import data.table
+#' @import futile.logger
 #' @useDynLib obadiah, .registration = TRUE
 
 
@@ -779,6 +780,79 @@ trading.period.data.table <- function(depth_changes, volume, tz="UTC") {
 }
 
 
+#' @export
+trading.period.connection <- function(con, start.time, end.time, exchange, pair, volume=0, frequency=NULL, tz='UTC') {
+
+  conn=con$con()
+
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+  stopifnot(is.null(frequency) || is.numeric(frequency))
+  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
+
+  flog.debug(paste0("trading.period(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),
+                    ", volume := ", volume, ", frequency := ", frequency, ", tz := ", tz , ")" ), name=packageName())
+
+  tzone <- tz
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+
+  if (!is.null(frequency)) {
+
+    if(frequency < 60) {
+      #start.time <- floor_date(start.time,  paste0(frequency, " seconds"))
+      end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
+    }
+    else {
+      #start.time <- floor_date(start.time, paste0(frequency %/% 60, " minutes"))
+      end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
+    }
+  }
+
+  loader <- function(exchange, pair) {
+
+    if(is.null(frequency))
+
+      query <- paste0(" SELECT timestamp, \"bid.price\",",
+                      "\"ask.price\" FROM devel_casual_draws.trading_period(",
+                      shQuote(format(start.time, usetz=T)), ",",
+                      shQuote(format(end.time, usetz=T)), ",",
+                      "get.pair_id(",shQuote(pair),"), " ,
+                      "get.exchange_id(", shQuote(exchange), "), ",
+                      volume,
+                      ")")
+    else
+      query <- paste0(" SELECT timestamp, \"bid.price\", ",
+                      "\"ask.price\", FROM devel_casual_draws.trading_period(",
+                      shQuote(format(start.time, usetz=T)), ",",
+                      shQuote(format(end.time, usetz=T)), ",",
+                      "get.pair_id(",shQuote(pair),"), " ,
+                      "get.exchange_id(", shQuote(exchange), "), ",
+                       volume, ", ",
+                      "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
+                      ") order by 1")
+
+    flog.debug(query, name=packageName())
+    result <- DBI::dbGetQuery(conn, query)
+    setDT(result)
+    if(nrow(result) > 0) {
+      result[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
+    }
+    result
+  }
+  result <- loader(exchange, pair)
+  if(nrow(result) > 0 ) {
+    result[, c("timestamp", pair, exchange) := .(with_tz(timestamp, tz), pair, exchange)]
+  }
+  result
+}
+
+
 
 
 #' Calculates the maximum profit trading strategy for the given time series of spreads
@@ -787,14 +861,15 @@ trading.period.data.table <- function(depth_changes, volume, tz="UTC") {
 #'
 #'
 #' @export
-trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), tz="UTC") {
+trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "EXCEPTION"), tz="UTC") {
   mode <- match.arg(mode)
+  debug.level <- match.arg(debug.level)
 
   if( mode == "bid-ask")
-    result <- DiscoverPositions(trading.period, phi, rho)
+    result <- DiscoverPositions(trading.period, phi, rho, debug.level)
   else {
     mid.price <- (trading.period$best.bid.price + trading.period$best.ask.price)/2
-    result <- DiscoverPositions(trading.period, phi, rho)
+    result <- DiscoverPositions(trading.period, phi, rho, debug.level)
   }
 
   setDT(result)

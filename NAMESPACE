@@ -2,6 +2,7 @@
 
 S3method(spread,connection)
 S3method(spread,data.table)
+S3method(trading.period,connection)
 S3method(trading.period,data.table)
 export(connect)
 export(depth)

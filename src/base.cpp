@@ -51,5 +51,21 @@ Timestamp::operator char *() {
  return buffer;
 }
 
+SeverityLevel
+GetSeverityLevel(const std::string s) {
+ static std::unordered_map<std::string, SeverityLevel> str_to_enum{
+     {"DEBUG5", SeverityLevel::DEBUG5},
+     {"DEBUG4", SeverityLevel::DEBUG4},
+     {"DEBUG3", SeverityLevel::DEBUG3},
+     {"DEBUG2", SeverityLevel::DEBUG2},
+     {"DEBUG1", SeverityLevel::DEBUG1},
+     {"LOG", SeverityLevel::LOG},
+     {"INFO", SeverityLevel::INFO},
+     {"NOTICE", SeverityLevel::NOTICE},
+     {"WARNING", SeverityLevel::WARNING},
+     {"EXCEPTION", SeverityLevel::EXCEPTION},
+ };
+ return str_to_enum.at(s);
+}
 
 }  // namespace obadiah

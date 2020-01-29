@@ -5,8 +5,8 @@ CalculateTradingPeriod <- function(depth_changes, volume) {
     .Call(`_obadiah_CalculateTradingPeriod`, depth_changes, volume)
 }
 
-DiscoverPositions <- function(computed_trading_period, phi, rho) {
-    .Call(`_obadiah_DiscoverPositions`, computed_trading_period, phi, rho)
+DiscoverPositions <- function(computed_trading_period, phi, rho, debug_level) {
+    .Call(`_obadiah_DiscoverPositions`, computed_trading_period, phi, rho, debug_level)
 }
 
 spread_from_depth <- function(timestamp, price, volume, side) {

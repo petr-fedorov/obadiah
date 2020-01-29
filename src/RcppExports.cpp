@@ -18,15 +18,16 @@ BEGIN_RCPP
 END_RCPP
 }
 // DiscoverPositions
-DataFrame DiscoverPositions(DataFrame computed_trading_period, NumericVector phi, NumericVector rho);
-RcppExport SEXP _obadiah_DiscoverPositions(SEXP computed_trading_periodSEXP, SEXP phiSEXP, SEXP rhoSEXP) {
+DataFrame DiscoverPositions(DataFrame computed_trading_period, NumericVector phi, NumericVector rho, CharacterVector debug_level);
+RcppExport SEXP _obadiah_DiscoverPositions(SEXP computed_trading_periodSEXP, SEXP phiSEXP, SEXP rhoSEXP, SEXP debug_levelSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< DataFrame >::type computed_trading_period(computed_trading_periodSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type phi(phiSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type rho(rhoSEXP);
-    rcpp_result_gen = Rcpp::wrap(DiscoverPositions(computed_trading_period, phi, rho));
+    Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
+    rcpp_result_gen = Rcpp::wrap(DiscoverPositions(computed_trading_period, phi, rho, debug_level));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -49,7 +50,7 @@ RcppExport SEXP run_testthat_tests();
 
 static const R_CallMethodDef CallEntries[] = {
     {"_obadiah_CalculateTradingPeriod", (DL_FUNC) &_obadiah_CalculateTradingPeriod, 2},
-    {"_obadiah_DiscoverPositions", (DL_FUNC) &_obadiah_DiscoverPositions, 3},
+    {"_obadiah_DiscoverPositions", (DL_FUNC) &_obadiah_DiscoverPositions, 4},
     {"_obadiah_spread_from_depth", (DL_FUNC) &_obadiah_spread_from_depth, 4},
     {"run_testthat_tests", (DL_FUNC) &run_testthat_tests, 0},
     {NULL, NULL, 0}
