@@ -25,6 +25,7 @@ extern "C" {
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
+//#include <unistd.h>
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -32,17 +33,23 @@ extern "C" {
 #include "postgres.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
-
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(depth_change_by_episode);
 PG_FUNCTION_INFO_V1(spread_by_episode);
 PG_FUNCTION_INFO_V1(to_microseconds);
 PG_FUNCTION_INFO_V1(CalculateTradingPeriod);
+PG_FUNCTION_INFO_V1(SetLogLevel);
 #ifdef __cplusplus
 }
 #endif  // __cplusplus
-
+#include <boost/log/expressions.hpp>
+#include <boost/log/sinks/basic_sink_backend.hpp>
+#include <boost/log/sinks/frontend_requirements.hpp>
+#include <boost/log/sinks/text_file_backend.hpp>
+#include <boost/log/sources/record_ostream.hpp>
+#include <boost/log/utility/setup/common_attributes.hpp>
+#include <boost/log/utility/setup/file.hpp>
 #include <map>
 #include <set>
 #include <sstream>
@@ -56,6 +63,10 @@ PG_FUNCTION_INFO_V1(CalculateTradingPeriod);
 #include "spi_allocator.h"
 // From R
 #include "../../../src/base.h"
+
+namespace logging = boost::log;
+namespace expr = boost::log::expressions;
+BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::SeverityLevel)
 
 namespace obad {
 
@@ -82,7 +93,73 @@ struct multi_call_context : public obad::postgres_heap {
  obad::depth *d;
  obad::deque<obad::level2> *l2;
 };
+
+class elog_sink
+    : public sinks::basic_formatted_sink_backend<char,
+                                                 sinks::synchronized_feeding> {
+public:
+ void consume(logging::record_view const &rec, string_type const &msg);
+};
+
+void
+elog_sink::consume(logging::record_view const &rec, string_type const &msg) {
+ logging::value_ref<obadiah::SeverityLevel, tag::severity> level =
+     rec[severity];
+ if (level == obadiah::SeverityLevel::kDebug5) {
+  elog(DEBUG5, "[5] %s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kDebug4) {
+  elog(DEBUG4, "[4] %s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kDebug3) {
+  elog(DEBUG3, "[3] %s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kDebug2) {
+  elog(DEBUG2, "[2] %s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kDebug1) {
+  elog(DEBUG1, "[1] %s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kInfo) {
+  elog(INFO, "%s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kNotice) {
+  elog(NOTICE, "%s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kWarning) {
+  elog(WARNING, "%s", msg.c_str());
+  return;
+ }
+ if (level == obadiah::SeverityLevel::kError) {
+  elog(ERROR, "%s", msg.c_str());
+  return;
+ }
+}
 }  // namespace obad
+
+extern "C" void
+_PG_init() {
+ logging::add_common_attributes();
+ /* pid_t pid = getpid();
+  char buffer[100];
+  sprintf(buffer, "log/obadiah_db_%i.log", pid);
+  logging::add_file_log(
+      keywords::file_name = buffer,
+      keywords::format = "[%TimeStamp%] [%Severity%]: %Message%");
+      */
+ typedef sinks::synchronous_sink<obad::elog_sink> sink_t;
+ boost::shared_ptr<sink_t> sink(new sink_t());
+ sink->set_formatter(expr::stream << expr::message);
+ logging::core::get()->add_sink(sink);
+ logging::core::get()->set_filter(severity > obadiah::SeverityLevel::kNotice);
+};
 
 Datum
 depth_change_by_episode(PG_FUNCTION_ARGS) {
@@ -328,7 +405,7 @@ DepthChangesStream::DepthChangesStream(Datum p_start_time, Datum p_end_time,
  SPI_cursor_open_with_args(kCursorName, R"QUERY(
         select timestamp::double precision/1000000.0 + 946684800 as timestamp,
                price, volume, side 
-        from get.depth($1, $2, $3, $4, $5);)QUERY",
+        from get.depth($1, $2, $3, $4, $5) order by 1, 2 desc;)QUERY",
                            5, types, values, nulls, true, 0);
 }
 
@@ -342,6 +419,9 @@ DepthChangesStream::operator bool() { return state_; }
 
 DepthChangesStream &
 DepthChangesStream::operator>>(obadiah::Level2 &dc) {
+ // R's NA value.
+ // See R source code: src/main/arithmetics.c R_ValueOfNA()
+ static const double kR_NaReal = std::nan("1954");
  if (cache_->empty()) {
   SPI_cursor_fetch(SPI_cursor_find(kCursorName), true, kFetchCount);
 
@@ -358,21 +438,25 @@ DepthChangesStream::operator>>(obadiah::Level2 &dc) {
                : obadiah::Side::kBid;
 
     try {
-     l2.t.t = strtod(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "timestamp")),
-                    nullptr);
+     l2.t.t =
+         strtod(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "timestamp")),
+                nullptr);
     } catch (...) {
+     l2.t.t = kR_NaReal;
     }
 
     try {
      l2.p = strtod(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "price")),
-                    nullptr);
+                   nullptr);
     } catch (...) {
+     l2.p = kR_NaReal;
     }
 
     try {
-     l2.v = strtod(
-         SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "volume")), nullptr);
+     l2.v = strtod(SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "volume")),
+                   nullptr);
     } catch (...) {
+     l2.v = kR_NaReal;
     }
     cache_->push_back(l2);
    }
@@ -462,7 +546,8 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
   values[1] = (char *)palloc(BUFFER_SIZE * sizeof(char));
   values[2] = (char *)palloc(BUFFER_SIZE * sizeof(char));
 
-  snprintf(values[0], BUFFER_SIZE, "%s", static_cast<char *>(output.t));
+  snprintf(values[0], BUFFER_SIZE, "%lu",
+           std::lround((output.t.t - 946684800.0) * 1000000));
   snprintf(values[1], BUFFER_SIZE, "%.5f", output.p_bid);
   snprintf(values[2], BUFFER_SIZE, "%.5f", output.p_ask);
 
@@ -480,3 +565,18 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
   SRF_RETURN_DONE(funcctx);
  }
 }
+
+Datum
+SetLogLevel(PG_FUNCTION_ARGS) {
+ text *t = PG_GETARG_TEXT_PP(0);
+ try {
+  logging::core::get()->set_filter(
+      !expr::has_attr(severity) ||
+      severity >= obadiah::GetSeverityLevel(
+                      std::string(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t))));
+ } catch (std::out_of_range &) {
+  logging::core::get()->set_filter(severity > obadiah::SeverityLevel::kNotice);
+ };
+ PG_RETURN_NULL();
+}
+

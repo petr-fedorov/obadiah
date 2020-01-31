@@ -22,6 +22,7 @@
 #include <ostream>
 #include <string>
 #include <unordered_map>
+#include "severity_level.h"
 
 namespace logging = boost::log;
 namespace src = boost::log::sources;
@@ -29,21 +30,6 @@ namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
 namespace obadiah {
 
-enum class SeverityLevel {
- DEBUG5 = -6,
- DEBUG4 = -5,
- DEBUG3 = -4,
- DEBUG2 = -3,
- DEBUG1 = -2,
- LOG = -1,
- INFO = 0,
- NOTICE = 1,
- WARNING = 2,
- EXCEPTION = 3
-};
-
-SeverityLevel
-GetSeverityLevel(const std::string s);
 
 struct Timestamp {
  Timestamp() : t(0){};
@@ -120,6 +106,7 @@ private:
  std::map<Price, Volume, std::less<Price>, Allocator<T>> bids_;
  std::map<Price, Volume, std::less<Price>, Allocator<T>> asks_;
  Timestamp latest_timestamp_;
+ src::severity_logger<SeverityLevel> lg;
 };
 
 template <template <typename> class Allocator,
@@ -163,10 +150,20 @@ OrderBook<Allocator, T>::operator<<(const Level2& next_depth) {
    side = &asks_;
    break;
  }
- if (next_depth.v == 0.0)
-  side->erase(next_depth.p);
- else
+ if (next_depth.v == 0.0){
+  auto search = side->find(next_depth.p);
+  if(search != side->end()) {
+   side->erase(search);
+   BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "From OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+  }
+  else 
+   BOOST_LOG_SEV(lg, SeverityLevel::kWarning) << "From OB(NOT FOUND!)" << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+
+ }
+ else{
   (*side)[next_depth.p] = next_depth.v;
+   BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "In OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+ }
  return *this;
 };
 
@@ -271,15 +268,15 @@ TradingPeriod<Allocator, T>&
 TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
  if (!is_failed_) {
   to_be_returned = current_;
-  BOOST_LOG_SEV(lg, SeverityLevel::DEBUG2) << "Previous=" << static_cast<char*>(current_);
+  BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Previous=" << static_cast<char*>(current_);
   while (ProcessNextEpisode()) {
    current_ = ob_.GetBidAskSpread(volume_);
-   BOOST_LOG_SEV(lg, SeverityLevel::DEBUG2)
+   BOOST_LOG_SEV(lg, SeverityLevel::kDebug3)
        << "Current=" << static_cast<char*>(current_) << ob_;
    if (current_ != to_be_returned) break;
   }
   if (current_ != to_be_returned) {
-   BOOST_LOG_SEV(lg, SeverityLevel::DEBUG2) << "Returned=" << static_cast<char*>(current_);
+   BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Returned=" << static_cast<char*>(current_);
    to_be_returned = current_;
   } else
    is_failed_ = true;
