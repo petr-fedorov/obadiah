@@ -66,6 +66,9 @@ TradingStrategy::operator>>(Position& p) {
   // Currently we just skip BidAskSpreads with NaN
   if ((std::isnan(c.p_ask) || std::isnan(c.p_bid)))
    continue;  
+  // We also ignore the crossed BidAskSpreads
+  if(c.p_bid > c.p_ask)
+   continue;
   InstantPrice bid(c.p_bid, c.t);
   InstantPrice ask(c.p_ask, c.t);
 

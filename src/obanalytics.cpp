@@ -32,7 +32,7 @@ using namespace std;
                             keywords::format = "[%TimeStamp%]: %Message%");   \
  } catch (const std::out_of_range&) {                                         \
   logging::core::get()->set_filter(severity >                                 \
-                                   obadiah::SeverityLevel::kException);        \
+                                   obadiah::SeverityLevel::kError);        \
  }                                                                            \
  src::severity_logger<obadiah::SeverityLevel> lg
 
