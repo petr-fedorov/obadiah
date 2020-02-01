@@ -32,11 +32,15 @@ Level2::operator char *() {
 }
 
 BidAskSpread::operator char *() {
- const size_t kBufferSize = 100;
+ const size_t kBufferSize = 200;
  static char buffer[kBufferSize];
- snprintf(buffer, kBufferSize,
+ int sz = snprintf(buffer, kBufferSize,
           "BAS t: %s bid: %.5lf ask: %.5lf",
           static_cast<char *>(t), p_bid, p_ask);
+ if(std::isnan(p_bid))
+  sz += snprintf(buffer+sz,kBufferSize-sz, " bid hex: 0x%lx ", *reinterpret_cast<unsigned long *>(&p_bid));
+ if(std::isnan(p_ask))
+  sz += snprintf(buffer+sz,kBufferSize-sz, " ask hex: 0x%lx ", *reinterpret_cast<unsigned long *>(&p_ask));
  return buffer;
 }
 

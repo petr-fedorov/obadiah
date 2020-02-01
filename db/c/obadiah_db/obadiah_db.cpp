@@ -25,7 +25,8 @@ extern "C" {
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
-//#include <unistd.h>
+        //#include <unistd.h>
+#include "access/htup_details.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -539,25 +540,39 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
  if (*trading_period >> output) {
   SPI_finish();
   MemoryContextSwitchTo(oldcontext);
+  get_call_result_type(fcinfo, NULL, &tupdesc);
+  tupdesc = BlessTupleDesc(tupdesc);
 
-  char **values = (char **)palloc(8 * sizeof(char *));
-  static const int BUFFER_SIZE = 128;
-  values[0] = (char *)palloc(BUFFER_SIZE * sizeof(char));
-  values[1] = (char *)palloc(BUFFER_SIZE * sizeof(char));
-  values[2] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+  Datum values[3];
+  bool nulls[3];
+  int j = 0;
+  std::memset(nulls, 0, sizeof nulls);
+  values[j++] =
+      Int64GetDatum(std::lround((output.t.t - 946684800.0) * 1000000));
+  values[j++] = Float8GetDatum(output.p_bid);
+  values[j++] = Float8GetDatum(output.p_ask);
+  HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+  SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+  /*
+    char **values = (char **)palloc(8 * sizeof(char *));
+    static const int BUFFER_SIZE = 128;
+    values[0] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+    values[1] = (char *)palloc(BUFFER_SIZE * sizeof(char));
+    values[2] = (char *)palloc(BUFFER_SIZE * sizeof(char));
 
-  snprintf(values[0], BUFFER_SIZE, "%lu",
-           std::lround((output.t.t - 946684800.0) * 1000000));
-  snprintf(values[1], BUFFER_SIZE, "%.5f", output.p_bid);
-  snprintf(values[2], BUFFER_SIZE, "%.5f", output.p_ask);
+    snprintf(values[0], BUFFER_SIZE, "%lu",
+             std::lround((output.t.t - 946684800.0) * 1000000));
+    snprintf(values[1], BUFFER_SIZE, "%.5f", output.p_bid);
+    snprintf(values[2], BUFFER_SIZE, "%.5f", output.p_ask);
 
-  HeapTuple tuple_out = BuildTupleFromCStrings(attinmeta, values);
-  pfree(values[0]);
-  pfree(values[1]);
-  pfree(values[2]);
-  pfree(values);
+    HeapTuple tuple_out = BuildTupleFromCStrings(attinmeta, values);
+    pfree(values[0]);
+    pfree(values[1]);
+    pfree(values[2]);
+    pfree(values);
 
-  SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple_out));
+    SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple_out));
+    */
  } else {
   delete trading_period;
   SPI_finish();
