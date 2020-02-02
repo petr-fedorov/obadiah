@@ -12,8 +12,8 @@
 // You should have received a copy of the GNU General Public License along
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 01110-1301 USA.
-#ifndef POSITION_DISCOVERY_H
-#define POSITION_DISCOVERY_H
+#ifndef OBADIAH_POSITION_DISCOVERY_H
+#define OBADIAH_POSITION_DISCOVERY_H
 
 #include "base.h"
 #include <cmath>
@@ -22,18 +22,6 @@
 #include <map>
 
 namespace obadiah {
-
-struct InstantPrice {
- InstantPrice() : p(0), t(0) {};
- InstantPrice(double price, double time) : p(price), t(time){};
- Price p;
- Timestamp t;
- double operator-(const InstantPrice& e) { return std::log(p) - std::log(e.p); }
- bool operator==(const InstantPrice& e) { return p == e.p && t == e.t; }
-};
-
-std::ostream&
-operator<<(std::ostream& stream, InstantPrice& p);
 
 struct Position {
  InstantPrice s;

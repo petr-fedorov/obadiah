@@ -46,12 +46,6 @@ TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
 };
 
 std::ostream&
-operator<<(std::ostream& stream, InstantPrice& price) {
- stream << "t: " << static_cast<char*>(price.t) << " p: " << price.p;
- return stream;
-};
-
-std::ostream&
 operator<<(std::ostream& stream, Position& position) {
  stream << "Position O: " << position.s << " C: " << position.e;
  return stream;

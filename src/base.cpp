@@ -55,5 +55,10 @@ Timestamp::operator char *() {
  return buffer;
 }
 
+std::ostream&
+operator<<(std::ostream& stream, InstantPrice& price) {
+ stream << "t: " << static_cast<char*>(price.t) << " p: " << price.p;
+ return stream;
+};
 
 }  // namespace obadiah

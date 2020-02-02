@@ -83,6 +83,18 @@ struct BidAskSpread {
  explicit operator char*();
 };
 
+struct InstantPrice {
+ InstantPrice() : p(0), t(0){};
+ InstantPrice(double price, double time) : p(price), t(time){};
+ Price p;
+ Timestamp t;
+ double operator-(const InstantPrice& e) { return std::log(p) - std::log(e.p); }
+ bool operator==(const InstantPrice& e) { return p == e.p && t == e.t; }
+};
+
+std::ostream&
+operator<<(std::ostream& stream, InstantPrice& p);
+
 // Source of Level2's and BidAskSpread's
 template <typename O>
 class ObjectStream {
