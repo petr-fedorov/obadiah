@@ -13,6 +13,7 @@
 #include <boost/log/utility/setup/common_attributes.hpp>
 #include <boost/log/utility/setup/file.hpp>
 #include "position_discovery.h"
+#include "epsilon_drawupdowns.h"
 
 namespace logging = boost::log;
 namespace src = boost::log::sources;
@@ -156,6 +157,59 @@ DiscoverPositions(DataFrame computed_trading_period, NumericVector phi,
                                 Rcpp::Named("rate") = rate);
 }
 
+class Prices : public obadiah::ObjectStream<obadiah::InstantPrice> {
+public:
+ Prices(DataFrame trading_period)
+     : timestamp_(as<NumericVector>(trading_period["timestamp"])),
+       prices_(as<NumericVector>(trading_period["price"])),
+       j_(0){};
+ operator bool() { return j_ <= timestamp_.length(); }
+ Prices& operator>>(obadiah::InstantPrice& s) {
+  j_++;
+  if (j_ <= timestamp_.length()) {
+   s.t = timestamp_[j_ - 1];
+   s.p = prices_[j_ - 1];
+   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug5) << s;
+  }
+  return *this;
+ }
+
+private:
+ NumericVector timestamp_;
+ NumericVector prices_;
+ R_xlen_t j_;
+ src::severity_logger<obadiah::SeverityLevel> lg;
+};
+
+// [[Rcpp::export]]
+DataFrame
+DiscoverDrawUpDowns(DataFrame precomputed_prices, NumericVector epsilon,
+                  CharacterVector debug_level) {
+ START_LOGGING(DiscoverDrawUpDowns.log, as<string>(debug_level));
+
+ Prices prices(precomputed_prices);
+ obadiah::EpsilonDrawUpDowns trading_strategy(&prices, epsilon[0]);
+ std::vector<double> opened_at, open_price, closed_at, close_price, log_return,
+     rate;
+ obadiah::Position p;
+ while (trading_strategy >> p) {
+  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug3) << p;
+  opened_at.push_back(p.s.t);
+  open_price.push_back(p.s.p);
+  closed_at.push_back(p.e.t);
+  close_price.push_back(p.e.p);
+  log_return.push_back(p.s.p > p.e.p ? std::log(p.s.p) - std::log(p.e.p)
+                                     : std::log(p.e.p) - std::log(p.s.p));
+  rate.push_back(std::exp(log_return.back() / (p.e.t - p.s.t)) - 1);
+ }
+ FINISH_LOGGING;
+ return Rcpp::DataFrame::create(Rcpp::Named("opened.at") = opened_at,
+                                Rcpp::Named("open.price") = open_price,
+                                Rcpp::Named("closed.at") = closed_at,
+                                Rcpp::Named("close.price") = close_price,
+                                Rcpp::Named("log.return") = log_return,
+                                Rcpp::Named("rate") = rate);
+}
 // [[Rcpp::export]]
 DataFrame
 spread_from_depth(DatetimeVector timestamp, NumericVector price,

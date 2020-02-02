@@ -9,6 +9,10 @@ DiscoverPositions <- function(computed_trading_period, phi, rho, debug_level) {
     .Call(`_obadiah_DiscoverPositions`, computed_trading_period, phi, rho, debug_level)
 }
 
+DiscoverDrawUpDowns <- function(precomputed_prices, epsilon, debug_level) {
+    .Call(`_obadiah_DiscoverDrawUpDowns`, precomputed_prices, epsilon, debug_level)
+}
+
 spread_from_depth <- function(timestamp, price, volume, side) {
     .Call(`_obadiah_spread_from_depth`, timestamp, price, volume, side)
 }

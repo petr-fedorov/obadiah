@@ -212,7 +212,7 @@ d <- obadiah::trading.strategy(s, phi=phi, rho=rho, mode="b", tz="Europe/Moscow"
 ```
 
 
-Interesting and thrilling hours are uncommon. For example the timeseries of BTCUSD price at Bitstamp in December 2019 contains only `r length(unique(floor_date(d$opened.at, 'hour')))` eventful hours and `r 31*24 - length(unique(floor_date(d$opened.at, 'hour')))` boring ones. Thus an automated tool is desirable in order to find eventful hours effortlessly. 
+Interesting and thrilling hours are uncommon. For example the timeseries of BTCUSD price at Bitstamp in December 2019 contains only `r length(unique(floor_date(d$opened.at, 'hour')))` hours with price spikes exceeding `r 2*phi*100`% and `r 31*24 - length(unique(floor_date(d$opened.at, 'hour')))` boring ones. Thus an automated tool is desirable in order to find eventful hours effortlessly. 
 
 
 ## An automated detection of eventful periods
@@ -220,11 +220,11 @@ Interesting and thrilling hours are uncommon. For example the timeseries of BTCU
 
 ### A naive approach  
 
-The first thought which probably comes to someone's mind is to look for hours during which the price change exceeded some reasonable threshold, say, `r (threshold <- 1)`%. All such hours in December 2019 are visualised at figure \@ref(fig:hourly-spread-changes). While we can find among them the thrilling hours from figures \@ref(fig:thrilling-up) and \@ref(fig:thrilling-down), there are also many boring hours too.
+The first thought which probably comes to someone's mind is to look for hours during which the price change calculated as highest price minus lowest price exceeded some reasonable threshold, say, `r (threshold <- 2.5)`%. All such hours in December 2019 are visualised at figure \@ref(fig:hourly-spread-changes). We can find among them the thrilling hours from figures \@ref(fig:thrilling-up) and \@ref(fig:thrilling-down) and some other interesting hours too. 
 
 
 ```{r hourly-spread-changes, cache=TRUE, fig.cap=paste0("Hours in December 2019 during the mid-price change of BTCUSD at Bitstamp exceeded ", threshold, "%. Not all of them are thrilling. Furthermore, some of them are not event interesting."), fig.height=10, fig.width=10}
-s_sampled <- s[order(timestamp), .(r = log(tail(mid.price,1)) -  log(head(mid.price,1))), by=.(start.time = floor_date(timestamp, '60 minutes'))]
+s_sampled <- s[order(timestamp), .(r = log(max(mid.price)) -  log(min(mid.price))), by=.(start.time = floor_date(timestamp, '60 minutes'))]
 
 
 ggplot(s_sampled[abs(r) > threshold/100,  s[timestamp >= start.time & timestamp <= start.time + minutes(60)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
@@ -232,22 +232,22 @@ ggplot(s_sampled[abs(r) > threshold/100,  s[timestamp >= start.time & timestamp 
 ```
 
 
-If we choose duration of the period smaller than one hour, the situation is getting even worser. On figure \@ref(fig:large-drawup-decomposed) we decomposed the large upward spike shown in figure \@ref(fig:thrilling-up) above into twelve five-minutes periods. It is rather difficult to catch from those pictures the sheer size of the spike behind them.
+If we try to locate spikes more precisely and choose the smaller duration of the period, the outcome worsens. Figure \@ref(fig:five-mins-spread-changes) shows all 5-minutes intervals in December during which BTCUSD the price changed has exceeded the same threshold of `r threshold`%. Note that there are few of them and there are no large spikes among them!
+
+```{r five-mins-spread-changes, cache=TRUE, fig.cap = paste0("All 5-minutes interval in December 2019 during which the mid-price change of BTCUSD at Bitstamp exceeded ", threshold, "%. There are few of them and there are no large spikes among them")}
+s_sampled <- s[order(timestamp), .(r = log(max(mid.price)) -  log(min(mid.price))), by=.(start.time = floor_date(timestamp, '5 minutes'))]
+
+ggplot(s_sampled[abs(r) > threshold/100,  s[timestamp >= start.time & timestamp <= start.time + minutes(5)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
+       aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
+```
+
+On figure \@ref(fig:large-drawup-decomposed) we decomposed the large upward spike shown in figure \@ref(fig:thrilling-up) above into twelve five-minutes periods. It is rather difficult to catch from those pictures the sheer size of the spike behind them.
 
 ```{r large-drawup-decomposed, cache=TRUE, fig.cap="It is difficult to recognize the largest BTCUSD price spike in December 2019 when price changes are decomposed into 5-minutes intervals"}
 
 s_sampled <- s[timestamp >= ymd_hms('2019-12-04 16:00:00+03') & timestamp <= ymd_hms('2019-12-04 17:00:00+03'), ][order(timestamp), .(r = log(tail(mid.price,1)) -  log(head(mid.price,1))), by=.(start.time = floor_date(timestamp, '5 minutes'))]
 
 ggplot(s_sampled[,  s[timestamp >= start.time & timestamp <= start.time + minutes(5)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
-       aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
-```
-
-Figure \@ref(fig:five-mins-spread-changes) shows all 5-minutes intervals in December during which BTCUSD price has changed more than 1%. Only half of them are showing or are related to a large upward or downward spike
-
-```{r five-mins-spread-changes, cache=TRUE, fig.cap = paste0("All 5-minutes interval in December 2019 during which the mid-price change of BTCUSD at Bitstamp exceeded ", threshold, "%. Only half of them is related to a large upward or downward spikes")}
-s_sampled <- s[order(timestamp), .(r = log(tail(mid.price,1)) -  log(head(mid.price,1))), by=.(start.time = floor_date(timestamp, '5 minutes'))]
-
-ggplot(s_sampled[abs(r) > 0.01,  s[timestamp >= start.time & timestamp <= start.time + minutes(5)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
        aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
 ```
 
@@ -385,9 +385,9 @@ Figure \@ref(fig:epsilon-drawdowns) shows examples of drawdowns and drawups calc
 
 
 
-```{r epsilon-drawdowns, fig.height=5, fig.cap="When $\\epsilon$ is large the big draw is identified correctly but it starts far too early. When $\\epsilon$ is small, the big draw is not identified at all.", eval=FALSE}
-period <- c("start"=with_tz(ymd_hms('2019-12-04 10:00:00+03'), tz="Europe/Moscow"),
-            "end"=with_tz(ymd_hms('2019-12-04 18:00:00+03'), tz="Europe/Moscow"))
+```{r epsilon-drawdowns, fig.height=5, fig.cap="When $\\epsilon$ is large the big draw is identified correctly but it starts far too early. When $\\epsilon$ is small, the big draw is not identified at all."}
+period <- c("start"=with_tz(ymd_hms('2019-12-04 08:00:00+03'), tz="Europe/Moscow"),
+            "end"=with_tz(ymd_hms('2019-12-04 17:00:00+03'), tz="Europe/Moscow"))
 
 ggplot(s[timestamp %between% period ,],
        aes(x=timestamp, y=mid.price)) + 
@@ -396,10 +396,9 @@ ggplot(s[timestamp %between% period ,],
                    group=as.character(minimal.size/10000),
                    colour=as.character(minimal.size/10000)),
                data.table(minimal.size=c(100,50,25))[,
-                                                         obadiah::draws(s[between(timestamp, period["start"],
+                                                         obadiah::epsilon.drawupdowns(s[between(timestamp, period["start"],
                                                                                   period["end"])],
-                                                                        draw.type="T3",
-                                                                        minimal.size=minimal.size, 
+                                                                        epsilon=minimal.size/10000, 
                                                                         tz="Europe/Moscow"),
                                                          by=.(minimal.size)]) +
   scale_x_datetime("Time", date_breaks='1 hour', date_labels = "%H:%M") +
@@ -411,9 +410,13 @@ ggplot(s[timestamp %between% period ,],
 
 ```
 
-### The position discovery method
 
-The position discovery method calculates the set of positions to be opened by a [trader](https://www.investopedia.com/terms/t/trader.asp) having a [margin account](https://www.investopedia.com/terms/m/marginaccount.asp) subject to [commission](https://www.investopedia.com/terms/c/commission.asp) and [margin interest rate]((https://www.investopedia.com/ask/answers/07/margin_interest.asp)) 
+
+
+### The ideal trading strategy method
+
+A [trading strategy](https://www.investopedia.com/terms/t/trading-strategy.asp) is usually defined as a method of buying and selling in markets that is based on predefined rules used to make trading decisions.
+The ideal trading strategy method calculates the set of positions to be opened by a [trader](https://www.investopedia.com/terms/t/trader.asp) having a [margin account](https://www.investopedia.com/terms/m/marginaccount.asp) subject to [commission](https://www.investopedia.com/terms/c/commission.asp) and [margin interest rate]((https://www.investopedia.com/ask/answers/07/margin_interest.asp)) 
 during given trading period to generate the maximum possible profit. It appears that the interesting and thrilling moments we described above will manifest as positions to be opened by the trader.
 
 
@@ -427,13 +430,15 @@ $$\mathcal{T} = \{ T_i \}_{i=0}^{i=\mathrm{N}} =  \{ (t_i, a_i, b_i) \}_{i=0}^{i
 that satisfies the following constraints:  
   
   a. $m < n \implies t_m < t_n \quad \forall m,n  \in [0 \isep \mathrm{N}]$ 
-  b. $a_i > 0 \quad \forall i  \in [0 \isep \mathrm{N}]$
-  c. $b_i > 0 \quad \forall i  \in [0 \isep \mathrm{N}]$ 
+  b. $a_i > 0  \vee a_i = \text{NaN}  \quad \forall i  \in [0 \isep \mathrm{N}]$
+  c. $b_i > 0  \vee b_i = \text{NaN}  \quad \forall i  \in [0 \isep \mathrm{N}]$ 
   d. $a_i \geq b_i \quad \forall i  \in [0 \isep \mathrm{N}]$
 
 ```
 
-In the definition \@ref(def:trading-period) $T_i$ should be understood as a [bid-ask spread](https://www.investopedia.com/terms/b/bid-askspread.asp) at time $t_i$. Then $a_i$ is the [ask price](https://www.investopedia.com/terms/a/ask.asp) at time $t_i$, i.e. the price at which the trader can buy the instrument at time $t_i$.  Similarly, $b_i$ is the [bid](https://www.investopedia.com/terms/b/bidprice.asp) price at time $t_i$, i.e. the price at which the trader can sell the instrument at time $t_i$.
+In the definition \@ref(def:trading-period) $T_i$ should be understood as a [bid-ask spread](https://www.investopedia.com/terms/b/bid-askspread.asp) at time $t_i$. Then $a_i$ is the [ask price](https://www.investopedia.com/terms/a/ask.asp) at time $t_i$, i.e. the price at which the trader can buy the instrument at time $t_i$.  When $a_i = \text{NaN}$ the order book does not contain any offers to sell instrument at  time $t_i$ (and aftewards till some $t_{i+k}: a_{i+k} \neq \text{NaN}$)
+Similarly, $b_i$ is the [bid](https://www.investopedia.com/terms/b/bidprice.asp) price at time $t_i$, i.e. the price at which the trader can sell the instrument at time $t_i$. 
+
 
 
 ```{definition, name="Trading strategy", echo=TRUE, label=trading-strategy}
@@ -485,7 +490,7 @@ $$
 ```
 
 
-The position disovery method aims to find the trading strategy $S_{max}$ such that: 
+The ideal trading strategy method aims to find the trading strategy $S_{max}$ such that: 
 $$
   S_{max} = \arg\,\max_{\mathcal{S}} V(\mathcal{S})
 $$
@@ -493,6 +498,8 @@ $$
 
 
 ## Some examples of located upward and downward spikes  {.tabset}
+
+The ideal trading strategy method has been able to identify `r nrow(d)` spikes in the timeseries of BTCUSD price at Bitstamp in December 2019 whith $\phi=$ `r round(phi*10000,2)` bps and $\rho=$ `r round(rho*10000,2)` bps. The largest ones are show below.
 
 ```{r, include=FALSE}
 
@@ -519,8 +526,9 @@ plotPosition <- function(s, d, n, b = 60, a = 60) {
            y = "Price",
            caption = TeX(
              paste0(
-               "BTCUSD, $\\epsilon$: 100 bps, $\\theta$: 0.45 bps, draw size: ",
-               d$bps.return,
+               "BTCUSD, $\\phi$: ", phi*10000," bps,",
+               " $\\rho$: ", rho*10000," bps, draw size: ",
+               round(d$bps.return,2),
                " bps"
              )
            ))

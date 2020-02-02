@@ -881,3 +881,20 @@ trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-
   setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
   result
 }
+
+
+#' @export
+epsilon.drawupdowns <- function(trading.period, epsilon, debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "EXCEPTION"), tz="UTC") {
+  debug.level <- match.arg(debug.level)
+
+  result <- DiscoverDrawUpDowns(trading.period[, .(timestamp, price = (bid.price + ask.price)/2)], epsilon, debug.level)
+
+  setDT(result)
+  cols <- c("opened.at", "closed.at")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
+  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
+  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
+  result
+}
+
