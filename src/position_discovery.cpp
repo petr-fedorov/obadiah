@@ -24,7 +24,6 @@ TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
                                  double rho)
     : rho_(rho),
       phi_(phi),
-      is_all_processed_(true),
       trading_period_(period),
       sl_(0, 0),
       el_(0, 0),
@@ -50,8 +49,6 @@ operator<<(std::ostream& stream, Position& position) {
  stream << "Position O: " << position.s << " C: " << position.e;
  return stream;
 };
-
-TradingStrategy::operator bool() { return !is_all_processed_; }
 
 ObjectStream<Position>&
 TradingStrategy::operator>>(Position& p) {

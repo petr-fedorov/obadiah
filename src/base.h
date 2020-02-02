@@ -92,6 +92,12 @@ struct InstantPrice {
  bool operator==(const InstantPrice& e) { return p == e.p && t == e.t; }
 };
 
+struct Position {
+ InstantPrice s;
+ InstantPrice e;
+ inline int d() { return s.p > e.p ? 1 : -1; }
+};
+
 std::ostream&
 operator<<(std::ostream& stream, InstantPrice& p);
 
@@ -99,10 +105,18 @@ operator<<(std::ostream& stream, InstantPrice& p);
 template <typename O>
 class ObjectStream {
 public:
- virtual explicit operator bool() = 0;
+ explicit ObjectStream() : is_all_processed_(true) {};
+ virtual explicit operator bool();
  virtual ObjectStream<O>& operator>>(O&) = 0;
  virtual ~ObjectStream(){};
+protected:
+ bool is_all_processed_;
 };
+
+
+template<typename O>
+ObjectStream<O>::operator bool() { return !is_all_processed_; }
+
 
 template <template <typename> class Allocator,
           typename T = std::pair<const Price, Volume>>
@@ -123,10 +137,9 @@ private:
 
 template <template <typename> class Allocator,
           typename T = std::pair<const Price, Volume>>
-class TradingPeriod : ObjectStream<BidAskSpread> {
+class TradingPeriod : public ObjectStream<BidAskSpread> {
 public:
  TradingPeriod(ObjectStream<Level2>* depth_changes, double volume);
- explicit operator bool();
  TradingPeriod<Allocator, T>& operator>>(BidAskSpread&);
 
 protected:
@@ -137,7 +150,6 @@ protected:
  Volume volume_;
  Level2 unprocessed_;
  BidAskSpread current_;
- bool is_failed_;
 
  src::severity_logger<SeverityLevel> lg;
 };
@@ -245,14 +257,10 @@ OrderBook<Allocator, T>::GetBidAskSpread(Volume volume) const {
 template <template <typename> class Allocator, typename T>
 TradingPeriod<Allocator, T>::TradingPeriod(ObjectStream<Level2>* depth_changes,
                                            double volume)
-    : depth_changes_(depth_changes), volume_(volume), is_failed_(false) {
- if (!(*depth_changes_ >> unprocessed_)) is_failed_ = true;
+    : depth_changes_(depth_changes), volume_(volume) {
+ if (*depth_changes_ >> unprocessed_) is_all_processed_ = false;
 }
 
-template <template <typename> class Allocator, typename T>
-TradingPeriod<Allocator, T>::operator bool() {
- return !is_failed_;
-}
 
 template <template <typename> class Allocator, typename T>
 bool
@@ -278,7 +286,7 @@ TradingPeriod<Allocator, T>::ProcessNextEpisode() {
 template <template <typename> class Allocator, typename T>
 TradingPeriod<Allocator, T>&
 TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
- if (!is_failed_) {
+ if (!is_all_processed_) {
   to_be_returned = current_;
   BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Previous=" << static_cast<char*>(current_);
   while (ProcessNextEpisode()) {
@@ -291,7 +299,7 @@ TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
    BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Returned=" << static_cast<char*>(current_);
    to_be_returned = current_;
   } else
-   is_failed_ = true;
+   is_all_processed_ = true;
  }
  return *this;
 }

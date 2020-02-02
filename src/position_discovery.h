@@ -23,19 +23,12 @@
 
 namespace obadiah {
 
-struct Position {
- InstantPrice s;
- InstantPrice e;
- inline int d() { return s.p > e.p ? 1 : -1; }
-};
-
 std::ostream&
 operator<<(std::ostream& stream, Position& p);
 
 class TradingStrategy : public ObjectStream<Position> {
 public:
  TradingStrategy(ObjectStream<BidAskSpread>* period, double phi, double rho);
- explicit operator bool();
  ObjectStream<Position>& operator >> (Position&);
 
 private:
@@ -47,7 +40,6 @@ private:
 
  double rho_;
  double phi_;
- bool is_all_processed_;
  ObjectStream<BidAskSpread>* trading_period_;
 
  InstantPrice sl_;  // start long
