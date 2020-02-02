@@ -842,12 +842,14 @@ trading.period.connection <- function(con, start.time, end.time, exchange, pair,
     setDT(result)
     if(nrow(result) > 0) {
       result[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
+      result[is.nan(bid.price), c("bid.price") := NA]
+      result[is.nan(ask.price), c("ask.price") := NA]
     }
     result
   }
   result <- loader(exchange, pair)
   if(nrow(result) > 0 ) {
-    result[, c("timestamp", pair, exchange) := .(with_tz(timestamp, tz), pair, exchange)]
+    result[, c("timestamp") := .(with_tz(timestamp, tz))]
   }
   result
 }
@@ -868,8 +870,7 @@ trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-
   if( mode == "bid-ask")
     result <- DiscoverPositions(trading.period, phi, rho, debug.level)
   else {
-    mid.price <- (trading.period$best.bid.price + trading.period$best.ask.price)/2
-    result <- DiscoverPositions(trading.period, phi, rho, debug.level)
+    result <- DiscoverPositions(trading.period[, .(timestamp, bid.price = (bid.price + ask.price)/2, ask.price = (bid.price + ask.price)/2)], phi, rho, debug.level)
   }
 
   setDT(result)
