@@ -673,6 +673,17 @@ CREATE FUNCTION get.pair_id(p_pair text) RETURNS smallint
 ALTER FUNCTION get.pair_id(p_pair text) OWNER TO "ob-analytics";
 
 --
+-- Name: set_log_level(text); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get.set_log_level(p_level text DEFAULT 'NOTICE'::text) RETURNS void
+    LANGUAGE c
+    AS '$libdir/libobadiah_db.so.1', 'SetLogLevel';
+
+
+ALTER FUNCTION get.set_log_level(p_level text) OWNER TO "ob-analytics";
+
+--
 -- Name: spread(timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
@@ -755,6 +766,17 @@ $$;
 
 
 ALTER FUNCTION get.trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: trading_period(timestamp with time zone, timestamp with time zone, integer, integer, double precision, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get.trading_period(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_volume double precision, p_frequency interval DEFAULT NULL::interval) RETURNS TABLE("timestamp" bigint, "bid.price" double precision, "ask.price" double precision)
+    LANGUAGE c
+    AS '$libdir/libobadiah_db.so.1', 'CalculateTradingPeriod';
+
+
+ALTER FUNCTION get.trading_period(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_volume double precision, p_frequency interval) OWNER TO "ob-analytics";
 
 --
 -- Name: SCHEMA get; Type: ACL; Schema: -; Owner: ob-analytics

@@ -819,7 +819,7 @@ trading.period.connection <- function(con, start.time, end.time, exchange, pair,
     if(is.null(frequency))
 
       query <- paste0(" SELECT timestamp, \"bid.price\",",
-                      "\"ask.price\" FROM devel_casual_draws.trading_period(",
+                      "\"ask.price\" FROM get.trading_period(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
                       "get.pair_id(",shQuote(pair),"), " ,
@@ -828,7 +828,7 @@ trading.period.connection <- function(con, start.time, end.time, exchange, pair,
                       ")")
     else
       query <- paste0(" SELECT timestamp, \"bid.price\", ",
-                      "\"ask.price\", FROM devel_casual_draws.trading_period(",
+                      "\"ask.price\", FROM get.trading_period(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
                       "get.pair_id(",shQuote(pair),"), " ,

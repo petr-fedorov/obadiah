@@ -113,18 +113,18 @@ library(ggplot2)
 library(data.table)
 library(lubridate)
 library(latex2exp)
-futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+#futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
 ```
 
 
 
 ```{r connect-to-database, eval=FALSE}
-con <- obadiah::connect("192.168.3.5", "5433", dbname = "obadiah-devel")
+con <- obadiah::connect("192.168.3.5", "5432", dbname = "ob-analytics-prod")
 
 ```
 
 ```{r include=FALSE}
-load("large-draw-detection.gz2")
+load("spike-detection.gz2")
 ```
 
 
@@ -140,7 +140,7 @@ exchange <- 'bitstamp'
 
 ```{r load-spread, eval=FALSE}
 tp <- obadiah::trading.period(con,start.time, end.time ,exchange, pair, tz='Europe/Moscow')
-save(con, tp, file="large-draw-detection.gz2")
+save(con, tp, file="spike-detection.gz2")
 ```
 
 
@@ -232,7 +232,7 @@ ggplot(s_sampled[abs(r) > threshold/100,  s[timestamp >= start.time & timestamp 
 ```
 
 
-If we try to locate spikes more precisely and choose the smaller duration of the period, the outcome worsens. Figure \@ref(fig:five-mins-spread-changes) shows all 5-minutes intervals in December during which BTCUSD the price changed has exceeded the same threshold of `r threshold`%. Note that there are few of them and there are no large spikes among them!
+But if we try to locate spikes more precisely and choose the shorter duration of the period, the outcome worsens. Figure \@ref(fig:five-mins-spread-changes) shows all 5-minutes intervals in December during which BTCUSD the price changed has exceeded the same threshold of `r threshold`%. Note that there are (i) few of them and (ii) none of them shows a large spike.
 
 ```{r five-mins-spread-changes, cache=TRUE, fig.cap = paste0("All 5-minutes interval in December 2019 during which the mid-price change of BTCUSD at Bitstamp exceeded ", threshold, "%. There are few of them and there are no large spikes among them")}
 s_sampled <- s[order(timestamp), .(r = log(max(mid.price)) -  log(min(mid.price))), by=.(start.time = floor_date(timestamp, '5 minutes'))]
@@ -241,7 +241,7 @@ ggplot(s_sampled[abs(r) > threshold/100,  s[timestamp >= start.time & timestamp 
        aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
 ```
 
-On figure \@ref(fig:large-drawup-decomposed) we decomposed the large upward spike shown in figure \@ref(fig:thrilling-up) above into twelve five-minutes periods. It is rather difficult to catch from those pictures the sheer size of the spike behind them.
+The reason of that will become clear if you look at figure \@ref(fig:large-drawup-decomposed) where we've decomposed the large upward spike shown in figure \@ref(fig:thrilling-up) above into twelve five-minutes periods. Since the large spike passes through the boundary between two intervals, the spike was simply cut into two smaller ones by the boundary. 
 
 ```{r large-drawup-decomposed, cache=TRUE, fig.cap="It is difficult to recognize the largest BTCUSD price spike in December 2019 when price changes are decomposed into 5-minutes intervals"}
 
@@ -416,8 +416,11 @@ ggplot(s[timestamp %between% period ,],
 ### The ideal trading strategy method
 
 A [trading strategy](https://www.investopedia.com/terms/t/trading-strategy.asp) is usually defined as a method of buying and selling in markets that is based on predefined rules used to make trading decisions.
-The ideal trading strategy method calculates the set of positions to be opened by a [trader](https://www.investopedia.com/terms/t/trader.asp) having a [margin account](https://www.investopedia.com/terms/m/marginaccount.asp) subject to [commission](https://www.investopedia.com/terms/c/commission.asp) and [margin interest rate]((https://www.investopedia.com/ask/answers/07/margin_interest.asp)) 
-during given trading period to generate the maximum possible profit. It appears that the interesting and thrilling moments we described above will manifest as positions to be opened by the trader.
+
+The *ideal* trading strategy method calculates the set of positions to be opened by a [trader](https://www.investopedia.com/terms/t/trader.asp) having a [margin account](https://www.investopedia.com/terms/m/marginaccount.asp) subject to [commission](https://www.investopedia.com/terms/c/commission.asp) and [margin interest rate]((https://www.investopedia.com/ask/answers/07/margin_interest.asp)) 
+during given trading period to generate the *maximum possible profit*. 
+
+It appears that the interesting and thrilling moments we described above will manifest as positions to be opened by the trader.
 
 
 \newcommand{\isep}{\mathrel{{.}\,{.}}}
