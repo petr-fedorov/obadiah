@@ -763,27 +763,40 @@ intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair
 }
 
 
-
+#' Calculates and returns a trading period
+#'
+#' @param depth a source of depth changes data: either data.table with the pre-computed depth  as returned by  \code{\link{depth}} or
+#' an object of class 'connection' as returned by  \code{\link{connect}} pointing to the OBADIah database
+#' @returns A data.table with one row per bid-ask spread.
+#' \describe{
+#'  \item{timestamp POSIXct}{a starting timestamp}
+#'  \item{bid.price numeric}{an effective price at which the specified \code{volume} may be sold}
+#'  \item{ask.price numeric}{an effective price at which the specified \code{volume} may be bought}
+#' }
 
 #' @export
-trading.period <- function(x, ...) {
-  UseMethod("trading.period",x)
+trading.period <- function(depth, ...) {
+  UseMethod("trading.period",depth)
 }
 
+
+#' @rdname trading.period
+#' @param volume a trading volume for the effective \code{bid.price} \code{ask.price} calculation
 #' @export
-trading.period.data.table <- function(depth_changes, volume, tz="UTC") {
-  result <- CalculateTradingPeriod(depth_changes, volume)
+trading.period.data.table <- function(depth, volume = 0, tz="UTC") {
+  result <- CalculateTradingPeriod(depth, volume)
   setDT(result)
   cols <- c("timestamp")
   result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
   result
 }
 
-
+#' @rdname trading.period
+#' @inheritParams depth
 #' @export
-trading.period.connection <- function(con, start.time, end.time, exchange, pair, volume=0, frequency=NULL, tz='UTC') {
+trading.period.connection <- function(depth, start.time, end.time, exchange, pair, frequency=NULL, volume=0,  tz='UTC') {
 
-  conn=con$con()
+  conn=depth$con()
 
   if(is.character(start.time)) start.time <- ymd_hms(start.time)
   if(is.character(end.time)) end.time <- ymd_hms(end.time)
@@ -857,13 +870,37 @@ trading.period.connection <- function(con, start.time, end.time, exchange, pair,
 
 
 
-#' Calculates the maximum profit trading strategy for the given time series of spreads
+#' Calculates and returns an ideal trading strategy
 #'
-#' The maximum profit
+#' The ideal trading strategy is the set of long and/or short positions that generates the maximum profit
+#' in the given trading period subject to the commission and margin interest rate constraints provided
 #'
+#' @param trading.period a data.table as returned by \code{\link{trading.period}} with the following columns:  \code{timestamp}, \code{bid.price}, \code{ask.price}
+#' @param phi a numeric value of the commission percentage charged per transaction. 1\% is 0.01
+#' @param rho a numeric value of the margin interest rate per second. 0.1\% is 0.001
+#' @param mode a character vector specifying price use mode
+#' @details If \code{mode} parameter equals 'bid-ask' then, \code{bid.price} is used for selling and \code{ask.price} for buying transactions. In 'mid-price' mode,
+#' buying and selling transactions are performed using \code{mid.price} calculated as (\code{bid.price} + \code{ask.price})/2.
+#' @param debug.level a character vector
+#' @param tz a character vector with a time zone name understood by \code{\link{with_tz}} for the \code{timestamp} column in the output
+#' @returns A data.table with one row per position. The following information is provided for each position
+#' \describe{
+#'  \item{opened.at POSIXct}{opened at}
+#'  \item{open.price numeric}{opening price}
+#'  \item{closed.at POSIXct}{closed at}
+#'  \item{close.price numeric}{closing price}
+#'  \item{bps.return numeric}{return in basis points}
+#'  \item{rate numeric}{actual interest rate per seconds}
+#'  \item{log.return numeric}{log-relative return: abs(log(open.price) - log(close.price))}
+#' }
+#' If \code{open.price} is greater than \code{close.price} then it is a short position: the instrument is sold at \code{open.price}
+#' and bought at \code{close.price}.
+#'
+#' If \code{open.price} is less than \code{close.price} then it is a long possition: the instrument is bought at \code{open.price}
+#' and sold at \code{close.price}.
 #'
 #' @export
-trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "EXCEPTION"), tz="UTC") {
+trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
   mode <- match.arg(mode)
   debug.level <- match.arg(debug.level)
 
