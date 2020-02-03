@@ -10,6 +10,7 @@ library(RPostgres)
 library(config)
 library(dplyr)
 library(lubridate)
+library(data.table)
 
 
 
@@ -53,8 +54,8 @@ server <- function(input, output, session) {
 
   DBI::dbExecute(con$con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
-  futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
-  futile.logger::flog.appender(futile.logger::appender.console(), name='obadiah')
+  #futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+  #futile.logger::flog.appender(futile.logger::appender.console(), name='obadiah')
   #futile.logger::flog.appender(futile.logger::appender.file('obadiah.log'), name='obadiah')
 
   pairs <- reactive({

@@ -152,8 +152,8 @@ fluidPage(
                  wellPanel(
                    verbatimTextOutput("price_level_volume_hoverinfo"),
                    fluidRow( column(5, wellPanel(fluidRow(
-                                                  column(4, selectInput("show.trading.period", label="Trading period", choices=c("Mid price"='M', "Best prices"='B', "None"='N'), selected='B')),
-                                                  column(2, numericInput("trading.period.volume", label="Volume", value=0.0)),
+                                                  column(3, selectInput("show.trading.period", label="Trading period", choices=c("Mid price"='M', "Best prices"='B', "None"='N'), selected='B')),
+                                                  column(3, numericInput("trading.period.volume", label="Volume", value=0.0)),
                                                   column(3, numericInput("trading.period.commission", label="Commission", value=0.0001)),
                                                   column(3, numericInput("trading.period.interest.rate", label="Rate", value=0.0))))),
                              column(2, wellPanel(checkboxGroupInput("showtrades",label="Show trades", choices=list("Buys"="buy", "Sells"="sell", "With exchange.trade.id only"="with.ids.only"), inline=F))),
