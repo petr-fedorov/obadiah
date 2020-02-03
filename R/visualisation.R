@@ -18,7 +18,7 @@
 
 #' @import ggplot2
 #' @importFrom lubridate tz
-#' @importFrom dplyr select group_by summarize mutate
+#' @importFrom dplyr select group_by summarize mutate dense_rank
 
 #' @export
 plotDataAvailability <- function(intervals) {
@@ -41,7 +41,7 @@ plotDataAvailability <- function(intervals) {
 
  intervals <- intervals %>%
    group_by(exchange) %>%
-   mutate(y=dense_rank(desc(pair)))
+   mutate(y=dplyr::dense_rank(desc(pair)))
 
   ggplot(intervals,
          aes(xmin=interval_start, xmax=interval_end, ymin=y, ymax=y+0.7))+
@@ -60,4 +60,41 @@ plotDataAvailability <- function(intervals) {
               hjust="left", size=2, vjust="top") +
     facet_grid(rows=vars(exchange), scales="free_y", switch="y") +
     theme(legend.position="bottom")
+}
+
+
+
+#' @importFrom lubridate seconds
+#' @export
+plotPositionTrellis <- function(positions, trading.period, log.relative.price=TRUE, around=60) {
+
+  (if(log.relative.price) {
+    trading.period.trellis <- positions[,
+                            trading.period[timestamp >= opened.at - seconds(around) & timestamp <=  closed.at + seconds(around),
+                                           .(timestamp,price=log((bid.price+ask.price)/2) - log(open.price))],
+                            by=.(closed.at)]
+    ggplot(trading.period.trellis,
+           aes(x=timestamp, y=price)) +
+      geom_point(size=0.1) +
+      geom_line() +
+      geom_segment(aes(x=opened.at, xend=closed.at, y=0.0, yend=log(close.price)-log(open.price)),positions, color="blue",
+                   arrow=arrow(angle=20, length=unit(0.05, "npc"))) +
+      facet_wrap(vars(as.character(closed.at)), scales="free", ncol=as.integer(round(sqrt(nrow(positions))))) +
+      labs(y="Log relative price (position start == 0.0)", x="Timestamp")
+  }
+  else {
+    trading.period.trellis <- positions[,
+                            trading.period[timestamp >= opened.at - seconds(around) & timestamp <=  closed.at + seconds(around),
+                                           .(timestamp,price=(bid.price+ask.price)/2)],
+                            by=.(closed.at)]
+    ggplot(trading.period.trellis,
+           aes(x=timestamp, y=price)) +
+      geom_point(size=0.1) +
+      geom_line() +
+      geom_segment(aes(x=opened.at, xend=closed.at, y=open.price, yend=close.price),positions, color="blue",
+                   arrow=arrow(angle=20, length=unit(0.05, "npc"))) +
+      facet_wrap(vars(as.character(closed.at)), scales="free", ncol=as.integer(round(sqrt(nrow(positions))))) +
+      labs(y="Price", x="Timestamp")
+
+  }) + scale_x_datetime(date_labels="%H:%M")
 }
