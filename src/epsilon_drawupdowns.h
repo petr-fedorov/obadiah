@@ -32,7 +32,10 @@ private:
  InstantPrice tp_;  // turning point
  InstantPrice en_;  // end
 
+#ifndef NDEBUG
  src::severity_logger<SeverityLevel> lg;
+#endif
+
 };
 }  // namespace obadiah
 #endif

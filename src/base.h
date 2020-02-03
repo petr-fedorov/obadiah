@@ -15,8 +15,12 @@
 
 #ifndef OBADIAH_BASE_H
 #define OBADIAH_BASE_H
+
+#ifndef NDEBUG
 #include <boost/log/sources/severity_feature.hpp>
 #include <boost/log/sources/severity_logger.hpp>
+#endif
+
 #include <cmath>
 #include <map>
 #include <ostream>
@@ -24,10 +28,13 @@
 #include <unordered_map>
 #include "severity_level.h"
 
+#ifndef NDEBUG
 namespace logging = boost::log;
 namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
+#endif
+
 namespace obadiah {
 
 
@@ -132,7 +139,9 @@ private:
  std::map<Price, Volume, std::less<Price>, Allocator<T>> bids_;
  std::map<Price, Volume, std::less<Price>, Allocator<T>> asks_;
  Timestamp latest_timestamp_;
+#ifndef NDEBUG
  src::severity_logger<SeverityLevel> lg;
+#endif
 };
 
 template <template <typename> class Allocator,
@@ -151,7 +160,9 @@ protected:
  Level2 unprocessed_;
  BidAskSpread current_;
 
+#ifndef NDEBUG
  src::severity_logger<SeverityLevel> lg;
+#endif
 };
 
 template <template <typename> class Allocator, typename T>
@@ -178,15 +189,21 @@ OrderBook<Allocator, T>::operator<<(const Level2& next_depth) {
   auto search = side->find(next_depth.p);
   if(search != side->end()) {
    side->erase(search);
+#ifndef NDEBUG
    BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "From OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+#endif
   }
+#ifndef NDEBUG
   else 
    BOOST_LOG_SEV(lg, SeverityLevel::kWarning) << "From OB(NOT FOUND!)" << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+#endif
 
  }
  else{
   (*side)[next_depth.p] = next_depth.v;
+#ifndef NDEBUG
    BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "In OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+#endif
  }
  return *this;
 };
@@ -288,15 +305,21 @@ TradingPeriod<Allocator, T>&
 TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
  if (!is_all_processed_) {
   to_be_returned = current_;
+#ifndef NDEBUG
   BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Previous=" << static_cast<char*>(current_);
+#endif
   while (ProcessNextEpisode()) {
    current_ = ob_.GetBidAskSpread(volume_);
+#ifndef NDEBUG
    BOOST_LOG_SEV(lg, SeverityLevel::kDebug3)
        << "Current=" << static_cast<char*>(current_) << ob_;
+#endif
    if (current_ != to_be_returned) break;
   }
   if (current_ != to_be_returned) {
+#ifndef NDEBUG
    BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Returned=" << static_cast<char*>(current_);
+#endif
    to_be_returned = current_;
   } else
    is_all_processed_ = true;

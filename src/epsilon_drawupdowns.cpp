@@ -13,7 +13,11 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 01110-1301 USA.
 #include "epsilon_drawupdowns.h"
+
+#ifndef NDEBUG
 #include <boost/log/sources/record_ostream.hpp>
+#endif
+
 namespace obadiah {
 
 std::ostream&
@@ -32,21 +36,29 @@ EpsilonDrawUpDowns::EpsilonDrawUpDowns(ObjectStream<InstantPrice>* period,
   en_ = st_;
   is_all_processed_ = false;
  }
+#ifndef NDEBUG
  BOOST_LOG_SEV(lg, SeverityLevel::kDebug4) << "Created " << *this;
+#endif
 }
 
 ObjectStream<Position>&
 EpsilonDrawUpDowns::operator>>(Position& pos) {
  if (!is_all_processed_) {
   while (*trading_period_ >> en_) {
+#ifndef NDEBUG
    BOOST_LOG_SEV(lg, SeverityLevel::kDebug4) << "End point " << en_;
+#endif
    if (en_.p == tp_.p) {
+#ifndef NDEBUG
     BOOST_LOG_SEV(lg, SeverityLevel::kDebug4) << *this;
+#endif
     continue;
    }
    if ((tp_.p >= st_.p && en_.p > tp_.p) || (tp_.p <= st_.p && en_.p < tp_.p)) {
     tp_ = en_;  // Extend the draw, set the new turning point
+#ifndef NDEBUG
     BOOST_LOG_SEV(lg, SeverityLevel::kDebug4) << "E " << *this;
+#endif
     continue;
    } else {
     double delta = std::abs(en_ - tp_);
@@ -54,10 +66,14 @@ EpsilonDrawUpDowns::operator>>(Position& pos) {
      pos.s = st_;
      pos.e = tp_;
      st_ = tp_;
+#ifndef NDEBUG
      BOOST_LOG_SEV(lg, SeverityLevel::kDebug4) << "N " << *this;
+#endif
      return *this;
     }
+#ifndef NDEBUG
     BOOST_LOG_SEV(lg, SeverityLevel::kDebug4) << "TP " << *this;
+#endif
     continue;
    }
   }
