@@ -1,0 +1,907 @@
+---
+title: "How to locate the largest spikes"
+author: "Petr Fedorov"
+date: "`r Sys.Date()`"
+output:
+  bookdown::html_document2:
+    number_sections: FALSE
+    figure_captions: TRUE
+references:
+  - id: gerlach2019
+    title: Dissection of Bitcoin’s multiscale bubble history from January 2012 to February 2018
+    author: 
+      - family: Gerlach
+        given: J.C.
+      - family: Demos
+        given: G.
+      - family: Sornette
+        given: D.
+    issued:
+      year: 2019
+      month: 7
+    volume: 6
+    issue: 7
+    container-title: Royal Society Open Science
+    type: article-journal
+    
+  - id: johansen1998
+    title: Stock market crashes are outliers
+    author: 
+      - family: Johansen
+        given: A. 
+      - family: Sornette
+        given: D.
+    issued:
+      year: 1998
+    volume: 1
+    issue: 2
+    container-title: European Physical Journal B
+    type: article-journal    
+
+  - id: johansen2001
+    title: Large Stock Market Price Drawdowns Are Outliers
+    author: 
+      - family: Johansen
+        given: A. 
+      - family: Sornette
+        given: D.
+    issued:
+      year: 2001
+    volume: 4
+    issue: 2
+    page: 69-110
+    container-title: Journal of Risk
+    type: article-journal    
+
+  - id: johansen2010
+    title: Shocks, crashes and bubbles in financial markets.
+    author: 
+      - family: Johansen
+        given: A. 
+      - family: Sornette
+        given: D.
+    issued:
+      year: 2010
+    volume: 53
+    issue: 2
+    container-title: Brussels EconomicReview (Cahiers economiques de Bruxelles)
+    type: article-journal    
+    
+  - id: mukherjee2019
+    title: "Financial econometrics and big data: A survey of volatility estimators and tests for the presence of jumps and co-jumps."
+    author: 
+      - family: Mukherjee
+        given: Arpita
+      - family: Peng
+        given: Weijia
+      - family: Swanson
+        given: Norman R.  
+      - family: Yang
+        given: Xiye
+    issued:
+      year: 2019
+    container-title: Handbook of Statistics
+    publisher: Elsevier
+    type: chapter
+    
+  - id: lee2008
+    title: "Jumps in Financial Markets: A New Nonparametric Test and Jump Dynamics"
+    author: 
+      - family: Lee
+        given: Suzanne S.
+      - family: Mykland
+        given: Per A.
+    issued:
+      year: 2008
+      month: 11
+    volume: 21
+    issue: 6
+    container-title: Review of Financial Studies
+    type: article-journal    
+
+    
+---
+
+
+[//]: # (http://docs.citationstyles.org/en/stable/specification.html#appendix-iii-types)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+options(xtable.type="html", scipen = 999, digits = 2, digits.secs=6)
+library(ggplot2)
+library(data.table)
+library(lubridate)
+library(latex2exp)
+#futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+```
+
+
+
+```{r connect-to-database, eval=FALSE}
+con <- obadiah::connect("192.168.3.5", "5432", dbname = "ob-analytics-prod")
+
+```
+
+```{r include=FALSE}
+load("spike-detection.gz2")
+```
+
+
+```{r}
+start.time <- "2019-12-01 00:00:00+03"
+end.time <- "2019-12-31 23:59:59.999999+03"
+
+pair <- 'btcusd'
+exchange <- 'bitstamp'
+```
+
+
+
+```{r load-spread, eval=FALSE}
+tp <- obadiah::trading.period(con,start.time, end.time ,exchange, pair, tz='Europe/Moscow')
+save(con, tp, file="spike-detection.gz2")
+```
+
+
+
+
+```{r}
+s <- tp[, 
+       mid.price := (bid.price + ask.price)/2 
+       ][ 
+         ask.price - bid.price < 100, # remove outliers due to single-sided order book 
+       ]
+
+```
+
+
+```{r}
+d <- data.table( opened.at =ymd_hms('2019-12-04 23:59:54.966359+03'),
+                    closed.at = ymd_hms('2019-12-05 00:01:41.881455+03'))
+d[, c("open.price", "close.price") := .(s[abs(timestamp -opened.at) < 0.000001, "mid.price"], s[abs(timestamp -closed.at) < 0.000001, "mid.price"])]
+```
+
+## The problem of finding interesting moments in a time series {.tabset}
+
+Not all hours are created equal. Some of them are *boring* for price oscillates with a small amplitude around the same value. Some other are *interesting* for the amplitude of the price's oscillations increases several-fold for a short time interval. Yet another hours are really *thrilling* for the price suddenly jumps and remaines pegged at the noticeably higher or lower level. Several examples of boring, interesting and thrilling hours are shown below. 
+
+
+### Boring
+
+```{r boring, fig.cap="A boring moment"}
+ggplot(s[timestamp >= ymd_hms('2019-12-05 15:00:00+03') & timestamp <= ymd_hms('2019-12-05 15:59:59+03'),],
+       aes(x=timestamp, y=mid.price)) + geom_line() + ylim(c(7200, 7800))
+```
+
+### Interesting
+
+```{r interesting, fig.cap="An interesting moment"}
+ggplot(s[timestamp >= ymd_hms('2019-12-19 01:30:00+03') & timestamp <= ymd_hms('2019-12-19 02:30:00+03'),],
+       aes(x=timestamp, y=mid.price)) + geom_line()+ ylim(c(7100, 7800))
+```
+
+
+### Thrilling{.tabset}
+
+#### Upward
+
+```{r thrilling-up, fig.cap="The price has increased for more than 7% in just four minutes"}
+du12_04 <- c(ymd_hms('2019-12-04 16:00:00+03'), ymd_hms('2019-12-04 16:59:00+03'))
+ggplot(s[timestamp %inrange% du12_04 ,],
+       aes(x=timestamp, y=mid.price)) + geom_line() + ylim(c(7200, 7800)) + scale_x_datetime(date_breaks = "5 mins", date_labels="%H:%M")
+```
+
+#### Downward
+
+
+```{r thrilling-down, fig.cap="A thrilling downward spike"}
+ggplot(s[timestamp >= ymd_hms('2019-12-04 23:15:00+03') & timestamp <= ymd_hms('2019-12-05 00:15:00+03'),],
+       aes(x=timestamp, y=mid.price)) + geom_line() 
+```
+
+#
+
+
+```{r, inlcude=FALSE, echo=FALSE}
+
+phi <- 0.005
+rho <- 0.000045
+
+d <- obadiah::trading.strategy(s, phi=phi, rho=rho, mode="b", tz="Europe/Moscow")
+```
+
+
+Interesting and thrilling hours are uncommon. For example the timeseries of BTCUSD price at Bitstamp in December 2019 contains only `r length(unique(floor_date(d$opened.at, 'hour')))` hours with price spikes exceeding `r 2*phi*100`% and `r 31*24 - length(unique(floor_date(d$opened.at, 'hour')))` boring ones. Thus an automated tool is desirable in order to find eventful hours effortlessly. 
+
+
+## An automated detection of eventful periods
+
+
+### A naive approach  
+
+The first thought which probably comes to someone's mind is to look for hours during which the price change calculated as highest price minus lowest price exceeded some reasonable threshold, say, `r (threshold <- 2.5)`%. All such hours in December 2019 are visualised at figure \@ref(fig:hourly-spread-changes). We can find among them the thrilling hours from figures \@ref(fig:thrilling-up) and \@ref(fig:thrilling-down) and some other interesting hours too. 
+
+
+```{r hourly-spread-changes, cache=TRUE, fig.cap=paste0("Hours in December 2019 during the mid-price change of BTCUSD at Bitstamp exceeded ", threshold, "%. Not all of them are thrilling. Furthermore, some of them are not event interesting."), fig.height=10, fig.width=10}
+s_sampled <- s[order(timestamp), .(r = log(max(mid.price)) -  log(min(mid.price))), by=.(start.time = floor_date(timestamp, '60 minutes'))]
+
+
+ggplot(s_sampled[abs(r) > threshold/100,  s[timestamp >= start.time & timestamp <= start.time + minutes(60)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
+       aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
+```
+
+
+But if we try to locate spikes more precisely and choose the shorter duration of the period, the outcome worsens. Figure \@ref(fig:five-mins-spread-changes) shows all 5-minutes intervals in December during which BTCUSD the price changed has exceeded the same threshold of `r threshold`%. Note that there are (i) few of them and (ii) none of them shows a large spike.
+
+```{r five-mins-spread-changes, cache=TRUE, fig.cap = paste0("All 5-minutes interval in December 2019 during which the mid-price change of BTCUSD at Bitstamp exceeded ", threshold, "%. There are few of them and there are no large spikes among them")}
+s_sampled <- s[order(timestamp), .(r = log(max(mid.price)) -  log(min(mid.price))), by=.(start.time = floor_date(timestamp, '5 minutes'))]
+
+ggplot(s_sampled[abs(r) > threshold/100,  s[timestamp >= start.time & timestamp <= start.time + minutes(5)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
+       aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
+```
+
+The reason of that will become clear if you look at figure \@ref(fig:large-drawup-decomposed) where we've decomposed the large upward spike shown in figure \@ref(fig:thrilling-up) above into twelve five-minutes periods. Since the large spike passes through the boundary between two intervals, the spike was simply cut into two smaller ones by the boundary. 
+
+```{r large-drawup-decomposed, cache=TRUE, fig.cap="It is difficult to recognize the largest BTCUSD price spike in December 2019 when price changes are decomposed into 5-minutes intervals"}
+
+s_sampled <- s[timestamp >= ymd_hms('2019-12-04 16:00:00+03') & timestamp <= ymd_hms('2019-12-04 17:00:00+03'), ][order(timestamp), .(r = log(tail(mid.price,1)) -  log(head(mid.price,1))), by=.(start.time = floor_date(timestamp, '5 minutes'))]
+
+ggplot(s_sampled[,  s[timestamp >= start.time & timestamp <= start.time + minutes(5)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
+       aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
+```
+
+### Jump testing
+
+According to the recent review [@mukherjee2019]
+
+> The existence of jumps in financial markets is obvious, which has led many researches to develop techniques which can test for jumps. Jump diffusion is pivotal in analyzing asset movement in financial econometrics and developing jump tests to identify jumps has been the focus for many theoretical econometricians in past few years. 
+
+The review mentions six tests for the existense of jumps. But only one of them, namely [@lee2008] is designed to detect the exact timing of jumps at the intra-day level so we reproduce it here.
+
+The statistics $\mathcal{L}(i)$ which tests at time $t_i$ whether there was a jump of price $P(t)$ from $t_{i-1}$ to $t_i$ is defined as 
+$$
+\mathcal{L}(i) \equiv \frac{\log P(t_i)/P(t_{i-1})}{\widehat{\sigma(t_i)}}
+$$
+where $\widehat{\sigma(t_i)}$ is so called *realized bipower variation* defined as 
+
+$$
+\widehat{\sigma(t_i)}^2 \equiv \frac{1}{K-2} \sum_{j=i-K+2}^{i-1}|\log P(t_j)/P(t_{j-1})||\log P(t_{j-1})/P(t_{j-2})|
+$$
+
+For the *window size* $K$ the authors suggest value $K=270$ when $\Delta t = t_j - t_{j-1}$ equals to 5 min and that the probability of no jump at $t_i$ is less than 1% if the inequality \@ref(eq:jump) holds:
+
+
+$$
+T(i) \equiv \frac{|\mathcal{L}(i)| - C_n}{S_n} > 4.6001 (\#eq:jump)
+$$
+where 
+$$
+\begin{eqnarray}
+C_n & = & \frac{2 \log n}{c} - \frac{\log \pi + \log(\log n)}{2c(2\log n)^{1/2}} \\
+S_n & = & \frac{1}{c(2\log n)^{1/2}} \\
+c & = & \sqrt{2}/\sqrt{\pi}
+\end{eqnarray}
+$$
+Here we assume that we correctly understand that $n$ means the number of observations *per day* so in our case it is $24 \times 60/5=288$ 
+
+The  table \@ref(tab:jump-test) shows starting times of ten 5-minutes intervals having highest value of $T(i)$ statistic. 
+
+```{r jump-test}
+K <- 270
+n <- 24*60/5
+c <- sqrt(2/pi)
+C_n <- 2*log(n)/c - (log(pi) + log(log(n)))/(2*c*sqrt(2*log(n)))
+S_n <- 1/(c*sqrt(2*log(n)))
+log_p <- s[order(timestamp), .(P = log(tail(mid.price,1))), by=.(start.time = floor_date(timestamp, '5 minutes'))]
+
+sigmas <- na.omit(log_p[, .(start.time, sigma = sqrt(frollsum(nafill(shift(abs(P - shift(P,1))*abs(shift(P,1) - shift(P,2)),1),fill=0)/(K-2),n=K)))])
+
+t <- merge.data.table(log_p[, .(start.time, r = P - shift(P, 1)) ], sigmas)[, .(start.time, T=((abs(r)/sigma)-C_n)/S_n)]
+
+knitr::kable(head(t[order(-T),], 6), col.names=c("Time", "T_i"), caption="5-minutes intervals with the highest values of T(i) statistics.")
+
+#head(t[order(-T),],10)
+
+```
+
+```{r }
+ggplot(head(t[order(-T),], 6)[,  s[timestamp >= start.time & timestamp <= start.time + minutes(5)][, .(timestamp, mid.price=log(mid.price) - log((min(mid.price) + max(mid.price))/2))], by=start.time ],
+       aes(x=timestamp, y=mid.price)) + geom_line() + facet_wrap(~start.time, scales="free_x") + theme(axis.text.x = element_text(size=6), axis.text.y = element_text(size=6), strip.text.x=element_text(size=6))
+```
+
+Formally speaking, test shows that there were only four jumps of BTCUSD price at Bitstamp in December 2019. Note that the value of $T(i)$ diminishes very fast, so even at 5% level there will be only four jumps detected.
+
+Figure \@ref(fig:missing-jump) shows an example of jump which was not detected by the test. The reason is rather clear - everything has happened within the 5-mins interval. 
+
+
+```{r missing-jump, fig.cap="This jump was not detected by the test because everything has happened within 5-minutes interval."}
+period <- c("start"=with_tz(ymd_hms('2019-12-05 07:25:00+03'), tz="Europe/Moscow"),
+            "end"=with_tz(ymd_hms('2019-12-05 07:55:00+03'), tz="Europe/Moscow"))
+
+ggplot(s[timestamp %between% period ,],
+       aes(x=timestamp, y=mid.price)) + 
+  geom_line()
+```
+
+The authors claim:
+
+> For simplicity, this article assumes that observation times are equally spaced: $\Delta t = t_i − t_{i−1}$. This simplified assumption can easily be generalized to non-equidistant cases by letting $\max_i (t_i − t_{i−1}) \rightarrow 0$.
+
+Figure \@ref(fig:missing-jump) illustrate why this claim may be wrong:  what is shown on the figure as well as the other events classified by the test as "jumps" are not actually jumps.
+
+
+### $\epsilon$-drawdowns method
+
+The *Epsilon Drawdown Method* has been developed by [@johansen1998] and further used in [@johansen2001; -@johansen2010]. We'll follow [@gerlach2019] to describe the method here.
+
+
+The purpose of the $\epsilon$-drawdown procedure is the systematic segmentation of a price trajectory into a sequence of alternating, consecutive price drawup and drawdown phases. A drawup is defined as a succession of positive returns that may only be interrupted by negative returns no larger in amplitude than a pre-specified tolerance level $\epsilon$. Likewise, a drawdown is defined as a succession of negative returns that may only be interrupted by positive returns no larger in amplitude than the pre-specified tolerance level $\epsilon$. Consequentially, a drawup (respectively, drawdown) ends when next drawdown (respectively, drawup), whose amplitude exceeds $\epsilon$, is observed.
+
+Suppose we are given a price series $P[t_i], \quad i=0,1, \ldots$ where $t_i$ deisgnates the moment in time when the price has changed. Let $i_0 = 0$ and define $i_k \equiv i_0+k$
+
+We can calculate the discrete log-returns 
+
+$$
+\begin{equation} 
+r_{i_k} = \ln P[t_{i_k}] - \ln P[t_{i_{k-1}}], \quad k=1,2,\ldots (\#eq:r)
+\end{equation}
+$$
+
+The first time $t_{i_0}$ is defined as the beginning of a drawup (drawdown) if $r_{i_1}>0$($r_{i_1} < 0$).
+Then, for each subsequent $t_{i_k} > t_{i_0}, \quad k=1,2,\ldots$, we calculate the cummulative return up to $t_{i_k}$ as 
+$$
+\begin{equation}
+p_{i_k} = \sum_{j=1}^k r_{i_j} = \ln P[t_{i_k}] - \ln P[t_{i_0}] (\#eq:p)
+\end{equation}
+$$
+
+At each time $t_{i_k}, \quad k=1,2,\ldots$ we need to check whether the current drawup (drawdown) phase is still active. We test this by calculating the largest deviation $\delta_{i_k}$ of the price trajectory from a previous maximum (minimum) 
+$$
+\begin{equation}
+\delta_{i_k} = \begin{cases} \max_{1 \leq j \leq k} \{p_{i_j}\} - p_{i_k} & \text{for drawups} \\  p_{i_k}  - \min_{1 \leq j \leq k} \{p_{i_j}\}& \text{for drawdowns} \end{cases}  (\#eq:delta)
+\end{equation}
+$$
+The procedure is stopped at time $k$ when the deviation exceeds a predefined tolerance $\epsilon$ 
+$$
+\begin{equation}
+\delta_{i_k} > \epsilon (\#eq:stop)
+\end{equation}
+$$ 
+
+The stopping tolerance quantifies how much the price is allowed to move in the direction opposite to the
+drawup/drawdown trend.
+When the procedure has been stopped, the end of the current drawup (drawdown) phase is determined as the time of the highest (lowest) price seen in the tested interval: 
+$$
+\begin{equation}
+M = \begin{cases} \arg \max_{1 \leq j \leq k} \{p_{i_j}\} & \text{for drawups} \\ \arg \min_{1 \leq j \leq k} \{p_{i_j}\}& \text{for drawdowns} \end{cases} (\#eq:M)
+\end{equation}
+$$
+The $\epsilon$-drawup/drawdown procedure is restarted at time $i_M$.  The start of the next drawup/drawdown period will then be located at this time, i.e. $i_0$ will be set to $i_M$. By construction of $\delta$ and the stopping condition a drawup (respectively, drawdown) is always followed by a drawdown (respectively,drawup). The procedure is repeated until the full length of the analysed time series is represented as a sequence of drawups and drawdowns.
+
+Note that all draws except may be the first one will be larger than $\epsilon$, so $\epsilon$ can be interpreted as a minimal draw size which may be produced by the procedure.
+
+Figure \@ref(fig:epsilon-drawdowns) shows examples of drawdowns and drawups calculated for different values of $\epsilon$. The main drawback of the $\epsilon$-drawdown method manifests there. When $\epsilon$ is large, the drawup correctly identifies the highest price, but it starts far too early. Small $\epsilon$ allows to find the beginning of the drawup more or less correctly. But all drawups end prematurely so the largest drawup is not even discovered.
+
+
+
+```{r epsilon-drawdowns, fig.height=5, fig.cap="When $\\epsilon$ is large the big draw is identified correctly but it starts far too early. When $\\epsilon$ is small, the big draw is not identified at all."}
+period <- c("start"=with_tz(ymd_hms('2019-12-04 08:00:00+03'), tz="Europe/Moscow"),
+            "end"=with_tz(ymd_hms('2019-12-04 17:00:00+03'), tz="Europe/Moscow"))
+
+ggplot(s[timestamp %between% period ,],
+       aes(x=timestamp, y=mid.price)) + 
+  geom_line() + 
+  geom_segment(aes(x=opened.at, xend=closed.at, y= open.price, yend=close.price,
+                   group=as.character(minimal.size/10000),
+                   colour=as.character(minimal.size/10000)),
+               data.table(minimal.size=c(100,50,25))[,
+                                                         obadiah::epsilon.drawupdowns(s[between(timestamp, period["start"],
+                                                                                  period["end"])],
+                                                                        epsilon=minimal.size/10000, 
+                                                                        tz="Europe/Moscow"),
+                                                         by=.(minimal.size)]) +
+  scale_x_datetime("Time", date_breaks='1 hour', date_labels = "%H:%M") +
+  scale_y_continuous("Price") + 
+  scale_color_discrete(TeX("$\\epsilon$:")) +
+  labs(caption="BTCUSD at Bitstamp, 2019-12-04") +
+  theme(legend.position = "bottom") 
+               
+
+```
+
+
+
+
+### The ideal trading strategy method
+
+A [trading strategy](https://www.investopedia.com/terms/t/trading-strategy.asp) is usually defined as a method of buying and selling in markets that is based on predefined rules used to make trading decisions.
+
+The *ideal* trading strategy method calculates the set of positions to be opened by a [trader](https://www.investopedia.com/terms/t/trader.asp) having a [margin account](https://www.investopedia.com/terms/m/marginaccount.asp) subject to [commission](https://www.investopedia.com/terms/c/commission.asp) and [margin interest rate]((https://www.investopedia.com/ask/answers/07/margin_interest.asp)) 
+during given trading period to generate the *maximum possible profit*. 
+
+It appears that the interesting and thrilling moments we described above will manifest as positions to be opened by the trader.
+
+
+\newcommand{\isep}{\mathrel{{.}\,{.}}}
+
+
+```{definition, name="Trading period", echo=TRUE, label=trading-period}
+
+A trading period $\mathcal{T}$ for some [instrument](https://www.investopedia.com/terms/f/financialinstrument.asp) traded at some exchange is a set of tuples $T_i = (t_i, a_i, b_i)$ called *bid-ask spreads*
+$$\mathcal{T} = \{ T_i \}_{i=0}^{i=\mathrm{N}} =  \{ (t_i, a_i, b_i) \}_{i=0}^{i=\mathrm{N}}$$
+that satisfies the following constraints:  
+  
+  a. $m < n \implies t_m < t_n \quad \forall m,n  \in [0 \isep \mathrm{N}]$ 
+  b. $a_i > 0  \vee a_i = \text{NaN}  \quad \forall i  \in [0 \isep \mathrm{N}]$
+  c. $b_i > 0  \vee b_i = \text{NaN}  \quad \forall i  \in [0 \isep \mathrm{N}]$ 
+  d. $a_i \geq b_i \quad \forall i  \in [0 \isep \mathrm{N}]$
+
+```
+
+In the definition \@ref(def:trading-period) $T_i$ should be understood as a [bid-ask spread](https://www.investopedia.com/terms/b/bid-askspread.asp) at time $t_i$. Then $a_i$ is the [ask price](https://www.investopedia.com/terms/a/ask.asp) at time $t_i$, i.e. the price at which the trader can buy the instrument at time $t_i$.  When $a_i = \text{NaN}$ the order book does not contain any offers to sell instrument at  time $t_i$ (and aftewards till some $t_{i+k}: a_{i+k} \neq \text{NaN}$)
+Similarly, $b_i$ is the [bid](https://www.investopedia.com/terms/b/bidprice.asp) price at time $t_i$, i.e. the price at which the trader can sell the instrument at time $t_i$. 
+
+
+
+```{definition, name="Trading strategy", echo=TRUE, label=trading-strategy}
+
+A trading strategy $\mathcal{S}$ for some trading period $\mathcal{T}$ is a set (possibly empty) of tuples $P_j = (s_j, e_j, d_j)$ called *positions*
+$$
+  \mathcal{S} = \{P_j\}_{j=0}^{j=\mathrm{M}}
+$$  
+  
+that satisfies the following constraints: 
+  
+  a. $s_j, e_j \in [1 \isep \mathrm{N}], d_j \in \{-1, +1\} \quad \forall j \in [0 \isep \mathrm{M}]$
+  b. $s_j < e_j \quad \forall j \in [0 \isep \mathrm{M}]$
+  c. $(s_m \isep e_m) \cap (s_n \isep e_n) = \emptyset \quad \forall m, n \in [0 \isep \mathrm{M}]$
+
+```
+
+Note that according to the definition \@ref(def:trading-strategy) it is allowed to have $e_k = s_l, k \neq l$.
+
+```{definition, name="Position profit", echo=TRUE, label=position-profit}
+
+For any position $P_j$ from some trading strategy $\mathcal{S}$ for some trading period $\mathcal{T}$ a position profit  $V(P_j)$ is calculated as:
+  
+$$
+  V(P_j) = \begin{cases} (\ln b_{s_j} - \phi) - (\ln a_{e_j} + \phi) - (t_{e_j} - t_{s_j}) \rho & \textit{for }  d_j = -1 \\
+                      (\ln a_{s_j} + \phi) - (\ln b_{e_j} - \phi) - (t_{e_j} - t_{s_j}) \rho & \textit{for } d_j = +1
+      \end{cases}
+$$  
+where *comission* $\phi$  and *margin interest rate* $\rho$ are constants.
+
+```
+
+Note that 
+
+* Commission $\phi$ is charged per transaction, i.e. once for a buy and once again for a sell 
+
+* [The Continuous Compounding](https://www.investopedia.com/terms/c/continuouscompounding.asp) is used and $\rho$ is the stated interst rate per unit of time use to measure $t_{i}$
+
+```{definition, name="Trading strategy profit", echo=TRUE, label=trading-strategy-profit}
+A profit $V(\mathcal{S})$ of the trading strategy $\mathcal{S}$ is calculated as:
+  $$
+    V(\mathcal{S}) = \sum_{j=0}^{j=\mathrm{M}} V(P_j) (\#eq:profit-strategy)
+  $$  
+
+If $\mathcal{S} = \emptyset$ we define:
+$$
+  V(\emptyset) = 0 (\#eq:profit-empty-strategy)
+$$
+```
+
+
+The ideal trading strategy method aims to find the trading strategy $S_{max}$ such that: 
+$$
+  S_{max} = \arg\,\max_{\mathcal{S}} V(\mathcal{S})
+$$
+
+
+
+## Some examples of located upward and downward spikes  {.tabset}
+
+The ideal trading strategy method has been able to identify `r nrow(d)` spikes in the timeseries of BTCUSD price at Bitstamp in December 2019 whith $\phi=$ `r round(phi*10000,2)` bps and $\rho=$ `r round(rho*10000,2)` bps. The largest ones are show below.
+
+```{r, include=FALSE}
+
+getPosition <- function(d, n) {
+  d[order(-abs(bps.return)), ][n,]
+}
+
+plotPosition <- function(s, d, n, b = 60, a = 60) {
+  if (!any(is.na(getPosition(d, n)))) {
+    period <- c(d[, opened.at] - seconds(b),
+                d[, closed.at] + seconds(a))
+    
+    ggplot(s[timestamp %between% period , ], aes(x = timestamp, y = mid.price)) +
+      geom_line() +
+      geom_segment(aes(
+        x = opened.at,
+        xend = closed.at,
+        y = open.price,
+        yend = close.price
+      ),
+      d,
+      color = "blue") +
+      labs(x = "Time",
+           y = "Price",
+           caption = TeX(
+             paste0(
+               "BTCUSD, $\\phi$: ", phi*10000," bps,",
+               " $\\rho$: ", rho*10000," bps, draw size: ",
+               round(d$bps.return,2),
+               " bps"
+             )
+           ))
+    
+  }
+}
+
+
+```
+
+
+
+### Upward spikes{.tabset} 
+
+```{r }
+n <- 1
+single_draw <- getPosition(d[open.price < close.price], n)
+fmt_str <- "%Y-%m-%d %H:%M:%S"
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 1}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 2}
+plotPosition(s, single_draw)
+```
+
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 3}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 4}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 5}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 6}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 7}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 8}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 9}
+plotPosition(s, single_draw)
+```
+
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price < close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r Upward spike 10}
+plotPosition(s, single_draw)
+```
+
+
+
+### Downward spikes{.tabset} 
+
+```{r Downward spikes}
+n <- 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+
+```{r}
+n <- n + 1
+single_draw <- getPosition(d[open.price > close.price], n)
+```
+
+#### `r format(single_draw$closed.at, fmt_str)`
+
+```{r}
+plotPosition(s, single_draw)
+```
+
+
+
+
+
+```{r, eval=FALSE}
+ggplot(s[timestamp >= ymd_hms('2019-12-04 17:00:00+03') & timestamp <= ymd_hms('2019-12-04 18:00:00+03', tz="Europe/Moscow"),],
+       aes(x=timestamp, y=mid.price)) + geom_line() 
+```
+
+
+
+```{r, eval=FALSE}
+ggplot(d02_3[opened.at <= ymd_hms('2019-12-06 00:00:00+03')], aes(x=opened.at, y=bps.return)) + geom_point() + scale_x_datetime(date_breaks = '2 hours', date_labels = "%d-%H") + theme(axis.text.x = element_text(angle=90, vjust=0.5))
+```
+
+
+
+```{r, eval=FALSE}
+ref.draws_02 <- fread(text=
+  "ref.opened.at, ref.closed.at, exchange, pair
+   2019-12-04 16:21:08.711719+03, 2019-12-04 16:23:22.878021+03,bitstamp,btcusd
+   2019-12-04 16:23:52.679087+03, 2019-12-04 16:25:20.313824+03,bitstamp,btcusd
+   2019-12-04 23:53:42.915552+03, 2019-12-04 23:54:53.731950+03,bitstamp,btcusd
+   2019-12-04 23:59:54.966359+03, 2019-12-05 00:01:41.881455+03,bitstamp,btcusd
+   2019-12-05 07:39:41.115334+03, 2019-12-05 07:40:49.050225+03,bitstamp,btcusd	
+   2019-12-05 07:40:49.247689+03, 2019-12-05 07:41:31.348919+03,bitstamp,btcusd
+   2019-12-06 20:53:02.446621+03, 2019-12-06 20:53:59.035335+03,bitstamp,btcusd
+   2019-12-06 20:54:59.561635+03, 2019-12-06 20:55:38.934822+03,bitstamp,btcusd
+   2019-12-16 21:34:33.339440+03, 2019-12-16 21:35:56.246698+03,bitstamp,btcusd
+   2019-12-17 16:44:21.821795+03, 2019-12-17 16:46:15.819507+03,bitstamp,btcusd
+   2019-12-18 02:09:18.176475+03, 2019-12-18 02:10:39.408296+03,bitstamp,btcusd
+   2019-12-19 01:59:55.544752+03, 2019-12-19 02:00:20.071688+03,bitstamp,btcusd
+  ")
+ref.draws_02[, c("ref.opened.at", "ref.closed.at") := .(ymd_hms(ref.opened.at, tz="Europe/Moscow", quiet=TRUE), ymd_hms(ref.closed.at, tz="Europe/Moscow", quiet=TRUE) )]
+
+ref.draws_02[, c("ref.open.price", "ref.close.price") := .(s[abs(timestamp - ref.opened.at) < 0.000001, mid.price], s[abs(timestamp - ref.closed.at) < 0.000001, mid.price] ),by=.(ref.opened.at, ref.closed.at, pair, exchange)]
+
+a <- 1
+ref.spreads_02 <- ref.draws_02[,
+          s[timestamp >= ref.opened.at - minutes(a) & timestamp <=  ref.closed.at + minutes(a),
+               .(timestamp,price=log(mid.price) - log(ref.open.price))],
+               #.(timestamp,price=mid.price)],
+          by=.(ref.closed.at)]
+
+```
+
+
+
+```{r, eval=FALSE, fig.height=10, fig.width=10}
+ggplot(ref.spreads_02,
+       aes(x=timestamp, y=price), group=e) + 
+  geom_point(size=0.1) + 
+  geom_line() + 
+  geom_segment(aes(x=ref.opened.at, xend=ref.closed.at, y=0.0, yend=log(ref.close.price)-log(ref.open.price)),ref.draws_02, color="red",
+  #geom_segment(aes(x=ref.opened.at, xend=ref.closed.at, y=ref.open.price, yend=ref.close.price),ref.draws, color="red",
+  arrow=arrow(angle=20, length=unit(0.05, "npc"))) + 
+  facet_wrap(vars(as.character(ref.closed.at)), scales="free", ncol=3) + labs(y="Log relative price (draw start == 0.0)", x="Timestamp, GMT+3", title="Reference Set II: 6 drawups and 6 drawdowns of BTCUSD mid-price at Bitstamp")
+
+```
+
+
+
+
+```{r, eval=FALSE, cache=TRUE}
+
+minimal.size <- 50
+minimal.rate <- 0.45
+
+#d02_3 <- obadiah::draws(s[timestamp >= ymd_hms('2019-12-04 16:21:00+03') & timestamp <= ('2019-12-04 17:54:00+03'), ], draw.type="T3", minimal.size=minimal.size, minimal.rate=minimal.rate, tz="Europe/Moscow")
+
+#d02_3 <- obadiah::draws(s[timestamp <= ymd_hms('2019-12-05 00:00:00+03'), ], draw.type="T3", minimal.size=minimal.size, minimal.rate=minimal.rate, tz="Europe/Moscow")
+
+d02_3 <- obadiah::draws(s, draw.type="T3", minimal.size=minimal.size, minimal.rate=minimal.rate, tz="Europe/Moscow")
+```
+
+
+
+```{r,eval=FALSE, fig.height=10, fig.width=10}
+
+t02_3.draws <- ref.draws_02[, d02_3[opened.at >= ref.opened.at - minutes(a) & closed.at <= ref.closed.at + minutes(a), ], by=.(ref.closed.at, ref.open.price)]
+
+ggplot(ref.spreads_02,
+       aes(x=timestamp, y=price), group=e) + 
+  geom_point(size=0.1) + 
+  geom_line() + 
+  geom_segment(aes(x=ref.opened.at, xend=ref.closed.at, y=0.0, yend=log(ref.close.price)-log(ref.open.price)),ref.draws_02, color="red",
+  #geom_segment(aes(x=ref.opened.at, xend=ref.closed.at, y=ref.open.price, yend=ref.close.price),ref.draws, color="red",
+  arrow=arrow(angle=20, length=unit(0.05, "npc"))) + 
+  geom_segment(aes(x=opened.at, xend=closed.at, y=log(open.price)-log(ref.open.price), yend=log(close.price)-log(ref.open.price)),t02_3.draws, color="blue") +
+  facet_wrap(vars(as.character(ref.closed.at)), scales="free", ncol=3)+ labs(y="Log relative price (draw start == 0.0)", x="Timestamp, GMT+3", title="Reference Set II: Type 3 draws vs reference", subtitle=paste0("Parameters: minimal.size=", minimal.size, " minimal.rate=", minimal.rate))
+```
+
+
+```{r, eval=FALSE, fig.height=15, fig.width=10}
+#large_draws <- obadiah::draws(s[timestamp <= ymd_hms('2019-12-01 08:35:18.770+03'), ], draw.type="T3", minimal.size=0.01, minimal.rate=0.0, tz="Europe/Moscow")
+
+large_draws <- obadiah::draws(s, draw.type="T3", minimal.size=25, minimal.rate=0.0, tz="Europe/Moscow")
+# obadiah::drawSpreadPlot(head(large_draws[order(-abs(bps.return)), ],16), s, around = 300)
+
+```
+
+```{r, eval=FALSE, fig.height=10, fig.width=10}
+obadiah::drawSpreadPlot(head(obadiah::draws(s, draw.type="T3", minimal.size=0.01, minimal.rate=0.00003, tz="Europe/Moscow")[order(-abs(bps.return)), ],9), s, around = 30)
+```
+
+
+
+```{r, eval=FALSE, fig.height=10, fig.width=10}
+obadiah::drawSpreadPlot(d02_3[opened.at == ymd_hms('2019-12-04 16:21:08.711719+03'), ], s, around = 30)
+```
+
+
+
+```{r, eval=FALSE, fig.height=10, fig.width=10}
+obadiah::drawSpreadPlot(head(d02_3[order(-abs(bps.return)), ],9), s, around = 30)
+```
+
+
+```{r, eval=FALSE}
+lm(log10(rnk)~log10(d.s), data=d02_3[order(-abs(bps.return)), .(d.s = abs(bps.return), rnk=.I/.N) ][d.s > 100,])
+```
+
+
+```{r, eval=FALSE}
+
+ggplot(d02_3[order(-abs(bps.return)), .(d.s = abs(bps.return), rnk=.I/.N) ], aes(x=d.s, y=rnk)) + geom_point() +  scale_x_log10() + scale_y_log10() + geom_abline(slope = -3.103, intercept=5.742, color="blue")
+
+```
+
+## References

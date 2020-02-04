@@ -17,12 +17,12 @@
 #' @importFrom lubridate with_tz ymd_hms seconds ceiling_date floor_date now minutes duration round_date
 #' @importFrom dplyr lead if_else filter select full_join rename mutate
 #' @importFrom plyr . empty
-#' @importFrom zoo na.locf
 #' @importFrom magrittr  %>%
 #' @importFrom purrr pmap_dfr
 #' @importFrom tibble tibble
 #' @import data.table
-#' @useDynLib obadiah
+#' @import futile.logger
+#' @useDynLib obadiah, .registration = TRUE
 
 
 .dummy <- function() {}
@@ -694,150 +694,6 @@ export <- function(con, start.time, end.time, exchange, pair, file = "events.csv
 
 
 #' @export
-draws <- function(x, ...) {
-  UseMethod("draws")
-}
-
-
-#' @export
-#' @method draws data.table
-draws.data.table <- function(spread.changes, gamma_0, theta, draw.type='mid-price', skip.crossed = TRUE, tz='UTC') {
-
-  if('pair' %in% colnames(spread.changes))
-    if(skip.crossed)
-      result <- spread.changes[best.bid.price <= best.ask.price, draws_from_spread(timestamp,
-                                                   switch(draw.type,
-                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                          "bid"=best.bid.price,
-                                                          "ask"=best.ask.price
-                                                   ),
-                                                   gamma_0,
-                                                   theta), by=.(pair, exchange) ]
-    else
-      result <- spread.changes[, draws_from_spread(timestamp,
-                                                   switch(draw.type,
-                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                          "bid"=best.bid.price,
-                                                          "ask"=best.ask.price
-                                                   ),
-                                                   gamma_0,
-                                                   theta), by=.(pair, exchange) ]
-
-  else {
-    if(skip.crossed)
-      result <- spread.changes[best.bid.price <= best.ask.price, draws_from_spread(timestamp,
-                                         switch(draw.type,
-                                                "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                "bid"=best.bid.price,
-                                                "ask"=best.ask.price
-                                         ),
-                                         gamma_0,
-                                         theta),]
-    else
-      result <- spread.changes[, draws_from_spread(timestamp,
-                                                   switch(draw.type,
-                                                          "mid-price"=(best.bid.price + best.ask.price)/2,
-                                                          "bid"=best.bid.price,
-                                                          "ask"=best.ask.price
-                                                   ),
-                                                   gamma_0,
-                                                   theta),]
-    setDT(result)
-  }
-  cols <- c("timestamp", "draw.end")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  setcolorder(result, c("timestamp","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
-  result
-}
-
-
-
-
-#' @export
-draws.connection <- function(con, start.time, end.time, exchanges, pairs, gamma_0, theta=0, draw.type='mid-price', frequency=NULL, skip.crossed=TRUE,  tz='UTC') {
-
-  conn=con$con()
-
-  if(is.character(start.time)) start.time <- ymd_hms(start.time)
-  if(is.character(end.time)) end.time <- ymd_hms(end.time)
-
-  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
-  stopifnot(is.null(frequency) || is.numeric(frequency))
-  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
-
-  if(is.null(frequency))
-    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", paste0("c(", paste0(shQuote(exchanges), collapse=","),")"), ", ", paste0("c(", paste0(shQuote(pairs), collapse=","),")"),")" ), name=packageName())
-  else
-    flog.debug(paste0("draws(conn,", shQuote(format(start.time, usetz=T)), "," , shQuote(format(end.time, usetz=T)),",", paste0("c(", paste0(shQuote(exchanges), collapse=","),")"), ", ", paste0("c(", paste0(shQuote(pairs), collapse=","),")"), ",", frequency, ")" ), name=packageName())
-
-  tzone <- tz
-
-  # Convert to UTC, so internally only UTC is used
-  start.time <- with_tz(start.time, tz='UTC')
-  end.time <- with_tz(end.time, tz='UTC')
-
-
-  result <- rbindlist(lapply(
-    do.call(c,
-            lapply(exchanges,
-                   function(e) {
-                     lapply(pairs, function(p) list(exchange=e, pair=p) )
-                   }
-                   )
-            ),
-    function(i) {
-      draws <- .draws(conn, start.time, end.time,  i$exchange, i$pair, gamma_0, theta, draw.type, frequency, skip.crossed)
-      if(nrow(draws) > 0) {
-        draws[, c("timestamp","draw.end","pair", "exchange") := .( with_tz(timestamp, tzone), with_tz(draw.end, tzone), ..i$pair, ..i$exchange)]
-      }
-      draws
-    }
-    )
-  )
-  setcolorder(result, c("timestamp","draw.end","start.price", "end.price", "draw.size", "draw.speed", "pair", "exchange"))
-  result
-}
-
-.draws <- function(conn, start.time, end.time, exchange, pair, gamma_0, theta, draw.type, frequency = NULL, skip.crossed=TRUE) {
-
-  if(is.null(frequency))
-    query <- paste0(" select timestamp, \"draw.end\", \"start.price\",",
-                    "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
-                    shQuote(format(start.time, usetz=T)), ",",
-                    shQuote(format(end.time, usetz=T)), ",",
-                    shQuote(draw.type), ",",
-                    "get.pair_id(",shQuote(pair),"), " ,
-                    "get.exchange_id(", shQuote(exchange), ") , ",
-                    "p_gamma_0 := ", gamma_0, ",",
-                    "p_theta := ",  theta, ",",
-                    "p_skip_crossed :=", skip.crossed,
-                    ") order by 1")
-  else
-    query <- paste0(" select \"timestamp\", \"draw.end\", \"start.price\",",
-                    "\"end.price\", \"draw.size\", \"draw.speed\" FROM get.draws(",
-                    shQuote(format(start.time, usetz=T)), ",",
-                    shQuote(format(end.time, usetz=T)), ",",
-                    shQuote(draw.type), ",",
-                    "get.pair_id(",shQuote(pair),"), " ,
-                    "get.exchange_id(", shQuote(exchange), "),",
-                    "p_gamma_0 := ", gamma_0, ",",
-                    "p_theta := ",  theta, ",",
-                    "p_frequency :=", shQuote(paste0(frequency, " seconds ")), ", " ,
-                    "p_skip_crossed :=", skip.crossed,
-                    ") order by 1")
-  flog.debug(query, name=packageName())
-  draws <- DBI::dbGetQuery(conn, query)
-  setDT(draws)
-
-  if(nrow(draws) > 0) {
-    draws[, c("timestamp", "draw.end") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01"),
-                                        as.POSIXct(draw.end/1000000.0, origin="2000-01-01")) ]
-  }
-  draws
-}
-
-
-#' @export
 intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair = NULL, tz='UTC') {
   conn=con$con()
 
@@ -905,3 +761,177 @@ intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair
   } )
 
 }
+
+
+#' Calculates and returns a trading period
+#'
+#' @param depth a source of depth changes data: either data.table with the pre-computed depth  as returned by  \code{\link{depth}} or
+#' an object of class 'connection' as returned by  \code{\link{connect}} pointing to the OBADIah database
+#' @returns A data.table with one row per bid-ask spread.
+#' \describe{
+#'  \item{timestamp POSIXct}{a starting timestamp}
+#'  \item{bid.price numeric}{an effective price at which the specified \code{volume} may be sold}
+#'  \item{ask.price numeric}{an effective price at which the specified \code{volume} may be bought}
+#' }
+
+#' @export
+trading.period <- function(depth, ...) {
+  UseMethod("trading.period",depth)
+}
+
+
+#' @rdname trading.period
+#' @param volume a trading volume for the effective \code{bid.price} \code{ask.price} calculation
+#' @export
+trading.period.data.table <- function(depth, volume = 0, tz="UTC") {
+  result <- CalculateTradingPeriod(depth, volume)
+  setDT(result)
+  cols <- c("timestamp")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result
+}
+
+#' @rdname trading.period
+#' @inheritParams depth
+#' @export
+trading.period.connection <- function(depth, start.time, end.time, exchange, pair, frequency=NULL, volume=0,  tz='UTC') {
+
+  conn=depth$con()
+
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+  stopifnot(is.null(frequency) || is.numeric(frequency))
+  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
+
+  flog.debug(paste0("trading.period(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),
+                    ", volume := ", volume, ", frequency := ", frequency, ", tz := ", tz , ")" ), name=packageName())
+
+  tzone <- tz
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+
+  if (!is.null(frequency)) {
+
+    if(frequency < 60) {
+      #start.time <- floor_date(start.time,  paste0(frequency, " seconds"))
+      end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
+    }
+    else {
+      #start.time <- floor_date(start.time, paste0(frequency %/% 60, " minutes"))
+      end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
+    }
+  }
+
+  loader <- function(exchange, pair) {
+
+    if(is.null(frequency))
+
+      query <- paste0(" SELECT timestamp, \"bid.price\",",
+                      "\"ask.price\" FROM get.trading_period(",
+                      shQuote(format(start.time, usetz=T)), ",",
+                      shQuote(format(end.time, usetz=T)), ",",
+                      "get.pair_id(",shQuote(pair),"), " ,
+                      "get.exchange_id(", shQuote(exchange), "), ",
+                      volume,
+                      ")")
+    else
+      query <- paste0(" SELECT timestamp, \"bid.price\", ",
+                      "\"ask.price\", FROM get.trading_period(",
+                      shQuote(format(start.time, usetz=T)), ",",
+                      shQuote(format(end.time, usetz=T)), ",",
+                      "get.pair_id(",shQuote(pair),"), " ,
+                      "get.exchange_id(", shQuote(exchange), "), ",
+                       volume, ", ",
+                      "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
+                      ") order by 1")
+
+    flog.debug(query, name=packageName())
+    result <- DBI::dbGetQuery(conn, query)
+    setDT(result)
+    if(nrow(result) > 0) {
+      result[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
+      result[is.nan(bid.price), c("bid.price") := NA]
+      result[is.nan(ask.price), c("ask.price") := NA]
+    }
+    result
+  }
+  result <- loader(exchange, pair)
+  if(nrow(result) > 0 ) {
+    result[, c("timestamp") := .(with_tz(timestamp, tz))]
+  }
+  result
+}
+
+
+
+
+#' Calculates and returns an ideal trading strategy
+#'
+#' The ideal trading strategy is the set of long and/or short positions that generates the maximum profit
+#' in the given trading period subject to the commission and margin interest rate constraints provided
+#'
+#' @param trading.period a data.table as returned by \code{\link{trading.period}} with the following columns:  \code{timestamp}, \code{bid.price}, \code{ask.price}
+#' @param phi a numeric value of the commission percentage charged per transaction. 1\% is 0.01
+#' @param rho a numeric value of the margin interest rate per second. 0.1\% is 0.001
+#' @param mode a character vector specifying price use mode
+#' @details If \code{mode} parameter equals 'bid-ask' then, \code{bid.price} is used for selling and \code{ask.price} for buying transactions. In 'mid-price' mode,
+#' buying and selling transactions are performed using \code{mid.price} calculated as (\code{bid.price} + \code{ask.price})/2.
+#' @param debug.level a character vector
+#' @param tz a character vector with a time zone name understood by \code{\link{with_tz}} for the \code{timestamp} column in the output
+#' @returns A data.table with one row per position. The following information is provided for each position
+#' \describe{
+#'  \item{opened.at POSIXct}{opened at}
+#'  \item{open.price numeric}{opening price}
+#'  \item{closed.at POSIXct}{closed at}
+#'  \item{close.price numeric}{closing price}
+#'  \item{bps.return numeric}{return in basis points}
+#'  \item{rate numeric}{actual interest rate per seconds}
+#'  \item{log.return numeric}{log-relative return: abs(log(open.price) - log(close.price))}
+#' }
+#' If \code{open.price} is greater than \code{close.price} then it is a short position: the instrument is sold at \code{open.price}
+#' and bought at \code{close.price}.
+#'
+#' If \code{open.price} is less than \code{close.price} then it is a long possition: the instrument is bought at \code{open.price}
+#' and sold at \code{close.price}.
+#'
+#' @export
+trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
+  mode <- match.arg(mode)
+  debug.level <- match.arg(debug.level)
+
+  if( mode == "bid-ask")
+    result <- DiscoverPositions(trading.period, phi, rho, debug.level)
+  else {
+    result <- DiscoverPositions(trading.period[, .(timestamp, bid.price = (bid.price + ask.price)/2, ask.price = (bid.price + ask.price)/2)], phi, rho, debug.level)
+  }
+
+  setDT(result)
+  cols <- c("opened.at", "closed.at")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
+  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
+  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
+  result
+}
+
+
+#' @export
+epsilon.drawupdowns <- function(trading.period, epsilon, debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "EXCEPTION"), tz="UTC") {
+  debug.level <- match.arg(debug.level)
+
+  result <- DiscoverDrawUpDowns(trading.period[, .(timestamp, price = (bid.price + ask.price)/2)], epsilon, debug.level)
+
+  setDT(result)
+  cols <- c("opened.at", "closed.at")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
+  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
+  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
+  result
+}
+

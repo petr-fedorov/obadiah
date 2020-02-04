@@ -10,6 +10,7 @@ library(RPostgres)
 library(config)
 library(dplyr)
 library(lubridate)
+library(data.table)
 
 
 
@@ -53,8 +54,8 @@ server <- function(input, output, session) {
 
   DBI::dbExecute(con$con(), paste0("set application_name to ",shQuote(isolate(input$remote_addr)) ))
 
-  futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
-  futile.logger::flog.appender(futile.logger::appender.console(), name='obadiah')
+  #futile.logger::flog.threshold(futile.logger::DEBUG, 'obadiah')
+  #futile.logger::flog.appender(futile.logger::appender.console(), name='obadiah')
   #futile.logger::flog.appender(futile.logger::appender.file('obadiah.log'), name='obadiah')
 
   pairs <- reactive({
@@ -166,7 +167,7 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$res, {
-    desired.sampling.freq <- as.integer(input$res)%/%900
+    desired.sampling.freq <- as.integer(input$res)%/%1800
 
     if(desired.sampling.freq > max(as.integer(frequencies))) {
       updateSelectInput(session, "freq", selected=max(as.integer(frequencies)))
@@ -193,15 +194,18 @@ server <- function(input, output, session) {
     )  %>% debounce(2000)
 
 
-  gamma_0 <- reactive({
-    req(input$gamma_0)
-    input$gamma_0
+  commission <- reactive({
+    req(input$trading.period.commission)
   }) %>% debounce(2000)
 
-  theta <- reactive({
-    req(input$theta)
-    input$theta/10000.0
+  interest.rate <- reactive({
+    req(input$trading.period.interest.rate)
   }) %>% debounce(2000)
+
+  volume <- reactive({
+    req(input$trading.period.volume)
+  }) %>% debounce(2000)
+
 
 
   period <- reactive({
@@ -242,7 +246,13 @@ server <- function(input, output, session) {
     depth
   })
 
-  draws <- reactive( {
+  trading_period <- reactive( {
+    tp <- timePoint()
+    obadiah::trading.period(depth_filtered(), volume(),tz=tz(tp))
+  })
+
+
+  trading_strategy <- reactive( {
 
     exchange <- isolate(input$exchange)
     pair <- pair()
@@ -253,8 +263,11 @@ server <- function(input, output, session) {
     to.time <- tp+zoomWidth()/2
     if (frequency == 0) frequency <- NULL
 
-    withProgress(message="loading draws ...", {
-      obadiah::draws(spread(), gamma_0(),theta(), input$showdraws, skip.crossed=input$skip.crossed, tz=tz(tp))
+    if(input$show.trading.period == 'M') mode='m'
+    else mode='b'
+
+    withProgress(message="calculating trading strategy ...", {
+      obadiah::trading.strategy(trading_period(),commission(), interest.rate() , mode=mode, tz=tz(tp))
     })
   })
 
@@ -271,20 +284,6 @@ server <- function(input, output, session) {
       mutate(cached.period.start=format(with_tz(cached.period.start, tz=values$tz), usetz=TRUE),
              cached.period.end=format(with_tz(cached.period.end, tz=values$tz), usetz=TRUE)
              )
-  })
-
-  spread <- reactive( {
-    tp <- timePoint()
-    # from.time <- tp-zoomWidth()/2
-    # to.time <- tp+zoomWidth()/2
-    # exchange <- isolate(input$exchange)
-    # pair <- pair()
-    #
-    #
-    # withProgress(message="loading spread...", {
-    #     obadiah::spread(con, from.time, to.time, exchange, pair, cache=cache, tz=tz(tp))
-    #   })
-    obadiah::spread(depth(), skip.crossed=input$skip.crossed, tz=tz(tp))
   })
 
   trades <- reactive( {
@@ -522,19 +521,17 @@ server <- function(input, output, session) {
       if("with.ids.only" %in% input$showtrades) trades <- trades %>% filter(!is.na(exchange.trade.id))
 
 
-      spread <- spread()
+      spread <- trading_period()
       if(nrow(spread) > 0) {
-        price.from <- 0.995*min(spread$best.bid.price)
-        price.to <- 1.005*max(spread$best.ask.price)
+        price.from <- 0.995*min(na.omit(spread$bid.price))
+        price.to <- 1.005*max(na.omit(spread$ask.price))
       }
       else {
         price.from <- min(depth$price)
         price.to <- max(depth$price)
       }
 
-      if (input$showdraws != 'N') draws <- draws()
-
-      show.mp <- if(input$showspread == 'M') TRUE else FALSE
+      if (input$show.trading.period != 'N') positions <- trading_strategy()
 
       show.all.depth <- "ro" %in% input$showdepth
 
@@ -548,17 +545,20 @@ server <- function(input, output, session) {
       if("lr" %in% input$showdepth) {
 
         first.depth.timestamp <- (depth %>% filter(timestamp >= from.time) %>% summarize(timestamp=min(timestamp)))$timestamp
-        first.spread <- (spread() %>% filter(lead(timestamp) >= first.depth.timestamp))[1, ]
+        first.spread <- na.omit(trading_period())[shift(timestamp, -1) >= first.depth.timestamp, ][1, ]
 
-        anchor.price <- (first.spread$best.bid.price + first.spread$best.ask.price)/2
+        anchor.price <- (first.spread$bid.price + first.spread$ask.price)/2
         depth <- depth %>% mutate(price = price/anchor.price - 1)
         trades <- trades %>% mutate(price = price/anchor.price-1)
         price.from <- price.from/anchor.price -1
         price.to <- price.to/anchor.price -1
 
-        if(input$showspread %in% c('M', 'B')) spread <- spread %>% mutate(best.bid.price = best.bid.price/anchor.price-1, best.ask.price = best.ask.price/anchor.price-1)
-        if(input$showdraws != 'N') draws <- draws %>% mutate(start.price = start.price/anchor.price-1,  end.price = end.price/anchor.price-1)
-
+        if(input$show.trading.period %in% c('M', 'B')) {
+          spread <- copy(spread)
+          positions <- copy(positions)
+          spread[, c("bid.price", "ask.price") := .(bid.price/anchor.price-1, ask.price = ask.price/anchor.price-1)]
+          positions[, c("open.price", "close.price") := .(open.price/anchor.price-1,close.price/anchor.price-1)]
+        }
       }
 
       col.bias <- if(input$depthbias == 0) depthbiasvalue() else 0
@@ -569,9 +569,7 @@ server <- function(input, output, session) {
 
       p <- if(!autoPvRange())
         plotPriceLevels(depth,
-                        switch(input$showspread, M=spread, B=spread, NULL),
-                        trades,
-                        show.mp=show.mp,
+                        trades=trades,
                         show.all.depth=show.all.depth,
                         col.bias=col.bias,
                         start.time=from.time,
@@ -583,9 +581,7 @@ server <- function(input, output, session) {
                         ) + ggplot2::scale_x_datetime(labels=scales::date_format(format=fmt, tz=tz))
       else
         plotPriceLevels(depth,
-                        switch(input$showspread, M=spread, B=spread, NULL),
-                        trades,
-                        show.mp=show.mp,
+                        trades=trades,
                         show.all.depth=show.all.depth,
                         col.bias=col.bias,
                         start.time=from.time,
@@ -594,7 +590,36 @@ server <- function(input, output, session) {
                         price.to=price.to
                         ) + ggplot2::scale_x_datetime(labels=scales::date_format(format=fmt, tz=tz))
         #p + ggplot2::geom_vline(xintercept=as.numeric(tp), col="red")
-      if (input$showdraws != 'N') p <- p + ggplot2::geom_segment(ggplot2::aes(x=timestamp, y=start.price, xend=draw.end, yend=end.price),draws, colour="white")
+      if (input$show.trading.period != 'N') {
+        p <- p +
+          ggplot2::geom_segment(ggplot2::aes(x=opened.at, y=open.price, xend=closed.at, yend=close.price),positions, colour="white", arrow=ggplot2::arrow(angle=20, length=ggplot2::unit(0.01, "npc"))) +
+          ggplot2::geom_point(ggplot2::aes(x=opened.at, y=open.price), positions, colour="white")
+        if (input$show.trading.period == 'M') {
+          spread[, "mid.price" := (ask.price + bid.price)/2 ]
+          for(data in split(spread, spread[, cumsum(!is.na(mid.price) & is.na(shift(mid.price))) ])) {
+            data <- head(data, nrow(data) - sum(is.na(data$mid.price))+1)
+            data <- na.omit(data)
+            p <- p +
+              ggplot2::geom_step(ggplot2::aes(x=timestamp, y=mid.price),data=na.omit(data), colour="white")
+          }
+        }
+        else {
+          for(data in split(spread, spread[, cumsum(!is.na(bid.price) & is.na(shift(bid.price))) ])) {
+            data <- head(data, nrow(data) - sum(is.na(data$bid.price))+1)
+            setnafill(data, "locf", cols="bid.price")
+            if(nrow(data > 1))
+              p <- p +
+                ggplot2::geom_step(ggplot2::aes(x=timestamp, y=bid.price),data=data, colour="red")
+          }
+          for( data in split(spread, spread[, cumsum(!is.na(ask.price) & is.na(shift(ask.price))) ])) {
+            data <- head(data, nrow(data) - sum(is.na(data$ask.price))+1)
+            setnafill(data, "locf", cols="ask.price")
+            if(nrow(data) > 1)
+              p <- p +
+                ggplot2::geom_step(ggplot2::aes(x=timestamp, y=ask.price),data=data, colour="green")
+          }
+        }
+      }
       p
     })
   })

@@ -13,22 +13,21 @@ License: GPL (>= 3)
 Encoding: UTF-8
 LazyData: true
 Imports:
-    obAnalytics,
     DBI,
     magrittr,
     dplyr,
     plyr,
     reshape2,
-    zoo,
     lubridate,
     futile.logger,
     purrr,
     tibble,
     ggplot2,
-    data.table
+    data.table,
+    RPostgres
 Suggests: testthat,
     knitr,
     rmarkdown
 VignetteBuilder: knitr
-LinkingTo: Rcpp
+LinkingTo: Rcpp, testthat
 RoxygenNote: 7.0.2

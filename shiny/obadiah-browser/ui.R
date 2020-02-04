@@ -151,15 +151,12 @@ fluidPage(
                  ,
                  wellPanel(
                    verbatimTextOutput("price_level_volume_hoverinfo"),
-                   fluidRow( column(2, wellPanel(radioButtons("showspread", label="Show spread", choices=c("Mid price"='M', "Best prices"='B', "None"='N'),
-                                                    selected='B', inline=F),
-                                                 checkboxInput("skip.crossed","Skip crossed", TRUE))),
-                             column(2, wellPanel(radioButtons("showdraws", label="Show draws", choices=c("None"='N', "Mid price"='mid-price', "Asks"='ask', "Bids"='bid'),
-                                                              selected='N', inline=F),
-                                                 numericInput("gamma_0", label="Initial gamma(x100)", value=30),
-                                                 numericInput("theta", label="Gamma time decay(x10000) ", value=25))
-                                    ),
-                             column(3, wellPanel(checkboxGroupInput("showtrades",label="Show trades", choices=list("Buys"="buy", "Sells"="sell", "With exchange.trade.id only"="with.ids.only"), inline=F))),
+                   fluidRow( column(5, wellPanel(fluidRow(
+                                                  column(3, selectInput("show.trading.period", label="Trading period", choices=c("Mid price"='M', "Best prices"='B', "None"='N'), selected='B')),
+                                                  column(3, numericInput("trading.period.volume", label="Volume", value=0.0)),
+                                                  column(3, numericInput("trading.period.commission", label="Commission", value=0.0001)),
+                                                  column(3, numericInput("trading.period.interest.rate", label="Rate", value=0.0))))),
+                             column(2, wellPanel(checkboxGroupInput("showtrades",label="Show trades", choices=list("Buys"="buy", "Sells"="sell", "With exchange.trade.id only"="with.ids.only"), inline=F))),
                              column(2, wellPanel(checkboxGroupInput("showdepth",label="Show depth", choices=list("Resting orders"="ro", "Relative price"="lr", "Liquidity percentiles (slow)" ="lp" )))),
                              column(3, wellPanel(fluidRow(
                                column(6, selectInput("depthbias","Colour bias",list("Log10"=2,"Custom"=0), selected=0)),

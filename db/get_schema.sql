@@ -290,73 +290,6 @@ $$;
 ALTER FUNCTION get.depth_summary(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_frequency interval, p_bps_step integer, p_max_bps_level integer) OWNER TO "ob-analytics";
 
 --
--- Name: draws(timestamp with time zone, timestamp with time zone, get.draw_type, integer, integer, numeric, numeric, interval, boolean); Type: FUNCTION; Schema: get; Owner: ob-analytics
---
-
-CREATE FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_pair_id integer, p_exchange_id integer, p_gamma_0 numeric, p_theta numeric DEFAULT 0, p_frequency interval DEFAULT NULL::interval, p_skip_crossed boolean DEFAULT true) RETURNS TABLE("timestamp" bigint, "draw.end" bigint, "start.price" numeric, "end.price" numeric, "draw.size" double precision, "draw.speed" double precision)
-    LANGUAGE sql STABLE SECURITY DEFINER
-    AS $$
-
-	with spread as (
-		select best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, microtimestamp, pair_id, exchange_id
-		from obanalytics.level1_continuous(p_start_time, p_end_time, p_pair_id, p_exchange_id, p_frequency)
-		where not p_skip_crossed or (best_bid_price <= best_ask_price)
-		union all
-		select (obanalytics._spread_from_depth(array_agg(d))).*
-		from get._starting_depth(p_start_time, p_pair_id, p_exchange_id, p_frequency) d
-	),
-	base_draws as (
-		select spread.*,
-				obanalytics.draw_agg(microtimestamp,
-									 case p_draw_type 
-										when 'bid' then round(best_bid_price, 5)
-										when 'ask' then round(best_ask_price, 5)
-										when 'mid-price' then round((best_bid_price + best_ask_price)/2, 5)
-									 end,
-									 p_gamma_0, p_theta) over w as draw, 
-				p_draw_type as draw_type
-		from spread
-		window w as (order by microtimestamp)
-	),
-	draws as (
-		select draw[1].microtimestamp as start_microtimestamp, 
-				draw[1].price as start_price, 
-				draw[2].microtimestamp as end_microtimestamp,
-				draw[2].price as end_price,
-				draw[3].microtimestamp as last_microtimestamp,
-				draw[3].price as last_price,
-				draw_type
-		from base_draws
-	),
-	final_draws as (
-		select distinct on (start_microtimestamp, draw_type )
-							 start_microtimestamp, 
-							 last_value(end_microtimestamp) over w as end_microtimestamp,
-							 last_microtimestamp,
-							 start_price, 
-							 last_value(end_price) over w as end_price,
-							 last_price,
-							 p_exchange_id::smallint, 
-							 p_pair_id::smallint,
-							 draw_type,
-							 (end_price - start_price)::double precision/start_price * 10000.0 as draw_size,
-							 p_gamma_0,
-							 (select exchange from obanalytics.exchanges where exchange_id = p_exchange_id),
-							 (select pair from obanalytics.pairs where pair_id = p_pair_id)
-		from draws
-		window w as ( partition by start_microtimestamp, draw_type order by end_microtimestamp )
-		order by draw_type, start_microtimestamp, end_microtimestamp desc, last_microtimestamp desc	
-	)	
-	select obanalytics._to_microseconds(start_microtimestamp), obanalytics._to_microseconds(end_microtimestamp), start_price, end_price, draw_size,
-			draw_size::double precision/(obanalytics._to_microseconds(end_microtimestamp) - obanalytics._to_microseconds(start_microtimestamp))::double precision
-	from final_draws
-	
-$$;
-
-
-ALTER FUNCTION get.draws(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_draw_type get.draw_type, p_pair_id integer, p_exchange_id integer, p_gamma_0 numeric, p_theta numeric, p_frequency interval, p_skip_crossed boolean) OWNER TO "ob-analytics";
-
---
 -- Name: events(timestamp with time zone, timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
@@ -673,6 +606,17 @@ CREATE FUNCTION get.pair_id(p_pair text) RETURNS smallint
 ALTER FUNCTION get.pair_id(p_pair text) OWNER TO "ob-analytics";
 
 --
+-- Name: set_log_level(text); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get.set_log_level(p_level text DEFAULT 'NOTICE'::text) RETURNS void
+    LANGUAGE c
+    AS '$libdir/libobadiah_db.so.1', 'SetLogLevel';
+
+
+ALTER FUNCTION get.set_log_level(p_level text) OWNER TO "ob-analytics";
+
+--
 -- Name: spread(timestamp with time zone, integer, integer, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
 --
 
@@ -755,6 +699,17 @@ $$;
 
 
 ALTER FUNCTION get.trades(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer) OWNER TO "ob-analytics";
+
+--
+-- Name: trading_period(timestamp with time zone, timestamp with time zone, integer, integer, double precision, interval); Type: FUNCTION; Schema: get; Owner: ob-analytics
+--
+
+CREATE FUNCTION get.trading_period(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_volume double precision, p_frequency interval DEFAULT NULL::interval) RETURNS TABLE("timestamp" bigint, "bid.price" double precision, "ask.price" double precision)
+    LANGUAGE c
+    AS '$libdir/libobadiah_db.so.1', 'CalculateTradingPeriod';
+
+
+ALTER FUNCTION get.trading_period(p_start_time timestamp with time zone, p_end_time timestamp with time zone, p_pair_id integer, p_exchange_id integer, p_volume double precision, p_frequency interval) OWNER TO "ob-analytics";
 
 --
 -- Name: SCHEMA get; Type: ACL; Schema: -; Owner: ob-analytics
