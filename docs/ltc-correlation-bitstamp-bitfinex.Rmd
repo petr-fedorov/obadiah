@@ -6,8 +6,8 @@ output: html_document
 params:
   start_time: 2019-09-01 00:00:00+03
   end_time: 2019-09-22 00:00:00+03
-  exchange1: Bitfinex
-  exchange2: Bitstamp
+  exchange1: bitfinex
+  exchange2: bitstamp
   pair: LTCUSD
   interval1: 2
   interval2: 10
@@ -29,12 +29,6 @@ library(latex2exp)
 library(knitr)
 library(gsubfn)
 
-config <- config::get()
-con <- DBI::dbConnect(RPostgres::Postgres(), user=config$user,dbname=config$dbname, host=config$host,
-                      port=config$port, sslmode="require", sslrootcert=config$sslrootcert,
-                      sslcert=config$sslcert,sslkey=config$sslkey,bigint="numeric")
-
-cache <- new.env(parent=emptyenv())
 options(digits.secs = 4, scipen=999)
 
 
@@ -47,6 +41,17 @@ knit_hooks$set(source = function(x, options) {
   })
   default_source_hook(x, options)
 })
+
+
+```
+
+
+```{r include=FALSE}
+config <- config::get()
+con <- obadiah::connect(user=config$user,dbname=config$dbname, host=config$host,
+                      port=config$port, sslrootcert=config$sslrootcert,
+                      sslcert=config$sslcert,sslkey=config$sslkey)
+
 
 ```
 
@@ -62,14 +67,12 @@ gridExtra::grid.arrange(
                    params$depth_end_time,
                    params$exchange1,
                    params$pair,
-                   cache=cache,
                    tz='Europe/Moscow'),
     obadiah::spread(con, 
                     params$depth_start_time,
                     params$depth_end_time,
                     params$exchange1,
                     params$pair,
-                    cache=cache,
                     tz='Europe/Moscow')
   ) + ggtitle(paste0(params$exchange1, ',', params$pair)),
   obAnalytics::plotPriceLevels(
@@ -78,18 +81,17 @@ gridExtra::grid.arrange(
                    params$depth_end_time,
                    params$exchange2,
                    params$pair,
-                   cache=cache,
                    tz='Europe/Moscow'),
     obadiah::spread(con, 
                     params$depth_start_time,
                     params$depth_end_time,
                     params$exchange2,
                     params$pair,
-                    cache=cache,
                     tz='Europe/Moscow')
   )+ ggtitle(paste0(params$exchange2, ',', params$pair))
 )  
 ```
+
 
 # Method
 
@@ -130,9 +132,8 @@ mid.price.changes <- purrr::map_dfr(intervals,
                                                         params$end_time,
                                                         exchange=exchange,
                                                         pair=pair,
-                                                        by.interval=dseconds(d),
-                                                        tz='Europe/Moscow',
-                                                        debug.query = FALSE)) %>% 
+                                                        frequency=d,
+                                                        tz='Europe/Moscow')) %>% 
                                      group_by(exchange, pair) %>%
                                      mutate(mid.price.change=log10(best.bid.price+best.ask.price) -
                                                              log10(lag(best.bid.price)+lag(best.ask.price)),

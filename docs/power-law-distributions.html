@@ -1,11 +1,10 @@
 <!DOCTYPE html>
 
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html>
 
 <head>
 
 <meta charset="utf-8" />
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="generator" content="pandoc" />
 <meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
 
@@ -232,6 +231,7 @@ $(document).ready(function () {
   border: none;
   display: inline-block;
   border-radius: 4px;
+  background-color: transparent;
 }
 
 .tabset-dropdown > .nav-tabs.nav-tabs-open > li {
@@ -323,7 +323,7 @@ $(document).ready(function () {
                           &#39;2019-09-17 00:00:00+03&#39;, 
                           &#39;Bitstamp&#39;, 
                           &#39;LTCUSD&#39;, 
-                          cache=cache,  tz=&#39;Europe/Moscow&#39;) %&gt;%
+                          tz=&#39;Europe/Moscow&#39;) %&gt;%
   select(-maker.event.id, -taker.event.id)
 kable(head(trades))</code></pre>
 <table>
@@ -455,9 +455,9 @@ kable(head(trades))</code></pre>
 </tr>
 </tbody>
 </table>
-<p>There are 621,605 <strong>real</strong> trades in total. Let’s calculate a trading volume and number of trades per 15 min period:</p>
+<p>There are 621,605 <strong>real</strong> trades in total. Let’s calculate a trading volume and number of trades per 900 period:</p>
 <pre class="r"><code>by_period &lt;- trades %&gt;%
-  mutate(period_end=ceiling_date(timestamp, &#39;15 min&#39;)) %&gt;% 
+  mutate(period_end=ceiling_date(timestamp, paste0(900, &quot; seconds&quot;))) %&gt;% 
   mutate(volume=replace_na(volume, 0), price=replace_na(price, 0)) %&gt;%
   group_by(period_end) %&gt;%
   summarize(volume=sum(volume), number.of.trades=sum(!is.na(timestamp)))
@@ -473,34 +473,34 @@ knitr::kable(head(by_period))</code></pre>
 </thead>
 <tbody>
 <tr class="odd">
-<td align="left">2019-02-01 00:15:00</td>
+<td align="left">2019-02-01 00:19:00</td>
 <td align="right">0.5851052</td>
 <td align="right">1</td>
 </tr>
 <tr class="even">
-<td align="left">2019-02-01 00:30:00</td>
-<td align="right">105.1180717</td>
-<td align="right">4</td>
+<td align="left">2019-02-01 00:32:00</td>
+<td align="right">104.8180717</td>
+<td align="right">3</td>
 </tr>
 <tr class="odd">
-<td align="left">2019-02-01 00:45:00</td>
-<td align="right">3.9536516</td>
-<td align="right">2</td>
-</tr>
-<tr class="even">
-<td align="left">2019-02-01 01:00:00</td>
-<td align="right">497.6865034</td>
-<td align="right">5</td>
-</tr>
-<tr class="odd">
-<td align="left">2019-02-01 01:15:00</td>
-<td align="right">46.1096915</td>
+<td align="left">2019-02-01 00:33:00</td>
+<td align="right">0.3000000</td>
 <td align="right">1</td>
 </tr>
 <tr class="even">
-<td align="left">2019-02-01 01:30:00</td>
-<td align="right">332.2872609</td>
-<td align="right">5</td>
+<td align="left">2019-02-01 00:57:00</td>
+<td align="right">3.9536516</td>
+<td align="right">2</td>
+</tr>
+<tr class="odd">
+<td align="left">2019-02-01 01:00:00</td>
+<td align="right">1.9475032</td>
+<td align="right">1</td>
+</tr>
+<tr class="even">
+<td align="left">2019-02-01 01:01:00</td>
+<td align="right">477.4679622</td>
+<td align="right">2</td>
 </tr>
 </tbody>
 </table>
@@ -513,7 +513,7 @@ knitr::kable(head(by_period))</code></pre>
 
 s_i &lt;- coef(lm(log10(prob) ~ log10(sigma), V %&gt;% filter(sigma &gt;=10)))
 zeta_V &lt;- -s_i[2]</code></pre>
-<p><span class="math inline">\(x\)</span> is measured in units of sample standard deviation of <code>volume</code>: <span class="math inline">\(\sigma_V =\)</span><code>sd(volume)</code> <span class="math inline">\(\approx\)</span> 1442.93.</p>
+<p><span class="math inline">\(x\)</span> is measured in units of sample standard deviation of <code>volume</code>: <span class="math inline">\(\sigma_V =\)</span><code>sd(volume)</code> <span class="math inline">\(\approx\)</span> 287.26.</p>
 <pre class="r"><code>ggplot(V ,  aes(sigma, prob)) + 
   geom_point(size=0.1) + 
   scale_y_log10(TeX(&#39;$P(V_t &gt; x)$&#39;),
@@ -528,9 +528,10 @@ zeta_V &lt;- -s_i[2]</code></pre>
            x=10,
            y=0.01, 
            label=TeX(paste0(&#39;$\\zeta_V=&#39;,round(zeta_V,2),&#39;$&#39;), output = &quot;character&quot;),
-           parse=TRUE)</code></pre>
-<p><img src="power-law-distributions_files/figure-html/unnamed-chunk-5-1.png" width="672" /></p>
-<p>We see that <span class="math inline">\(\zeta_V=3.39 \neq 1.5\)</span>.</p>
+           parse=TRUE)
+#&gt; Warning: Removed 4 rows containing missing values (geom_point).</code></pre>
+<p><img src="power-law-distributions_files/figure-html/unnamed-chunk-6-1.png" width="672" /></p>
+<p>We see that <span class="math inline">\(\zeta_V=3.17 \neq 1.5\)</span>.</p>
 <p>For a number of trades per period <span class="math inline">\(P(N_t &gt; x)\)</span> we have:</p>
 <pre class="r"><code>N &lt;- by_period %&gt;% 
   arrange(-number.of.trades) %&gt;%
@@ -540,7 +541,7 @@ zeta_V &lt;- -s_i[2]</code></pre>
 
 s_i &lt;- coef(lm(log10(prob) ~ log10(sigma), N %&gt;% filter(sigma &gt;=9)))
 zeta_N &lt;- -s_i[2]</code></pre>
-<p>Again, <span class="math inline">\(x\)</span> is measured in units of sample standard deviation of <code>number.of.trades</code>: <span class="math inline">\(\sigma_N =\)</span><code>sd(number.of.trades)</code> <span class="math inline">\(\approx\)</span> 61.87.</p>
+<p>Again, <span class="math inline">\(x\)</span> is measured in units of sample standard deviation of <code>number.of.trades</code>: <span class="math inline">\(\sigma_N =\)</span><code>sd(number.of.trades)</code> <span class="math inline">\(\approx\)</span> 9.43.</p>
 <pre class="r"><code>ggplot(N ,  aes(sigma, prob)) + geom_point(size=0.1) + 
   scale_y_log10(TeX(&#39;$P(N_t &gt; x)$&#39;),
                 breaks=c(0.001, 0.01, 0.1, 1),
@@ -554,8 +555,9 @@ zeta_N &lt;- -s_i[2]</code></pre>
            x=10, 
            y=0.01, 
            label=TeX(paste0(&#39;$\\zeta_N=&#39;,round(zeta_N,2),&#39;$&#39;), output = &quot;character&quot;),
-           parse=TRUE)</code></pre>
-<p><img src="power-law-distributions_files/figure-html/unnamed-chunk-7-1.png" width="672" /></p>
+           parse=TRUE)
+#&gt; Warning: Removed 1 rows containing missing values (geom_point).</code></pre>
+<p><img src="power-law-distributions_files/figure-html/unnamed-chunk-8-1.png" width="672" /></p>
 <p>We see that <span class="math inline">\(\zeta_N=3.62 \approx 3.4\)</span>.</p>
 </div>
 <div id="returns" class="section level2">
@@ -564,7 +566,7 @@ zeta_N &lt;- -s_i[2]</code></pre>
 <blockquote>
 <p>Define <span class="math inline">\(p_t\)</span> as the price of a given stock and the stock price ‘return’ <span class="math inline">\(r_t\)</span> as the change of the logarithm of stock price in a given time interval <span class="math inline">\(\Delta t\)</span>, <span class="math inline">\(r_t \equiv \ln p_t - \ln p_{t -\Delta t}\)</span>. The probability that a return has an absolute value larger than <span class="math inline">\(x\)</span> is found empirically to be: <span class="math display">\[ P(| r_t | &gt; x) \sim x^{-\zeta_r} \tag{1}\]</span> with <span class="math inline">\(\zeta_r \approx 3\)</span>. The ‘inverse cubic law’ of equation (1) is rather ‘universal’, holding over as many as 80 standard deviations for some stock markets, with <span class="math inline">\(\Delta t\)</span> ranging from one minute to one month, across different sizes of stocks, different time periods, and also for different stock market indices.</p>
 </blockquote>
-<p>Let’s load spreads at the end of every 15 min interval for <strong>LTCUSD</strong> pair traded at <strong>Bitstamp</strong> from 2019-02-01 00:00:00+03 till 2019-09-17 00:00:00+03. Since there are too many of them to be loaded at once, we will process them by time ranges:</p>
+<p>Let’s load spreads at the end of every 900 interval for <strong>LTCUSD</strong> pair traded at <strong>Bitstamp</strong> from 2019-02-01 00:00:00+03 till 2019-09-17 00:00:00+03. Since there are too many of them to be loaded at once, we will process them by time ranges:</p>
 <pre class="r"><code>ranges &lt;- tibble(s=with_tz(seq(ymd_hms(&#39;2019-02-01 00:00:00+03&#39;), ymd_hms(&#39;2019-09-17 00:00:00+03&#39;), by=&quot;1 week&quot;), tz=&quot;Europe/Moscow&quot;))
 ranges$e &lt;- c(tail(ranges$s, -1),ymd_hms(&#39;2019-09-17 00:00:00+03&#39;))
 kable(head(ranges))</code></pre>
@@ -604,7 +606,7 @@ kable(head(ranges))</code></pre>
 </table>
 <p>We will use a <em>mid-price</em> (best bid price plus best ask price divided by two) as a proxy for <span class="math inline">\(p_t\)</span>:</p>
 <pre class="r"><code>by_period &lt;- ranges %&gt;% rowwise() %&gt;% do({
-  obadiah::spread(con, .$s, .$e, &#39;Bitstamp&#39;, &#39;LTCUSD&#39;, by.interval=duration(&#39;15 min&#39;), cache=cache,  tz=&#39;Europe/Moscow&#39;) %&gt;% 
+  obadiah::spread(con, .$s, .$e, &#39;Bitstamp&#39;, &#39;LTCUSD&#39;, frequency=900, tz=&#39;Europe/Moscow&#39;) %&gt;% 
     mutate(price=(best.ask.price+best.bid.price)/2) %&gt;% # mid-price
     select(timestamp, price)
   }) %&gt;%  
@@ -625,33 +627,33 @@ kable(head(by_period))</code></pre>
 <tbody>
 <tr class="odd">
 <td align="left">2019-02-01 00:15:00</td>
-<td align="right">31.235</td>
-<td align="right">0.0001601</td>
-</tr>
-<tr class="even">
-<td align="left">2019-02-01 00:30:00</td>
 <td align="right">31.215</td>
 <td align="right">0.0006405</td>
 </tr>
-<tr class="odd">
-<td align="left">2019-02-01 00:45:00</td>
+<tr class="even">
+<td align="left">2019-02-01 00:30:00</td>
 <td align="right">31.220</td>
 <td align="right">0.0001602</td>
 </tr>
-<tr class="even">
-<td align="left">2019-02-01 01:00:00</td>
+<tr class="odd">
+<td align="left">2019-02-01 00:45:00</td>
 <td align="right">31.200</td>
 <td align="right">0.0006408</td>
 </tr>
+<tr class="even">
+<td align="left">2019-02-01 01:00:00</td>
+<td align="right">31.170</td>
+<td align="right">0.0009620</td>
+</tr>
 <tr class="odd">
 <td align="left">2019-02-01 01:15:00</td>
-<td align="right">31.175</td>
-<td align="right">0.0008016</td>
+<td align="right">31.230</td>
+<td align="right">0.0019231</td>
 </tr>
 <tr class="even">
 <td align="left">2019-02-01 01:30:00</td>
-<td align="right">31.230</td>
-<td align="right">0.0017627</td>
+<td align="right">31.240</td>
+<td align="right">0.0003202</td>
 </tr>
 </tbody>
 </table>
@@ -680,8 +682,8 @@ zeta_r &lt;- -s_i[2]
            y=0.01, 
            label=TeX(paste0(&#39;$\\zeta_r=&#39;,round(zeta_r,2),&#39;$&#39;), output = &quot;character&quot;),
            parse=TRUE)</code></pre>
-<p><img src="power-law-distributions_files/figure-html/unnamed-chunk-11-1.png" width="672" /></p>
-<p>Again we see that <span class="math inline">\(\zeta_r=3.15 \approx 3\)</span>.</p>
+<p><img src="power-law-distributions_files/figure-html/unnamed-chunk-12-1.png" width="672" /></p>
+<p>Again we see that <span class="math inline">\(\zeta_r=3.23 \approx 3\)</span>.</p>
 </div>
 <div id="references" class="section level2 unnumbered">
 <h2>References</h2>

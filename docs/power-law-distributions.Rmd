@@ -8,7 +8,7 @@ params:
   pair: LTCUSD
   start_time: 2019-02-01 00:00:00+03
   end_time: 2019-09-17 00:00:00+03
-  period: 15 min
+  period: 900
 references:
 - id: Gabaix2003
   title: A theory of power-law distributions in financial market fluctuations
@@ -48,14 +48,7 @@ library(latex2exp)
 library(knitr)
 library(gsubfn)
 
-config <- config::get()
-con <- DBI::dbConnect(RPostgres::Postgres(), user=config$user,dbname=config$dbname, host=config$host,
-                      port=config$port, sslmode="require", sslrootcert=config$sslrootcert,
-                      sslcert=config$sslcert,sslkey=config$sslkey,bigint="numeric")
-
-cache <- new.env(parent=emptyenv())
 options(digits.secs = 4, scipen=999)
-
 
 default_source_hook <- knit_hooks$get('source')
 
@@ -76,6 +69,15 @@ sql_end_time <- params$end_time
 
 
 ```
+
+```{r include=FALSE}
+config <- config::get()
+con <- obadiah::connect(user=config$user,dbname=config$dbname, host=config$host,
+                      port=config$port,  sslrootcert=config$sslrootcert,
+                      sslcert=config$sslcert,sslkey=config$sslkey)
+
+```
+
 
 According to [@Gabaix2003]:
 
@@ -102,7 +104,7 @@ trades <- obadiah::trades(con,
                           params$end_time, 
                           params$exchange, 
                           params$pair, 
-                          cache=cache,  tz='Europe/Moscow') %>%
+                          tz='Europe/Moscow') %>%
   select(-maker.event.id, -taker.event.id)
 kable(head(trades))
 ```
@@ -124,7 +126,7 @@ There are `r scales::number_format(big.mark=',')(nrow(trades))` **real** trades 
 
 ```{r}
 by_period <- trades %>%
-  mutate(period_end=ceiling_date(timestamp, params$period)) %>% 
+  mutate(period_end=ceiling_date(timestamp, paste0(params$period, " seconds"))) %>% 
   mutate(volume=replace_na(volume, 0), price=replace_na(price, 0)) %>%
   group_by(period_end) %>%
   summarize(volume=sum(volume), number.of.trades=sum(!is.na(timestamp)))
@@ -236,7 +238,7 @@ We will use a *mid-price* (best bid price plus best ask price divided by two) as
 
 ```{r, cache=TRUE}
 by_period <- ranges %>% rowwise() %>% do({
-  obadiah::spread(con, .$s, .$e, params$exchange, params$pair, by.interval=duration(params$period), cache=cache,  tz='Europe/Moscow') %>% 
+  obadiah::spread(con, .$s, .$e, params$exchange, params$pair, frequency=params$period, tz='Europe/Moscow') %>% 
     mutate(price=(best.ask.price+best.bid.price)/2) %>% # mid-price
     select(timestamp, price)
   }) %>%  

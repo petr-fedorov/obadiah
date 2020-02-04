@@ -1,5 +1,5 @@
 ---
-title: "How to locate the largest spikes"
+title: "How to locate the largest price spikes"
 author: "Petr Fedorov"
 date: "`r Sys.Date()`"
 output:
@@ -140,7 +140,7 @@ exchange <- 'bitstamp'
 
 ```{r load-spread, eval=FALSE}
 tp <- obadiah::trading.period(con,start.time, end.time ,exchange, pair, tz='Europe/Moscow')
-save(con, tp, file="spike-detection.gz2")
+#save(con, tp, file="spike-detection.gz2")
 ```
 
 
@@ -328,7 +328,7 @@ The authors claim:
 
 > For simplicity, this article assumes that observation times are equally spaced: $\Delta t = t_i − t_{i−1}$. This simplified assumption can easily be generalized to non-equidistant cases by letting $\max_i (t_i − t_{i−1}) \rightarrow 0$.
 
-Figure \@ref(fig:missing-jump) illustrate why this claim may be wrong:  what is shown on the figure as well as the other events classified by the test as "jumps" are not actually jumps.
+Figure \@ref(fig:missing-jump) illustrate why this claim may be wrong:  what is shown on the figure as well as the other events classified by the test as "jumps" are not actually jumps but the events with the duration that is significantly greater than zero.
 
 
 ### $\epsilon$-drawdowns method

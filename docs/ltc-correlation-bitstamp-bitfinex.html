@@ -1,11 +1,10 @@
 <!DOCTYPE html>
 
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html>
 
 <head>
 
 <meta charset="utf-8" />
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
 <meta name="generator" content="pandoc" />
 <meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
 
@@ -234,6 +233,7 @@ $(document).ready(function () {
   border: none;
   display: inline-block;
   border-radius: 4px;
+  background-color: transparent;
 }
 
 .tabset-dropdown > .nav-tabs.nav-tabs-open > li {
@@ -313,20 +313,20 @@ $(document).ready(function () {
 <div id="introduction" class="section level1">
 <h1>Introduction</h1>
 <p>On the figure below the white line shows how the mid-price of LTCUSD pair changes at Bitfinex and Bitstamp between 2019-09-21 00:20:00+03 and 2019-09-21 00:30:00+03. The changes look similar but they are not completely the same. One could ask: is it possible to use the mid-price change that <em>has just happened</em> at one of the exchanges to predict the change that <em>will hapen</em> at the other? Let’s try to answer this question.</p>
-<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-1-1.png" width="672" style="display: block; margin: auto;" /></p>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-2-1.png" width="672" style="display: block; margin: auto;" /></p>
 </div>
 <div id="method" class="section level1">
 <h1>Method</h1>
 <p>We will sample LTCUSD mid-price at regular intervals (2, 10 and 30 seconds) at Bitstamp and Bitfinex from 2019-09-01 00:00:00+03 till 2019-09-22 00:00:00+03. Then we’ll calculate mid-price change during each interval. Finally we’ll estimate Pearson correlation between mid-price change at Bitstamp and at Bitfinex using intervals of the same length but shifted relative to each other in time. We’ll also look at the size of mid-price changes.</p>
 <p>We start from creating a tibble whith definitions of two instruments we will compare. It will be used to call functions from obadiah package that are vectorized over instruments:</p>
 <pre class="r"><code>instruments &lt;- tribble(~exchange, ~pair,
-                       &#39;Bitfinex&#39;, &#39;LTCUSD&#39;,
-                       &#39;Bitstamp&#39;, &#39;LTCUSD&#39;)</code></pre>
+                       &#39;bitfinex&#39;, &#39;LTCUSD&#39;,
+                       &#39;bitstamp&#39;, &#39;LTCUSD&#39;)</code></pre>
 <p>The first such function allows us to check whether we have required data in the database:</p>
 <pre class="r"><code>obadiah::plotDataAvailability( 
   with(instruments, obadiah::intervals(con, &#39;2019-09-01 00:00:00+03&#39;, &#39;2019-09-22 00:00:00+03&#39;, exchange, pair, tz=&#39;Europe/Moscow&#39;)) 
 )</code></pre>
-<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-3-1.png" width="672" style="display: block; margin: auto;" /></p>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-4-1.png" width="672" style="display: block; margin: auto;" /></p>
 <p>Almost everything is green, so we may start the analysis.</p>
 <p><code>obadiah::spread()</code> will load from the database the spread the the end of the interval specified <code>by.interval</code> parameter. The function is vectorized over <code>exchange</code> and <code>pair</code> parameters so we utilize our <code>instruments</code> here. We will analyse several intervals held in <code>intervals</code> vector:</p>
 <pre class="r"><code>intervals &lt;- c( 2, 10, 30)  # seconds 
@@ -339,9 +339,8 @@ mid.price.changes &lt;- purrr::map_dfr(intervals,
                                                         &#39;2019-09-22 00:00:00+03&#39;,
                                                         exchange=exchange,
                                                         pair=pair,
-                                                        by.interval=dseconds(d),
-                                                        tz=&#39;Europe/Moscow&#39;,
-                                                        debug.query = FALSE)) %&gt;% 
+                                                        frequency=d,
+                                                        tz=&#39;Europe/Moscow&#39;)) %&gt;% 
                                      group_by(exchange, pair) %&gt;%
                                      mutate(mid.price.change=log10(best.bid.price+best.ask.price) -
                                                              log10(lag(best.bid.price)+lag(best.ask.price)),
@@ -367,38 +366,38 @@ kable(tail(mid.price.changes))</code></pre>
 <tr class="odd">
 <td align="right">30</td>
 <td align="left">2019-09-21 23:57:30</td>
-<td align="right">0</td>
-<td align="right">0.0001491</td>
+<td align="right">NA</td>
+<td align="right">0.0000000</td>
 </tr>
 <tr class="even">
 <td align="right">30</td>
 <td align="left">2019-09-21 23:58:00</td>
-<td align="right">0</td>
+<td align="right">0.0000000</td>
 <td align="right">0.0000000</td>
 </tr>
 <tr class="odd">
 <td align="right">30</td>
 <td align="left">2019-09-21 23:58:30</td>
-<td align="right">0</td>
-<td align="right">-0.0000596</td>
+<td align="right">NA</td>
+<td align="right">0.0000000</td>
 </tr>
 <tr class="even">
 <td align="right">30</td>
 <td align="left">2019-09-21 23:59:00</td>
-<td align="right">0</td>
-<td align="right">0.0000596</td>
+<td align="right">0.0000000</td>
+<td align="right">0.0000000</td>
 </tr>
 <tr class="odd">
 <td align="right">30</td>
 <td align="left">2019-09-21 23:59:30</td>
-<td align="right">0</td>
-<td align="right">-0.0000596</td>
+<td align="right">0.0000000</td>
+<td align="right">0.0000000</td>
 </tr>
 <tr class="even">
 <td align="right">30</td>
 <td align="left">2019-09-22 00:00:00</td>
-<td align="right">0</td>
-<td align="right">0.0000596</td>
+<td align="right">0.0000951</td>
+<td align="right">-0.0002982</td>
 </tr>
 </tbody>
 </table>
@@ -419,18 +418,18 @@ kable(mid.price.changes %&gt;%
 <tbody>
 <tr class="odd">
 <td align="center">2</td>
-<td align="center">895998</td>
-<td align="center">894214</td>
+<td align="center">340130</td>
+<td align="center">694797</td>
 </tr>
 <tr class="even">
 <td align="center">10</td>
-<td align="center">179212</td>
-<td align="center">179072</td>
+<td align="center">118979</td>
+<td align="center">164352</td>
 </tr>
 <tr class="odd">
 <td align="center">30</td>
-<td align="center">59747</td>
-<td align="center">59753</td>
+<td align="center">50506</td>
+<td align="center">57848</td>
 </tr>
 </tbody>
 </table>
@@ -474,7 +473,7 @@ kable(mid.price.changes %&gt;%
             size=3) + 
   scale_color_discrete(&quot;Duration of intervals, seconds&quot;) + 
   theme(legend.position = &quot;bottom&quot;)</code></pre>
-<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-7-1.png" width="672" style="display: block; margin: auto;" /></p>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-8-1.png" width="672" style="display: block; margin: auto;" /></p>
 <p>We see that:</p>
 <ol style="list-style-type: decimal">
 <li><p>The strongest correlation is between mid-price changes happened during simultaneous 30-seconds intervals at Bitstamp and Bitfinex (point 30:0).</p></li>
@@ -495,7 +494,7 @@ kable(mid.price.changes %&gt;%
   geom_smooth(method=&quot;lm&quot;) + 
   labs(x=&quot;Mid-price change that has happened at Bitstamp&quot;, y=&quot;Mid-price change that will happen at Bitfinex&quot;) +
   facet_grid(cols=vars(duration))</code></pre>
-<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-8-1.png" width="672" style="display: block; margin: auto;" /></p>
+<p><img src="ltc-correlation-bitstamp-bitfinex_files/figure-html/unnamed-chunk-9-1.png" width="672" style="display: block; margin: auto;" /></p>
 </div>
 <div id="discussion" class="section level1">
 <h1>Discussion</h1>

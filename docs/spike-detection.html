@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+
+<meta name="author" content="Petr Fedorov" />
+
+<meta name="date" content="2020-02-04" />
+
+<title>How to locate the largest price spikes</title>
+
+<script src="site_libs/jquery-1.11.3/jquery.min.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link href="site_libs/bootstrap-3.3.5/css/bootstrap.min.css" rel="stylesheet" />
+<script src="site_libs/bootstrap-3.3.5/js/bootstrap.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/html5shiv.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/respond.min.js"></script>
+<script src="site_libs/navigation-1.1/tabsets.js"></script>
+<link href="site_libs/highlightjs-9.12.0/default.css" rel="stylesheet" />
+<script src="site_libs/highlightjs-9.12.0/highlight.js"></script>
+
+<style type="text/css">code{white-space: pre;}</style>
+<style type="text/css">
+  pre:not([class]) {
+    background-color: white;
+  }
+</style>
+<script type="text/javascript">
+if (window.hljs) {
+  hljs.configure({languages: []});
+  hljs.initHighlightingOnLoad();
+  if (document.readyState && document.readyState === "complete") {
+    window.setTimeout(function() { hljs.initHighlighting(); }, 0);
+  }
+}
+</script>
+
+
+
+<style type="text/css">
+h1 {
+  font-size: 34px;
+}
+h1.title {
+  font-size: 38px;
+}
+h2 {
+  font-size: 30px;
+}
+h3 {
+  font-size: 24px;
+}
+h4 {
+  font-size: 18px;
+}
+h5 {
+  font-size: 16px;
+}
+h6 {
+  font-size: 12px;
+}
+.table th:not([align]) {
+  text-align: left;
+}
+</style>
+
+
+
+
+<style type = "text/css">
+.main-container {
+  max-width: 940px;
+  margin-left: auto;
+  margin-right: auto;
+}
+code {
+  color: inherit;
+  background-color: rgba(0, 0, 0, 0.04);
+}
+img {
+  max-width:100%;
+}
+.tabbed-pane {
+  padding-top: 12px;
+}
+.html-widget {
+  margin-bottom: 20px;
+}
+button.code-folding-btn:focus {
+  outline: none;
+}
+summary {
+  display: list-item;
+}
+</style>
+
+
+<style type="text/css">
+/* padding for bootstrap navbar */
+body {
+  padding-top: 51px;
+  padding-bottom: 40px;
+}
+/* offset scroll position for anchor links (for fixed navbar)  */
+.section h1 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h2 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h3 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h4 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h5 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.section h6 {
+  padding-top: 56px;
+  margin-top: -56px;
+}
+.dropdown-submenu {
+  position: relative;
+}
+.dropdown-submenu>.dropdown-menu {
+  top: 0;
+  left: 100%;
+  margin-top: -6px;
+  margin-left: -1px;
+  border-radius: 0 6px 6px 6px;
+}
+.dropdown-submenu:hover>.dropdown-menu {
+  display: block;
+}
+.dropdown-submenu>a:after {
+  display: block;
+  content: " ";
+  float: right;
+  width: 0;
+  height: 0;
+  border-color: transparent;
+  border-style: solid;
+  border-width: 5px 0 5px 5px;
+  border-left-color: #cccccc;
+  margin-top: 5px;
+  margin-right: -10px;
+}
+.dropdown-submenu:hover>a:after {
+  border-left-color: #ffffff;
+}
+.dropdown-submenu.pull-left {
+  float: none;
+}
+.dropdown-submenu.pull-left>.dropdown-menu {
+  left: -100%;
+  margin-left: 10px;
+  border-radius: 6px 0 6px 6px;
+}
+</style>
+
+<script>
+// manage active state of menu based on current page
+$(document).ready(function () {
+  // active menu anchor
+  href = window.location.pathname
+  href = href.substr(href.lastIndexOf('/') + 1)
+  if (href === "")
+    href = "index.html";
+  var menuAnchor = $('a[href="' + href + '"]');
+
+  // mark it active
+  menuAnchor.parent().addClass('active');
+
+  // if it's got a parent navbar menu mark it active as well
+  menuAnchor.closest('li.dropdown').addClass('active');
+});
+</script>
+
+<!-- tabsets -->
+
+<style type="text/css">
+.tabset-dropdown > .nav-tabs {
+  display: inline-table;
+  max-height: 500px;
+  min-height: 44px;
+  overflow-y: auto;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+.tabset-dropdown > .nav-tabs > li.active:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li.active:before {
+  content: "&#xe258;";
+  border: none;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs > li.active {
+  display: block;
+}
+
+.tabset-dropdown > .nav-tabs > li > a,
+.tabset-dropdown > .nav-tabs > li > a:focus,
+.tabset-dropdown > .nav-tabs > li > a:hover {
+  border: none;
+  display: inline-block;
+  border-radius: 4px;
+  background-color: transparent;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li {
+  display: block;
+  float: none;
+}
+
+.tabset-dropdown > .nav-tabs > li {
+  display: none;
+}
+</style>
+
+<!-- code folding -->
+
+
+
+
+</head>
+
+<body>
+
+
+<div class="container-fluid main-container">
+
+
+
+
+<div class="navbar navbar-default  navbar-fixed-top" role="navigation">
+  <div class="container">
+    <div class="navbar-header">
+      <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar">
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+      </button>
+      <a class="navbar-brand" href="index.html">OBADiah</a>
+    </div>
+    <div id="navbar" class="navbar-collapse collapse">
+      <ul class="nav navbar-nav">
+        <li>
+  <a href="index.html">Home</a>
+</li>
+<li>
+  <a href="explore.html">Explore</a>
+</li>
+<li>
+  <a href="verify.html">Verify</a>
+</li>
+<li>
+  <a href="research.html">Research</a>
+</li>
+<li>
+  <a href="trade.html">Trade</a>
+</li>
+<li>
+  <a href="about.html">About</a>
+</li>
+      </ul>
+      <ul class="nav navbar-nav navbar-right">
+        
+      </ul>
+    </div><!--/.nav-collapse -->
+  </div><!--/.container -->
+</div><!--/.navbar -->
+
+<div class="fluid-row" id="header">
+
+
+
+<h1 class="title toc-ignore">How to locate the largest price spikes</h1>
+<h4 class="author">Petr Fedorov</h4>
+<h4 class="date">2020-02-04</h4>
+
+</div>
+
+
+<div id="the-problem-of-finding-interesting-moments-in-a-time-series" class="section level2 tabset">
+<h2>The problem of finding interesting moments in a time series</h2>
+<p>Not all hours are created equal. Some of them are <em>boring</em> for price oscillates with a small amplitude around the same value. Some other are <em>interesting</em> for the amplitude of the price’s oscillations increases several-fold for a short time interval. Yet another hours are really <em>thrilling</em> for the price suddenly jumps and remaines pegged at the noticeably higher or lower level. Several examples of boring, interesting and thrilling hours are shown below.</p>
+<div id="boring" class="section level3">
+<h3>Boring</h3>
+<div class="figure"><span id="fig:boring"></span>
+<img src="spike-detection_files/figure-html/boring-1.png" alt="A boring moment" width="672" />
+<p class="caption">
+Figure 1: A boring moment
+</p>
+</div>
+</div>
+<div id="interesting" class="section level3">
+<h3>Interesting</h3>
+<div class="figure"><span id="fig:interesting"></span>
+<img src="spike-detection_files/figure-html/interesting-1.png" alt="An interesting moment" width="672" />
+<p class="caption">
+Figure 2: An interesting moment
+</p>
+</div>
+</div>
+<div id="thrilling" class="section level3 tabset">
+<h3>Thrilling</h3>
+<div id="upward" class="section level4">
+<h4>Upward</h4>
+<div class="figure"><span id="fig:thrilling-up"></span>
+<img src="spike-detection_files/figure-html/thrilling-up-1.png" alt="The price has increased for more than 7% in just four minutes" width="672" />
+<p class="caption">
+Figure 3: The price has increased for more than 7% in just four minutes
+</p>
+</div>
+</div>
+<div id="downward" class="section level4">
+<h4>Downward</h4>
+<div class="figure"><span id="fig:thrilling-down"></span>
+<img src="spike-detection_files/figure-html/thrilling-down-1.png" alt="A thrilling downward spike" width="672" />
+<p class="caption">
+Figure 4: A thrilling downward spike
+</p>
+</div>
+</div>
+</div>
+</div>
+<div id="section" class="section level1">
+<h1></h1>
+<p>Interesting and thrilling hours are uncommon. For example the timeseries of BTCUSD price at Bitstamp in December 2019 contains only 14 hours with price spikes exceeding 1% and 730 boring ones. Thus an automated tool is desirable in order to find eventful hours effortlessly.</p>
+<div id="an-automated-detection-of-eventful-periods" class="section level2">
+<h2>An automated detection of eventful periods</h2>
+<div id="a-naive-approach" class="section level3">
+<h3>A naive approach</h3>
+<p>The first thought which probably comes to someone’s mind is to look for hours during which the price change calculated as highest price minus lowest price exceeded some reasonable threshold, say, 2.5%. All such hours in December 2019 are visualised at figure <a href="#fig:hourly-spread-changes">5</a>. We can find among them the thrilling hours from figures <a href="#fig:thrilling-up">3</a> and <a href="#fig:thrilling-down">4</a> and some other interesting hours too.</p>
+<div class="figure"><span id="fig:hourly-spread-changes"></span>
+<img src="spike-detection_files/figure-html/hourly-spread-changes-1.png" alt="Hours in December 2019 during the mid-price change of BTCUSD at Bitstamp exceeded 2.5%. Not all of them are thrilling. Furthermore, some of them are not event interesting." width="960" />
+<p class="caption">
+Figure 5: Hours in December 2019 during the mid-price change of BTCUSD at Bitstamp exceeded 2.5%. Not all of them are thrilling. Furthermore, some of them are not event interesting.
+</p>
+</div>
+<p>But if we try to locate spikes more precisely and choose the shorter duration of the period, the outcome worsens. Figure <a href="#fig:five-mins-spread-changes">6</a> shows all 5-minutes intervals in December during which BTCUSD the price changed has exceeded the same threshold of 2.5%. Note that there are (i) few of them and (ii) none of them shows a large spike.</p>
+<div class="figure"><span id="fig:five-mins-spread-changes"></span>
+<img src="spike-detection_files/figure-html/five-mins-spread-changes-1.png" alt="All 5-minutes interval in December 2019 during which the mid-price change of BTCUSD at Bitstamp exceeded 2.5%. There are few of them and there are no large spikes among them" width="672" />
+<p class="caption">
+Figure 6: All 5-minutes interval in December 2019 during which the mid-price change of BTCUSD at Bitstamp exceeded 2.5%. There are few of them and there are no large spikes among them
+</p>
+</div>
+<p>The reason of that will become clear if you look at figure <a href="#fig:large-drawup-decomposed">7</a> where we’ve decomposed the large upward spike shown in figure <a href="#fig:thrilling-up">3</a> above into twelve five-minutes periods. Since the large spike passes through the boundary between two intervals, the spike was simply cut into two smaller ones by the boundary.</p>
+<div class="figure"><span id="fig:large-drawup-decomposed"></span>
+<img src="spike-detection_files/figure-html/large-drawup-decomposed-1.png" alt="It is difficult to recognize the largest BTCUSD price spike in December 2019 when price changes are decomposed into 5-minutes intervals" width="672" />
+<p class="caption">
+Figure 7: It is difficult to recognize the largest BTCUSD price spike in December 2019 when price changes are decomposed into 5-minutes intervals
+</p>
+</div>
+</div>
+<div id="jump-testing" class="section level3">
+<h3>Jump testing</h3>
+<p>According to the recent review <span class="citation">(Mukherjee et al. 2019)</span></p>
+<blockquote>
+<p>The existence of jumps in financial markets is obvious, which has led many researches to develop techniques which can test for jumps. Jump diffusion is pivotal in analyzing asset movement in financial econometrics and developing jump tests to identify jumps has been the focus for many theoretical econometricians in past few years.</p>
+</blockquote>
+<p>The review mentions six tests for the existense of jumps. But only one of them, namely <span class="citation">(Lee and Mykland 2008)</span> is designed to detect the exact timing of jumps at the intra-day level so we reproduce it here.</p>
+<p>The statistics <span class="math inline">\(\mathcal{L}(i)\)</span> which tests at time <span class="math inline">\(t_i\)</span> whether there was a jump of price <span class="math inline">\(P(t)\)</span> from <span class="math inline">\(t_{i-1}\)</span> to <span class="math inline">\(t_i\)</span> is defined as
+<span class="math display">\[
+\mathcal{L}(i) \equiv \frac{\log P(t_i)/P(t_{i-1})}{\widehat{\sigma(t_i)}}
+\]</span>
+where <span class="math inline">\(\widehat{\sigma(t_i)}\)</span> is so called <em>realized bipower variation</em> defined as</p>
+<p><span class="math display">\[
+\widehat{\sigma(t_i)}^2 \equiv \frac{1}{K-2} \sum_{j=i-K+2}^{i-1}|\log P(t_j)/P(t_{j-1})||\log P(t_{j-1})/P(t_{j-2})|
+\]</span></p>
+<p>For the <em>window size</em> <span class="math inline">\(K\)</span> the authors suggest value <span class="math inline">\(K=270\)</span> when <span class="math inline">\(\Delta t = t_j - t_{j-1}\)</span> equals to 5 min and that the probability of no jump at <span class="math inline">\(t_i\)</span> is less than 1% if the inequality <a href="#eq:jump">(1)</a> holds:</p>
+<p><span class="math display" id="eq:jump">\[
+T(i) \equiv \frac{|\mathcal{L}(i)| - C_n}{S_n} &gt; 4.6001 \tag{1}
+\]</span>
+where
+<span class="math display">\[
+\begin{eqnarray}
+C_n &amp; = &amp; \frac{2 \log n}{c} - \frac{\log \pi + \log(\log n)}{2c(2\log n)^{1/2}} \\
+S_n &amp; = &amp; \frac{1}{c(2\log n)^{1/2}} \\
+c &amp; = &amp; \sqrt{2}/\sqrt{\pi}
+\end{eqnarray}
+\]</span>
+Here we assume that we correctly understand that <span class="math inline">\(n\)</span> means the number of observations <em>per day</em> so in our case it is <span class="math inline">\(24 \times 60/5=288\)</span></p>
+<p>The table <a href="#tab:jump-test">1</a> shows starting times of ten 5-minutes intervals having highest value of <span class="math inline">\(T(i)\)</span> statistic.</p>
+<table>
+<caption><span id="tab:jump-test">Table 1: </span>5-minutes intervals with the highest values of T(i) statistics.</caption>
+<thead>
+<tr class="header">
+<th align="left">Time</th>
+<th align="right">T_i</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">2019-12-04 16:20:00</td>
+<td align="right">120.5</td>
+</tr>
+<tr class="even">
+<td align="left">2019-12-16 21:30:00</td>
+<td align="right">48.4</td>
+</tr>
+<tr class="odd">
+<td align="left">2019-12-06 20:50:00</td>
+<td align="right">18.1</td>
+</tr>
+<tr class="even">
+<td align="left">2019-12-22 19:05:00</td>
+<td align="right">17.8</td>
+</tr>
+<tr class="odd">
+<td align="left">2019-12-04 23:50:00</td>
+<td align="right">2.5</td>
+</tr>
+<tr class="even">
+<td align="left">2019-12-22 00:30:00</td>
+<td align="right">1.3</td>
+</tr>
+</tbody>
+</table>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-6-1.png" width="672" /></p>
+<p>Formally speaking, test shows that there were only four jumps of BTCUSD price at Bitstamp in December 2019. Note that the value of <span class="math inline">\(T(i)\)</span> diminishes very fast, so even at 5% level there will be only four jumps detected.</p>
+<p>Figure <a href="#fig:missing-jump">8</a> shows an example of jump which was not detected by the test. The reason is rather clear - everything has happened within the 5-mins interval.</p>
+<div class="figure"><span id="fig:missing-jump"></span>
+<img src="spike-detection_files/figure-html/missing-jump-1.png" alt="This jump was not detected by the test because everything has happened within 5-minutes interval." width="672" />
+<p class="caption">
+Figure 8: This jump was not detected by the test because everything has happened within 5-minutes interval.
+</p>
+</div>
+<p>The authors claim:</p>
+<blockquote>
+<p>For simplicity, this article assumes that observation times are equally spaced: <span class="math inline">\(\Delta t = t_i − t_{i−1}\)</span>. This simplified assumption can easily be generalized to non-equidistant cases by letting <span class="math inline">\(\max_i (t_i − t_{i−1}) \rightarrow 0\)</span>.</p>
+</blockquote>
+<p>Figure <a href="#fig:missing-jump">8</a> illustrate why this claim may be wrong: what is shown on the figure as well as the other events classified by the test as “jumps” are not actually jumps but the events with the duration that is significantly greater than zero.</p>
+</div>
+<div id="epsilon-drawdowns-method" class="section level3">
+<h3><span class="math inline">\(\epsilon\)</span>-drawdowns method</h3>
+<p>The <em>Epsilon Drawdown Method</em> has been developed by <span class="citation">(Johansen and Sornette 1998)</span> and further used in <span class="citation">(Johansen and Sornette 2001, 2010)</span>. We’ll follow <span class="citation">(Gerlach, Demos, and Sornette 2019)</span> to describe the method here.</p>
+<p>The purpose of the <span class="math inline">\(\epsilon\)</span>-drawdown procedure is the systematic segmentation of a price trajectory into a sequence of alternating, consecutive price drawup and drawdown phases. A drawup is defined as a succession of positive returns that may only be interrupted by negative returns no larger in amplitude than a pre-specified tolerance level <span class="math inline">\(\epsilon\)</span>. Likewise, a drawdown is defined as a succession of negative returns that may only be interrupted by positive returns no larger in amplitude than the pre-specified tolerance level <span class="math inline">\(\epsilon\)</span>. Consequentially, a drawup (respectively, drawdown) ends when next drawdown (respectively, drawup), whose amplitude exceeds <span class="math inline">\(\epsilon\)</span>, is observed.</p>
+<p>Suppose we are given a price series <span class="math inline">\(P[t_i], \quad i=0,1, \ldots\)</span> where <span class="math inline">\(t_i\)</span> deisgnates the moment in time when the price has changed. Let <span class="math inline">\(i_0 = 0\)</span> and define <span class="math inline">\(i_k \equiv i_0+k\)</span></p>
+<p>We can calculate the discrete log-returns</p>
+<p><span class="math display" id="eq:r">\[
+\begin{equation} 
+r_{i_k} = \ln P[t_{i_k}] - \ln P[t_{i_{k-1}}], \quad k=1,2,\ldots \tag{2}
+\end{equation}
+\]</span></p>
+<p>The first time <span class="math inline">\(t_{i_0}\)</span> is defined as the beginning of a drawup (drawdown) if <span class="math inline">\(r_{i_1}&gt;0\)</span>(<span class="math inline">\(r_{i_1} &lt; 0\)</span>).
+Then, for each subsequent <span class="math inline">\(t_{i_k} &gt; t_{i_0}, \quad k=1,2,\ldots\)</span>, we calculate the cummulative return up to <span class="math inline">\(t_{i_k}\)</span> as
+<span class="math display" id="eq:p">\[
+\begin{equation}
+p_{i_k} = \sum_{j=1}^k r_{i_j} = \ln P[t_{i_k}] - \ln P[t_{i_0}] \tag{3}
+\end{equation}
+\]</span></p>
+<p>At each time <span class="math inline">\(t_{i_k}, \quad k=1,2,\ldots\)</span> we need to check whether the current drawup (drawdown) phase is still active. We test this by calculating the largest deviation <span class="math inline">\(\delta_{i_k}\)</span> of the price trajectory from a previous maximum (minimum)
+<span class="math display" id="eq:delta">\[
+\begin{equation}
+\delta_{i_k} = \begin{cases} \max_{1 \leq j \leq k} \{p_{i_j}\} - p_{i_k} &amp; \text{for drawups} \\  p_{i_k}  - \min_{1 \leq j \leq k} \{p_{i_j}\}&amp; \text{for drawdowns} \end{cases}  \tag{4}
+\end{equation}
+\]</span>
+The procedure is stopped at time <span class="math inline">\(k\)</span> when the deviation exceeds a predefined tolerance <span class="math inline">\(\epsilon\)</span>
+<span class="math display" id="eq:stop">\[
+\begin{equation}
+\delta_{i_k} &gt; \epsilon \tag{5}
+\end{equation}
+\]</span></p>
+<p>The stopping tolerance quantifies how much the price is allowed to move in the direction opposite to the
+drawup/drawdown trend.
+When the procedure has been stopped, the end of the current drawup (drawdown) phase is determined as the time of the highest (lowest) price seen in the tested interval:
+<span class="math display" id="eq:M">\[
+\begin{equation}
+M = \begin{cases} \arg \max_{1 \leq j \leq k} \{p_{i_j}\} &amp; \text{for drawups} \\ \arg \min_{1 \leq j \leq k} \{p_{i_j}\}&amp; \text{for drawdowns} \end{cases} \tag{6}
+\end{equation}
+\]</span>
+The <span class="math inline">\(\epsilon\)</span>-drawup/drawdown procedure is restarted at time <span class="math inline">\(i_M\)</span>. The start of the next drawup/drawdown period will then be located at this time, i.e. <span class="math inline">\(i_0\)</span> will be set to <span class="math inline">\(i_M\)</span>. By construction of <span class="math inline">\(\delta\)</span> and the stopping condition a drawup (respectively, drawdown) is always followed by a drawdown (respectively,drawup). The procedure is repeated until the full length of the analysed time series is represented as a sequence of drawups and drawdowns.</p>
+<p>Note that all draws except may be the first one will be larger than <span class="math inline">\(\epsilon\)</span>, so <span class="math inline">\(\epsilon\)</span> can be interpreted as a minimal draw size which may be produced by the procedure.</p>
+<p>Figure <a href="#fig:epsilon-drawdowns">9</a> shows examples of drawdowns and drawups calculated for different values of <span class="math inline">\(\epsilon\)</span>. The main drawback of the <span class="math inline">\(\epsilon\)</span>-drawdown method manifests there. When <span class="math inline">\(\epsilon\)</span> is large, the drawup correctly identifies the highest price, but it starts far too early. Small <span class="math inline">\(\epsilon\)</span> allows to find the beginning of the drawup more or less correctly. But all drawups end prematurely so the largest drawup is not even discovered.</p>
+<div class="figure"><span id="fig:epsilon-drawdowns"></span>
+<img src="spike-detection_files/figure-html/epsilon-drawdowns-1.png" alt="When $\epsilon$ is large the big draw is identified correctly but it starts far too early. When $\epsilon$ is small, the big draw is not identified at all." width="672" />
+<p class="caption">
+Figure 9: When <span class="math inline">\(\epsilon\)</span> is large the big draw is identified correctly but it starts far too early. When <span class="math inline">\(\epsilon\)</span> is small, the big draw is not identified at all.
+</p>
+</div>
+</div>
+<div id="the-ideal-trading-strategy-method" class="section level3">
+<h3>The ideal trading strategy method</h3>
+<p>A <a href="https://www.investopedia.com/terms/t/trading-strategy.asp">trading strategy</a> is usually defined as a method of buying and selling in markets that is based on predefined rules used to make trading decisions.</p>
+<p>The <em>ideal</em> trading strategy method calculates the set of positions to be opened by a <a href="https://www.investopedia.com/terms/t/trader.asp">trader</a> having a <a href="https://www.investopedia.com/terms/m/marginaccount.asp">margin account</a> subject to <a href="https://www.investopedia.com/terms/c/commission.asp">commission</a> and <a href="(https://www.investopedia.com/ask/answers/07/margin_interest.asp)">margin interest rate</a>
+during given trading period to generate the <em>maximum possible profit</em>.</p>
+<p>It appears that the interesting and thrilling moments we described above will manifest as positions to be opened by the trader.</p>
+
+
+<div class="definition">
+<p><span id="def:trading-period" class="definition"><strong>Definition 1  (Trading period)  </strong></span>
+A trading period <span class="math inline">\(\mathcal{T}\)</span> for some <a href="https://www.investopedia.com/terms/f/financialinstrument.asp">instrument</a> traded at some exchange is a set of tuples <span class="math inline">\(T_i = (t_i, a_i, b_i)\)</span> called <em>bid-ask spreads</em>
+<span class="math display">\[\mathcal{T} = \{ T_i \}_{i=0}^{i=\mathrm{N}} =  \{ (t_i, a_i, b_i) \}_{i=0}^{i=\mathrm{N}}\]</span>
+that satisfies the following constraints:</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(m &lt; n \implies t_m &lt; t_n \quad \forall m,n \in [0 \mathrel{{.}\,{.}}\mathrm{N}]\)</span></li>
+<li><span class="math inline">\(a_i &gt; 0 \vee a_i = \text{NaN} \quad \forall i \in [0 \mathrel{{.}\,{.}}\mathrm{N}]\)</span></li>
+<li><span class="math inline">\(b_i &gt; 0 \vee b_i = \text{NaN} \quad \forall i \in [0 \mathrel{{.}\,{.}}\mathrm{N}]\)</span></li>
+<li><span class="math inline">\(a_i \geq b_i \quad \forall i \in [0 \mathrel{{.}\,{.}}\mathrm{N}]\)</span></li>
+</ol>
+</div>
+
+<p>In the definition <a href="#def:trading-period">1</a> <span class="math inline">\(T_i\)</span> should be understood as a <a href="https://www.investopedia.com/terms/b/bid-askspread.asp">bid-ask spread</a> at time <span class="math inline">\(t_i\)</span>. Then <span class="math inline">\(a_i\)</span> is the <a href="https://www.investopedia.com/terms/a/ask.asp">ask price</a> at time <span class="math inline">\(t_i\)</span>, i.e. the price at which the trader can buy the instrument at time <span class="math inline">\(t_i\)</span>. When <span class="math inline">\(a_i = \text{NaN}\)</span> the order book does not contain any offers to sell instrument at time <span class="math inline">\(t_i\)</span> (and aftewards till some <span class="math inline">\(t_{i+k}: a_{i+k} \neq \text{NaN}\)</span>)
+Similarly, <span class="math inline">\(b_i\)</span> is the <a href="https://www.investopedia.com/terms/b/bidprice.asp">bid</a> price at time <span class="math inline">\(t_i\)</span>, i.e. the price at which the trader can sell the instrument at time <span class="math inline">\(t_i\)</span>.</p>
+
+<div class="definition">
+<p><span id="def:trading-strategy" class="definition"><strong>Definition 2  (Trading strategy)  </strong></span>
+A trading strategy <span class="math inline">\(\mathcal{S}\)</span> for some trading period <span class="math inline">\(\mathcal{T}\)</span> is a set (possibly empty) of tuples <span class="math inline">\(P_j = (s_j, e_j, d_j)\)</span> called <em>positions</em>
+<span class="math display">\[
+  \mathcal{S} = \{P_j\}_{j=0}^{j=\mathrm{M}}
+\]</span></p>
+<p>that satisfies the following constraints:</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(s_j, e_j \in [1 \mathrel{{.}\,{.}}\mathrm{N}], d_j \in \{-1, +1\} \quad \forall j \in [0 \mathrel{{.}\,{.}}\mathrm{M}]\)</span></li>
+<li><span class="math inline">\(s_j &lt; e_j \quad \forall j \in [0 \mathrel{{.}\,{.}}\mathrm{M}]\)</span></li>
+<li><span class="math inline">\((s_m \mathrel{{.}\,{.}}e_m) \cap (s_n \mathrel{{.}\,{.}}e_n) = \emptyset \quad \forall m, n \in [0 \mathrel{{.}\,{.}}\mathrm{M}]\)</span></li>
+</ol>
+</div>
+
+<p>Note that according to the definition <a href="#def:trading-strategy">2</a> it is allowed to have <span class="math inline">\(e_k = s_l, k \neq l\)</span>.</p>
+
+<div class="definition">
+<p><span id="def:position-profit" class="definition"><strong>Definition 3  (Position profit)  </strong></span>
+For any position <span class="math inline">\(P_j\)</span> from some trading strategy <span class="math inline">\(\mathcal{S}\)</span> for some trading period <span class="math inline">\(\mathcal{T}\)</span> a position profit <span class="math inline">\(V(P_j)\)</span> is calculated as:</p>
+<p><span class="math display">\[
+  V(P_j) = \begin{cases} (\ln b_{s_j} - \phi) - (\ln a_{e_j} + \phi) - (t_{e_j} - t_{s_j}) \rho &amp; \textit{for }  d_j = -1 \\
+                      (\ln a_{s_j} + \phi) - (\ln b_{e_j} - \phi) - (t_{e_j} - t_{s_j}) \rho &amp; \textit{for } d_j = +1
+      \end{cases}
+\]</span><br />
+where <em>comission</em> <span class="math inline">\(\phi\)</span> and <em>margin interest rate</em> <span class="math inline">\(\rho\)</span> are constants.</p>
+</div>
+
+<p>Note that</p>
+<ul>
+<li><p>Commission <span class="math inline">\(\phi\)</span> is charged per transaction, i.e. once for a buy and once again for a sell</p></li>
+<li><p><a href="https://www.investopedia.com/terms/c/continuouscompounding.asp">The Continuous Compounding</a> is used and <span class="math inline">\(\rho\)</span> is the stated interst rate per unit of time use to measure <span class="math inline">\(t_{i}\)</span></p></li>
+</ul>
+
+<div class="definition">
+<p><span id="def:trading-strategy-profit" class="definition"><strong>Definition 4  (Trading strategy profit)  </strong></span>A profit <span class="math inline">\(V(\mathcal{S})\)</span> of the trading strategy <span class="math inline">\(\mathcal{S}\)</span> is calculated as:
+<span class="math display" id="eq:profit-strategy">\[
+    V(\mathcal{S}) = \sum_{j=0}^{j=\mathrm{M}} V(P_j) \tag{7}
+  \]</span></p>
+If <span class="math inline">\(\mathcal{S} = \emptyset\)</span> we define:
+<span class="math display" id="eq:profit-empty-strategy">\[
+  V(\emptyset) = 0 \tag{8}
+\]</span>
+</div>
+
+<p>The ideal trading strategy method aims to find the trading strategy <span class="math inline">\(S_{max}\)</span> such that:
+<span class="math display">\[
+  S_{max} = \arg\,\max_{\mathcal{S}} V(\mathcal{S})
+\]</span></p>
+</div>
+</div>
+<div id="some-examples-of-located-upward-and-downward-spikes" class="section level2 tabset">
+<h2>Some examples of located upward and downward spikes</h2>
+<p>The ideal trading strategy method has been able to identify 24 spikes in the timeseries of BTCUSD price at Bitstamp in December 2019 whith <span class="math inline">\(\phi=\)</span> 50 bps and <span class="math inline">\(\rho=\)</span> 0.45 bps. The largest ones are show below.</p>
+<div id="upward-spikes" class="section level3 tabset">
+<h3>Upward spikes</h3>
+<div id="section-1" class="section level4">
+<h4>2019-12-04 16:25:20</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%201-1.png" width="672" /></p>
+</div>
+<div id="section-2" class="section level4">
+<h4>2019-12-19 01:59:55</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%202-1.png" width="672" /></p>
+</div>
+<div id="section-3" class="section level4">
+<h4>2019-12-18 16:32:23</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%203-1.png" width="672" /></p>
+</div>
+<div id="section-4" class="section level4">
+<h4>2019-12-06 20:54:59</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%204-1.png" width="672" /></p>
+</div>
+<div id="section-5" class="section level4">
+<h4>2019-12-05 07:40:49</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%205-1.png" width="672" /></p>
+</div>
+<div id="section-6" class="section level4">
+<h4>2019-12-04 23:55:25</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%206-1.png" width="672" /></p>
+</div>
+<div id="section-7" class="section level4">
+<h4>2019-12-09 18:02:10</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%207-1.png" width="672" /></p>
+</div>
+<div id="section-8" class="section level4">
+<h4>2019-12-17 19:11:30</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%208-1.png" width="672" /></p>
+</div>
+<div id="section-9" class="section level4">
+<h4>2019-12-16 21:36:25</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%209-1.png" width="672" /></p>
+</div>
+<div id="section-10" class="section level4">
+<h4>2019-12-22 19:07:51</h4>
+<p><img src="spike-detection_files/figure-html/Upward%20spike%2010-1.png" width="672" /></p>
+</div>
+</div>
+<div id="downward-spikes" class="section level3 tabset">
+<h3>Downward spikes</h3>
+<div id="section-11" class="section level4">
+<h4>2019-12-04 23:54:53</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-18-1.png" width="672" /></p>
+</div>
+<div id="section-12" class="section level4">
+<h4>2019-12-05 07:44:08</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-20-1.png" width="672" /></p>
+</div>
+<div id="section-13" class="section level4">
+<h4>2019-12-19 02:02:06</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-22-1.png" width="672" /></p>
+</div>
+<div id="section-14" class="section level4">
+<h4>2019-12-16 21:32:13</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-24-1.png" width="672" /></p>
+</div>
+<div id="section-15" class="section level4">
+<h4>2019-12-04 16:26:24</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-26-1.png" width="672" /></p>
+</div>
+<div id="section-16" class="section level4">
+<h4>2019-12-26 22:55:35</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-28-1.png" width="672" /></p>
+</div>
+<div id="section-17" class="section level4">
+<h4>2019-12-17 16:46:15</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-30-1.png" width="672" /></p>
+</div>
+<div id="section-18" class="section level4">
+<h4>2019-12-16 21:35:39</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-32-1.png" width="672" /></p>
+</div>
+<div id="section-19" class="section level4">
+<h4>2019-12-04 03:37:17</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-34-1.png" width="672" /></p>
+</div>
+<div id="section-20" class="section level4">
+<h4>2019-12-18 16:33:41</h4>
+<p><img src="spike-detection_files/figure-html/unnamed-chunk-36-1.png" width="672" /></p>
+</div>
+</div>
+</div>
+<div id="references" class="section level2 unnumbered">
+<h2>References</h2>
+<div id="refs" class="references">
+<div id="ref-gerlach2019">
+<p>Gerlach, J.C., G. Demos, and D. Sornette. 2019. “Dissection of Bitcoin’s Multiscale Bubble History from January 2012 to February 2018.” <em>Royal Society Open Science</em> 6 (7).</p>
+</div>
+<div id="ref-johansen1998">
+<p>Johansen, A., and D. Sornette. 1998. “Stock Market Crashes Are Outliers.” <em>European Physical Journal B</em> 1 (2).</p>
+</div>
+<div id="ref-johansen2001">
+<p>———. 2001. “Large Stock Market Price Drawdowns Are Outliers.” <em>Journal of Risk</em> 4 (2): 69–110.</p>
+</div>
+<div id="ref-johansen2010">
+<p>———. 2010. “Shocks, Crashes and Bubbles in Financial Markets.” <em>Brussels EconomicReview (Cahiers Economiques de Bruxelles)</em> 53 (2).</p>
+</div>
+<div id="ref-lee2008">
+<p>Lee, Suzanne S., and Per A. Mykland. 2008. “Jumps in Financial Markets: A New Nonparametric Test and Jump Dynamics.” <em>Review of Financial Studies</em> 21 (6).</p>
+</div>
+<div id="ref-mukherjee2019">
+<p>Mukherjee, Arpita, Weijia Peng, Norman R. Swanson, and Xiye Yang. 2019. “Financial Econometrics and Big Data: A Survey of Volatility Estimators and Tests for the Presence of Jumps and Co-Jumps.” In <em>Handbook of Statistics</em>. Elsevier.</p>
+</div>
+</div>
+</div>
+</div>
+
+
+
+
+</div>
+
+<script>
+
+// add bootstrap table styles to pandoc tables
+function bootstrapStylePandocTables() {
+  $('tr.header').parent('thead').parent('table').addClass('table table-condensed');
+}
+$(document).ready(function () {
+  bootstrapStylePandocTables();
+});
+
+
+</script>
+
+<!-- tabsets -->
+
+<script>
+$(document).ready(function () {
+  window.buildTabsets("TOC");
+});
+
+$(document).ready(function () {
+  $('.tabset-dropdown > .nav-tabs > li').click(function () {
+    $(this).parent().toggleClass('nav-tabs-open')
+  });
+});
+</script>
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>
