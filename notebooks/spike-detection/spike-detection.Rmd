@@ -107,6 +107,7 @@ references:
 
 
 ```{r setup, include=FALSE}
+#knitr::opts_knit$set(base.dir = normalizePath("../../docs"), root.dir=normalizePath("../../docs"))
 knitr::opts_chunk$set(echo = FALSE)
 options(xtable.type="html", scipen = 999, digits = 2, digits.secs=6)
 library(ggplot2)

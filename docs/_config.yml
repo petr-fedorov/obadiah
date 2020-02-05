@@ -1,2 +1,2 @@
-exclude: [spike-detection.Rmd]
+exclude: [about.Rmd, explore.Rmd, index.Rmd, research.Rmd, trade.Rmd, verify.Rmd]
 
