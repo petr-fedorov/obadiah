@@ -36,7 +36,7 @@ TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
  BidAskSpread c;
  // Let's find the first BidAskSpread where both prices are not NaN
  while (*trading_period_ >> c) {
-  if (!(std::isnan(c.p_ask) || std::isnan(c.p_bid))) {
+  if (!(std::isnan(c.p_ask) || std::isnan(c.p_bid)) && !(c.p_bid > c.p_ask)) {
    sl_.p = c.p_ask;
    sl_.t = c.t;
 
@@ -59,11 +59,9 @@ TradingStrategy::operator>>(Position& p) {
  BidAskSpread c;
  while (*trading_period_ >> c) {
   // Currently we just skip BidAskSpreads with NaN
-  if ((std::isnan(c.p_ask) || std::isnan(c.p_bid)))
-   continue;  
+  if ((std::isnan(c.p_ask) || std::isnan(c.p_bid))) continue;
   // We also ignore the crossed BidAskSpreads
-  if(c.p_bid > c.p_ask)
-   continue;
+  if (c.p_bid > c.p_ask) continue;
   InstantPrice bid(c.p_bid, c.t);
   InstantPrice ask(c.p_ask, c.t);
 
