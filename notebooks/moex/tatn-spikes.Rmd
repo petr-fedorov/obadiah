@@ -1,0 +1,63 @@
+---
+title: "Does Tatneft spike?"
+author: "Petr Fedorov"
+date: "`r Sys.Date()`"
+output:
+  bookdown::html_document2:
+    number_sections: FALSE
+    figure_captions: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 999, digits = 10, digits.secs=6)
+library(ggplot2)
+library(data.table)
+library(lubridate)
+library(latex2exp)
+```
+
+
+
+```{r}
+tatn <- fread('TATN_1min.csv')
+tatn[, c("timestamp", "mid.price") := .(ymd_hms(timestamp, tz="Europe/Moscow"), (bid.price + ask.price)/2)]
+head(tatn)
+```
+
+
+```{r}
+ggplot(tatn, aes(x=timestamp, y=mid.price)) + 
+  geom_line() +
+  scale_x_datetime(date_breaks = '10 week', date_label="%Y-%m-%d") + 
+  theme(axis.text.x = element_text(angle=45, hjust=1))
+```
+
+
+
+```{r}
+phi <- 0.00057
+rho <- 0.000001
+ts_tatn <-obadiah::trading.strategy(tatn, phi,rho , tz="Europe/Moscow")
+nrow(ts_tatn)
+head(ts_tatn[order(-bps.return,), .(opened.at, open.price, closed.at, close.price, bps.return)], 12)
+```
+
+
+```{r}
+obadiah::plotPositionTrellis(head(ts_tatn[order(-bps.return)],12), tatn, around=600)
+```
+
+```{r}
+nrow(ts_tatn[bps.return > 200]) # i.e. spike greater than 2%
+```
+
+
+```{r}
+nrow(ts_tatn[bps.return > 150])
+```
+
+```{r}
+nrow(ts_tatn[bps.return > 100])
+```
+

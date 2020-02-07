@@ -3,6 +3,8 @@ title: "Research"
 output: html_document
 ---
 
+2020-02-07 [Does Tatneft spike?](tatn-spikes.html)
+
 2020-02-04 [How to locate the largest price spikes](spike-detection.html)
 
 2019-09-22 [An analysis of the correlations between LTCUSD price movements at Bitstamp and Bitfinex](ltc-correlation-bitstamp-bitfinex.html)
