@@ -829,6 +829,8 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
 
   loader <- function(exchange, pair) {
 
+    volume_postgres <- if(is.finite(volume)) volume else "'infinity'::double precision"
+
     if(is.null(frequency))
 
       query <- paste0(" SELECT timestamp, \"bid.price\",",
@@ -837,7 +839,7 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
                       shQuote(format(end.time, usetz=T)), ",",
                       "get.pair_id(",shQuote(pair),"), " ,
                       "get.exchange_id(", shQuote(exchange), "), ",
-                      volume,
+                      volume_postgres,
                       ")")
     else
       query <- paste0(" SELECT timestamp, \"bid.price\", ",
@@ -846,7 +848,7 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
                       shQuote(format(end.time, usetz=T)), ",",
                       "get.pair_id(",shQuote(pair),"), " ,
                       "get.exchange_id(", shQuote(exchange), "), ",
-                       volume, ", ",
+                       volume_postgres, ", ",
                       "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
                       ") order by 1")
 

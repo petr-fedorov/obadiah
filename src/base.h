@@ -229,7 +229,7 @@ OrderBook<Allocator, T>::GetBidAskSpread(Volume volume) const {
      v += it->second;
     }
    }
-   if (v >= volume)
+   if (v >= volume || std::isinf(volume))
     to_be_returned.p_bid /= v;
    else {
     to_be_returned.p_bid = kR_NaReal;
@@ -249,7 +249,7 @@ OrderBook<Allocator, T>::GetBidAskSpread(Volume volume) const {
      v += it->second;
     }
    }
-   if (v >= volume)
+   if (v >= volume || std::isinf(volume))
     to_be_returned.p_ask /= v;
    else
     to_be_returned.p_ask = kR_NaReal;

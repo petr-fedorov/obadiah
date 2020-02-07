@@ -204,6 +204,7 @@ server <- function(input, output, session) {
 
   volume <- reactive({
     req(input$trading.period.volume)
+    as.numeric(input$trading.period.volume)
   }) %>% debounce(2000)
 
 
