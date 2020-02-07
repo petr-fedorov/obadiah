@@ -17,6 +17,18 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// CalculateOrderBookChanges
+DataFrame CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level);
+RcppExport SEXP _obadiah_CalculateOrderBookChanges(SEXP depth_changesSEXP, SEXP debug_levelSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
+    Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
+    rcpp_result_gen = Rcpp::wrap(CalculateOrderBookChanges(depth_changes, debug_level));
+    return rcpp_result_gen;
+END_RCPP
+}
 // DiscoverPositions
 DataFrame DiscoverPositions(DataFrame computed_trading_period, NumericVector phi, NumericVector rho, CharacterVector debug_level);
 RcppExport SEXP _obadiah_DiscoverPositions(SEXP computed_trading_periodSEXP, SEXP phiSEXP, SEXP rhoSEXP, SEXP debug_levelSEXP) {
@@ -63,6 +75,7 @@ RcppExport SEXP run_testthat_tests();
 
 static const R_CallMethodDef CallEntries[] = {
     {"_obadiah_CalculateTradingPeriod", (DL_FUNC) &_obadiah_CalculateTradingPeriod, 2},
+    {"_obadiah_CalculateOrderBookChanges", (DL_FUNC) &_obadiah_CalculateOrderBookChanges, 2},
     {"_obadiah_DiscoverPositions", (DL_FUNC) &_obadiah_DiscoverPositions, 4},
     {"_obadiah_DiscoverDrawUpDowns", (DL_FUNC) &_obadiah_DiscoverDrawUpDowns, 3},
     {"_obadiah_spread_from_depth", (DL_FUNC) &_obadiah_spread_from_depth, 4},

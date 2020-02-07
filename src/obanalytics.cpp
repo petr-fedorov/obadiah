@@ -16,6 +16,7 @@
 
 #include "position_discovery.h"
 #include "epsilon_drawupdowns.h"
+#include "order_book_investigation.h"
 
 using namespace Rcpp;
 using namespace std;
@@ -93,11 +94,11 @@ private:
 // [[Rcpp::export]]
 DataFrame
 CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume) {
- START_LOGGING(CalculateTradingPeriod.log, "kInfo");
+ START_LOGGING(CalculateTradingPeriod.log, "INFO");
 
  DepthChangesStream dc{depth_changes};
  obadiah::TradingPeriod<std::allocator> trading_period{&dc, as<double>(volume)};
- std::vector<double> timestamp, bid_price, bid_volume, ask_price, ask_volume;
+ std::vector<double> timestamp, bid_price,ask_price;
  obadiah::BidAskSpread output;
  while (trading_period >> output) {
 #ifndef NDEBUG
@@ -113,6 +114,38 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume) {
  return Rcpp::DataFrame::create(Rcpp::Named("timestamp") = timestamp,
                                 Rcpp::Named("bid.price") = bid_price,
                                 Rcpp::Named("ask.price") = ask_price);
+};
+
+// [[Rcpp::export]]
+DataFrame
+CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level) {
+ START_LOGGING(CalculateOrderBookChanges.log,as<string>(debug_level));
+
+ DepthChangesStream dc{depth_changes};
+ obadiah::OrderBookChanges<std::allocator> order_book_changes(&dc);
+ std::vector<double> timestamp, price, volume;
+ std::vector<string> side;
+
+ obadiah::Level2 output;
+ while (order_book_changes >> output) {
+#ifndef NDEBUG
+  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug4)
+      << static_cast<char*>(output);
+#endif
+  timestamp.push_back(output.t.t);
+  price.push_back(output.p);
+  volume.push_back(output.v);
+  if(output.s == obadiah::Side::kBid)
+   side.push_back("bid");
+  else
+   side.push_back("ask");
+ }
+ FINISH_LOGGING;
+
+ return Rcpp::DataFrame::create(Rcpp::Named("timestamp") = timestamp,
+                                Rcpp::Named("price") = price,
+                                Rcpp::Named("volume") = volume,
+                                Rcpp::Named("side") = side);
 };
 
 class TradingPeriod : public obadiah::ObjectStream<obadiah::BidAskSpread> {

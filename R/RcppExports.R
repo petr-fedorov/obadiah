@@ -5,6 +5,10 @@ CalculateTradingPeriod <- function(depth_changes, volume) {
     .Call(`_obadiah_CalculateTradingPeriod`, depth_changes, volume)
 }
 
+CalculateOrderBookChanges <- function(depth_changes, debug_level) {
+    .Call(`_obadiah_CalculateOrderBookChanges`, depth_changes, debug_level)
+}
+
 DiscoverPositions <- function(computed_trading_period, phi, rho, debug_level) {
     .Call(`_obadiah_DiscoverPositions`, computed_trading_period, phi, rho, debug_level)
 }

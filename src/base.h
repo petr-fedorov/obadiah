@@ -135,7 +135,7 @@ public:
  template <template <typename> class A, typename B>
  friend std::ostream& operator<<(std::ostream&, const OrderBook<A, B>&);
 
-private:
+protected:
  std::map<Price, Volume, std::less<Price>, Allocator<T>> bids_;
  std::map<Price, Volume, std::less<Price>, Allocator<T>> asks_;
  Timestamp latest_timestamp_;

@@ -870,6 +870,16 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
 }
 
 
+#' @export
+order.book.changes <- function(depth,debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
+  debug.level <- match.arg(debug.level)
+  result <- CalculateOrderBookChanges(depth, debug.level)
+  setDT(result)
+  cols <- c("timestamp")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result
+}
+
 
 
 #' Calculates and returns an ideal trading strategy
@@ -923,7 +933,7 @@ trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-
 
 
 #' @export
-epsilon.drawupdowns <- function(trading.period, epsilon, debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "EXCEPTION"), tz="UTC") {
+epsilon.drawupdowns <- function(trading.period, epsilon, debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
   debug.level <- match.arg(debug.level)
 
   result <- DiscoverDrawUpDowns(trading.period[, .(timestamp, price = (bid.price + ask.price)/2)], epsilon, debug.level)
