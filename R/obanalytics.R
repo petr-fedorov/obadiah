@@ -869,6 +869,16 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
   result
 }
 
+.validate.trading.period <- function(tp) {
+  stopifnot(is.data.frame(tp),
+            "timestamp" %in% colnames(tp),
+            "bid.price" %in% colnames(tp),
+            "ask.price" %in% colnames(tp),
+            is.POSIXct(tp$timestamp),
+            is.numeric(tp$bid.price),
+            is.numeric(tp$ask.price))
+}
+
 
 #' @export
 order.book.changes <- function(depth,debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
@@ -913,6 +923,7 @@ order.book.changes <- function(depth,debug.level=c("NONE", "DEBUG5", "DEBUG4", "
 #'
 #' @export
 trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
+  .validate.trading.period(trading.period)
   mode <- match.arg(mode)
   debug.level <- match.arg(debug.level)
 

@@ -125,8 +125,9 @@ CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level) 
  obadiah::OrderBookChanges<std::allocator> order_book_changes(&dc);
  std::vector<double> timestamp, price, volume;
  std::vector<string> side;
+ std::vector<obadiah::ChainId> chain_id;
 
- obadiah::Level2 output;
+ obadiah::OrderBookChange output;
  while (order_book_changes >> output) {
 #ifndef NDEBUG
   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug4)
@@ -135,6 +136,7 @@ CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level) 
   timestamp.push_back(output.t.t);
   price.push_back(output.p);
   volume.push_back(output.v);
+  chain_id.push_back(output.id);
   if(output.s == obadiah::Side::kBid)
    side.push_back("bid");
   else
@@ -145,7 +147,8 @@ CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level) 
  return Rcpp::DataFrame::create(Rcpp::Named("timestamp") = timestamp,
                                 Rcpp::Named("price") = price,
                                 Rcpp::Named("volume") = volume,
-                                Rcpp::Named("side") = side);
+                                Rcpp::Named("side") = side,
+                                Rcpp::Named("chain.id") = chain_id);
 };
 
 class TradingPeriod : public obadiah::ObjectStream<obadiah::BidAskSpread> {
