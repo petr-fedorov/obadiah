@@ -6,14 +6,15 @@
 using namespace Rcpp;
 
 // CalculateTradingPeriod
-DataFrame CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume);
-RcppExport SEXP _obadiah_CalculateTradingPeriod(SEXP depth_changesSEXP, SEXP volumeSEXP) {
+DataFrame CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume, CharacterVector debug_level);
+RcppExport SEXP _obadiah_CalculateTradingPeriod(SEXP depth_changesSEXP, SEXP volumeSEXP, SEXP debug_levelSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type volume(volumeSEXP);
-    rcpp_result_gen = Rcpp::wrap(CalculateTradingPeriod(depth_changes, volume));
+    Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
+    rcpp_result_gen = Rcpp::wrap(CalculateTradingPeriod(depth_changes, volume, debug_level));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -26,6 +27,19 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
     Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
     rcpp_result_gen = Rcpp::wrap(CalculateOrderBookChanges(depth_changes, debug_level));
+    return rcpp_result_gen;
+END_RCPP
+}
+// ChangeTickSize
+DataFrame ChangeTickSize(DataFrame depth_changes, NumericVector tick_size, CharacterVector debug_level);
+RcppExport SEXP _obadiah_ChangeTickSize(SEXP depth_changesSEXP, SEXP tick_sizeSEXP, SEXP debug_levelSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type tick_size(tick_sizeSEXP);
+    Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
+    rcpp_result_gen = Rcpp::wrap(ChangeTickSize(depth_changes, tick_size, debug_level));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -74,8 +88,9 @@ END_RCPP
 RcppExport SEXP run_testthat_tests();
 
 static const R_CallMethodDef CallEntries[] = {
-    {"_obadiah_CalculateTradingPeriod", (DL_FUNC) &_obadiah_CalculateTradingPeriod, 2},
+    {"_obadiah_CalculateTradingPeriod", (DL_FUNC) &_obadiah_CalculateTradingPeriod, 3},
     {"_obadiah_CalculateOrderBookChanges", (DL_FUNC) &_obadiah_CalculateOrderBookChanges, 2},
+    {"_obadiah_ChangeTickSize", (DL_FUNC) &_obadiah_ChangeTickSize, 3},
     {"_obadiah_DiscoverPositions", (DL_FUNC) &_obadiah_DiscoverPositions, 4},
     {"_obadiah_DiscoverDrawUpDowns", (DL_FUNC) &_obadiah_DiscoverDrawUpDowns, 3},
     {"_obadiah_spread_from_depth", (DL_FUNC) &_obadiah_spread_from_depth, 4},

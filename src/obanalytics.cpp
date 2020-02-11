@@ -10,13 +10,14 @@
 #include <boost/log/sinks/text_file_backend.hpp>
 #include <boost/log/sources/record_ostream.hpp>
 #include <boost/log/sources/severity_logger.hpp>
+#include <boost/log/support/date_time.hpp>
 #include <boost/log/utility/setup/common_attributes.hpp>
 #include <boost/log/utility/setup/file.hpp>
 #endif
 
-#include "position_discovery.h"
 #include "epsilon_drawupdowns.h"
 #include "order_book_investigation.h"
+#include "position_discovery.h"
 
 using namespace Rcpp;
 using namespace std;
@@ -26,19 +27,31 @@ namespace logging = boost::log;
 namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
+namespace expr = boost::log::expressions;
 
-#define START_LOGGING(f, s)                                                   \
- using sink_t = sinks::synchronous_sink<sinks::text_file_backend>;            \
- boost::shared_ptr<sink_t> g_file_sink = nullptr;                             \
- try {                                                                        \
-  logging::core::get()->set_filter(severity >= obadiah::GetSeverityLevel(s)); \
-  g_file_sink =                                                               \
-      logging::add_file_log(keywords::file_name = #f,                         \
-                            keywords::format = "[%TimeStamp%]: %Message%");   \
- } catch (const std::out_of_range&) {                                         \
-  logging::core::get()->set_filter(severity >                                 \
-                                   obadiah::SeverityLevel::kError);        \
- }                                                                            \
+#define START_LOGGING(f, s)                                                    \
+ using sink_t = sinks::synchronous_sink<sinks::text_file_backend>;             \
+ boost::shared_ptr<sink_t> g_file_sink = nullptr;                              \
+ try {                                                                         \
+  logging::core::get()->set_filter(severity >= obadiah::GetSeverityLevel(s));  \
+  g_file_sink =                                                                \
+      logging::add_file_log(                                                   \
+          keywords::file_name = #f,                                            \
+          keywords::format =                                                   \
+              (expr::stream                                                    \
+               << expr::format_date_time<boost::posix_time::ptime>(            \
+                      "TimeStamp", "%Y-%m-%d %H:%M:%S.%f")                     \
+               << " "                                                          \
+               << expr::if_(expr::has_attr<boost::posix_time::time_duration>(  \
+                      "RunTime"))[expr::stream                                 \
+                                  << expr::format_date_time<                   \
+                                         boost::posix_time::time_duration>(    \
+                                         "RunTime", "%S.%f")]                  \
+                      .else_[expr::stream << "--"]                             \
+               << " " << expr::message));                                      \
+ } catch (const std::out_of_range&) {                                          \
+  logging::core::get()->set_filter(severity > obadiah::SeverityLevel::kError); \
+ }                                                                             \
  src::severity_logger<obadiah::SeverityLevel> lg
 
 #define FINISH_LOGGING                            \
@@ -47,14 +60,15 @@ namespace keywords = boost::log::keywords;
   g_file_sink.reset();                            \
  }
 #else
-#define START_LOGGING(f, s) 
-#define FINISH_LOGGING                       
+#define START_LOGGING(f, s)
+#define FINISH_LOGGING
 #endif
 
 #ifndef NDEBUG
 __attribute__((constructor)) void
 init() {
  logging::add_common_attributes();
+ logging::core::get()->add_global_attribute("Scope", attrs::named_scope());
 }
 
 BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::SeverityLevel)
@@ -63,18 +77,21 @@ BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::SeverityLevel)
 class DepthChangesStream : public obadiah::ObjectStream<obadiah::Level2> {
 public:
  DepthChangesStream(DataFrame depth_changes)
-     : depth_changes_(depth_changes), j_(0){};
- operator bool() { return j_ <= depth_changes_.nrow(); }
+     : timestamp_{as<NumericVector>(
+           depth_changes["timestamp"])},  // as<> is rather expensive!
+       price_{as<NumericVector>(depth_changes["price"])},
+       volume_{as<NumericVector>(depth_changes["volume"])},
+       side_{as<CharacterVector>(depth_changes["side"])},
+       j_(0){};
+ operator bool() { return j_ <= timestamp_.length(); }
  DepthChangesStream& operator>>(obadiah::Level2& dc) {
   ++j_;
-  if (j_ <= depth_changes_.nrow()) {
-   dc.t = as<NumericVector>(depth_changes_["timestamp"])[j_ - 1];
-   dc.p = as<NumericVector>(depth_changes_["price"])[j_ - 1];
-   dc.v = as<NumericVector>(depth_changes_["volume"])[j_ - 1];
-   dc.s =
-       !std::strcmp(as<CharacterVector>(depth_changes_["side"])[j_ - 1], "ask")
-           ? obadiah::Side::kAsk
-           : obadiah::Side::kBid;
+  if (j_ <= timestamp_.length()) {
+   dc.t = timestamp_[j_ - 1];
+   dc.p = price_[j_ - 1];
+   dc.v = volume_[j_ - 1];
+   dc.s = !std::strcmp(side_[j_ - 1], "ask") ? obadiah::Side::kAsk
+                                             : obadiah::Side::kBid;
 #ifndef NDEBUG
    BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug5)
        << "j_-1=" << j_ - 1 << " " << static_cast<char*>(dc);
@@ -84,7 +101,10 @@ public:
  }
 
 private:
- DataFrame depth_changes_;
+ NumericVector timestamp_;
+ NumericVector price_;
+ NumericVector volume_;
+ CharacterVector side_;
  R_xlen_t j_;
 #ifndef NDEBUG
  src::severity_logger<obadiah::SeverityLevel> lg;
@@ -93,21 +113,26 @@ private:
 
 // [[Rcpp::export]]
 DataFrame
-CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume) {
- START_LOGGING(CalculateTradingPeriod.log, "INFO");
+CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
+                       CharacterVector debug_level) {
+ START_LOGGING(CalculateTradingPeriod.log, as<string>(debug_level));
 
  DepthChangesStream dc{depth_changes};
  obadiah::TradingPeriod<std::allocator> trading_period{&dc, as<double>(volume)};
- std::vector<double> timestamp, bid_price,ask_price;
+ std::vector<double> timestamp, bid_price, ask_price;
  obadiah::BidAskSpread output;
- while (trading_period >> output) {
+ while (true) {
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug4)
-      << static_cast<char*>(output);
+  BOOST_LOG_SCOPED_LOGGER_ATTR(lg, "RunTime", attrs::timer());
 #endif
+  if (!(trading_period >> output)) break;
   timestamp.push_back(output.t.t);
   bid_price.push_back(output.p_bid);
   ask_price.push_back(output.p_ask);
+#ifndef NDEBUG
+  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug1)
+      << static_cast<char*>(output);
+#endif
  }
  FINISH_LOGGING;
 
@@ -118,11 +143,12 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume) {
 
 // [[Rcpp::export]]
 DataFrame
-CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level) {
- START_LOGGING(CalculateOrderBookChanges.log,as<string>(debug_level));
+CalculateOrderBookChanges(DataFrame depth_changes,
+                          CharacterVector debug_level) {
+ START_LOGGING(CalculateOrderBookChanges.log, as<string>(debug_level));
 
  DepthChangesStream dc{depth_changes};
- obadiah::OrderBookChanges<std::allocator> order_book_changes(&dc);
+ obadiah::OrderBookChanges<> order_book_changes(&dc);
  std::vector<double> timestamp, price, volume;
  std::vector<string> side;
  std::vector<obadiah::ChainId> chain_id;
@@ -137,20 +163,50 @@ CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level) 
   price.push_back(output.p);
   volume.push_back(output.v);
   chain_id.push_back(output.id);
-  if(output.s == obadiah::Side::kBid)
+  if (output.s == obadiah::Side::kBid)
    side.push_back("bid");
   else
    side.push_back("ask");
  }
  FINISH_LOGGING;
 
- return Rcpp::DataFrame::create(Rcpp::Named("timestamp") = timestamp,
-                                Rcpp::Named("price") = price,
-                                Rcpp::Named("volume") = volume,
-                                Rcpp::Named("side") = side,
-                                Rcpp::Named("chain.id") = chain_id);
+ return Rcpp::DataFrame::create(
+     Rcpp::Named("timestamp") = timestamp, Rcpp::Named("price") = price,
+     Rcpp::Named("volume") = volume, Rcpp::Named("side") = side,
+     Rcpp::Named("chain.id") = chain_id);
 };
 
+// [[Rcpp::export]]
+DataFrame
+ChangeTickSize(DataFrame depth_changes, NumericVector tick_size,
+               CharacterVector debug_level) {
+ START_LOGGING(ChangeTickSize.log, as<string>(debug_level));
+
+ DepthChangesStream dc{depth_changes};
+ obadiah::TickSizeChanger<> tick_size_changer(&dc, tick_size[0]);
+ std::vector<double> timestamp, price, volume;
+ std::vector<string> side;
+
+ obadiah::Level2 output;
+ while (tick_size_changer >> output) {
+#ifndef NDEBUG
+  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug4)
+      << static_cast<char*>(output);
+#endif
+  timestamp.push_back(output.t.t);
+  price.push_back(output.p);
+  volume.push_back(output.v);
+  if (output.s == obadiah::Side::kBid)
+   side.push_back("bid");
+  else
+   side.push_back("ask");
+ }
+ FINISH_LOGGING;
+
+ return Rcpp::DataFrame::create(
+     Rcpp::Named("timestamp") = timestamp, Rcpp::Named("price") = price,
+     Rcpp::Named("volume") = volume, Rcpp::Named("side") = side);
+};
 class TradingPeriod : public obadiah::ObjectStream<obadiah::BidAskSpread> {
 public:
  TradingPeriod(DataFrame trading_period)
@@ -245,7 +301,7 @@ private:
 // [[Rcpp::export]]
 DataFrame
 DiscoverDrawUpDowns(DataFrame precomputed_prices, NumericVector epsilon,
-                  CharacterVector debug_level) {
+                    CharacterVector debug_level) {
  START_LOGGING(DiscoverDrawUpDowns.log, as<string>(debug_level));
 
  Prices prices(precomputed_prices);

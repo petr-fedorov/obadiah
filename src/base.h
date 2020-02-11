@@ -19,6 +19,8 @@
 #ifndef NDEBUG
 #include <boost/log/sources/severity_feature.hpp>
 #include <boost/log/sources/severity_logger.hpp>
+#include <boost/log/attributes/scoped_attribute.hpp>
+#include <boost/log/attributes/timer.hpp>
 #endif
 
 #include <cmath>
@@ -33,10 +35,10 @@ namespace logging = boost::log;
 namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
+namespace attrs = boost::log::attributes;
 #endif
 
 namespace obadiah {
-
 
 struct Timestamp {
  Timestamp() : t(0){};
@@ -112,18 +114,19 @@ operator<<(std::ostream& stream, InstantPrice& p);
 template <typename O>
 class ObjectStream {
 public:
- explicit ObjectStream() : is_all_processed_(true) {};
+ explicit ObjectStream() : is_all_processed_(true){};
  virtual explicit operator bool();
  virtual ObjectStream<O>& operator>>(O&) = 0;
  virtual ~ObjectStream(){};
+
 protected:
  bool is_all_processed_;
 };
 
-
-template<typename O>
-ObjectStream<O>::operator bool() { return !is_all_processed_; }
-
+template <typename O>
+ObjectStream<O>::operator bool() {
+ return !is_all_processed_;
+}
 
 template <template <typename> class Allocator,
           typename T = std::pair<const Price, Volume>>
@@ -185,24 +188,29 @@ OrderBook<Allocator, T>::operator<<(const Level2& next_depth) {
    side = &asks_;
    break;
  }
- if (next_depth.v == 0.0){
+ if (next_depth.v == 0.0) {
   auto search = side->find(next_depth.p);
-  if(search != side->end()) {
+  if (search != side->end()) {
    side->erase(search);
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "From OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+   BOOST_LOG_SEV(lg, SeverityLevel::kDebug5)
+       << "From OB " << next_depth.p << " " << static_cast<char>(next_depth.s)
+       << " (" << side->size() << ")";
 #endif
   }
 #ifndef NDEBUG
-  else 
-   BOOST_LOG_SEV(lg, SeverityLevel::kWarning) << "From OB(NOT FOUND!)" << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+  else
+   BOOST_LOG_SEV(lg, SeverityLevel::kWarning)
+       << "From OB(NOT FOUND!)" << next_depth.p << " "
+       << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
 #endif
 
- }
- else{
+ } else {
   (*side)[next_depth.p] = next_depth.v;
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "In OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+  BOOST_LOG_SEV(lg, SeverityLevel::kDebug5)
+      << "In OB " << next_depth.p << " " << static_cast<char>(next_depth.s)
+      << " (" << side->size() << ")";
 #endif
  }
  return *this;
@@ -278,7 +286,6 @@ TradingPeriod<Allocator, T>::TradingPeriod(ObjectStream<Level2>* depth_changes,
  if (*depth_changes_ >> unprocessed_) is_all_processed_ = false;
 }
 
-
 template <template <typename> class Allocator, typename T>
 bool
 TradingPeriod<Allocator, T>::ProcessNextEpisode() {
@@ -306,7 +313,8 @@ TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
  if (!is_all_processed_) {
   to_be_returned = current_;
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Previous=" << static_cast<char*>(current_);
+  BOOST_LOG_SEV(lg, SeverityLevel::kDebug2)
+      << "Previous=" << static_cast<char*>(current_);
 #endif
   while (ProcessNextEpisode()) {
    current_ = ob_.GetBidAskSpread(volume_);
@@ -318,7 +326,8 @@ TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
   }
   if (current_ != to_be_returned) {
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Returned=" << static_cast<char*>(current_);
+   BOOST_LOG_SEV(lg, SeverityLevel::kDebug2)
+       << "Returned=" << static_cast<char*>(current_);
 #endif
    to_be_returned = current_;
   } else

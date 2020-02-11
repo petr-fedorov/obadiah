@@ -26,6 +26,7 @@
 
 
 .dummy <- function() {}
+.debug.levels <- c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR")
 
 #' Securely connects to the OBADiah database and initializes an internal cache for the data
 #'
@@ -222,6 +223,16 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
   setDT(depth)
   depth[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
   depth
+}
+
+#' @export
+change.tick.size <- function(depth, tick_size, debug.level = .debug.levels, tz="UTC") {
+  debug.level <- match.arg(debug.level)
+  result <- ChangeTickSize(depth, tick_size, debug.level)
+  setDT(result)
+  cols <- c("timestamp")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result
 }
 
 
@@ -783,8 +794,9 @@ trading.period <- function(depth, ...) {
 #' @rdname trading.period
 #' @param volume a trading volume for the effective \code{bid.price} \code{ask.price} calculation
 #' @export
-trading.period.data.table <- function(depth, volume = 0, tz="UTC") {
-  result <- CalculateTradingPeriod(depth, volume)
+trading.period.data.table <- function(depth, volume = 0, debug.level = .debug.levels, tz="UTC") {
+  debug.level <- match.arg(debug.level)
+  result <- CalculateTradingPeriod(depth, volume, debug.level)
   setDT(result)
   cols <- c("timestamp")
   result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
@@ -843,7 +855,7 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
                       ")")
     else
       query <- paste0(" SELECT timestamp, \"bid.price\", ",
-                      "\"ask.price\", FROM get.trading_period(",
+                      "\"ask.price\" FROM get.trading_period(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
                       "get.pair_id(",shQuote(pair),"), " ,
