@@ -19,16 +19,16 @@ BEGIN_RCPP
 END_RCPP
 }
 // CalculateOrderBookSnapshots
-DataFrame CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size, IntegerVector max_levels, CharacterVector debug_level);
-RcppExport SEXP _obadiah_CalculateOrderBookSnapshots(SEXP depth_changesSEXP, SEXP tick_sizeSEXP, SEXP max_levelsSEXP, SEXP debug_levelSEXP) {
+DataFrame CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size, IntegerVector ticks, CharacterVector debug_level);
+RcppExport SEXP _obadiah_CalculateOrderBookSnapshots(SEXP depth_changesSEXP, SEXP tick_sizeSEXP, SEXP ticksSEXP, SEXP debug_levelSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type tick_size(tick_sizeSEXP);
-    Rcpp::traits::input_parameter< IntegerVector >::type max_levels(max_levelsSEXP);
+    Rcpp::traits::input_parameter< IntegerVector >::type ticks(ticksSEXP);
     Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
-    rcpp_result_gen = Rcpp::wrap(CalculateOrderBookSnapshots(depth_changes, tick_size, max_levels, debug_level));
+    rcpp_result_gen = Rcpp::wrap(CalculateOrderBookSnapshots(depth_changes, tick_size, ticks, debug_level));
     return rcpp_result_gen;
 END_RCPP
 }

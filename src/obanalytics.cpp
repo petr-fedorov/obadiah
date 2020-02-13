@@ -155,15 +155,15 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
 
 // [[Rcpp::export]]
 DataFrame
-CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size, IntegerVector max_levels,
+CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
+  IntegerVector ticks,
                        CharacterVector debug_level) {
  START_LOGGING(CalculateOrderBookSnapshots.log, as<string>(debug_level));
 
- std::size_t max_lvl = max_levels[0];
-
  DepthChangesStream dc{depth_changes};
- obadiah::DepthToSnapshots<> depth_to_snapshots{&dc,tick_size[0], max_lvl};
+ obadiah::DepthToSnapshots<> depth_to_snapshots{&dc,tick_size[0], ticks[0], ticks[1]};
  std::vector<double> timestamp, bid_price, ask_price;
+ unsigned max_lvl = ticks[1]-ticks[0] + 1;
  std::vector<std::vector<obadiah::Volume>> ask_levels{max_lvl};
  std::vector<std::vector<obadiah::Volume>> bid_levels{max_lvl};
  obadiah::OrderBookSnapshot<> output;
@@ -199,10 +199,10 @@ CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size, In
  names[1] = "bid.price";
  names[2] = "ask.price";
  char buffer[100];
- for(std::size_t i=0; i< max_lvl; ++i) {
-  sprintf(buffer, "b%lu", i);
+ for(unsigned i=0; i< max_lvl; ++i) {
+  sprintf(buffer, "b%lu", i+ticks[0]);
   names[3+2*i] = buffer; 
-  sprintf(buffer, "a%lu", i);
+  sprintf(buffer, "a%lu", i+ticks[0]);
   names[3+2*i+1] = buffer;
  }
  result.attr("names") = names;

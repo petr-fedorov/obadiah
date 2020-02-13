@@ -904,9 +904,9 @@ order.book.changes <- function(depth,debug.level=c("NONE", "DEBUG5", "DEBUG4", "
 
 
 #' @export
-order.book.snapshots <- function(depth, tick.size, max.levels , debug.level = .debug.levels, tz="UTC") {
+order.book.snapshots <- function(depth, tick.size, ticks , debug.level = .debug.levels, tz="UTC") {
   debug.level <- match.arg(debug.level)
-  result <- CalculateOrderBookSnapshots(depth, tick.size, max.levels, debug.level)
+  result <- CalculateOrderBookSnapshots(depth, tick.size, ticks, debug.level)
   setDT(result)
   cols <- c("timestamp")
   result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
