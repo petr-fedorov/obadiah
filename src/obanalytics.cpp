@@ -135,12 +135,80 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
 #endif
  }
  FINISH_LOGGING;
+ Rcpp::List tmp(3);
+ tmp[0] = timestamp;
+ tmp[1] = bid_price;
+ tmp[2] = ask_price;
+ Rcpp::DataFrame result(tmp);
+ Rcpp::CharacterVector names(3);
+ names[0] = "timestamp";
+ names[1] = "bid.price";
+ names[2] = "ask.price";
+ result.attr("names") = names;
 
- return Rcpp::DataFrame::create(Rcpp::Named("timestamp") = timestamp,
+ return result;
+ /*return Rcpp::DataFrame::create(Rcpp::Named("timestamp") = timestamp,
                                 Rcpp::Named("bid.price") = bid_price,
                                 Rcpp::Named("ask.price") = ask_price);
+                                */
 };
 
+// [[Rcpp::export]]
+DataFrame
+CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size, IntegerVector max_levels,
+                       CharacterVector debug_level) {
+ START_LOGGING(CalculateOrderBookSnapshots.log, as<string>(debug_level));
+
+ std::size_t max_lvl = max_levels[0];
+
+ DepthChangesStream dc{depth_changes};
+ obadiah::DepthToSnapshots<> depth_to_snapshots{&dc,tick_size[0], max_lvl};
+ std::vector<double> timestamp, bid_price, ask_price;
+ std::vector<std::vector<obadiah::Volume>> ask_levels{max_lvl};
+ std::vector<std::vector<obadiah::Volume>> bid_levels{max_lvl};
+ obadiah::OrderBookSnapshot<> output;
+ while (true) {
+#ifndef NDEBUG
+  BOOST_LOG_SCOPED_LOGGER_ATTR(lg, "RunTime", attrs::timer());
+#endif
+  if (!(depth_to_snapshots >> output)) break;
+  timestamp.push_back(output.t.t);
+  bid_price.push_back(output.bid_price);
+  ask_price.push_back(output.ask_price);
+  for(std::size_t i=0; i < max_lvl; ++i) {
+   ask_levels[i].push_back(output.asks[i]);
+   bid_levels[i].push_back(output.bids[i]);
+  }
+#ifndef NDEBUG
+  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug1)
+      << static_cast<char *>(output.t);
+#endif
+ }
+ FINISH_LOGGING;
+ Rcpp::List tmp(3+ 2*max_lvl);
+ tmp[0] = timestamp;
+ tmp[1] = bid_price;
+ tmp[2] = ask_price;
+ for(std::size_t i=0; i< max_lvl; ++i) {
+  tmp[3+2*i] = bid_levels[i];
+  tmp[3+2*i+1] = ask_levels[i];
+ }
+ Rcpp::DataFrame result(tmp);
+ Rcpp::CharacterVector names(3+ 2*max_lvl);
+ names[0] = "timestamp";
+ names[1] = "bid.price";
+ names[2] = "ask.price";
+ char buffer[100];
+ for(std::size_t i=0; i< max_lvl; ++i) {
+  sprintf(buffer, "b%lu", i);
+  names[3+2*i] = buffer; 
+  sprintf(buffer, "a%lu", i);
+  names[3+2*i+1] = buffer;
+ }
+ result.attr("names") = names;
+
+ return result;
+};
 // [[Rcpp::export]]
 DataFrame
 CalculateOrderBookChanges(DataFrame depth_changes,
