@@ -156,58 +156,66 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
 // [[Rcpp::export]]
 DataFrame
 CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
-  IntegerVector ticks,
-                       CharacterVector debug_level) {
- START_LOGGING(CalculateOrderBookSnapshots.log, as<string>(debug_level));
+                            IntegerVector ticks, CharacterVector debug_level) {
 
- DepthChangesStream dc{depth_changes};
- obadiah::DepthToSnapshots<> depth_to_snapshots{&dc,tick_size[0], ticks[0], ticks[1]};
- std::vector<double> timestamp, bid_price, ask_price;
- unsigned max_lvl = ticks[1]-ticks[0] + 1;
- std::vector<std::vector<obadiah::Volume>> ask_levels{max_lvl};
- std::vector<std::vector<obadiah::Volume>> bid_levels{max_lvl};
- obadiah::OrderBookSnapshot<> output;
- while (true) {
+ if (tick_size[0] > 0 && ticks[0] > 0 && ticks[1] > 0 && ticks[1] >= ticks[0]) {
+  START_LOGGING(CalculateOrderBookSnapshots.log, as<string>(debug_level));
+  DepthChangesStream dc{depth_changes};
+  using LevelNo = obadiah::DepthToSnapshots<>::LevelNo;
+  LevelNo first_tick = static_cast<LevelNo>(ticks[0]),
+          last_tick = static_cast<LevelNo>(ticks[1]),
+          total_ticks = last_tick - first_tick + 1;
+  obadiah::DepthToSnapshots<> depth_to_snapshots{&dc, tick_size[0], first_tick,last_tick};
+
+  std::vector<double> timestamp, bid_price, ask_price;
+  std::vector<std::vector<obadiah::Volume>> ask_levels{total_ticks};
+  std::vector<std::vector<obadiah::Volume>> bid_levels{total_ticks};
+  obadiah::OrderBookSnapshot<> output;
+  while (true) {
 #ifndef NDEBUG
-  BOOST_LOG_SCOPED_LOGGER_ATTR(lg, "RunTime", attrs::timer());
+   BOOST_LOG_SCOPED_LOGGER_ATTR(lg, "RunTime", attrs::timer());
 #endif
-  if (!(depth_to_snapshots >> output)) break;
-  timestamp.push_back(output.t.t);
-  bid_price.push_back(output.bid_price);
-  ask_price.push_back(output.ask_price);
-  for(std::size_t i=0; i < max_lvl; ++i) {
-   ask_levels[i].push_back(output.asks[i]);
-   bid_levels[i].push_back(output.bids[i]);
+   if (!(depth_to_snapshots >> output)) break;
+   timestamp.push_back(output.t.t);
+   bid_price.push_back(output.bid_price);
+   ask_price.push_back(output.ask_price);
+   for (std::size_t i = 0; i < total_ticks; ++i) {
+    ask_levels[i].push_back(output.asks[i]);
+    bid_levels[i].push_back(output.bids[i]);
+   }
+#ifndef NDEBUG
+   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug1)
+       << static_cast<char*>(output.t);
+#endif
   }
-#ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug1)
-      << static_cast<char *>(output.t);
-#endif
- }
- FINISH_LOGGING;
- Rcpp::List tmp(3+ 2*max_lvl);
- tmp[0] = timestamp;
- tmp[1] = bid_price;
- tmp[2] = ask_price;
- for(std::size_t i=0; i< max_lvl; ++i) {
-  tmp[3+2*i] = bid_levels[i];
-  tmp[3+2*i+1] = ask_levels[i];
- }
- Rcpp::DataFrame result(tmp);
- Rcpp::CharacterVector names(3+ 2*max_lvl);
- names[0] = "timestamp";
- names[1] = "bid.price";
- names[2] = "ask.price";
- char buffer[100];
- for(unsigned i=0; i< max_lvl; ++i) {
-  sprintf(buffer, "b%lu", i+ticks[0]);
-  names[3+2*i] = buffer; 
-  sprintf(buffer, "a%lu", i+ticks[0]);
-  names[3+2*i+1] = buffer;
- }
- result.attr("names") = names;
+  FINISH_LOGGING;
+  Rcpp::List tmp(3 + 2 * total_ticks);
+  tmp[0] = timestamp;
+  tmp[1] = bid_price;
+  tmp[2] = ask_price;
+  for (LevelNo i = 0; i < total_ticks; ++i) {
+   tmp[3 + 2 * i] = bid_levels[i];
+   tmp[3 + 2 * i + 1] = ask_levels[i];
+  }
+  Rcpp::DataFrame result(tmp);
+  Rcpp::CharacterVector names(3 + 2 * total_ticks);
+  names[0] = "timestamp";
+  names[1] = "bid.price";
+  names[2] = "ask.price";
+  char buffer[100];
+  for (LevelNo i = 0; i < total_ticks; ++i) {
+   sprintf(buffer, "b%i", i + ticks[0]);
+   names[3 + 2 * i] = buffer;
+   sprintf(buffer, "a%i", i + ticks[0]);
+   names[3 + 2 * i + 1] = buffer;
+  }
+  result.attr("names") = names;
 
- return result;
+  return result;
+ }
+ else
+  ::Rf_error("Some argument(s) is invalid");
+
 };
 // [[Rcpp::export]]
 DataFrame
