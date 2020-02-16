@@ -34,13 +34,16 @@ Level2::operator char *() {
 BidAskSpread::operator char *() {
  const size_t kBufferSize = 200;
  static char buffer[kBufferSize];
- int sz = snprintf(buffer, kBufferSize,
-          "BAS t: %s bid: %.5lf ask: %.5lf",
+ // int sz =
+ snprintf(buffer, kBufferSize, "BAS t: %s bid: %.5lf ask: %.5lf",
           static_cast<char *>(t), p_bid, p_ask);
+ /*
  if(std::isnan(p_bid))
-  sz += snprintf(buffer+sz,kBufferSize-sz, " bid hex: 0x%lx ", *reinterpret_cast<unsigned long *>(&p_bid));
- if(std::isnan(p_ask))
-  sz += snprintf(buffer+sz,kBufferSize-sz, " ask hex: 0x%lx ", *reinterpret_cast<unsigned long *>(&p_ask));
+  sz += snprintf(buffer+sz,kBufferSize-sz, " bid hex: 0x%lx ",
+ *reinterpret_cast<unsigned long *>(&p_bid)); if(std::isnan(p_ask)) sz +=
+ snprintf(buffer+sz,kBufferSize-sz, " ask hex: 0x%lx ",
+ *reinterpret_cast<unsigned long *>(&p_ask));
+  */
  return buffer;
 }
 
@@ -55,9 +58,9 @@ Timestamp::operator char *() {
  return buffer;
 }
 
-std::ostream&
-operator<<(std::ostream& stream, InstantPrice& price) {
- stream << "t: " << static_cast<char*>(price.t) << " p: " << price.p;
+std::ostream &
+operator<<(std::ostream &stream, InstantPrice &price) {
+ stream << "t: " << static_cast<char *>(price.t) << " p: " << price.p;
  return stream;
 };
 

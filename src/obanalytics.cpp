@@ -156,8 +156,8 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
 // [[Rcpp::export]]
 DataFrame
 CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
-                            IntegerVector ticks, CharacterVector debug_level) {
-
+                            IntegerVector ticks, CharacterVector type,
+                            CharacterVector debug_level) {
  if (tick_size[0] > 0 && ticks[0] > 0 && ticks[1] > 0 && ticks[1] >= ticks[0]) {
   START_LOGGING(CalculateOrderBookSnapshots.log, as<string>(debug_level));
   DepthChangesStream dc{depth_changes};
@@ -165,7 +165,9 @@ CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
   LevelNo first_tick = static_cast<LevelNo>(ticks[0]),
           last_tick = static_cast<LevelNo>(ticks[1]),
           total_ticks = last_tick - first_tick + 1;
-  obadiah::DepthToSnapshots<> depth_to_snapshots{&dc, tick_size[0], first_tick,last_tick};
+
+  obadiah::DepthToSnapshots<> depth_to_snapshots{&dc, tick_size[0], first_tick,
+                                                 last_tick, as<string>(type[0])};
 
   std::vector<double> timestamp, bid_price, ask_price;
   std::vector<std::vector<obadiah::Volume>> ask_levels{total_ticks};
@@ -212,10 +214,8 @@ CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
   result.attr("names") = names;
 
   return result;
- }
- else
+ } else
   ::Rf_error("Some argument(s) is invalid");
-
 };
 // [[Rcpp::export]]
 DataFrame

@@ -5,8 +5,8 @@ CalculateTradingPeriod <- function(depth_changes, volume, debug_level) {
     .Call(`_obadiah_CalculateTradingPeriod`, depth_changes, volume, debug_level)
 }
 
-CalculateOrderBookSnapshots <- function(depth_changes, tick_size, ticks, debug_level) {
-    .Call(`_obadiah_CalculateOrderBookSnapshots`, depth_changes, tick_size, ticks, debug_level)
+CalculateOrderBookSnapshots <- function(depth_changes, tick_size, ticks, type, debug_level) {
+    .Call(`_obadiah_CalculateOrderBookSnapshots`, depth_changes, tick_size, ticks, type, debug_level)
 }
 
 CalculateOrderBookChanges <- function(depth_changes, debug_level) {

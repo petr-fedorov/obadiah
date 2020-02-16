@@ -17,6 +17,8 @@
 #define OBADIAH_ORDER_BOOK_INVESTIGATION_H
 
 #include <deque>
+#include <vector>
+#include <set>
 #include "base.h"
 
 #ifndef NDEBUG
@@ -37,51 +39,104 @@ struct OrderBookSnapshot {
  DepthVolumes asks;
 };
 
+enum class SnapshotType { kAbsolute, kLogRelative };
+SnapshotType
+GetSnapshotType(const std::string s);
+
 template <template <typename> class Allocator = std::allocator>
 class InstrumentedOrderBook : public obadiah::OrderBook<Allocator> {
  using Pair = std::pair<const Price, Volume>;
 
 public:
  using LevelNo = unsigned;
- enum class SnapshotType { kAbsolute, kRelative };
  Volume GetVolume(Price p, Side s);
  Volume GetVolume(Price p, Side s, Price tick_size);
  inline void GetSnapshot(OrderBookSnapshot<Allocator>& ds,
                          const Price tick_size, LevelNo first_tick,
                          LevelNo last_tick, SnapshotType type) {
-  if (type == SnapshotType::kAbsolute) {
-   GetBidsSnapshot(ds, first_tick, last_tick, AbsoluteBidPriceLevel{tick_size});
-   GetAsksSnapshot(ds, first_tick, last_tick, AbsoluteAskPriceLevel{tick_size});
+  switch (type) {
+   case SnapshotType::kAbsolute:
+    GetBidsSnapshot(ds, first_tick, last_tick,
+                    AbsoluteBidPriceLevel{tick_size});
+    GetAsksSnapshot(ds, first_tick, last_tick,
+                    AbsoluteAskPriceLevel{tick_size});
+    break;
+   case SnapshotType::kLogRelative:
+    GetBidsSnapshot(ds, first_tick, last_tick,
+                    LogRelativeBidPriceLevel{tick_size});
+    GetAsksSnapshot(ds, first_tick, last_tick,
+                    LogRelativeAskPriceLevel{tick_size});
+    break;
   }
  }
 
 protected:
- class AbsoluteBidPriceLevel {
+ class LogRelativeBidPriceLevel {
  public:
-  AbsoluteBidPriceLevel(Price tick_size) : tick_size_{tick_size} {};
-  inline Price operator()(Price start, LevelNo lvl) {
-   return start - lvl * tick_size_;
+  LogRelativeBidPriceLevel(Price tick_size)
+      : tick_size_{tick_size},
+        price_{std::numeric_limits<Price>::infinity()} {};
+  Price set(Price price, LevelNo lvl) {
+   price_ = std::log(price) - tick_size_ * lvl;
+   return std::exp(price_);
   }
+  inline bool encompass(Price price) { return std::log(price) >= price_; }
 
  private:
   Price tick_size_;
+  Price price_;
+ };
+ class AbsoluteBidPriceLevel {
+ public:
+  AbsoluteBidPriceLevel(Price tick_size)
+      : tick_size_{tick_size},
+        price_{std::numeric_limits<Price>::infinity()} {};
+  Price set(Price price, LevelNo lvl) {
+   price_ = price - tick_size_ * lvl;
+   return price_;
+  }
+  inline bool encompass(Price price) { return price >= price_; }
+
+ private:
+  Price tick_size_;
+  Price price_;
+ };
+ class LogRelativeAskPriceLevel {
+ public:
+  LogRelativeAskPriceLevel(Price tick_size)
+      : tick_size_{tick_size},
+        price_{-std::numeric_limits<Price>::infinity()} {};
+  Price set(Price price, LevelNo lvl) {
+   price_ = std::log(price) + tick_size_ * lvl;
+   return std::exp(price_);
+  }
+  inline bool encompass(Price price) { return std::log(price) <= price_; }
+
+ private:
+  Price tick_size_;
+  Price price_;
  };
  class AbsoluteAskPriceLevel {
  public:
-  AbsoluteAskPriceLevel(Price tick_size) : tick_size_{tick_size} {};
-  Price operator()(Price start, LevelNo lvl) {
-   return start + lvl * tick_size_;
+  AbsoluteAskPriceLevel(Price tick_size)
+      : tick_size_{tick_size},
+        price_{-std::numeric_limits<Price>::infinity()} {};
+  Price set(Price price, LevelNo lvl) {
+   price_ = price + tick_size_ * lvl;
+   return price_;
   }
+  inline bool encompass(Price price) { return price <= price_; }
 
  private:
   Price tick_size_;
+  Price price_;
  };
  template <typename T>
  void GetBidsSnapshot(OrderBookSnapshot<Allocator>&, LevelNo, LevelNo,
-                      T price_level);
+                      T&& price_level);
  template <typename T>
  void GetAsksSnapshot(OrderBookSnapshot<Allocator>&, LevelNo, LevelNo,
-                      T price_level);
+                      T&& price_level);
 };
 
 template <template <typename> class Allocator>
@@ -89,7 +144,7 @@ template <typename T>
 void
 InstrumentedOrderBook<Allocator>::GetBidsSnapshot(
     OrderBookSnapshot<Allocator>& ds, LevelNo first_tick, LevelNo last_tick,
-    T price_level) {
+    T&& price_level) {
  auto it = OrderBook<Allocator>::bids_.crbegin();
  if (it != this->bids_.crend())
   ds.bid_price = it->first;
@@ -104,11 +159,12 @@ InstrumentedOrderBook<Allocator>::GetBidsSnapshot(
  if (this->asks_.cbegin() != this->asks_.cend())
   start = this->asks_.cbegin()->first;
  it = typename OrderBook<Allocator>::PriceVolumeMap::reverse_iterator{
-     this->bids_.lower_bound(price_level(start, first_tick - 1))};
+     this->bids_.lower_bound(price_level.set(start, first_tick - 1))};
  for (auto lvl = first_tick; lvl <= last_tick; ++lvl) {
   Volume vol = 0.0;
+  price_level.set(start, lvl);
   for (; it != this->bids_.crend(); ++it)
-   if (it->first >= price_level(start, lvl))
+   if (price_level.encompass(it->first))
     vol += it->second;
    else
     break;
@@ -121,10 +177,10 @@ template <typename T>
 void
 InstrumentedOrderBook<Allocator>::GetAsksSnapshot(
     OrderBookSnapshot<Allocator>& ds, LevelNo first_tick, LevelNo last_tick,
-    T price_level) {
+    T&& price_level) {
  auto it = this->asks_.cbegin();
- if (it != this->asks_.cend()) ds.ask_price = it->first;
- // ds.ask_price = std::ceil(it->first / tick_size) * tick_size;
+ if (it != this->asks_.cend())
+  ds.ask_price = it->first;
  else
   ds.ask_price = R_NAREAL;
 
@@ -135,11 +191,12 @@ InstrumentedOrderBook<Allocator>::GetAsksSnapshot(
  Price start = -std::numeric_limits<Price>::infinity();
  if (this->bids_.crbegin() != this->bids_.crend())
   start = this->bids_.crbegin()->first;
- it = this->asks_.upper_bound(price_level(start, first_tick - 1));
+ it = this->asks_.upper_bound(price_level.set(start, first_tick - 1));
  for (auto lvl = first_tick; lvl <= last_tick; ++lvl) {
   Volume vol = 0.0;
+  price_level.set(start, lvl);
   for (; it != this->asks_.cend(); ++it)
-   if (it->first <= price_level(start, lvl))
+   if (price_level.encompass(it->first))
     vol += it->second;
    else
     break;
@@ -344,11 +401,12 @@ public:
  using LevelNo = typename InstrumentedOrderBook<Allocator>::LevelNo;
 
  DepthToSnapshots(ObjectStream<Level2>* depth_changes, const Price tick_size,
-                  LevelNo first_tick, LevelNo last_tick)
+                  LevelNo first_tick, LevelNo last_tick, std::string type)
      : EpisodeProcessor<Allocator, OrderBookSnapshot<Allocator>>{depth_changes},
        tick_size_{tick_size},
        first_tick_{first_tick},
-       last_tick_{last_tick} {};
+       last_tick_{last_tick},
+       type_{GetSnapshotType(type)} {};
  DepthToSnapshots<Allocator>& operator>>(OrderBookSnapshot<Allocator>&);
 
 protected:
@@ -356,6 +414,7 @@ protected:
  Price tick_size_;
  LevelNo first_tick_;
  LevelNo last_tick_;
+ SnapshotType type_;
 };
 
 template <template <typename> class Allocator>
@@ -365,8 +424,7 @@ DepthToSnapshots<Allocator>::operator>>(
  if (!this->is_all_processed_) {
   Timestamp current_timestamp = this->unprocessed_.t;
   if (this->ProcessNextEpisode(ob_)) {
-   ob_.GetSnapshot(to_be_returned, tick_size_, first_tick_, last_tick_,
-                   InstrumentedOrderBook<Allocator>::SnapshotType::kAbsolute);
+   ob_.GetSnapshot(to_be_returned, tick_size_, first_tick_, last_tick_, type_);
    to_be_returned.t = current_timestamp.t;
   } else
    this->is_all_processed_ = true;
