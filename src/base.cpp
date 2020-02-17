@@ -19,6 +19,7 @@
 #include <ctime>
 
 namespace obadiah {
+namespace R {
 
 using namespace std;
 using namespace std::chrono;
@@ -64,4 +65,5 @@ operator<<(std::ostream &stream, InstantPrice &price) {
  return stream;
 };
 
+}  // namespace R
 }  // namespace obadiah

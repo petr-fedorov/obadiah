@@ -39,6 +39,7 @@ namespace attrs = boost::log::attributes;
 #endif
 
 namespace obadiah {
+ namespace R {
 
 struct Timestamp {
  Timestamp() : t(0){};
@@ -346,6 +347,7 @@ TradingPeriod<Allocator>::operator>>(BidAskSpread& to_be_returned) {
    this->is_all_processed_ = true;
  }
  return *this;
+}
 }
 }  // namespace obadiah
 #endif

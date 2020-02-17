@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 namespace obadiah {
+ namespace R {
 
 SnapshotType
 GetSnapshotType(const std::string s) {
@@ -27,5 +28,6 @@ GetSnapshotType(const std::string s) {
  } catch (const std::out_of_range &) {
   return SnapshotType::kAbsolute;
  }
+}
 }
 };  // namespace obadiah

@@ -16,6 +16,7 @@
 #include <unordered_map>
 
 namespace obadiah {
+namespace R {
 static std::unordered_map<std::string, SeverityLevel> str_to_enum{
     {"DEBUG5", SeverityLevel::kDebug5},   {"DEBUG4", SeverityLevel::kDebug4},
     {"DEBUG3", SeverityLevel::kDebug3},   {"DEBUG2", SeverityLevel::kDebug2},
@@ -43,4 +44,5 @@ operator<<(std::ostream& strm, SeverityLevel level) {
  strm << ToString(level);
  return strm;
 }
+}  // namespace R
 }  // namespace obadiah

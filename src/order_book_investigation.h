@@ -17,8 +17,8 @@
 #define OBADIAH_ORDER_BOOK_INVESTIGATION_H
 
 #include <deque>
-#include <vector>
 #include <set>
+#include <vector>
 #include "base.h"
 
 #ifndef NDEBUG
@@ -28,7 +28,7 @@
 #endif
 
 namespace obadiah {
-
+namespace R {
 template <template <typename> class Allocator = std::allocator>
 struct OrderBookSnapshot {
  using DepthVolumes = std::vector<Volume, Allocator<Volume>>;
@@ -44,7 +44,7 @@ SnapshotType
 GetSnapshotType(const std::string s);
 
 template <template <typename> class Allocator = std::allocator>
-class InstrumentedOrderBook : public obadiah::OrderBook<Allocator> {
+class InstrumentedOrderBook : public OrderBook<Allocator> {
  using Pair = std::pair<const Price, Volume>;
 
 public:
@@ -226,7 +226,7 @@ InstrumentedOrderBook<Allocator>::GetVolume(Price p, Side s, Price tick_size) {
    volume += it->second;
   }
 #ifndef NDEBUG
-  BOOST_LOG_SEV(this->lg, obadiah::SeverityLevel::kDebug5)
+  BOOST_LOG_SEV(this->lg, SeverityLevel::kDebug5)
       << "Price: " << p << " Side: " << static_cast<char>(s)
       << " Volume: " << volume;
 #endif
@@ -240,7 +240,7 @@ InstrumentedOrderBook<Allocator>::GetVolume(Price p, Side s, Price tick_size) {
    volume += it->second;
   }
 #ifndef NDEBUG
-  BOOST_LOG_SEV(this->lg, obadiah::SeverityLevel::kDebug5)
+  BOOST_LOG_SEV(this->lg, SeverityLevel::kDebug5)
       << "Price: " << p << " Side: " << static_cast<char>(s)
       << " Volume: " << volume;
 #endif
@@ -355,7 +355,7 @@ TickSizeChanger<Allocator>::ProcessNextEpisode() {
    unprocessed_.falsify();
   } while (*depth_changes_ >> unprocessed_);
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug4)
+  BOOST_LOG_SEV(lg, SeverityLevel::kDebug4)
       << "TickSizeChanger " << static_cast<char*>(current);
 #endif
 
@@ -431,6 +431,7 @@ DepthToSnapshots<Allocator>::operator>>(
  }
  return *this;
 }
+}  // namespace R
 }  // namespace obadiah
 #endif
 

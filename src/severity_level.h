@@ -17,23 +17,23 @@
 #define OBADIAH_SEVERITY_LEVEL_H
 #include <ostream>
 namespace obadiah {
-enum class SeverityLevel {
- kDebug5 = -6,
- kDebug4 = -5,
- kDebug3 = -4,
- kDebug2 = -3,
- kDebug1 = -2,
- kLog = -1,
- kInfo = 0,
- kNotice = 1,
- kWarning = 2,
- kError = 3
-};
+namespace R {
+ enum class SeverityLevel {
+  kDebug5 = -6,
+  kDebug4 = -5,
+  kDebug3 = -4,
+  kDebug2 = -3,
+  kDebug1 = -2,
+  kLog = -1,
+  kInfo = 0,
+  kNotice = 1,
+  kWarning = 2,
+  kError = 3
+ };
 
-SeverityLevel
-GetSeverityLevel(const std::string s);
-std::string ToString(SeverityLevel l);
-std::ostream& operator<< (std::ostream& strm, SeverityLevel level);
-
+ SeverityLevel GetSeverityLevel(const std::string s);
+ std::string ToString(SeverityLevel l);
+ std::ostream& operator<<(std::ostream& strm, SeverityLevel level);
+}
 }  // namespace obadiah
 #endif
