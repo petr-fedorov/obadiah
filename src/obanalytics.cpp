@@ -33,7 +33,7 @@ namespace expr = boost::log::expressions;
  using sink_t = sinks::synchronous_sink<sinks::text_file_backend>;             \
  boost::shared_ptr<sink_t> g_file_sink = nullptr;                              \
  try {                                                                         \
-  logging::core::get()->set_filter(severity >= obadiah::GetSeverityLevel(s));  \
+  logging::core::get()->set_filter(severity >= obadiah::R::GetSeverityLevel(s));  \
   g_file_sink =                                                                \
       logging::add_file_log(                                                   \
           keywords::file_name = #f,                                            \
@@ -50,9 +50,9 @@ namespace expr = boost::log::expressions;
                       .else_[expr::stream << "--"]                             \
                << " " << expr::message));                                      \
  } catch (const std::out_of_range&) {                                          \
-  logging::core::get()->set_filter(severity > obadiah::SeverityLevel::kError); \
+  logging::core::get()->set_filter(severity > obadiah::R::SeverityLevel::kError); \
  }                                                                             \
- src::severity_logger<obadiah::SeverityLevel> lg
+ src::severity_logger<obadiah::R::SeverityLevel> lg
 
 #define FINISH_LOGGING                            \
  if (g_file_sink) {                               \
@@ -71,10 +71,10 @@ init() {
  logging::core::get()->add_global_attribute("Scope", attrs::named_scope());
 }
 
-BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::SeverityLevel)
+BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::R::SeverityLevel)
 #endif
 
-class DepthChangesStream : public obadiah::ObjectStream<obadiah::Level2> {
+class DepthChangesStream : public obadiah::R::ObjectStream<obadiah::R::Level2> {
 public:
  DepthChangesStream(DataFrame depth_changes)
      : timestamp_{as<NumericVector>(
@@ -84,16 +84,16 @@ public:
        side_{as<CharacterVector>(depth_changes["side"])},
        j_(0){};
  operator bool() { return j_ <= timestamp_.length(); }
- DepthChangesStream& operator>>(obadiah::Level2& dc) {
+ DepthChangesStream& operator>>(obadiah::R::Level2& dc) {
   ++j_;
   if (j_ <= timestamp_.length()) {
    dc.t = timestamp_[j_ - 1];
    dc.p = price_[j_ - 1];
    dc.v = volume_[j_ - 1];
-   dc.s = !std::strcmp(side_[j_ - 1], "ask") ? obadiah::Side::kAsk
-                                             : obadiah::Side::kBid;
+   dc.s = !std::strcmp(side_[j_ - 1], "ask") ? obadiah::R::Side::kAsk
+                                             : obadiah::R::Side::kBid;
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug5)
+   BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug5)
        << "j_-1=" << j_ - 1 << " " << static_cast<char*>(dc);
 #endif
   }
@@ -107,7 +107,7 @@ private:
  CharacterVector side_;
  R_xlen_t j_;
 #ifndef NDEBUG
- src::severity_logger<obadiah::SeverityLevel> lg;
+ src::severity_logger<obadiah::R::SeverityLevel> lg;
 #endif
 };
 
@@ -118,9 +118,9 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
  START_LOGGING(CalculateTradingPeriod.log, as<string>(debug_level));
 
  DepthChangesStream dc{depth_changes};
- obadiah::TradingPeriod<std::allocator> trading_period{&dc, as<double>(volume)};
+ obadiah::R::TradingPeriod<std::allocator> trading_period{&dc, as<double>(volume)};
  std::vector<double> timestamp, bid_price, ask_price;
- obadiah::BidAskSpread output;
+ obadiah::R::BidAskSpread output;
  while (true) {
 #ifndef NDEBUG
   BOOST_LOG_SCOPED_LOGGER_ATTR(lg, "RunTime", attrs::timer());
@@ -130,7 +130,7 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
   bid_price.push_back(output.p_bid);
   ask_price.push_back(output.p_ask);
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug1)
+  BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug1)
       << static_cast<char*>(output);
 #endif
  }
@@ -161,18 +161,18 @@ CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
  if (tick_size[0] > 0 && ticks[0] > 0 && ticks[1] > 0 && ticks[1] >= ticks[0]) {
   START_LOGGING(CalculateOrderBookSnapshots.log, as<string>(debug_level));
   DepthChangesStream dc{depth_changes};
-  using LevelNo = obadiah::DepthToSnapshots<>::LevelNo;
+  using LevelNo = obadiah::R::DepthToSnapshots<>::LevelNo;
   LevelNo first_tick = static_cast<LevelNo>(ticks[0]),
           last_tick = static_cast<LevelNo>(ticks[1]),
           total_ticks = last_tick - first_tick + 1;
 
-  obadiah::DepthToSnapshots<> depth_to_snapshots{&dc, tick_size[0], first_tick,
+  obadiah::R::DepthToSnapshots<> depth_to_snapshots{&dc, tick_size[0], first_tick,
                                                  last_tick, as<string>(type[0])};
 
   std::vector<double> timestamp, bid_price, ask_price;
-  std::vector<std::vector<obadiah::Volume>> ask_levels{total_ticks};
-  std::vector<std::vector<obadiah::Volume>> bid_levels{total_ticks};
-  obadiah::OrderBookSnapshot<> output;
+  std::vector<std::vector<obadiah::R::Volume>> ask_levels{total_ticks};
+  std::vector<std::vector<obadiah::R::Volume>> bid_levels{total_ticks};
+  obadiah::R::OrderBookSnapshot<> output;
   while (true) {
 #ifndef NDEBUG
    BOOST_LOG_SCOPED_LOGGER_ATTR(lg, "RunTime", attrs::timer());
@@ -186,7 +186,7 @@ CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
     bid_levels[i].push_back(output.bids[i]);
    }
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug1)
+   BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug1)
        << static_cast<char*>(output.t);
 #endif
   }
@@ -224,22 +224,22 @@ CalculateOrderBookChanges(DataFrame depth_changes,
  START_LOGGING(CalculateOrderBookChanges.log, as<string>(debug_level));
 
  DepthChangesStream dc{depth_changes};
- obadiah::OrderBookChanges<> order_book_changes(&dc);
+ obadiah::R::OrderBookChanges<> order_book_changes(&dc);
  std::vector<double> timestamp, price, volume;
  std::vector<string> side;
- std::vector<obadiah::ChainId> chain_id;
+ std::vector<obadiah::R::ChainId> chain_id;
 
- obadiah::OrderBookChange output;
+ obadiah::R::OrderBookChange output;
  while (order_book_changes >> output) {
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug4)
+  BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug4)
       << static_cast<char*>(output);
 #endif
   timestamp.push_back(output.t.t);
   price.push_back(output.p);
   volume.push_back(output.v);
   chain_id.push_back(output.id);
-  if (output.s == obadiah::Side::kBid)
+  if (output.s == obadiah::R::Side::kBid)
    side.push_back("bid");
   else
    side.push_back("ask");
@@ -259,20 +259,20 @@ ChangeTickSize(DataFrame depth_changes, NumericVector tick_size,
  START_LOGGING(ChangeTickSize.log, as<string>(debug_level));
 
  DepthChangesStream dc{depth_changes};
- obadiah::TickSizeChanger<> tick_size_changer(&dc, tick_size[0]);
+ obadiah::R::TickSizeChanger<> tick_size_changer(&dc, tick_size[0]);
  std::vector<double> timestamp, price, volume;
  std::vector<string> side;
 
- obadiah::Level2 output;
+ obadiah::R::Level2 output;
  while (tick_size_changer >> output) {
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug4)
+  BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug4)
       << static_cast<char*>(output);
 #endif
   timestamp.push_back(output.t.t);
   price.push_back(output.p);
   volume.push_back(output.v);
-  if (output.s == obadiah::Side::kBid)
+  if (output.s == obadiah::R::Side::kBid)
    side.push_back("bid");
   else
    side.push_back("ask");
@@ -283,7 +283,7 @@ ChangeTickSize(DataFrame depth_changes, NumericVector tick_size,
      Rcpp::Named("timestamp") = timestamp, Rcpp::Named("price") = price,
      Rcpp::Named("volume") = volume, Rcpp::Named("side") = side);
 };
-class TradingPeriod : public obadiah::ObjectStream<obadiah::BidAskSpread> {
+class TradingPeriod : public obadiah::R::ObjectStream<obadiah::R::BidAskSpread> {
 public:
  TradingPeriod(DataFrame trading_period)
      : timestamp_(as<NumericVector>(trading_period["timestamp"])),
@@ -291,14 +291,14 @@ public:
        ask_(as<NumericVector>(trading_period["ask.price"])),
        j_(0){};
  operator bool() { return j_ <= timestamp_.length(); }
- TradingPeriod& operator>>(obadiah::BidAskSpread& s) {
+ TradingPeriod& operator>>(obadiah::R::BidAskSpread& s) {
   j_++;
   if (j_ <= timestamp_.length()) {
    s.t = timestamp_[j_ - 1];
    s.p_bid = bid_[j_ - 1];
    s.p_ask = ask_[j_ - 1];
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug5) << static_cast<char*>(s);
+   BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug5) << static_cast<char*>(s);
 #endif
   }
   return *this;
@@ -310,7 +310,7 @@ private:
  NumericVector ask_;
  R_xlen_t j_;
 #ifndef NDEBUG
- src::severity_logger<obadiah::SeverityLevel> lg;
+ src::severity_logger<obadiah::R::SeverityLevel> lg;
 #endif
 };
 
@@ -321,13 +321,13 @@ DiscoverPositions(DataFrame computed_trading_period, NumericVector phi,
  START_LOGGING(DiscoverPositions.log, as<string>(debug_level));
 
  TradingPeriod trading_period(computed_trading_period);
- obadiah::TradingStrategy trading_strategy(&trading_period, phi[0], rho[0]);
+ obadiah::R::TradingStrategy trading_strategy(&trading_period, phi[0], rho[0]);
  std::vector<double> opened_at, open_price, closed_at, close_price, log_return,
      rate;
- obadiah::Position p;
+ obadiah::R::Position p;
  while (trading_strategy >> p) {
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug3) << p;
+  BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug3) << p;
 #endif
   opened_at.push_back(p.s.t);
   open_price.push_back(p.s.p);
@@ -346,20 +346,20 @@ DiscoverPositions(DataFrame computed_trading_period, NumericVector phi,
                                 Rcpp::Named("rate") = rate);
 }
 
-class Prices : public obadiah::ObjectStream<obadiah::InstantPrice> {
+class Prices : public obadiah::R::ObjectStream<obadiah::R::InstantPrice> {
 public:
  Prices(DataFrame trading_period)
      : timestamp_(as<NumericVector>(trading_period["timestamp"])),
        prices_(as<NumericVector>(trading_period["price"])),
        j_(0){};
  operator bool() { return j_ <= timestamp_.length(); }
- Prices& operator>>(obadiah::InstantPrice& s) {
+ Prices& operator>>(obadiah::R::InstantPrice& s) {
   j_++;
   if (j_ <= timestamp_.length()) {
    s.t = timestamp_[j_ - 1];
    s.p = prices_[j_ - 1];
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug5) << s;
+   BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug5) << s;
 #endif
   }
   return *this;
@@ -370,7 +370,7 @@ private:
  NumericVector prices_;
  R_xlen_t j_;
 #ifndef NDEBUG
- src::severity_logger<obadiah::SeverityLevel> lg;
+ src::severity_logger<obadiah::R::SeverityLevel> lg;
 #endif
 };
 
@@ -381,13 +381,13 @@ DiscoverDrawUpDowns(DataFrame precomputed_prices, NumericVector epsilon,
  START_LOGGING(DiscoverDrawUpDowns.log, as<string>(debug_level));
 
  Prices prices(precomputed_prices);
- obadiah::EpsilonDrawUpDowns trading_strategy(&prices, epsilon[0]);
+ obadiah::R::EpsilonDrawUpDowns trading_strategy(&prices, epsilon[0]);
  std::vector<double> opened_at, open_price, closed_at, close_price, log_return,
      rate;
- obadiah::Position p;
+ obadiah::R::Position p;
  while (trading_strategy >> p) {
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug3) << p;
+  BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug3) << p;
 #endif
   opened_at.push_back(p.s.t);
   open_price.push_back(p.s.p);
@@ -427,7 +427,7 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
  for (int i = 0; i <= timestamp.size(); i++) {
   if (i == timestamp.size() || timestamp[i] > episode) {
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug3)
+   BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug3)
        << "Updating spread after episode " << Datetime(episode);
 #endif
 
@@ -444,7 +444,7 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
      is_changed = true;
     }
 #ifndef NDEBUG
-    BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug3)
+    BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug3)
         << " BID Current price: " << bids.rbegin()->first
         << " Best price: " << best_bid_price
         << " Current qty: " << bids.rbegin()->second
@@ -467,7 +467,7 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
      is_changed = true;
     }
 #ifndef NDEBUG
-    BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug3)
+    BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug3)
         << "ASK Current price: " << asks.begin()->first
         << " Best price: " << best_ask_price
         << " Current qty: " << asks.begin()->second
@@ -497,7 +497,7 @@ spread_from_depth(DatetimeVector timestamp, NumericVector price,
     }
 
 #ifndef NDEBUG
-    BOOST_LOG_SEV(lg, obadiah::SeverityLevel::kDebug3)
+    BOOST_LOG_SEV(lg, obadiah::R::SeverityLevel::kDebug3)
         << "Produced spread change record - timestamp:" << Datetime(episode)
         << "BID P: " << best_bid_price << " Q: " << best_bid_qty
         << "ASK P: " << best_ask_price << " Q: " << best_ask_qty;

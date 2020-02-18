@@ -24,6 +24,7 @@
 #include <iomanip>
 
 namespace obadiah {
+namespace R {
 TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
                                  double rho)
     : rho_(rho),
@@ -223,4 +224,5 @@ TradingStrategy::operator>>(Position& p) {
   }
  }
 }
+}  // namespace R
 }  // namespace obadiah

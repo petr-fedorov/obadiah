@@ -17,7 +17,7 @@
 #include <ostream>
 #include "base.h"
 namespace obadiah {
-
+namespace R {
 class EpsilonDrawUpDowns : public ObjectStream<Position> {
 public:
  EpsilonDrawUpDowns(ObjectStream<InstantPrice>* period, double epsilon);
@@ -35,8 +35,8 @@ private:
 #ifndef NDEBUG
  src::severity_logger<SeverityLevel> lg;
 #endif
-
 };
+}  // namespace R
 }  // namespace obadiah
 #endif
 

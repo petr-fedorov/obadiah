@@ -22,6 +22,7 @@
 #include <map>
 
 namespace obadiah {
+ namespace R {
 
 std::ostream&
 operator<<(std::ostream& stream, Position& p);
@@ -53,5 +54,6 @@ private:
 #endif
 };
 
+}
 }  // namespace obadiah
 #endif
