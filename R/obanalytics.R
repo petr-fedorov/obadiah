@@ -1015,6 +1015,7 @@ order.book.snapshots.connection <- function(depth, start.time, end.time, exchang
                       ")")
     else
       query <- paste0(" SELECT devel_imbalance._to_microseconds(timestamp) as \"timestamp\", \"bid.price\", ",
+                      "\"ask.price\",  ", col.list,
                       " FROM devel_imbalance.order_book_snapshots(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
