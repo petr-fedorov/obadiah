@@ -39,7 +39,7 @@ namespace attrs = boost::log::attributes;
 #endif
 
 namespace obadiah {
- namespace R {
+namespace R {
 
 struct Timestamp {
  Timestamp() : t(0){};
@@ -162,7 +162,7 @@ public:
  EpisodeProcessor(ObjectStream<Level2>* depth_changes);
 
 protected:
- bool ProcessNextEpisode(OrderBook<Allocator> &);
+ bool ProcessNextEpisode(OrderBook<Allocator>&);
 
  ObjectStream<Level2>* depth_changes_;
  Level2 unprocessed_;
@@ -172,7 +172,17 @@ template <template <typename> class Allocator>
 class TradingPeriod : public EpisodeProcessor<Allocator, BidAskSpread> {
 public:
  TradingPeriod(ObjectStream<Level2>* depth_changes, double volume)
-     : EpisodeProcessor<Allocator, BidAskSpread>{depth_changes}, volume_(volume){};
+     : EpisodeProcessor<Allocator, BidAskSpread>{depth_changes},
+       volume_(volume) {
+  if (volume_ < 0) {
+#ifndef NDEBUG
+   BOOST_LOG_SEV(this->lg, SeverityLevel::kWarning)
+       << "A wrong value for volume (" << volume_
+       << ") was provided. Will use 0.0 instead";
+#endif
+   volume_ = 0;
+  }
+ };
  TradingPeriod<Allocator>& operator>>(BidAskSpread&);
 
 protected:
@@ -293,7 +303,7 @@ OrderBook<Allocator>::GetBidAskSpread(Volume volume) const {
 };
 
 template <template <typename> class Allocator, class Output>
-EpisodeProcessor<Allocator,Output>::EpisodeProcessor(
+EpisodeProcessor<Allocator, Output>::EpisodeProcessor(
     ObjectStream<Level2>* depth_changes)
     : depth_changes_{depth_changes} {
  if (*depth_changes_ >> unprocessed_) this->is_all_processed_ = false;
@@ -301,7 +311,8 @@ EpisodeProcessor<Allocator,Output>::EpisodeProcessor(
 
 template <template <typename> class Allocator, class Output>
 bool
-EpisodeProcessor<Allocator, Output>::ProcessNextEpisode(OrderBook<Allocator>& ob) {
+EpisodeProcessor<Allocator, Output>::ProcessNextEpisode(
+    OrderBook<Allocator>& ob) {
  if (unprocessed_) {
   Timestamp current_timestamp = unprocessed_.t;
   bool is_unprocessed_ = false;
@@ -348,6 +359,6 @@ TradingPeriod<Allocator>::operator>>(BidAskSpread& to_be_returned) {
  }
  return *this;
 }
-}
+}  // namespace R
 }  // namespace obadiah
 #endif

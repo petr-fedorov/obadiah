@@ -32,7 +32,7 @@ public:
  TradingStrategy(ObjectStream<BidAskSpread>* period, double phi, double rho);
  ObjectStream<Position>& operator >> (Position&);
 
-private:
+protected:
  inline double Interest(InstantPrice a, InstantPrice b) {
   return rho_ * std::abs(b.t - a.t);
  }

@@ -32,9 +32,9 @@ extern "C" {
 #include "fmgr.h"
 #include "funcapi.h"
 #include "postgres.h"
+#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
-#include "utils/lsyscache.h"
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(depth_change_by_episode);
@@ -43,6 +43,7 @@ PG_FUNCTION_INFO_V1(to_microseconds);
 PG_FUNCTION_INFO_V1(CalculateTradingPeriod);
 PG_FUNCTION_INFO_V1(SetLogLevel);
 PG_FUNCTION_INFO_V1(GetOrderBookSnapshots);
+PG_FUNCTION_INFO_V1(DiscoverPositions);
 #ifdef __cplusplus
 }
 #endif  // __cplusplus
@@ -67,6 +68,7 @@ PG_FUNCTION_INFO_V1(GetOrderBookSnapshots);
 // From R
 #include "../../../src/base.h"
 #include "../../../src/order_book_investigation.h"
+#include "../../../src/position_discovery.h"
 
 namespace logging = boost::log;
 namespace expr = boost::log::expressions;
@@ -409,7 +411,7 @@ DepthChangesStream::DepthChangesStream(Datum p_start_time, Datum p_end_time,
  if (p_frequency == obad::NULL_FREQ) nulls[4] = 'n';
 
  SPI_cursor_open_with_args(kCursorName, R"QUERY(
-        select timestamp::double precision/1000000.0 + 946684800 as timestamp,
+        select extract(epoch from timestamp) as timestamp,
                price, volume, side 
         from get.depth($1, $2, $3, $4, $5) order by 1, 2 desc;)QUERY",
                            5, types, values, nulls, true, 0);
@@ -558,7 +560,7 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
   int j = 0;
   std::memset(nulls, 0, sizeof nulls);
   values[j++] =
-      Int64GetDatum(std::lround((output.t.t - 946684800.0) * 1000000));
+      TimestampTzGetDatum(std::lround((output.t.t - 946684800.0) * 1000000));
   values[j++] = Float8GetDatum(output.p_bid);
   values[j++] = Float8GetDatum(output.p_ask);
   HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
@@ -694,11 +696,9 @@ GetOrderBookSnapshots(PG_FUNCTION_ARGS) {
   std::vector<Datum, obad::p_allocator<Datum>> bids;
   std::vector<Datum, obad::p_allocator<Datum>> asks;
   bids.reserve(output.bids.size());
-  for(auto v : output.bids) 
-   bids.push_back(Float8GetDatum(v));
+  for (auto v : output.bids) bids.push_back(Float8GetDatum(v));
   asks.reserve(output.asks.size());
-  for(auto v : output.asks) 
-   asks.push_back(Float8GetDatum(v));
+  for (auto v : output.asks) asks.push_back(Float8GetDatum(v));
   get_call_result_type(fcinfo, NULL, &tupdesc);
   tupdesc = BlessTupleDesc(tupdesc);
 
@@ -716,8 +716,10 @@ GetOrderBookSnapshots(PG_FUNCTION_ARGS) {
       TimestampTzGetDatum(std::lround((output.t.t - 946684800.0) * 1000000));
   values[j++] = Float8GetDatum(output.bid_price);
   values[j++] = Float8GetDatum(output.ask_price);
-  values[j++] = PointerGetDatum(construct_array(bids.data(),bids.size(), FLOAT8OID, typlen, typbyval, typalign));
-  values[j++] = PointerGetDatum(construct_array(asks.data(),asks.size(), FLOAT8OID, typlen, typbyval, typalign));
+  values[j++] = PointerGetDatum(construct_array(
+      bids.data(), bids.size(), FLOAT8OID, typlen, typbyval, typalign));
+  values[j++] = PointerGetDatum(construct_array(
+      asks.data(), asks.size(), FLOAT8OID, typlen, typbyval, typalign));
   HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
   SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
  } else {
@@ -727,3 +729,115 @@ GetOrderBookSnapshots(PG_FUNCTION_ARGS) {
   SRF_RETURN_DONE(funcctx);
  }
 }
+
+namespace obadiah {
+namespace postgres {
+
+class TradingStrategy : public obadiah::R::TradingStrategy,
+                        public obad::postgres_heap {
+public:
+ TradingStrategy(
+     obadiah::R::ObjectStream<obadiah::R::BidAskSpread> *trading_period,
+     double phi, double rho)
+     : obadiah::R::TradingStrategy{trading_period, phi, rho} {};
+
+ ~TradingStrategy() { delete trading_period_; }
+};
+
+}  // namespace postgres
+}  // namespace obadiah
+
+Datum
+DiscoverPositions(PG_FUNCTION_ARGS) {
+ FuncCallContext *funcctx;
+ TupleDesc tupdesc;
+ AttInMetadata *attinmeta;
+
+ if (SRF_IS_FIRSTCALL()) {
+  MemoryContext oldcontext;
+
+  funcctx = SRF_FIRSTCALL_INIT();
+
+  oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+  if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+   ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                   errmsg("function returning record called in context "
+                          "that cannot accept type record")));
+  if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) ||
+      PG_ARGISNULL(3) || PG_ARGISNULL(4))
+   ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                   errmsg("p_start_time, p_end_time, pair_id, exchange_id must "
+                          "not be NULL")));
+  attinmeta = TupleDescGetAttInMetadata(tupdesc);
+  funcctx->attinmeta = attinmeta;
+
+  Datum frequency = obad::NULL_FREQ;
+  if (!PG_ARGISNULL(7)) frequency = PG_GETARG_DATUM(7);
+
+  SPI_connect();
+
+  obadiah::postgres::DepthChangesStream *depth_changes_stream =
+      new (obad::allocation_mode::spi) obadiah::postgres::DepthChangesStream{
+          PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), PG_GETARG_DATUM(2),
+          PG_GETARG_DATUM(3), frequency};
+
+  obadiah::postgres::TradingPeriod *trading_period =
+      new (obad::allocation_mode::spi) obadiah::postgres::TradingPeriod{
+          depth_changes_stream, PG_GETARG_FLOAT8(4)};
+
+  obadiah::postgres::TradingStrategy *trading_strategy =
+      new (obad::allocation_mode::spi) obadiah::postgres::TradingStrategy{
+          trading_period, PG_GETARG_FLOAT8(5), PG_GETARG_FLOAT8(6)};
+  funcctx->user_fctx = trading_strategy;
+  SPI_finish();
+
+  MemoryContextSwitchTo(oldcontext);
+ }
+
+ funcctx = SRF_PERCALL_SETUP();
+
+ MemoryContext oldcontext;
+ oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+ obadiah::postgres::TradingStrategy *trading_strategy =
+     static_cast<obadiah::postgres::TradingStrategy *>(funcctx->user_fctx);
+ attinmeta = funcctx->attinmeta;
+ obadiah::R::Position output;
+ SPI_connect();
+
+ if (*trading_strategy >> output) {
+  SPI_finish();
+  MemoryContextSwitchTo(oldcontext);
+  get_call_result_type(fcinfo, NULL, &tupdesc);
+  tupdesc = BlessTupleDesc(tupdesc);
+
+  Datum values[7];
+  bool nulls[7];
+  int j = 0;
+  std::memset(nulls, 0, sizeof nulls);
+  values[j++] =
+      TimestampTzGetDatum(std::lround((output.s.t.t - 946684800.0) * 1000000));
+  values[j++] = Float8GetDatum(output.s.p);
+  values[j++] =
+      TimestampTzGetDatum(std::lround((output.e.t.t - 946684800.0) * 1000000));
+  values[j++] = Float8GetDatum(output.e.p);
+  values[j++] = Float8GetDatum(
+      output.s.p > output.e.p ? (output.s.p - output.e.p) / output.s.p * 10000
+                              : (output.e.p - output.s.p) / output.s.p * 10000);
+  double log_return = output.s.p > output.e.p
+                          ? std::log(output.s.p) - std::log(output.e.p)
+                          : std::log(output.e.p) - std::log(output.s.p);
+  values[j++] =
+      Float8GetDatum(std::exp(log_return / (output.e.t - output.s.t)) - 1);
+  values[j++] = Float8GetDatum(log_return);
+
+  HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+  SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+ } else {
+  delete trading_strategy;
+  SPI_finish();
+  MemoryContextSwitchTo(oldcontext);
+  SRF_RETURN_DONE(funcctx);
+ }
+}
+
