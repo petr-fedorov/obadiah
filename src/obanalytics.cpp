@@ -155,24 +155,24 @@ CalculateTradingPeriod(DataFrame depth_changes, NumericVector volume,
 
 // [[Rcpp::export]]
 DataFrame
-CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size,
+CalculateOrderBookQueues(DataFrame depth_changes, NumericVector tick_size,
                             IntegerVector ticks, CharacterVector type,
                             CharacterVector debug_level) {
  if (tick_size[0] > 0 && ticks[0] > 0 && ticks[1] > 0 && ticks[1] >= ticks[0]) {
-  START_LOGGING(CalculateOrderBookSnapshots.log, as<string>(debug_level));
+  START_LOGGING(CalculateOrderBookQueues.log, as<string>(debug_level));
   DepthChangesStream dc{depth_changes};
-  using LevelNo = obadiah::R::DepthToSnapshots<>::LevelNo;
+  using LevelNo = obadiah::R::DepthToQueues<>::LevelNo;
   LevelNo first_tick = static_cast<LevelNo>(ticks[0]),
           last_tick = static_cast<LevelNo>(ticks[1]),
           total_ticks = last_tick - first_tick + 1;
 
-  obadiah::R::DepthToSnapshots<> depth_to_snapshots{&dc, tick_size[0], first_tick,
+  obadiah::R::DepthToQueues<> depth_to_snapshots{&dc, tick_size[0], first_tick,
                                                  last_tick, as<string>(type[0])};
 
   std::vector<double> timestamp, bid_price, ask_price;
   std::vector<std::vector<obadiah::R::Volume>> ask_levels{total_ticks};
   std::vector<std::vector<obadiah::R::Volume>> bid_levels{total_ticks};
-  obadiah::R::OrderBookSnapshot<> output;
+  obadiah::R::OrderBookQueues<> output;
   while (true) {
 #ifndef NDEBUG
    BOOST_LOG_SCOPED_LOGGER_ATTR(lg, "RunTime", attrs::timer());

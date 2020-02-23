@@ -18,15 +18,15 @@
 namespace obadiah {
  namespace R {
 
-SnapshotType
-GetSnapshotType(const std::string s) {
- static std::unordered_map<std::string, SnapshotType> str_to_enum{
-     {"ABSOLUTE", SnapshotType::kAbsolute},
-     {"LOGRELATIVE", SnapshotType::kLogRelative}};
+TickSizeType
+GetTickSizeType(const std::string s) {
+ static std::unordered_map<std::string, TickSizeType> str_to_enum{
+     {"ABSOLUTE", TickSizeType::kAbsolute},
+     {"LOGRELATIVE", TickSizeType::kLogRelative}};
  try {
   return str_to_enum.at(s);
  } catch (const std::out_of_range &) {
-  return SnapshotType::kAbsolute;
+  return TickSizeType::kAbsolute;
  }
 }
 }

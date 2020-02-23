@@ -18,9 +18,9 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// CalculateOrderBookSnapshots
-DataFrame CalculateOrderBookSnapshots(DataFrame depth_changes, NumericVector tick_size, IntegerVector ticks, CharacterVector type, CharacterVector debug_level);
-RcppExport SEXP _obadiah_CalculateOrderBookSnapshots(SEXP depth_changesSEXP, SEXP tick_sizeSEXP, SEXP ticksSEXP, SEXP typeSEXP, SEXP debug_levelSEXP) {
+// CalculateOrderBookQueues
+DataFrame CalculateOrderBookQueues(DataFrame depth_changes, NumericVector tick_size, IntegerVector ticks, CharacterVector type, CharacterVector debug_level);
+RcppExport SEXP _obadiah_CalculateOrderBookQueues(SEXP depth_changesSEXP, SEXP tick_sizeSEXP, SEXP ticksSEXP, SEXP typeSEXP, SEXP debug_levelSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -29,7 +29,7 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< IntegerVector >::type ticks(ticksSEXP);
     Rcpp::traits::input_parameter< CharacterVector >::type type(typeSEXP);
     Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
-    rcpp_result_gen = Rcpp::wrap(CalculateOrderBookSnapshots(depth_changes, tick_size, ticks, type, debug_level));
+    rcpp_result_gen = Rcpp::wrap(CalculateOrderBookQueues(depth_changes, tick_size, ticks, type, debug_level));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -104,7 +104,7 @@ RcppExport SEXP run_testthat_tests();
 
 static const R_CallMethodDef CallEntries[] = {
     {"_obadiah_CalculateTradingPeriod", (DL_FUNC) &_obadiah_CalculateTradingPeriod, 3},
-    {"_obadiah_CalculateOrderBookSnapshots", (DL_FUNC) &_obadiah_CalculateOrderBookSnapshots, 5},
+    {"_obadiah_CalculateOrderBookQueues", (DL_FUNC) &_obadiah_CalculateOrderBookQueues, 5},
     {"_obadiah_CalculateOrderBookChanges", (DL_FUNC) &_obadiah_CalculateOrderBookChanges, 2},
     {"_obadiah_ChangeTickSize", (DL_FUNC) &_obadiah_ChangeTickSize, 3},
     {"_obadiah_DiscoverPositions", (DL_FUNC) &_obadiah_DiscoverPositions, 4},
