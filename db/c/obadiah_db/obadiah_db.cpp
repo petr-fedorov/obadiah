@@ -42,7 +42,7 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 PG_FUNCTION_INFO_V1(to_microseconds);
 PG_FUNCTION_INFO_V1(CalculateTradingPeriod);
 PG_FUNCTION_INFO_V1(SetLogLevel);
-PG_FUNCTION_INFO_V1(GetOrderBookSnapshots);
+PG_FUNCTION_INFO_V1(GetOrderBookQueues);
 PG_FUNCTION_INFO_V1(DiscoverPositions);
 #ifdef __cplusplus
 }
@@ -612,26 +612,26 @@ namespace obadiah {
 namespace postgres {
 using Price = obadiah::R::Price;
 using Volume = obadiah::R::Volume;
-using SnapshotType = obadiah::R::SnapshotType;
+using TickSizeType = obadiah::R::TickSizeType;
 
-class DepthToSnapshots
-    : public obadiah::R::DepthToSnapshots<obad::spi_allocator>,
+class DepthToQueues
+    : public obadiah::R::DepthToQueues<obad::spi_allocator>,
       public obad::postgres_heap {
 public:
- using LevelNo = obadiah::R::DepthToSnapshots<obad::spi_allocator>::LevelNo;
- DepthToSnapshots(ObjectStream<obadiah::R::Level2> *depth_changes,
+ using LevelNo = obadiah::R::DepthToQueues<obad::spi_allocator>::LevelNo;
+ DepthToQueues(ObjectStream<obadiah::R::Level2> *depth_changes,
                   const Price tick_size, LevelNo first_tick, LevelNo last_tick,
                   std::string tick_type)
-     : obadiah::R::DepthToSnapshots<obad::spi_allocator>(
+     : obadiah::R::DepthToQueues<obad::spi_allocator>(
            depth_changes, tick_size, first_tick, last_tick, tick_type){};
- ~DepthToSnapshots() { delete depth_changes_; }
+ ~DepthToQueues() { delete depth_changes_; }
 };
 
 }  // namespace postgres
 }  // namespace obadiah
 
 Datum
-GetOrderBookSnapshots(PG_FUNCTION_ARGS) {
+GetOrderBookQueues(PG_FUNCTION_ARGS) {
  FuncCallContext *funcctx;
  TupleDesc tupdesc;
  AttInMetadata *attinmeta;
@@ -667,8 +667,8 @@ GetOrderBookSnapshots(PG_FUNCTION_ARGS) {
           PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), PG_GETARG_DATUM(2),
           PG_GETARG_DATUM(3), frequency};
 
-  obadiah::postgres::DepthToSnapshots *depth_to_snapshots =
-      new (obad::allocation_mode::spi) obadiah::postgres::DepthToSnapshots{
+  obadiah::postgres::DepthToQueues *depth_to_snapshots =
+      new (obad::allocation_mode::spi) obadiah::postgres::DepthToQueues{
           depth_changes_stream, PG_GETARG_FLOAT8(4), PG_GETARG_INT32(5),
           PG_GETARG_INT32(6),
           std::string{VARDATA_ANY(PG_GETARG_TEXT_PP(7)),
@@ -684,11 +684,11 @@ GetOrderBookSnapshots(PG_FUNCTION_ARGS) {
 
  MemoryContext oldcontext;
  oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
- obadiah::postgres::DepthToSnapshots *depth_to_snapshots =
-     static_cast<obadiah::postgres::DepthToSnapshots *>(funcctx->user_fctx);
+ obadiah::postgres::DepthToQueues *depth_to_snapshots =
+     static_cast<obadiah::postgres::DepthToQueues *>(funcctx->user_fctx);
  attinmeta = funcctx->attinmeta;
  SPI_connect();
- obadiah::R::OrderBookSnapshot<obad::spi_allocator> output;
+ obadiah::R::OrderBookQueues<obad::spi_allocator> output;
 
  if (*depth_to_snapshots >> output) {
   SPI_finish();
