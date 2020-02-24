@@ -81,12 +81,17 @@ protected:
       : tick_size_{tick_size},
         price_{std::numeric_limits<Price>::infinity()} {};
   Price set(Price price, LevelNo lvl) {
-   price_ = std::log(price) - tick_size_ * lvl;
+   price_ = (std::ceil(std::log(price)/tick_size_)-lvl)*tick_size_; 
    return std::exp(price_);
   }
   inline bool encompass(Price price) {
    price = std::log(price);
    return geq(price, price_);
+  }
+
+  inline Price BestBidPrice(Price actual_bid) {
+   actual_bid = std::log(actual_bid);
+   return std::exp(std::floor(actual_bid / tick_size_) * tick_size_);
   }
 
  private:
@@ -99,10 +104,13 @@ protected:
       : tick_size_{tick_size},
         price_{std::numeric_limits<Price>::infinity()} {};
   Price set(Price price, LevelNo lvl) {
-   price_ = price - tick_size_ * lvl;
+   price_ = (std::ceil(price / tick_size_) - lvl) * tick_size_;
    return price_;
   }
   inline bool encompass(Price price) { return geq(price, price_); }
+  inline Price BestBidPrice(Price actual_bid) {
+   return std::floor(actual_bid / tick_size_) * tick_size_;
+  }
 
  private:
   Price tick_size_;
@@ -114,12 +122,16 @@ protected:
       : tick_size_{tick_size},
         price_{-std::numeric_limits<Price>::infinity()} {};
   Price set(Price price, LevelNo lvl) {
-   price_ = std::log(price) + tick_size_ * lvl;
+   price_ = (std::floor(std::log(price)/tick_size_) + lvl)*tick_size_;
    return std::exp(price_);
   }
   inline bool encompass(Price price) {
    price = std::log(price);
    return geq(price_, price);
+  }
+  inline Price BestAskPrice(Price actual_ask) {
+   actual_ask = std::log(actual_ask);
+   return std::exp(std::ceil(actual_ask / tick_size_) * tick_size_);
   }
 
  private:
@@ -132,10 +144,13 @@ protected:
       : tick_size_{tick_size},
         price_{-std::numeric_limits<Price>::infinity()} {};
   Price set(Price price, LevelNo lvl) {
-   price_ = price + lvl * tick_size_;
+   price_ = (std::floor(price / tick_size_) + lvl) * tick_size_;
    return price_;
   }
   inline bool encompass(Price price) { return geq(price_, price); }
+  inline Price BestAskPrice(Price actual_ask) {
+   return std::ceil(actual_ask / tick_size_) * tick_size_;
+  }
 
  private:
   Price tick_size_;
@@ -158,7 +173,7 @@ InstrumentedOrderBook<Allocator>::GetBidsQueues(OrderBookQueues<Allocator>& ds,
                                                 T&& price_level) {
  auto it = OrderBook<Allocator>::bids_.crbegin();
  if (it != this->bids_.crend())
-  ds.bid_price = it->first;
+  ds.bid_price = price_level.BestBidPrice(it->first);
  else
   ds.bid_price = R_NAREAL;
 
@@ -192,7 +207,7 @@ InstrumentedOrderBook<Allocator>::GetAsksQueues(OrderBookQueues<Allocator>& ds,
                                                 T&& price_level) {
  auto it = this->asks_.cbegin();
  if (it != this->asks_.cend())
-  ds.ask_price = it->first;
+  ds.ask_price = price_level.BestAskPrice(it->first);
  else
   ds.ask_price = R_NAREAL;
 
