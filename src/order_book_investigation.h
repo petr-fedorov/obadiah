@@ -77,13 +77,13 @@ protected:
 
  inline static Price AlignUp(Price price, Price tick) {
   Price result = std::round(price/tick)*tick;
-  if(geq(price, result))
+  if(!geq(result, price))
    result += tick;
   return result;
  }
  inline static Price AlignDown(Price price, Price tick) {
   Price result = std::round(price/tick)*tick;
-  if(geq(result, price))
+  if(!geq(price, result))
    result -= tick;
   return result;
  }
