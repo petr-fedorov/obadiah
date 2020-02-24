@@ -192,25 +192,28 @@ CalculateOrderBookQueues(DataFrame depth_changes, NumericVector tick_size,
   }
   FINISH_LOGGING;
   Rcpp::List tmp(3 + 2 * total_ticks);
+  Rcpp::CharacterVector names(3 + 2 * total_ticks);
   tmp[0] = timestamp;
   tmp[1] = bid_price;
   tmp[2] = ask_price;
-  for (LevelNo i = 0; i < total_ticks; ++i) {
-   tmp[3 + 2 * i] = bid_levels[i];
-   tmp[3 + 2 * i + 1] = ask_levels[i];
-  }
-  Rcpp::DataFrame result(tmp);
-  Rcpp::CharacterVector names(3 + 2 * total_ticks);
   names[0] = "timestamp";
   names[1] = "bid.price";
   names[2] = "ask.price";
+
   char buffer[100];
+
   for (LevelNo i = 0; i < total_ticks; ++i) {
+   tmp[3 + i] = bid_levels[i];
    sprintf(buffer, "b%i", i + ticks[0]);
-   names[3 + 2 * i] = buffer;
-   sprintf(buffer, "a%i", i + ticks[0]);
-   names[3 + 2 * i + 1] = buffer;
+   names[3 + i] = buffer;
   }
+  for (LevelNo i = 0; i < total_ticks; ++i) {
+   tmp[3 + total_ticks + i] = ask_levels[i];
+   sprintf(buffer, "a%i", i + ticks[0]);
+   names[3 + total_ticks + i] = buffer;
+  }
+
+  Rcpp::DataFrame result(tmp);
   result.attr("names") = names;
 
   return result;
