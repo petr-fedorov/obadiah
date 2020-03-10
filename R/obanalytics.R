@@ -86,17 +86,113 @@ getQuery.default <- function(con, query) {
   DBI::dbGetQuery(con, query)
 }
 
+#' @export
+intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair = NULL, tz='UTC') {
+  conn=con$con()
 
 
-#' Calculates and downloads depth changes from the OBADiah database
+  if(!is.null(start.time)) {
+    if(is.character(start.time)) start.time <- ymd_hms(start.time)
+    stopifnot(inherits(start.time, 'POSIXt'))
+    start.time <- with_tz(start.time, tz='UTC')
+    start.time <- shQuote(format(start.time,"%Y-%m-%d %H:%M:%S%z")) # ISO 8601 format which is understood by both: Postgres and ymd_hms()
+  }
+  else
+    start.time <- "NULL"
+
+  if(!is.null(end.time)) {
+    if(is.character(end.time)) end.time <- ymd_hms(end.time)
+    stopifnot(inherits(end.time, 'POSIXt'))
+    end.time <- with_tz(end.time, tz='UTC')
+    end.time <- shQuote(format(end.time,"%Y-%m-%d %H:%M:%S%z"))
+  }
+  else
+    end.time <- "NULL"
+
+  if(!is.null(pair)) pair <- paste0(" get.pair_id(",shQuote(pair),") ") else pair <- "NULL"
+  if(!is.null(exchange)) exchange <- paste0(" get.exchange_id(", shQuote(exchange), ") ") else exchange <- "NULL"
+
+
+  pmap_dfr(tibble(pair, exchange),function(pair, exchange) {
+
+    # Various PostgreSQL-drivers in R are not able to handle timezone conversion correctly/consistently
+    # So we use EXTRACT epoch and then convert the epoch to POSIXct on the R side
+
+    query <- paste0("select exchange_id, pair_id, extract(epoch from interval_start) as interval_start, extract(epoch from interval_end) as interval_end,",
+                    " case when events then 'G'  else 'R' end as c, exchange, pair, extract(epoch from era) as era from get.events_intervals( ",
+                    " p_pair_id => ", pair,
+                    ", ",
+                    " p_exchange_id => ", exchange,
+                    ")",
+                    " where interval_end > coalesce( ", start.time, " , interval_end - '1 second'::interval ) ",
+                    "   and interval_start < coalesce( ", end.time, " , interval_start + '1 second'::interval ) "
+    )
+
+    flog.debug(query, name=packageName())
+    intervals <- DBI::dbGetQuery(conn, query)
+
+    intervals <- intervals %>%
+      mutate(interval_start=as.POSIXct(interval_start, origin="1970-01-01"),
+             interval_end=as.POSIXct(interval_end, origin="1970-01-01"),
+             era=as.POSIXct(era, origin="1970-01-01")
+      )
+
+    if(start.time != "NULL") {
+      start.time <- ymd_hms(start.time)
+      intervals <- intervals %>% mutate(interval_start=if_else(interval_start < start.time, start.time, interval_start))
+    }
+    if(end.time != "NULL") {
+      end.time <- ymd_hms(end.time)
+      intervals <- intervals %>% mutate(interval_end=if_else(interval_end > end.time, end.time, interval_end))
+    }
+
+    intervals$interval_start <- with_tz(intervals$interval_start, tz)
+    intervals$interval_end <- with_tz(intervals$interval_end, tz)
+    intervals$era <- with_tz(intervals$era, tz)
+
+    intervals
+  } )
+
+}
+
+#' @export
+export <- function(con, start.time, end.time, exchange, pair, file = "events.csv") {
+  conn=con$con()
+
+  start.time <- format(start.time, usetz=T)
+  end.time <- format(end.time, usetz=T)
+
+  query <- paste0(" select * from get.export(", shQuote(start.time),
+                  ", ",
+                  shQuote(format(end.time, usetz=T)), ",",
+                  "get.pair_id(",shQuote(pair),"), " ,
+                  "get.exchange_id(", shQuote(exchange), ") ",
+                  ") order by timestamp")
+  flog.debug(query, name=packageName())
+  events <- DBI::dbGetQuery(conn, query)
+  write.csv(events, file = file, row.names = FALSE)
+}
+
+
+.load_cached <- function(conn, start.time, end.time, exchange, pair, loader, cache, right=FALSE) {
+
+  .update_cache(conn, floor_date(start.time), ceiling_date(end.time), exchange, pair, loader, cache)
+  .load_from_cache(start.time, end.time, cache, right=right)
+}
+
+
+
+# Depth ----
+
+#' Depth level volume updates
 #'
-#' A depth change is the new bid or ask volume  offered at some price in an exchange order book at some moment in time.
-#' The change is caused by placement or cancellation of an order which happened on the exchange either at the time of the reported depth change
-#' or between the current and pervious reported sample times if the depth changes are calculated using fixed frequency.
+#' A depth level volume update is the new bid or ask volume  offered at some price in an exchange order book for some pair at some moment in time.
+#' The volume update is caused by placement, execution or cancellation of an order which happened on the exchange either at the time of the reported depth volume update
+#' or between the current and pervious reported sample times if the depth volume updates are calculated using fixed frequency.
 #'
-#' The depth changes are calculated as if before \code{start.time} the order book was empty, which effectively means that  the initial state of the order book at the start.time is conveyed.
-#' The function ignores interruptions in the data and calculates depth changes over the interruptions. This may lead to the presence of long gaps between consecutive changes.
-#' Not every order placement and/or cancellation produces a depth change. For example, if an order placement and cancellation are reported as happened at the same time, the depth change will
+#' The depth volume updates are calculated as if before \code{start.time} the order book was empty, which effectively means that  the initial state of the order book at the start.time is conveyed.
+#' The function ignores interruptions in the data and calculates depth volume updates over the interruptions. This may lead to the presence of long gaps between consecutive updates.
+#' Not every order placement and/or cancellation produces a depth update. For example, if an order placement and cancellation are reported as happened at the same time, the depth update will
 #' not be generated.
 #'
 #' @param con a connection object as returned by \code{\link{connect}}
@@ -104,13 +200,13 @@ getQuery.default <- function(con, query) {
 #' @param end.time POSIXct or character vector understood by \code{\link{ymd_hms}}
 #' @param exchange a character vector with the name of the exchange
 #' @param pair a character vector with the name of the pair
-#' @param frequency if NULL, the actual depth changes are returned. Otherwise an integer number of seconds between depth samples.
+#' @param frequency if NULL, the actual depth updates are returned. Otherwise an integer number of seconds between depth samples.
 #' @param tz a character vector with a time zone name understood by \code{\link{with_tz}} for the \code{timestamp} column in the output
-#' @returns A data.table with one row per the depth change reported. The following information is provided for each depth change
+#' @returns A data.table with one row per the depth update reported. The following information is provided for each depth update
 #' \describe{
-#'  \item{timestmap POSIXct}{timestamp of the depth change}
-#'  \item{price numeric}{the price level for which the depth change is reported}
-#'  \item{volume numeric}{The new amount available at the price level. Will be zero, when the last order with the given price will leave the order book.}
+#'  \item{timestmap POSIXct}{timestamp of the depth update}
+#'  \item{price numeric}{the price level for which the depth update is reported}
+#'  \item{volume numeric}{The new amount available at the price level. Zero, whenever the last order with the given price leaves the order book.}
 #'  \item{side character}{the side of the order book where the price level currently resides.  Either 'bid' or 'ask'.}
 #'  \item{pair character}{a character vector with the pair name}
 #'  \item{exchange character}{a character vector with the pair name}
@@ -140,9 +236,9 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
   # Convert to UTC, so internally only UTC is used
   start.time <- with_tz(start.time, tz='UTC')
   end.time <- with_tz(end.time, tz='UTC')
-  starting_depth <- .starting_depth(conn, start.time, exchange, pair, frequency)
+  starting_depth <- .query.initial.depth(conn, start.time, exchange, pair, frequency)
   if(is.null(cache) || start.time > cache.bound)
-    depth_changes <- .depth_changes(conn, start.time, end.time, exchange, pair, frequency)
+    depth_changes <- .query.depth.updates(conn, start.time, end.time, exchange, pair, frequency)
   else {
     if(is.null(frequency)) {
       cache_key <- "depth"
@@ -157,7 +253,7 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
         end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
     }
     loader <- function(conn, start.time, end.time, exchange, pair) {
-      .depth_changes(conn, start.time, end.time, exchange, pair, frequency)
+      .query.depth.updates(conn, start.time, end.time, exchange, pair, frequency)
       }
     if(end.time <= cache.bound )
       depth_changes <- .load_cached(conn, start.time, end.time, exchange, pair,loader, .leaf_cache(cache, exchange, pair, cache_key), right=right)
@@ -173,14 +269,8 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
 }
 
 
-.load_cached <- function(conn, start.time, end.time, exchange, pair, loader, cache, right=FALSE) {
 
-  .update_cache(conn, floor_date(start.time), ceiling_date(end.time), exchange, pair, loader, cache)
-  .load_from_cache(start.time, end.time, cache, right=right)
-}
-
-
-.depth_changes <- function(conn, start.time, end.time, exchange, pair, frequency = NULL)   {
+.query.depth.updates <- function(conn, start.time, end.time, exchange, pair, frequency = NULL)   {
   if(is.null(frequency))
     query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side  FROM get.depth(",
                     shQuote(format(start.time, usetz=T)), ",",
@@ -204,7 +294,7 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
 }
 
 
-.starting_depth <- function(conn, start.time, exchange, pair, frequency)   {
+.query.initial.depth <- function(conn, start.time, exchange, pair, frequency)   {
   if(is.null(frequency))
     query <- paste0("SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side FROM get.depth(",
                     shQuote(format(start.time,usetz=T)), ", NULL, ",
@@ -225,10 +315,18 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
   depth
 }
 
+#' Depth level volume changes
+#'
+#' A depth level volume change is the change of bid or ask volume  offered at some price in an exchange order book for some pair at some moment in time.
+#'
 #' @export
-change.tick.size <- function(depth, tick_size, debug.level = .debug.levels, tz="UTC") {
+depth.changes <- function(depth, debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
+  .validate.depth(depth)
   debug.level <- match.arg(debug.level)
-  result <- ChangeTickSize(depth, tick_size, debug.level)
+  depth[side == "ask", sort.price.ugly.name := price]
+  depth[side == "bid", sort.price.ugly.name := -price]
+  result <- CalculateDepthChanges(depth[order(timestamp, side, sort.price.ugly.name)], debug.level)
+  depth[, c("sort.price.ugly.name") := NULL]
   setDT(result)
   cols <- c("timestamp")
   result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
@@ -236,6 +334,267 @@ change.tick.size <- function(depth, tick_size, debug.level = .debug.levels, tz="
 }
 
 
+#' Depth level volume updates resampled possibly with different frequency, tick size, period start and end times
+#'
+#'
+#' @export
+depth.resample <- function(depth, tick.size=0.0, start.time=NULL, end.time=NULL, frequency=0.0, debug.level = .debug.levels, tz="UTC") {
+  debug.level <- match.arg(debug.level)
+
+  if(is.null(start.time)) start.time <- min(depth$timestamp)
+  if(is.null(end.time)) end.time <- max(depth$timestamp)
+
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+  stopifnot(is.numeric(frequency))
+  stopifnot(frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency >= 0)
+
+
+result <- ResampleDepth(depth, tick.size, start.time, end.time, frequency, debug.level)
+  setDT(result)
+  cols <- c("timestamp")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result[, side := as.character(side)]
+  result
+}
+
+#' @export
+depth_summary <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, tz='UTC') {
+
+  if(con$use.cache) cache = con else cache=NULL
+  conn=con$con()
+  cache.bound = now(tz='UTC') - minutes(15)
+
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+
+  flog.debug(paste0("depth_summary(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),")" ), name=packageName())
+
+  tzone <- tz
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+
+  if(is.null(cache) || start.time > cache.bound)
+    ds <- .depth_summary(conn, start.time, end.time, exchange, pair, frequency)
+  else {
+    if(is.null(frequency)) {
+      cache_key <- "depth_summary"
+      right <- FALSE
+    }
+    else {
+      cache_key <- paste0("depth_summary",frequency)
+      right <- TRUE
+      if(frequency < 60)
+        end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
+      else
+        end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
+    }
+    loader <- function(conn, start.time, end.time, exchange, pair) {
+      .depth_summary(conn, start.time, end.time, exchange, pair, frequency)
+    }
+
+    if(end.time <= cache.bound )
+      ds <- .load_cached(conn, start.time, end.time, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right)
+    else
+      ds <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right ),
+                  loader(conn, cache.bound, end.time, exchange, pair)
+      )
+  }
+  ds <- ds %>%
+    filter(bps_level == 0) %>%
+    select(-volume) %>%
+    dcast(list(.(timestamp), .(paste0(side,'.price',bps_level, "bps"))), value.var="price")   %>%
+    full_join(ds %>%
+                select(-price) %>%
+                dcast(list(.(timestamp), .(paste0(side,'.vol',bps_level, "bps"))), value.var="volume")
+              , by="timestamp" ) %>%  rename(best.ask.price = ask.price0bps,
+                                             best.bid.price = bid.price0bps,
+                                             best.ask.vol = ask.vol0bps,
+                                             best.bid.vol = bid.vol0bps)
+
+  bid.names <- paste0("bid.vol", seq(from = 25, to = 500, by = 25),
+                      "bps")
+  ask.names <- paste0("ask.vol", seq(from = 25, to = 500, by = 25),
+                      "bps")
+  ds[setdiff(bid.names, colnames(ds))] <- 0
+  ds[setdiff(ask.names, colnames(ds))] <- 0
+  ds[is.na(ds)] <- 0
+
+  if(!empty(ds)) {
+    # Assign timezone of start.time, if any, to timestamp column
+    ds$timestamp <- with_tz(ds$timestamp, tzone)
+  }
+  ds
+}
+
+
+.depth_summary <- function(conn, start.time, end.time, exchange, pair, frequency) {
+  if(is.null(frequency))
+    query <- paste0(" with depth_summary as ( select timestamp, price, volume, side, bps_level, rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r ",
+                    " from get.depth_summary(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), ") ",
+                    " )) select get._in_milliseconds(timestamp) as timestamp, side,  bps_level, price, volume from depth_summary ",
+                    # this is a workaround for the inability of R to handle microseconds in POSIXct
+                    " where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently order by 1, 2 desc")
+  else
+    query <- paste0(" with depth_summary as ( select timestamp, price, volume, side, bps_level, rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r ",
+                    " from get.depth_summary(",
+                    shQuote(format(start.time, usetz=T)), ",",
+                    shQuote(format(end.time, usetz=T)), ",",
+                    "get.pair_id(",shQuote(pair),"), " ,
+                    "get.exchange_id(", shQuote(exchange), "), ",
+                    "p_frequency := ", shQuote(paste0(frequency, " seconds ")),
+                    " )) select get._in_milliseconds(timestamp) as timestamp, side,  bps_level, price, volume from depth_summary ",
+                    # this is a workaround for the inability of R to handle microseconds in POSIXct
+                    " where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently order by 1, 2 desc")
+  flog.debug(query, name=packageName())
+  df <- DBI::dbGetQuery(conn, query)
+  df$timestamp <- as.POSIXct(as.numeric(df$timestamp)/1000, origin="1970-01-01")
+  df
+
+}
+
+.validate.depth <- function(depth) {
+  stopifnot(is.data.frame(depth),
+            "timestamp" %in% colnames(depth),
+            "price" %in% colnames(depth),
+            "volume" %in% colnames(depth),
+            "side" %in% colnames(depth),
+            is.POSIXct(depth$timestamp),
+            is.numeric(depth$price),
+            is.numeric(depth$volume),
+            is.character(depth$side))
+}
+
+
+
+# Trading Period ----
+
+#' Calculates and returns a trading period
+#'
+#' @param depth a source of depth changes data: either data.table with the pre-computed depth  as returned by  \code{\link{depth}} or
+#' an object of class 'connection' as returned by  \code{\link{connect}} pointing to the OBADIah database
+#' @returns A data.table with one row per bid-ask spread.
+#' \describe{
+#'  \item{timestamp POSIXct}{a starting timestamp}
+#'  \item{bid.price numeric}{an effective price at which the specified \code{volume} may be sold}
+#'  \item{ask.price numeric}{an effective price at which the specified \code{volume} may be bought}
+#' }
+#' @export
+trading.period <- function(depth, ...) {
+  UseMethod("trading.period",depth)
+}
+
+
+#' @rdname trading.period
+#' @param volume a trading volume for the effective \code{bid.price} \code{ask.price} calculation
+#' @export
+trading.period.data.table <- function(depth, volume = 0, debug.level = .debug.levels, tz="UTC") {
+  debug.level <- match.arg(debug.level)
+  result <- CalculateTradingPeriod(depth, volume, debug.level)
+  setDT(result)
+  cols <- c("timestamp")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result
+}
+
+#' @rdname trading.period
+#' @inheritParams depth
+#' @export
+trading.period.connection <- function(depth, start.time, end.time, exchange, pair, frequency=NULL, volume=0,  tz='UTC') {
+
+  conn=depth$con()
+
+  if(is.character(start.time)) start.time <- ymd_hms(start.time)
+  if(is.character(end.time)) end.time <- ymd_hms(end.time)
+
+  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
+  stopifnot(is.null(frequency) || is.numeric(frequency))
+  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
+
+  flog.debug(paste0("trading.period(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),
+                    ", volume := ", volume, ", frequency := ", frequency, ", tz := ", tz , ")" ), name=packageName())
+
+  tzone <- tz
+
+  # Convert to UTC, so internally only UTC is used
+  start.time <- with_tz(start.time, tz='UTC')
+  end.time <- with_tz(end.time, tz='UTC')
+
+
+  if (!is.null(frequency)) {
+
+    if(frequency < 60) {
+      #start.time <- floor_date(start.time,  paste0(frequency, " seconds"))
+      end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
+    }
+    else {
+      #start.time <- floor_date(start.time, paste0(frequency %/% 60, " minutes"))
+      end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
+    }
+  }
+
+  loader <- function(exchange, pair) {
+
+    volume_postgres <- if(is.finite(volume)) volume else "'infinity'::double precision"
+
+    if(is.null(frequency))
+
+      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\",",
+                      "\"ask.price\" FROM get.trading_period(",
+                      shQuote(format(start.time, usetz=T)), ",",
+                      shQuote(format(end.time, usetz=T)), ",",
+                      "get.pair_id(",shQuote(pair),"), " ,
+                      "get.exchange_id(", shQuote(exchange), "), ",
+                      volume_postgres,
+                      ")")
+    else
+      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\", ",
+                      "\"ask.price\" FROM get.trading_period(",
+                      shQuote(format(start.time, usetz=T)), ",",
+                      shQuote(format(end.time, usetz=T)), ",",
+                      "get.pair_id(",shQuote(pair),"), " ,
+                      "get.exchange_id(", shQuote(exchange), "), ",
+                      volume_postgres, ", ",
+                      "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
+                      ") order by 1")
+
+    flog.debug(query, name=packageName())
+    result <- DBI::dbGetQuery(conn, query)
+    setDT(result)
+    if(nrow(result) > 0) {
+      result[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
+      result[is.nan(bid.price), c("bid.price") := NA]
+      result[is.nan(ask.price), c("ask.price") := NA]
+    }
+    result
+  }
+  result <- loader(exchange, pair)
+  if(nrow(result) > 0 ) {
+    result[, c("timestamp") := .(with_tz(timestamp, tz))]
+  }
+  result
+}
+
+.validate.trading.period <- function(tp) {
+  stopifnot(is.data.frame(tp),
+            "timestamp" %in% colnames(tp),
+            "bid.price" %in% colnames(tp),
+            "ask.price" %in% colnames(tp),
+            is.POSIXct(tp$timestamp),
+            is.numeric(tp$bid.price),
+            is.numeric(tp$ask.price))
+}
 
 
 #' @export
@@ -403,7 +762,75 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
 }
 
 
+#' Calculates and returns an ideal trading strategy
+#'
+#' The ideal trading strategy is the set of long and/or short positions that generates the maximum profit
+#' in the given trading period subject to the commission and margin interest rate constraints provided
+#'
+#' @param trading.period a data.table as returned by \code{\link{trading.period}} with the following columns:  \code{timestamp}, \code{bid.price}, \code{ask.price}
+#' @param phi a numeric value of the commission percentage charged per transaction. 1\% is 0.01
+#' @param rho a numeric value of the margin interest rate per second. 0.1\% is 0.001
+#' @param mode a character vector specifying price use mode
+#' @details If \code{mode} parameter equals 'bid-ask' then, \code{bid.price} is used for selling and \code{ask.price} for buying transactions. In 'mid-price' mode,
+#' buying and selling transactions are performed using \code{mid.price} calculated as (\code{bid.price} + \code{ask.price})/2.
+#' @param debug.level a character vector
+#' @param tz a character vector with a time zone name understood by \code{\link{with_tz}} for the \code{timestamp} column in the output
+#' @returns A data.table with one row per position. The following information is provided for each position
+#' \describe{
+#'  \item{opened.at POSIXct}{opened at}
+#'  \item{open.price numeric}{opening price}
+#'  \item{closed.at POSIXct}{closed at}
+#'  \item{close.price numeric}{closing price}
+#'  \item{bps.return numeric}{return in basis points}
+#'  \item{rate numeric}{actual interest rate per seconds}
+#'  \item{log.return numeric}{log-relative return: abs(log(open.price) - log(close.price))}
+#' }
+#' If \code{open.price} is greater than \code{close.price} then it is a short position: the instrument is sold at \code{open.price}
+#' and bought at \code{close.price}.
+#'
+#' If \code{open.price} is less than \code{close.price} then it is a long possition: the instrument is bought at \code{open.price}
+#' and sold at \code{close.price}.
+#'
+#' @export
+trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
+  .validate.trading.period(trading.period)
+  mode <- match.arg(mode)
+  debug.level <- match.arg(debug.level)
 
+  if( mode == "bid-ask")
+    result <- DiscoverPositions(trading.period, phi, rho, debug.level)
+  else {
+    result <- DiscoverPositions(trading.period[, .(timestamp, bid.price = (bid.price + ask.price)/2, ask.price = (bid.price + ask.price)/2)], phi, rho, debug.level)
+  }
+
+  setDT(result)
+  cols <- c("opened.at", "closed.at")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
+  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
+  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
+  result
+}
+
+
+#' @export
+epsilon.drawupdowns <- function(trading.period, epsilon, debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
+  debug.level <- match.arg(debug.level)
+
+  result <- DiscoverDrawUpDowns(trading.period[, .(timestamp, price = (bid.price + ask.price)/2)], epsilon, debug.level)
+
+  setDT(result)
+  cols <- c("opened.at", "closed.at")
+  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
+  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
+  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
+  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
+  result
+}
+
+
+
+# Events ----
 
 #' @export
 events <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
@@ -483,6 +910,8 @@ events <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
   events
 }
 
+# Trades ----
+
 #' @export
 trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
 
@@ -513,11 +942,10 @@ trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
                     .trades(conn, cache.bound, end.time, exchange, pair)
     )
 
-  if(!empty(trades)) {
-    # Assign timezone of start.time, if any, to timestamp column
-    trades$timestamp <- with_tz(trades$timestamp, tzone)
+  if(nrow(trades) > 0 ) {
+    trades[, c("timestamp") := .(with_tz(timestamp, tz))]
   }
-  trades  %>% arrange(timestamp)
+  trades[order(timestamp), ]
 }
 
 
@@ -539,110 +967,8 @@ trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
 }
 
 
-#' @export
-depth_summary <- function(conn, start.time, end.time, exchange, pair, frequency=NULL, tz='UTC') {
 
-  if(con$use.cache) cache = con else cache=NULL
-  conn=con$con()
-  cache.bound = now(tz='UTC') - minutes(15)
-
-  if(is.character(start.time)) start.time <- ymd_hms(start.time)
-  if(is.character(end.time)) end.time <- ymd_hms(end.time)
-
-  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
-
-  flog.debug(paste0("depth_summary(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),")" ), name=packageName())
-
-  tzone <- tz
-
-  # Convert to UTC, so internally only UTC is used
-  start.time <- with_tz(start.time, tz='UTC')
-  end.time <- with_tz(end.time, tz='UTC')
-
-
-  if(is.null(cache) || start.time > cache.bound)
-    ds <- .depth_summary(conn, start.time, end.time, exchange, pair, frequency)
-  else {
-    if(is.null(frequency)) {
-      cache_key <- "depth_summary"
-      right <- FALSE
-    }
-    else {
-      cache_key <- paste0("depth_summary",frequency)
-      right <- TRUE
-      if(frequency < 60)
-        end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
-      else
-        end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
-    }
-    loader <- function(conn, start.time, end.time, exchange, pair) {
-      .depth_summary(conn, start.time, end.time, exchange, pair, frequency)
-    }
-
-    if(end.time <= cache.bound )
-      ds <- .load_cached(conn, start.time, end.time, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right)
-    else
-      ds <- rbind(.load_cached(conn, start.time, cache.bound, exchange, pair, loader, .leaf_cache(cache, exchange, pair, cache_key), right ),
-                    loader(conn, cache.bound, end.time, exchange, pair)
-    )
-  }
-  ds <- ds %>%
-    filter(bps_level == 0) %>%
-    select(-volume) %>%
-    dcast(list(.(timestamp), .(paste0(side,'.price',bps_level, "bps"))), value.var="price")   %>%
-    full_join(ds %>%
-                select(-price) %>%
-                dcast(list(.(timestamp), .(paste0(side,'.vol',bps_level, "bps"))), value.var="volume")
-              , by="timestamp" ) %>%  rename(best.ask.price = ask.price0bps,
-                                             best.bid.price = bid.price0bps,
-                                             best.ask.vol = ask.vol0bps,
-                                             best.bid.vol = bid.vol0bps)
-
-  bid.names <- paste0("bid.vol", seq(from = 25, to = 500, by = 25),
-                      "bps")
-  ask.names <- paste0("ask.vol", seq(from = 25, to = 500, by = 25),
-                      "bps")
-  ds[setdiff(bid.names, colnames(ds))] <- 0
-  ds[setdiff(ask.names, colnames(ds))] <- 0
-  ds[is.na(ds)] <- 0
-
-  if(!empty(ds)) {
-    # Assign timezone of start.time, if any, to timestamp column
-    ds$timestamp <- with_tz(ds$timestamp, tzone)
-  }
-  ds
-}
-
-
-.depth_summary <- function(conn, start.time, end.time, exchange, pair, frequency) {
-  if(is.null(frequency))
-    query <- paste0(" with depth_summary as ( select timestamp, price, volume, side, bps_level, rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r ",
-                    " from get.depth_summary(",
-                    shQuote(format(start.time, usetz=T)), ",",
-                    shQuote(format(end.time, usetz=T)), ",",
-                    "get.pair_id(",shQuote(pair),"), " ,
-                    "get.exchange_id(", shQuote(exchange), ") ",
-                    " )) select get._in_milliseconds(timestamp) as timestamp, side,  bps_level, price, volume from depth_summary ",
-                    # this is a workaround for the inability of R to handle microseconds in POSIXct
-                    " where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently order by 1, 2 desc")
-  else
-    query <- paste0(" with depth_summary as ( select timestamp, price, volume, side, bps_level, rank() over (partition by get._in_milliseconds(timestamp) order by timestamp desc) as r ",
-                    " from get.depth_summary(",
-                    shQuote(format(start.time, usetz=T)), ",",
-                    shQuote(format(end.time, usetz=T)), ",",
-                    "get.pair_id(",shQuote(pair),"), " ,
-                    "get.exchange_id(", shQuote(exchange), "), ",
-                    "p_frequency := ", shQuote(paste0(frequency, " seconds ")),
-                    " )) select get._in_milliseconds(timestamp) as timestamp, side,  bps_level, price, volume from depth_summary ",
-                    # this is a workaround for the inability of R to handle microseconds in POSIXct
-                    " where r=1 -- if rounded to milliseconds 'microtimestamp's are not unique, we'll take the LasT one and will drop the first silently order by 1, 2 desc")
-  flog.debug(query, name=packageName())
-  df <- DBI::dbGetQuery(conn, query)
-  df$timestamp <- as.POSIXct(as.numeric(df$timestamp)/1000, origin="1970-01-01")
-  df
-
-}
-
+# Order Book ----
 
 #' @export
 order_book <- function(con, tp, exchange, pair, max.levels = NA, bps.range = NA, min.bid = NA, max.ask = NA, tz='UTC') {
@@ -685,237 +1011,10 @@ order_book <- function(con, tp, exchange, pair, max.levels = NA, bps.range = NA,
 
 
 
-#' @export
-export <- function(con, start.time, end.time, exchange, pair, file = "events.csv") {
-  conn=con$con()
-
-  start.time <- format(start.time, usetz=T)
-  end.time <- format(end.time, usetz=T)
-
-  query <- paste0(" select * from get.export(", shQuote(start.time),
-                  ", ",
-                  shQuote(format(end.time, usetz=T)), ",",
-                  "get.pair_id(",shQuote(pair),"), " ,
-                  "get.exchange_id(", shQuote(exchange), ") ",
-                  ") order by timestamp")
-  flog.debug(query, name=packageName())
-  events <- DBI::dbGetQuery(conn, query)
-  write.csv(events, file = file, row.names = FALSE)
-}
-
-
-#' @export
-intervals <- function(con, start.time=NULL, end.time=NULL, exchange = NULL, pair = NULL, tz='UTC') {
-  conn=con$con()
-
-
-  if(!is.null(start.time)) {
-    if(is.character(start.time)) start.time <- ymd_hms(start.time)
-    stopifnot(inherits(start.time, 'POSIXt'))
-    start.time <- with_tz(start.time, tz='UTC')
-    start.time <- shQuote(format(start.time,"%Y-%m-%d %H:%M:%S%z")) # ISO 8601 format which is understood by both: Postgres and ymd_hms()
-  }
-  else
-    start.time <- "NULL"
-
-  if(!is.null(end.time)) {
-    if(is.character(end.time)) end.time <- ymd_hms(end.time)
-    stopifnot(inherits(end.time, 'POSIXt'))
-    end.time <- with_tz(end.time, tz='UTC')
-    end.time <- shQuote(format(end.time,"%Y-%m-%d %H:%M:%S%z"))
-  }
-  else
-    end.time <- "NULL"
-
-  if(!is.null(pair)) pair <- paste0(" get.pair_id(",shQuote(pair),") ") else pair <- "NULL"
-  if(!is.null(exchange)) exchange <- paste0(" get.exchange_id(", shQuote(exchange), ") ") else exchange <- "NULL"
-
-
-  pmap_dfr(tibble(pair, exchange),function(pair, exchange) {
-
-    # Various PostgreSQL-drivers in R are not able to handle timezone conversion correctly/consistently
-    # So we use EXTRACT epoch and then convert the epoch to POSIXct on the R side
-
-    query <- paste0("select exchange_id, pair_id, extract(epoch from interval_start) as interval_start, extract(epoch from interval_end) as interval_end,",
-                      " case when events then 'G'  else 'R' end as c, exchange, pair, extract(epoch from era) as era from get.events_intervals( ",
-                    " p_pair_id => ", pair,
-                    ", ",
-                    " p_exchange_id => ", exchange,
-                    ")",
-                    " where interval_end > coalesce( ", start.time, " , interval_end - '1 second'::interval ) ",
-                    "   and interval_start < coalesce( ", end.time, " , interval_start + '1 second'::interval ) "
-    )
-
-    flog.debug(query, name=packageName())
-    intervals <- DBI::dbGetQuery(conn, query)
-
-    intervals <- intervals %>%
-      mutate(interval_start=as.POSIXct(interval_start, origin="1970-01-01"),
-             interval_end=as.POSIXct(interval_end, origin="1970-01-01"),
-             era=as.POSIXct(era, origin="1970-01-01")
-      )
-
-    if(start.time != "NULL") {
-      start.time <- ymd_hms(start.time)
-      intervals <- intervals %>% mutate(interval_start=if_else(interval_start < start.time, start.time, interval_start))
-    }
-    if(end.time != "NULL") {
-      end.time <- ymd_hms(end.time)
-      intervals <- intervals %>% mutate(interval_end=if_else(interval_end > end.time, end.time, interval_end))
-    }
-
-    intervals$interval_start <- with_tz(intervals$interval_start, tz)
-    intervals$interval_end <- with_tz(intervals$interval_end, tz)
-    intervals$era <- with_tz(intervals$era, tz)
-
-    intervals
-  } )
-
-}
-
-
-#' Calculates and returns a trading period
-#'
-#' @param depth a source of depth changes data: either data.table with the pre-computed depth  as returned by  \code{\link{depth}} or
-#' an object of class 'connection' as returned by  \code{\link{connect}} pointing to the OBADIah database
-#' @returns A data.table with one row per bid-ask spread.
-#' \describe{
-#'  \item{timestamp POSIXct}{a starting timestamp}
-#'  \item{bid.price numeric}{an effective price at which the specified \code{volume} may be sold}
-#'  \item{ask.price numeric}{an effective price at which the specified \code{volume} may be bought}
-#' }
-#' @export
-trading.period <- function(depth, ...) {
-  UseMethod("trading.period",depth)
-}
-
-
-#' @rdname trading.period
-#' @param volume a trading volume for the effective \code{bid.price} \code{ask.price} calculation
-#' @export
-trading.period.data.table <- function(depth, volume = 0, debug.level = .debug.levels, tz="UTC") {
-  debug.level <- match.arg(debug.level)
-  result <- CalculateTradingPeriod(depth, volume, debug.level)
-  setDT(result)
-  cols <- c("timestamp")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  result
-}
-
-#' @rdname trading.period
-#' @inheritParams depth
-#' @export
-trading.period.connection <- function(depth, start.time, end.time, exchange, pair, frequency=NULL, volume=0,  tz='UTC') {
-
-  conn=depth$con()
-
-  if(is.character(start.time)) start.time <- ymd_hms(start.time)
-  if(is.character(end.time)) end.time <- ymd_hms(end.time)
-
-  stopifnot(inherits(start.time, 'POSIXt') & inherits(end.time, 'POSIXt'))
-  stopifnot(is.null(frequency) || is.numeric(frequency))
-  stopifnot(is.null(frequency) || frequency < 3600 || (frequency > 60 && frequency %% 60 == 0) || frequency < 60 && frequency > 0)
-
-  flog.debug(paste0("trading.period(con,", format(start.time, usetz=T), "," , format(end.time, usetz=T),",", shQuote(exchange), ", ", shQuote(pair),
-                    ", volume := ", volume, ", frequency := ", frequency, ", tz := ", tz , ")" ), name=packageName())
-
-  tzone <- tz
-
-  # Convert to UTC, so internally only UTC is used
-  start.time <- with_tz(start.time, tz='UTC')
-  end.time <- with_tz(end.time, tz='UTC')
-
-
-  if (!is.null(frequency)) {
-
-    if(frequency < 60) {
-      #start.time <- floor_date(start.time,  paste0(frequency, " seconds"))
-      end.time <- ceiling_date(end.time, paste0(frequency, " seconds"))
-    }
-    else {
-      #start.time <- floor_date(start.time, paste0(frequency %/% 60, " minutes"))
-      end.time <- ceiling_date(end.time, paste0(frequency %/% 60, " minutes"))
-    }
-  }
-
-  loader <- function(exchange, pair) {
-
-    volume_postgres <- if(is.finite(volume)) volume else "'infinity'::double precision"
-
-    if(is.null(frequency))
-
-      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\",",
-                      "\"ask.price\" FROM get.trading_period(",
-                      shQuote(format(start.time, usetz=T)), ",",
-                      shQuote(format(end.time, usetz=T)), ",",
-                      "get.pair_id(",shQuote(pair),"), " ,
-                      "get.exchange_id(", shQuote(exchange), "), ",
-                      volume_postgres,
-                      ")")
-    else
-      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\", ",
-                      "\"ask.price\" FROM get.trading_period(",
-                      shQuote(format(start.time, usetz=T)), ",",
-                      shQuote(format(end.time, usetz=T)), ",",
-                      "get.pair_id(",shQuote(pair),"), " ,
-                      "get.exchange_id(", shQuote(exchange), "), ",
-                       volume_postgres, ", ",
-                      "p_frequency :=", shQuote(paste0(frequency, " seconds ")),
-                      ") order by 1")
-
-    flog.debug(query, name=packageName())
-    result <- DBI::dbGetQuery(conn, query)
-    setDT(result)
-    if(nrow(result) > 0) {
-      result[, c("timestamp") := .(as.POSIXct(timestamp/1000000.0, origin="2000-01-01")) ]
-      result[is.nan(bid.price), c("bid.price") := NA]
-      result[is.nan(ask.price), c("ask.price") := NA]
-    }
-    result
-  }
-  result <- loader(exchange, pair)
-  if(nrow(result) > 0 ) {
-    result[, c("timestamp") := .(with_tz(timestamp, tz))]
-  }
-  result
-}
-
-.validate.trading.period <- function(tp) {
-  stopifnot(is.data.frame(tp),
-            "timestamp" %in% colnames(tp),
-            "bid.price" %in% colnames(tp),
-            "ask.price" %in% colnames(tp),
-            is.POSIXct(tp$timestamp),
-            is.numeric(tp$bid.price),
-            is.numeric(tp$ask.price))
-}
-
-.validate.depth <- function(depth) {
-  stopifnot(is.data.frame(depth),
-            "timestamp" %in% colnames(depth),
-            "price" %in% colnames(depth),
-            "volume" %in% colnames(depth),
-            "side" %in% colnames(depth),
-            is.POSIXct(depth$timestamp),
-            is.numeric(depth$price),
-            is.numeric(depth$volume),
-            is.character(depth$side))
-}
 
 
 
-#' @export
-order.book.changes <- function(depth,debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
-  .validate.depth(depth)
-  debug.level <- match.arg(debug.level)
-  result <- CalculateOrderBookChanges(depth, debug.level)
-  setDT(result)
-  cols <- c("timestamp")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  result
-}
-
-#' Calculates and returns order book snapshots
+#' Calculates and returns order book queues
 #'
 #' @param depth a source of depth changes data: either data.table with the pre-computed depth  as returned by  \code{\link{depth}} or
 #' an object of class 'connection' as returned by  \code{\link{connect}} pointing to the OBADIah database
@@ -1046,72 +1145,4 @@ queues.connection <- function(depth, start.time, end.time, exchange, pair,  tick
 }
 
 
-
-
-
-#' Calculates and returns an ideal trading strategy
-#'
-#' The ideal trading strategy is the set of long and/or short positions that generates the maximum profit
-#' in the given trading period subject to the commission and margin interest rate constraints provided
-#'
-#' @param trading.period a data.table as returned by \code{\link{trading.period}} with the following columns:  \code{timestamp}, \code{bid.price}, \code{ask.price}
-#' @param phi a numeric value of the commission percentage charged per transaction. 1\% is 0.01
-#' @param rho a numeric value of the margin interest rate per second. 0.1\% is 0.001
-#' @param mode a character vector specifying price use mode
-#' @details If \code{mode} parameter equals 'bid-ask' then, \code{bid.price} is used for selling and \code{ask.price} for buying transactions. In 'mid-price' mode,
-#' buying and selling transactions are performed using \code{mid.price} calculated as (\code{bid.price} + \code{ask.price})/2.
-#' @param debug.level a character vector
-#' @param tz a character vector with a time zone name understood by \code{\link{with_tz}} for the \code{timestamp} column in the output
-#' @returns A data.table with one row per position. The following information is provided for each position
-#' \describe{
-#'  \item{opened.at POSIXct}{opened at}
-#'  \item{open.price numeric}{opening price}
-#'  \item{closed.at POSIXct}{closed at}
-#'  \item{close.price numeric}{closing price}
-#'  \item{bps.return numeric}{return in basis points}
-#'  \item{rate numeric}{actual interest rate per seconds}
-#'  \item{log.return numeric}{log-relative return: abs(log(open.price) - log(close.price))}
-#' }
-#' If \code{open.price} is greater than \code{close.price} then it is a short position: the instrument is sold at \code{open.price}
-#' and bought at \code{close.price}.
-#'
-#' If \code{open.price} is less than \code{close.price} then it is a long possition: the instrument is bought at \code{open.price}
-#' and sold at \code{close.price}.
-#'
-#' @export
-trading.strategy <- function(trading.period, phi, rho, mode=c("mid-price", "bid-ask"), debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
-  .validate.trading.period(trading.period)
-  mode <- match.arg(mode)
-  debug.level <- match.arg(debug.level)
-
-  if( mode == "bid-ask")
-    result <- DiscoverPositions(trading.period, phi, rho, debug.level)
-  else {
-    result <- DiscoverPositions(trading.period[, .(timestamp, bid.price = (bid.price + ask.price)/2, ask.price = (bid.price + ask.price)/2)], phi, rho, debug.level)
-  }
-
-  setDT(result)
-  cols <- c("opened.at", "closed.at")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
-  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
-  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
-  result
-}
-
-
-#' @export
-epsilon.drawupdowns <- function(trading.period, epsilon, debug.level=c("NONE", "DEBUG5", "DEBUG4", "DEBUG3", "DEBUG2", "DEBUG1", "LOG", "INFO", "NOTICE", "WARNING", "ERROR"), tz="UTC") {
-  debug.level <- match.arg(debug.level)
-
-  result <- DiscoverDrawUpDowns(trading.period[, .(timestamp, price = (bid.price + ask.price)/2)], epsilon, debug.level)
-
-  setDT(result)
-  cols <- c("opened.at", "closed.at")
-  result[, (cols) := lapply(.SD, lubridate::as_datetime, tz=tz), .SDcols=cols ]
-  result[ open.price > close.price, bps.return := (exp(-log.return) -1)*-10000 ]
-  result[ open.price < close.price, bps.return := (exp(log.return) -1)*10000 ]
-  setcolorder(result, c("opened.at","open.price","closed.at", "close.price", "bps.return", "rate", "log.return"))
-  result
-}
 

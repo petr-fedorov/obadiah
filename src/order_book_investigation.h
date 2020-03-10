@@ -51,7 +51,7 @@ class InstrumentedOrderBook : public OrderBook<Allocator> {
 public:
  using LevelNo = unsigned;
  Volume GetVolume(Price p, Side s);
- Volume GetVolume(Price p, Side s, Price tick_size);
+ Volume GetVolume(Price p, Side s, Price tick_size) noexcept;
  inline void GetQueues(OrderBookQueues<Allocator>& ds, const Price tick_size,
                        LevelNo first_tick, LevelNo last_tick,
                        TickSizeType type) {
@@ -70,31 +70,13 @@ public:
  }
 
 protected:
- inline static bool geq(Price first, Price second) {
-  return first >= second ||
-         (second - first) / second <= std::numeric_limits<Price>::epsilon();
- }
-
- inline static Price AlignUp(Price price, Price tick) {
-  Price result = std::round(price/tick)*tick;
-  if(!geq(result, price))
-   result += tick;
-  return result;
- }
- inline static Price AlignDown(Price price, Price tick) {
-  Price result = std::round(price/tick)*tick;
-  if(!geq(price, result))
-   result -= tick;
-  return result;
- }
-
  class LogRelativeBidPriceLevel {
  public:
   LogRelativeBidPriceLevel(Price tick_size)
       : tick_size_{tick_size},
         price_{std::numeric_limits<Price>::infinity()} {};
   Price set(Price price, LevelNo lvl) {
-   price_ = AlignUp(std::log(price) - lvl*tick_size_, tick_size_);
+   price_ = AlignUp(std::log(price) - lvl * tick_size_, tick_size_);
    return std::exp(price_);
   }
   inline bool encompass(Price price) {
@@ -134,7 +116,7 @@ protected:
       : tick_size_{tick_size},
         price_{-std::numeric_limits<Price>::infinity()} {};
   Price set(Price price, LevelNo lvl) {
-   price_ = AlignDown(std::log(price) + lvl*tick_size_, tick_size_);
+   price_ = AlignDown(std::log(price) + lvl * tick_size_, tick_size_);
    return std::exp(price_);
   }
   inline bool encompass(Price price) {
@@ -183,7 +165,7 @@ InstrumentedOrderBook<Allocator>::GetBidsQueues(OrderBookQueues<Allocator>& ds,
                                                 LevelNo last_tick,
                                                 T&& price_level) {
  auto it = OrderBook<Allocator>::bids_.crbegin();
- if (it != this->bids_.crend()) 
+ if (it != this->bids_.crend())
   ds.bid_price = price_level.BestBidPrice(it->first);
  else
   ds.bid_price = R_NAREAL;
@@ -253,14 +235,20 @@ InstrumentedOrderBook<Allocator>::GetVolume(Price p, Side s) {
 
 template <template <typename> class Allocator>
 Volume
-InstrumentedOrderBook<Allocator>::GetVolume(Price p, Side s, Price tick_size) {
+InstrumentedOrderBook<Allocator>::GetVolume(Price p, Side s,
+                                            Price tick_size) noexcept {
  Volume volume = 0.0;
+ if (!tick_size) try {
+   return GetVolume(p, s);
+  } catch (const std::out_of_range&) {
+   return 0;
+  }
  if (s == Side::kBid) {
-  auto price_from = std::floor(p / tick_size) * tick_size;
-  auto price_to = (std::floor(p / tick_size) + 1) * tick_size;
+  auto price_from = AlignDown(p, tick_size);
+  auto price_to = price_from + tick_size;
   for (auto it = this->bids_.lower_bound(price_from); it != this->bids_.end();
        ++it) {
-   if (it->first >= price_to) break;
+   if (geq(it->first, price_to)) break;
    volume += it->second;
   }
 #ifndef NDEBUG
@@ -270,11 +258,11 @@ InstrumentedOrderBook<Allocator>::GetVolume(Price p, Side s, Price tick_size) {
 #endif
   return volume;
  } else {
-  auto price_from = (std::ceil(p / tick_size) - 1) * tick_size;
-  auto price_to = std::ceil(p / tick_size) * tick_size;
+  auto price_to = AlignUp(p, tick_size);
+  auto price_from = price_to - tick_size;
   for (auto it = this->asks_.upper_bound(price_from); it != this->asks_.end();
        ++it) {
-   if (it->first > price_to) break;
+   if (!geq(price_to, it->first)) break;
    volume += it->second;
   }
 #ifndef NDEBUG
@@ -288,30 +276,36 @@ InstrumentedOrderBook<Allocator>::GetVolume(Price p, Side s, Price tick_size) {
 
 using ChainId = int;
 
-struct OrderBookChange : public Level2 {
+struct DepthChange : public Level2 {
  ChainId id;
+ Price bid_price;
+ Price ask_price;
 };
 
 template <template <typename> class Allocator = std::allocator>
-class OrderBookChanges : public ObjectStream<OrderBookChange> {
+class DepthChanges : public ObjectStream<DepthChange> {
 public:
- OrderBookChanges(ObjectStream<Level2>* depth_changes)
-     : depth_changes_{depth_changes}, next_chain_id_{1} {
-  ObjectStream<OrderBookChange>::is_all_processed_ =
-      false;  // static_cast<bool>(*depth_changes);
+ DepthChanges(ObjectStream<Level2>* depth_updates)
+     : depth_updates_{depth_updates}, next_chain_id_{1}, current_{0} {
+  ObjectStream<DepthChange>::is_all_processed_ =
+      false;  // static_cast<bool>(*depth_updates);
+  spread_.p_bid = R_NAREAL;
+  spread_.p_ask = R_NAREAL;
  };
- OrderBookChanges<Allocator>& operator>>(OrderBookChange&);
+ DepthChanges<Allocator>& operator>>(DepthChange&);
 
 protected:
- ChainId GetChainId(const OrderBookChange&);
+ ChainId GetChainId(const DepthChange&);
 
  InstrumentedOrderBook<Allocator> ob_;
- ObjectStream<Level2>* depth_changes_;
+ ObjectStream<Level2>* depth_updates_;
  using ChainIds = std::map<Volume, ChainId, std::less<Volume>,
                            Allocator<std::pair<const Volume, ChainId>>>;
  ChainIds bid_chains_;
  ChainIds ask_chains_;
  ChainId next_chain_id_;
+ Timestamp current_;
+ BidAskSpread spread_;
 #ifndef NDEBUG
  src::severity_logger<SeverityLevel> lg;
 #endif
@@ -319,56 +313,74 @@ protected:
 
 template <template <typename> class Allocator>
 ChainId
-OrderBookChanges<Allocator>::GetChainId(const OrderBookChange& ob_change) {
+DepthChanges<Allocator>::GetChainId(const DepthChange& depth_change) {
  ChainIds* chain_ids;
- if (ob_change.s == Side::kBid)
+ if (depth_change.s == Side::kBid)
   chain_ids = &bid_chains_;
  else
   chain_ids = &ask_chains_;
- auto chain = chain_ids->find(std::abs(ob_change.v));
+ auto chain = chain_ids->find(std::abs(depth_change.v));
  if (chain != chain_ids->end()) {
   return chain->second;
  } else {
-  return (*chain_ids)[std::abs(ob_change.v)] = next_chain_id_++;
+  return (*chain_ids)[std::abs(depth_change.v)] = next_chain_id_++;
  }
 }
 
 template <template <typename> class Allocator>
-OrderBookChanges<Allocator>&
-OrderBookChanges<Allocator>::operator>>(OrderBookChange& ob_change) {
- Level2 depth_change;
- if (*depth_changes_ >> depth_change) {
-  ob_change.t = depth_change.t;
-  ob_change.p = depth_change.p;
-  ob_change.s = depth_change.s;
-  try {
-   ob_change.v = depth_change.v - ob_.GetVolume(depth_change.p, depth_change.s);
-  } catch (const std::out_of_range&) {
-   ob_change.v = depth_change.v;
+DepthChanges<Allocator>&
+DepthChanges<Allocator>::operator>>(DepthChange& depth_change) {
+ Level2 depth_update;
+ if (*depth_updates_ >> depth_update) {
+  if (!(current_ == depth_update.t)) {
+   spread_ = ob_.GetBidAskSpread(0);
+   current_ = depth_update.t;
   }
-  ob_change.id = GetChainId(ob_change);
-  ob_ << depth_change;
+  depth_change.t = depth_update.t;
+  depth_change.p = depth_update.p;
+  depth_change.s = depth_update.s;
+  try {
+   depth_change.v =
+       depth_update.v - ob_.GetVolume(depth_update.p, depth_update.s);
+  } catch (const std::out_of_range&) {
+   depth_change.v = depth_update.v;
+  }
+  depth_change.id = GetChainId(depth_change);
+  depth_change.bid_price = spread_.p_bid;
+  depth_change.ask_price = spread_.p_ask;
+  ob_ << depth_update;
  } else
   is_all_processed_ = true;
  return *this;
 }
 
 template <template <typename> class Allocator = std::allocator>
-class TickSizeChanger : public ObjectStream<Level2> {
+class DepthResampler : public ObjectStream<Level2> {
 public:
- TickSizeChanger(ObjectStream<Level2>* depth_changes, Price tick_size)
-     : depth_changes_{depth_changes}, tick_size_{tick_size} {
-  if (*depth_changes >> unprocessed_) is_all_processed_ = false;
+ DepthResampler(ObjectStream<Level2>* depth_updates, Price tick_size,
+                Timestamp start_time, Timestamp end_time, Frequency frequency)
+     : depth_updates_{depth_updates},
+       tick_size_{tick_size},
+       start_time_{start_time},
+       end_time_{end_time},
+       frequency_{frequency} {
+  if (*depth_updates >> unprocessed_) is_all_processed_ = false;
+  start_time_.AlignUp(frequency);
+  end_time_.AlignDown(frequency);
+  if (start_time_ > end_time_) unprocessed_.falsify();
  }
- TickSizeChanger<Allocator>& operator>>(Level2&);
+ DepthResampler<Allocator>& operator>>(Level2&);
 
 private:
  void ProcessNextEpisode();
 
  InstrumentedOrderBook<Allocator> ob_;
- ObjectStream<Level2>* depth_changes_;
+ ObjectStream<Level2>* depth_updates_;
  Price tick_size_;
+ Timestamp start_time_;
+ Timestamp end_time_;
  Level2 unprocessed_;
+ Frequency frequency_;
  std::deque<Level2, Allocator<Level2>> output_;
 #ifndef NDEBUG
  src::severity_logger<SeverityLevel> lg;
@@ -377,29 +389,45 @@ private:
 
 template <template <typename> class Allocator>
 void
-TickSizeChanger<Allocator>::ProcessNextEpisode() {
+DepthResampler<Allocator>::ProcessNextEpisode() {
  if (unprocessed_) {
-  std::set<Price, std::less<Price>, Allocator<Price>> bid_prices;
-  std::set<Price, std::less<Price>, Allocator<Price>> ask_prices;
-  Timestamp current = unprocessed_.t;
+  std::set<Price, less, Allocator<Price>> bid_prices;
+  std::set<Price, less, Allocator<Price>> ask_prices;
   do {
-   if (!(current == unprocessed_.t)) break;
+   if (unprocessed_.t > start_time_) {
+    break;
+   }
    if (unprocessed_.s == Side::kBid) {
-    bid_prices.insert(std::floor(unprocessed_.p / tick_size_) * tick_size_);
+    Price aligned = AlignDown(unprocessed_.p, tick_size_);
+    bid_prices.insert(aligned);
+#ifndef NDEBUG
+    BOOST_LOG_SEV(lg, SeverityLevel::kDebug5)
+        << "BID: timestamp: " << static_cast<char*>(start_time_)
+        << " price: " << unprocessed_.p << " AlignedDown: " << aligned
+        << " bid_prices.size() " << bid_prices.size();
+#endif
    } else {
-    ask_prices.insert(std::ceil(unprocessed_.p / tick_size_) * tick_size_);
+    Price aligned = AlignUp(unprocessed_.p, tick_size_);
+    ask_prices.insert(aligned);
+#ifndef NDEBUG
+    BOOST_LOG_SEV(lg, SeverityLevel::kDebug5)
+        << "ASK: timestamp: " << static_cast<char*>(start_time_)
+        << " price: " << unprocessed_.p << " AlignedUp: " << aligned
+        << " ask_prices.size() " << ask_prices.size();
+    ;
+#endif
    }
    ob_ << unprocessed_;
    unprocessed_.falsify();
-  } while (*depth_changes_ >> unprocessed_);
+  } while (*depth_updates_ >> unprocessed_);
 #ifndef NDEBUG
   BOOST_LOG_SEV(lg, SeverityLevel::kDebug4)
-      << "TickSizeChanger " << static_cast<char*>(current);
+      << "DepthResampler " << static_cast<char*>(start_time_);
 #endif
 
   for (auto price = ask_prices.rbegin(); price != ask_prices.rend(); ++price) {
    Level2 o;
-   o.t = current;
+   o.t = start_time_;
    o.p = *price;
    o.v = ob_.GetVolume(*price, Side::kAsk, tick_size_);
    o.s = Side::kAsk;
@@ -407,18 +435,23 @@ TickSizeChanger<Allocator>::ProcessNextEpisode() {
   }
   for (auto price = bid_prices.rbegin(); price != bid_prices.rend(); ++price) {
    Level2 o;
-   o.t = current;
+   o.t = start_time_;
    o.p = *price;
    o.v = ob_.GetVolume(*price, Side::kBid, tick_size_);
    o.s = Side::kBid;
    output_.push_front(o);
   }
+  start_time_ = unprocessed_.t;
+  start_time_.AlignUp(frequency_);
+  if (start_time_ > end_time_)
+   unprocessed_
+       .falsify();  // Level2's is beyond end_time_, so processing is stopped
  }
 }
 
 template <template <typename> class Allocator>
-TickSizeChanger<Allocator>&
-TickSizeChanger<Allocator>::operator>>(Level2& out) {
+DepthResampler<Allocator>&
+DepthResampler<Allocator>::operator>>(Level2& out) {
  if (!is_all_processed_) {
   if (output_.empty()) ProcessNextEpisode();
 
@@ -438,9 +471,9 @@ class DepthToQueues
 public:
  using LevelNo = typename InstrumentedOrderBook<Allocator>::LevelNo;
 
- DepthToQueues(ObjectStream<Level2>* depth_changes, const Price tick_size,
+ DepthToQueues(ObjectStream<Level2>* depth_updates, const Price tick_size,
                LevelNo first_tick, LevelNo last_tick, std::string type)
-     : EpisodeProcessor<Allocator, OrderBookQueues<Allocator>>{depth_changes},
+     : EpisodeProcessor<Allocator, OrderBookQueues<Allocator>>{depth_updates},
        tick_size_{tick_size},
        first_tick_{first_tick},
        last_tick_{last_tick},

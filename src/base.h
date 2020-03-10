@@ -48,17 +48,63 @@ struct Timestamp {
  inline operator double() { return t; }
  inline double operator-(Timestamp a) { return t - a.t; }
  inline bool operator==(Timestamp a) { return t == a.t; }
+ inline bool operator>(Timestamp a) { return t > a.t; }
  operator char*();
+ constexpr static double kMicrosecond =
+     0.000001;  // the minimal difference between two Timestamps
+
+ inline Timestamp& AlignUp(double frequency) {
+  if (frequency) t = std::ceil((t - kMicrosecond) / frequency) * frequency;
+  return *this;
+ }
+
+ inline Timestamp& AlignDown(double frequency) {
+  if (frequency) t = std::floor((t + kMicrosecond) / frequency) * frequency;
+  return *this;
+ }
 };
 
-using Price = double;
-constexpr double kPricePrecision = 0.00001;
+using Frequency = double;
 
+using Price = double;
+constexpr double kPricePrecision =
+    0.00001;  // the (theoretical) minimal difference between consequitive
+              // prices
+constexpr double kPricePrecisionFraction =
+    0.000001;  // must be strictly less than a half of kPricePrecision
+
+inline static Price
+AlignUp(Price price, Price tick_size) {
+ return tick_size > kPricePrecision
+            ? std::ceil((price - kPricePrecisionFraction) / tick_size) *
+                  tick_size
+            : price;
+}
+
+inline static Price
+AlignDown(Price price, Price tick_size) {
+ return tick_size > kPricePrecision
+            ? std::floor((price + kPricePrecisionFraction) / tick_size) *
+                  tick_size
+            : price;
+}
 // R's NA value.
 // See R source code: src/main/arithmetics.c R_ValueOfNA()
 #define R_NAREAL std::nan("1954")
 
 using Volume = double;
+
+inline static bool
+geq(Price first, Price second) {
+ return first >= second ||
+        (second - first) / second <= std::numeric_limits<Price>::epsilon();
+}
+
+struct less {
+ bool operator()(const Price& lhs, const Price& rhs) const {
+  return !geq(lhs, rhs);
+ }
+};
 
 enum Side { kBid = 'b', kAsk = 'a' };
 
@@ -146,8 +192,8 @@ public:
  friend std::ostream& operator<<(std::ostream&, const OrderBook<A>&);
 
 protected:
- using PriceVolumeMap = std::map<Price, Volume, std::less<Price>,
-                                 Allocator<std::pair<const Price, Volume>>>;
+ using PriceVolumeMap =
+     std::map<Price, Volume, less, Allocator<std::pair<const Price, Volume>>>;
  PriceVolumeMap bids_;
  PriceVolumeMap asks_;
  Timestamp latest_timestamp_;

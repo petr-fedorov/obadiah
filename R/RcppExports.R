@@ -9,12 +9,12 @@ CalculateOrderBookQueues <- function(depth_changes, tick_size, ticks, type, debu
     .Call(`_obadiah_CalculateOrderBookQueues`, depth_changes, tick_size, ticks, type, debug_level)
 }
 
-CalculateOrderBookChanges <- function(depth_changes, debug_level) {
-    .Call(`_obadiah_CalculateOrderBookChanges`, depth_changes, debug_level)
+CalculateDepthChanges <- function(depth_updates, debug_level) {
+    .Call(`_obadiah_CalculateDepthChanges`, depth_updates, debug_level)
 }
 
-ChangeTickSize <- function(depth_changes, tick_size, debug_level) {
-    .Call(`_obadiah_ChangeTickSize`, depth_changes, tick_size, debug_level)
+ResampleDepth <- function(depth_updates, tick_size, start_time, end_time, frequency, debug_level) {
+    .Call(`_obadiah_ResampleDepth`, depth_updates, tick_size, start_time, end_time, frequency, debug_level)
 }
 
 DiscoverPositions <- function(computed_trading_period, phi, rho, debug_level) {

@@ -33,28 +33,31 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// CalculateOrderBookChanges
-DataFrame CalculateOrderBookChanges(DataFrame depth_changes, CharacterVector debug_level);
-RcppExport SEXP _obadiah_CalculateOrderBookChanges(SEXP depth_changesSEXP, SEXP debug_levelSEXP) {
+// CalculateDepthChanges
+DataFrame CalculateDepthChanges(DataFrame depth_updates, CharacterVector debug_level);
+RcppExport SEXP _obadiah_CalculateDepthChanges(SEXP depth_updatesSEXP, SEXP debug_levelSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
+    Rcpp::traits::input_parameter< DataFrame >::type depth_updates(depth_updatesSEXP);
     Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
-    rcpp_result_gen = Rcpp::wrap(CalculateOrderBookChanges(depth_changes, debug_level));
+    rcpp_result_gen = Rcpp::wrap(CalculateDepthChanges(depth_updates, debug_level));
     return rcpp_result_gen;
 END_RCPP
 }
-// ChangeTickSize
-DataFrame ChangeTickSize(DataFrame depth_changes, NumericVector tick_size, CharacterVector debug_level);
-RcppExport SEXP _obadiah_ChangeTickSize(SEXP depth_changesSEXP, SEXP tick_sizeSEXP, SEXP debug_levelSEXP) {
+// ResampleDepth
+DataFrame ResampleDepth(DataFrame depth_updates, NumericVector tick_size, NumericVector start_time, NumericVector end_time, NumericVector frequency, CharacterVector debug_level);
+RcppExport SEXP _obadiah_ResampleDepth(SEXP depth_updatesSEXP, SEXP tick_sizeSEXP, SEXP start_timeSEXP, SEXP end_timeSEXP, SEXP frequencySEXP, SEXP debug_levelSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< DataFrame >::type depth_changes(depth_changesSEXP);
+    Rcpp::traits::input_parameter< DataFrame >::type depth_updates(depth_updatesSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type tick_size(tick_sizeSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type start_time(start_timeSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type end_time(end_timeSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type frequency(frequencySEXP);
     Rcpp::traits::input_parameter< CharacterVector >::type debug_level(debug_levelSEXP);
-    rcpp_result_gen = Rcpp::wrap(ChangeTickSize(depth_changes, tick_size, debug_level));
+    rcpp_result_gen = Rcpp::wrap(ResampleDepth(depth_updates, tick_size, start_time, end_time, frequency, debug_level));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -105,8 +108,8 @@ RcppExport SEXP run_testthat_tests();
 static const R_CallMethodDef CallEntries[] = {
     {"_obadiah_CalculateTradingPeriod", (DL_FUNC) &_obadiah_CalculateTradingPeriod, 3},
     {"_obadiah_CalculateOrderBookQueues", (DL_FUNC) &_obadiah_CalculateOrderBookQueues, 5},
-    {"_obadiah_CalculateOrderBookChanges", (DL_FUNC) &_obadiah_CalculateOrderBookChanges, 2},
-    {"_obadiah_ChangeTickSize", (DL_FUNC) &_obadiah_ChangeTickSize, 3},
+    {"_obadiah_CalculateDepthChanges", (DL_FUNC) &_obadiah_CalculateDepthChanges, 2},
+    {"_obadiah_ResampleDepth", (DL_FUNC) &_obadiah_ResampleDepth, 6},
     {"_obadiah_DiscoverPositions", (DL_FUNC) &_obadiah_DiscoverPositions, 4},
     {"_obadiah_DiscoverDrawUpDowns", (DL_FUNC) &_obadiah_DiscoverDrawUpDowns, 3},
     {"_obadiah_spread_from_depth", (DL_FUNC) &_obadiah_spread_from_depth, 4},

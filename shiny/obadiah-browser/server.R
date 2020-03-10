@@ -365,7 +365,7 @@ server <- function(input, output, session) {
 
 
     order.book.data <- withProgress(message="loading order book ...", {
-      obadiah::order_book(con, tp, exchange, pair, bps.range=100, tz=tz(tp) )
+      obadiah::order_book(con, tp, exchange, pair, bps.range=1000, tz=tz(tp) )
     })
     if(!autoPvRange()) {
       bids <- order.book.data$bids
