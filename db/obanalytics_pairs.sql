@@ -43,6 +43,10 @@ COPY obanalytics.pairs (pair_id, pair, "R0", "P0", "P1", "P2", "P3", fmu) FROM s
 6	BTCEUR	2	1	\N	\N	\N	8
 7	ETHBTC	8	1	\N	\N	\N	18
 1	BTCUSD	2	1	0	-1	-2	8
+8	SBERRUB	2	\N	\N	\N	\N	0
+9	VTBRRUB	2	\N	\N	\N	\N	0
+10	LKOHRUB	2	\N	\N	\N	\N	0
+11	GAZPRUB	2	\N	\N	\N	\N	0
 \.
 
 

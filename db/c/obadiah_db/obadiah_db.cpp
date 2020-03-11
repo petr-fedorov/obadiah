@@ -32,6 +32,7 @@ extern "C" {
 #include "fmgr.h"
 #include "funcapi.h"
 #include "postgres.h"
+#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
 PG_MODULE_MAGIC;
@@ -41,6 +42,8 @@ PG_FUNCTION_INFO_V1(spread_by_episode);
 PG_FUNCTION_INFO_V1(to_microseconds);
 PG_FUNCTION_INFO_V1(CalculateTradingPeriod);
 PG_FUNCTION_INFO_V1(SetLogLevel);
+PG_FUNCTION_INFO_V1(GetOrderBookQueues);
+PG_FUNCTION_INFO_V1(DiscoverPositions);
 #ifdef __cplusplus
 }
 #endif  // __cplusplus
@@ -64,10 +67,12 @@ PG_FUNCTION_INFO_V1(SetLogLevel);
 #include "spi_allocator.h"
 // From R
 #include "../../../src/base.h"
+#include "../../../src/order_book_investigation.h"
+#include "../../../src/position_discovery.h"
 
 namespace logging = boost::log;
 namespace expr = boost::log::expressions;
-BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::SeverityLevel)
+BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", obadiah::R::SeverityLevel)
 
 namespace obad {
 
@@ -104,41 +109,41 @@ public:
 
 void
 elog_sink::consume(logging::record_view const &rec, string_type const &msg) {
- logging::value_ref<obadiah::SeverityLevel, tag::severity> level =
+ logging::value_ref<obadiah::R::SeverityLevel, tag::severity> level =
      rec[severity];
- if (level == obadiah::SeverityLevel::kDebug5) {
+ if (level == obadiah::R::SeverityLevel::kDebug5) {
   elog(DEBUG5, "[5] %s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kDebug4) {
+ if (level == obadiah::R::SeverityLevel::kDebug4) {
   elog(DEBUG4, "[4] %s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kDebug3) {
+ if (level == obadiah::R::SeverityLevel::kDebug3) {
   elog(DEBUG3, "[3] %s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kDebug2) {
+ if (level == obadiah::R::SeverityLevel::kDebug2) {
   elog(DEBUG2, "[2] %s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kDebug1) {
+ if (level == obadiah::R::SeverityLevel::kDebug1) {
   elog(DEBUG1, "[1] %s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kInfo) {
+ if (level == obadiah::R::SeverityLevel::kInfo) {
   elog(INFO, "%s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kNotice) {
+ if (level == obadiah::R::SeverityLevel::kNotice) {
   elog(NOTICE, "%s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kWarning) {
+ if (level == obadiah::R::SeverityLevel::kWarning) {
   elog(WARNING, "%s", msg.c_str());
   return;
  }
- if (level == obadiah::SeverityLevel::kError) {
+ if (level == obadiah::R::SeverityLevel::kError) {
   elog(ERROR, "%s", msg.c_str());
   return;
  }
@@ -159,7 +164,8 @@ _PG_init() {
  boost::shared_ptr<sink_t> sink(new sink_t());
  sink->set_formatter(expr::stream << expr::message);
  logging::core::get()->add_sink(sink);
- logging::core::get()->set_filter(severity > obadiah::SeverityLevel::kNotice);
+ logging::core::get()->set_filter(severity >
+                                  obadiah::R::SeverityLevel::kNotice);
 };
 
 Datum
@@ -361,21 +367,22 @@ to_microseconds(PG_FUNCTION_ARGS) {
  Timestamp arg = PG_GETARG_TIMESTAMP(0);
  PG_RETURN_INT64(arg);
 }
-
-class DepthChangesStream : public obadiah::ObjectStream<obadiah::Level2>,
+namespace obadiah {
+namespace postgres {
+class DepthChangesStream : public obadiah::R::ObjectStream<obadiah::R::Level2>,
                            public obad::postgres_heap {
 public:
  DepthChangesStream(Datum p_start_time, Datum p_end_time, Datum p_pair_id,
                     Datum p_exchange_id, Datum frequency);
  ~DepthChangesStream();
  operator bool();
- DepthChangesStream &operator>>(obadiah::Level2 &dc);
+ DepthChangesStream &operator>>(obadiah::R::Level2 &dc);
 
 private:
  const char *kCursorName = "depth_changes_stream";
  const int kFetchCount = 1000;
  using Cache =
-     std::deque<obadiah::Level2, obad::spi_allocator<obadiah::Level2>>;
+     std::deque<obadiah::R::Level2, obad::spi_allocator<obadiah::R::Level2>>;
  bool state_;
  Cache *cache_;
 };
@@ -404,7 +411,7 @@ DepthChangesStream::DepthChangesStream(Datum p_start_time, Datum p_end_time,
  if (p_frequency == obad::NULL_FREQ) nulls[4] = 'n';
 
  SPI_cursor_open_with_args(kCursorName, R"QUERY(
-        select timestamp::double precision/1000000.0 + 946684800 as timestamp,
+        select extract(epoch from timestamp) as timestamp,
                price, volume, side 
         from get.depth($1, $2, $3, $4, $5) order by 1, 2 desc;)QUERY",
                            5, types, values, nulls, true, 0);
@@ -419,7 +426,7 @@ DepthChangesStream::~DepthChangesStream() {
 DepthChangesStream::operator bool() { return state_; }
 
 DepthChangesStream &
-DepthChangesStream::operator>>(obadiah::Level2 &dc) {
+DepthChangesStream::operator>>(obadiah::R::Level2 &dc) {
  // R's NA value.
  // See R source code: src/main/arithmetics.c R_ValueOfNA()
  static const double kR_NaReal = std::nan("1954");
@@ -429,14 +436,14 @@ DepthChangesStream::operator>>(obadiah::Level2 &dc) {
   if (SPI_processed > 0 && SPI_tuptable != NULL) {
    HeapTuple tuple;
    TupleDesc tupdesc = SPI_tuptable->tupdesc;
-   obadiah::Level2 l2;
+   obadiah::R::Level2 l2;
 
    for (uint64 j = 0; j < SPI_processed; j++) {
     tuple = SPI_tuptable->vals[j];
 
     l2.s = SPI_getvalue(tuple, tupdesc, SPI_fnumber(tupdesc, "side"))[0] == 'a'
-               ? obadiah::Side::kAsk
-               : obadiah::Side::kBid;
+               ? obadiah::R::Side::kAsk
+               : obadiah::R::Side::kBid;
 
     try {
      l2.t.t =
@@ -472,15 +479,18 @@ DepthChangesStream::operator>>(obadiah::Level2 &dc) {
  return *this;
 }
 
-class TradingPeriod : public obadiah::TradingPeriod<obad::spi_allocator>,
+class TradingPeriod : public obadiah::R::TradingPeriod<obad::spi_allocator>,
                       public obad::postgres_heap {
 public:
- TradingPeriod(obadiah::ObjectStream<obadiah::Level2> *depth_changes,
+ TradingPeriod(obadiah::R::ObjectStream<obadiah::R::Level2> *depth_changes,
                double volume)
-     : obadiah::TradingPeriod<obad::spi_allocator>{depth_changes, volume} {};
+     : obadiah::R::TradingPeriod<obad::spi_allocator>{depth_changes, volume} {};
 
  ~TradingPeriod() { delete depth_changes_; }
 };
+
+}  // namespace postgres
+}  // namespace obadiah
 
 Datum
 CalculateTradingPeriod(PG_FUNCTION_ARGS) {
@@ -515,12 +525,14 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
 
   SPI_connect();
 
-  DepthChangesStream *depth_changes_stream = new (allocation_mode::spi)
-      DepthChangesStream{PG_GETARG_DATUM(0), PG_GETARG_DATUM(1),
-                         PG_GETARG_DATUM(2), PG_GETARG_DATUM(3), frequency};
+  obadiah::postgres::DepthChangesStream *depth_changes_stream =
+      new (allocation_mode::spi) obadiah::postgres::DepthChangesStream{
+          PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), PG_GETARG_DATUM(2),
+          PG_GETARG_DATUM(3), frequency};
 
-  TradingPeriod *trading_period = new (allocation_mode::spi)
-      TradingPeriod{depth_changes_stream, PG_GETARG_FLOAT8(4)};
+  obadiah::postgres::TradingPeriod *trading_period =
+      new (allocation_mode::spi) obadiah::postgres::TradingPeriod{
+          depth_changes_stream, PG_GETARG_FLOAT8(4)};
   funcctx->user_fctx = trading_period;
   SPI_finish();
 
@@ -531,10 +543,10 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
 
  MemoryContext oldcontext;
  oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
- TradingPeriod *trading_period =
-     static_cast<TradingPeriod *>(funcctx->user_fctx);
+ obadiah::postgres::TradingPeriod *trading_period =
+     static_cast<obadiah::postgres::TradingPeriod *>(funcctx->user_fctx);
  attinmeta = funcctx->attinmeta;
- obadiah::BidAskSpread output;
+ obadiah::R::BidAskSpread output;
  SPI_connect();
 
  if (*trading_period >> output) {
@@ -548,7 +560,7 @@ CalculateTradingPeriod(PG_FUNCTION_ARGS) {
   int j = 0;
   std::memset(nulls, 0, sizeof nulls);
   values[j++] =
-      Int64GetDatum(std::lround((output.t.t - 946684800.0) * 1000000));
+      TimestampTzGetDatum(std::lround((output.t.t - 946684800.0) * 1000000));
   values[j++] = Float8GetDatum(output.p_bid);
   values[j++] = Float8GetDatum(output.p_ask);
   HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
@@ -587,11 +599,245 @@ SetLogLevel(PG_FUNCTION_ARGS) {
  try {
   logging::core::get()->set_filter(
       !expr::has_attr(severity) ||
-      severity >= obadiah::GetSeverityLevel(
+      severity >= obadiah::R::GetSeverityLevel(
                       std::string(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t))));
  } catch (std::out_of_range &) {
-  logging::core::get()->set_filter(severity > obadiah::SeverityLevel::kNotice);
+  logging::core::get()->set_filter(severity >
+                                   obadiah::R::SeverityLevel::kNotice);
  };
  PG_RETURN_NULL();
+}
+
+namespace obadiah {
+namespace postgres {
+using Price = obadiah::R::Price;
+using Volume = obadiah::R::Volume;
+using TickSizeType = obadiah::R::TickSizeType;
+
+class DepthToQueues
+    : public obadiah::R::DepthToQueues<obad::spi_allocator>,
+      public obad::postgres_heap {
+public:
+ using LevelNo = obadiah::R::DepthToQueues<obad::spi_allocator>::LevelNo;
+ DepthToQueues(ObjectStream<obadiah::R::Level2> *depth_changes,
+                  const Price tick_size, LevelNo first_tick, LevelNo last_tick,
+                  std::string tick_type)
+     : obadiah::R::DepthToQueues<obad::spi_allocator>(
+           depth_changes, tick_size, first_tick, last_tick, tick_type){};
+ ~DepthToQueues() { delete depth_changes_; }
+};
+
+}  // namespace postgres
+}  // namespace obadiah
+
+Datum
+GetOrderBookQueues(PG_FUNCTION_ARGS) {
+ FuncCallContext *funcctx;
+ TupleDesc tupdesc;
+ AttInMetadata *attinmeta;
+
+ if (SRF_IS_FIRSTCALL()) {
+  MemoryContext oldcontext;
+
+  funcctx = SRF_FIRSTCALL_INIT();
+
+  oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+  if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+   ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                   errmsg("function returning record called in context "
+                          "that cannot accept type record")));
+  if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) ||
+      PG_ARGISNULL(3) || PG_ARGISNULL(4) || PG_ARGISNULL(5) ||
+      PG_ARGISNULL(6) || PG_ARGISNULL(7))
+   ereport(ERROR,
+           (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+            errmsg("p_start_time, p_end_time, pair_id, exchange_id, tick_size, "
+                   "first_tick, last_tick, tick_type must not be NULL")));
+  attinmeta = TupleDescGetAttInMetadata(tupdesc);
+  funcctx->attinmeta = attinmeta;
+
+  Datum frequency = obad::NULL_FREQ;
+  if (!PG_ARGISNULL(8)) frequency = PG_GETARG_DATUM(8);
+
+  SPI_connect();
+
+  obadiah::postgres::DepthChangesStream *depth_changes_stream =
+      new (obad::allocation_mode::spi) obadiah::postgres::DepthChangesStream{
+          PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), PG_GETARG_DATUM(2),
+          PG_GETARG_DATUM(3), frequency};
+
+  obadiah::postgres::DepthToQueues *depth_to_snapshots =
+      new (obad::allocation_mode::spi) obadiah::postgres::DepthToQueues{
+          depth_changes_stream, PG_GETARG_FLOAT8(4), PG_GETARG_INT32(5),
+          PG_GETARG_INT32(6),
+          std::string{VARDATA_ANY(PG_GETARG_TEXT_PP(7)),
+                      VARSIZE_ANY_EXHDR(PG_GETARG_TEXT_PP(7))}};
+
+  funcctx->user_fctx = depth_to_snapshots;
+  SPI_finish();
+
+  MemoryContextSwitchTo(oldcontext);
+ }
+
+ funcctx = SRF_PERCALL_SETUP();
+
+ MemoryContext oldcontext;
+ oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+ obadiah::postgres::DepthToQueues *depth_to_snapshots =
+     static_cast<obadiah::postgres::DepthToQueues *>(funcctx->user_fctx);
+ attinmeta = funcctx->attinmeta;
+ SPI_connect();
+ obadiah::R::OrderBookQueues<obad::spi_allocator> output;
+
+ if (*depth_to_snapshots >> output) {
+  SPI_finish();
+  MemoryContextSwitchTo(oldcontext);
+  std::vector<Datum, obad::p_allocator<Datum>> bids;
+  std::vector<Datum, obad::p_allocator<Datum>> asks;
+  bids.reserve(output.bids.size());
+  for (auto v : output.bids) bids.push_back(Float8GetDatum(v));
+  asks.reserve(output.asks.size());
+  for (auto v : output.asks) asks.push_back(Float8GetDatum(v));
+  get_call_result_type(fcinfo, NULL, &tupdesc);
+  tupdesc = BlessTupleDesc(tupdesc);
+
+  Datum values[5];
+  int16 typlen;
+  bool typbyval;
+  char typalign;
+
+  get_typlenbyvalalign(FLOAT8OID, &typlen, &typbyval, &typalign);
+
+  bool nulls[5];
+  int j = 0;
+  std::memset(nulls, 0, sizeof nulls);
+  values[j++] =
+      TimestampTzGetDatum(std::lround((output.t.t - 946684800.0) * 1000000));
+  values[j++] = Float8GetDatum(output.bid_price);
+  values[j++] = Float8GetDatum(output.ask_price);
+  values[j++] = PointerGetDatum(construct_array(
+      bids.data(), bids.size(), FLOAT8OID, typlen, typbyval, typalign));
+  values[j++] = PointerGetDatum(construct_array(
+      asks.data(), asks.size(), FLOAT8OID, typlen, typbyval, typalign));
+  HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+  SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+ } else {
+  delete depth_to_snapshots;
+  SPI_finish();
+  MemoryContextSwitchTo(oldcontext);
+  SRF_RETURN_DONE(funcctx);
+ }
+}
+
+namespace obadiah {
+namespace postgres {
+
+class TradingStrategy : public obadiah::R::TradingStrategy,
+                        public obad::postgres_heap {
+public:
+ TradingStrategy(
+     obadiah::R::ObjectStream<obadiah::R::BidAskSpread> *trading_period,
+     double phi, double rho)
+     : obadiah::R::TradingStrategy{trading_period, phi, rho} {};
+
+ ~TradingStrategy() { delete trading_period_; }
+};
+
+}  // namespace postgres
+}  // namespace obadiah
+
+Datum
+DiscoverPositions(PG_FUNCTION_ARGS) {
+ FuncCallContext *funcctx;
+ TupleDesc tupdesc;
+ AttInMetadata *attinmeta;
+
+ if (SRF_IS_FIRSTCALL()) {
+  MemoryContext oldcontext;
+
+  funcctx = SRF_FIRSTCALL_INIT();
+
+  oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+  if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+   ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                   errmsg("function returning record called in context "
+                          "that cannot accept type record")));
+  if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) ||
+      PG_ARGISNULL(3) || PG_ARGISNULL(4))
+   ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                   errmsg("p_start_time, p_end_time, pair_id, exchange_id must "
+                          "not be NULL")));
+  attinmeta = TupleDescGetAttInMetadata(tupdesc);
+  funcctx->attinmeta = attinmeta;
+
+  Datum frequency = obad::NULL_FREQ;
+  if (!PG_ARGISNULL(7)) frequency = PG_GETARG_DATUM(7);
+
+  SPI_connect();
+
+  obadiah::postgres::DepthChangesStream *depth_changes_stream =
+      new (obad::allocation_mode::spi) obadiah::postgres::DepthChangesStream{
+          PG_GETARG_DATUM(0), PG_GETARG_DATUM(1), PG_GETARG_DATUM(2),
+          PG_GETARG_DATUM(3), frequency};
+
+  obadiah::postgres::TradingPeriod *trading_period =
+      new (obad::allocation_mode::spi) obadiah::postgres::TradingPeriod{
+          depth_changes_stream, PG_GETARG_FLOAT8(4)};
+
+  obadiah::postgres::TradingStrategy *trading_strategy =
+      new (obad::allocation_mode::spi) obadiah::postgres::TradingStrategy{
+          trading_period, PG_GETARG_FLOAT8(5), PG_GETARG_FLOAT8(6)};
+  funcctx->user_fctx = trading_strategy;
+  SPI_finish();
+
+  MemoryContextSwitchTo(oldcontext);
+ }
+
+ funcctx = SRF_PERCALL_SETUP();
+
+ MemoryContext oldcontext;
+ oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+ obadiah::postgres::TradingStrategy *trading_strategy =
+     static_cast<obadiah::postgres::TradingStrategy *>(funcctx->user_fctx);
+ attinmeta = funcctx->attinmeta;
+ obadiah::R::Position output;
+ SPI_connect();
+
+ if (*trading_strategy >> output) {
+  SPI_finish();
+  MemoryContextSwitchTo(oldcontext);
+  get_call_result_type(fcinfo, NULL, &tupdesc);
+  tupdesc = BlessTupleDesc(tupdesc);
+
+  Datum values[7];
+  bool nulls[7];
+  int j = 0;
+  std::memset(nulls, 0, sizeof nulls);
+  values[j++] =
+      TimestampTzGetDatum(std::lround((output.s.t.t - 946684800.0) * 1000000));
+  values[j++] = Float8GetDatum(output.s.p);
+  values[j++] =
+      TimestampTzGetDatum(std::lround((output.e.t.t - 946684800.0) * 1000000));
+  values[j++] = Float8GetDatum(output.e.p);
+  values[j++] = Float8GetDatum(
+      output.s.p > output.e.p ? (output.s.p - output.e.p) / output.s.p * 10000
+                              : (output.e.p - output.s.p) / output.s.p * 10000);
+  double log_return = output.s.p > output.e.p
+                          ? std::log(output.s.p) - std::log(output.e.p)
+                          : std::log(output.e.p) - std::log(output.s.p);
+  values[j++] =
+      Float8GetDatum(std::exp(log_return / (output.e.t - output.s.t)) - 1);
+  values[j++] = Float8GetDatum(log_return);
+
+  HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+  SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+ } else {
+  delete trading_strategy;
+  SPI_finish();
+  MemoryContextSwitchTo(oldcontext);
+  SRF_RETURN_DONE(funcctx);
+ }
 }
 

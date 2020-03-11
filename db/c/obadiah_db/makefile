@@ -1,8 +1,9 @@
 R_SOURCE_DIR = ../../../src
-SRC = $(wildcard *.cpp) $(R_SOURCE_DIR)/base.cpp $(R_SOURCE_DIR)/severity_level.cpp
+SRC = $(wildcard *.cpp) $(R_SOURCE_DIR)/base.cpp $(R_SOURCE_DIR)/severity_level.cpp $(R_SOURCE_DIR)/order_book_investigation.cpp $(R_SOURCE_DIR)/position_discovery.cpp
+
 OBJS = $(SRC:.cpp=.o)
 DEPS = $(SRC:.cpp=.d)
-POSTGRES = /usr/pgsql-11
+POSTGRES = /usr/pgsql-11-devel
 BASE=libobadiah_db.so
 MAJOR=1
 MINOR=1

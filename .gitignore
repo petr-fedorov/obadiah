@@ -99,3 +99,7 @@ docs/*_cache
 *.d
 doc
 Meta
+
+# R
+**/*.gz2
+man/**

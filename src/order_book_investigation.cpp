@@ -12,28 +12,22 @@
 // You should have received a copy of the GNU General Public License along
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 01110-1301 USA.
+#include "order_book_investigation.h"
+#include <unordered_map>
 
-#ifndef OBADIAH_SEVERITY_LEVEL_H
-#define OBADIAH_SEVERITY_LEVEL_H
-#include <ostream>
 namespace obadiah {
-namespace R {
- enum class SeverityLevel {
-  kDebug5 = -6,
-  kDebug4 = -5,
-  kDebug3 = -4,
-  kDebug2 = -3,
-  kDebug1 = -2,
-  kLog = -1,
-  kInfo = 0,
-  kNotice = 1,
-  kWarning = 2,
-  kError = 3
- };
+ namespace R {
 
- SeverityLevel GetSeverityLevel(const std::string s);
- std::string ToString(SeverityLevel l);
- std::ostream& operator<<(std::ostream& strm, SeverityLevel level);
+TickSizeType
+GetTickSizeType(const std::string s) {
+ static std::unordered_map<std::string, TickSizeType> str_to_enum{
+     {"ABSOLUTE", TickSizeType::kAbsolute},
+     {"LOGRELATIVE", TickSizeType::kLogRelative}};
+ try {
+  return str_to_enum.at(s);
+ } catch (const std::out_of_range &) {
+  return TickSizeType::kAbsolute;
+ }
 }
-}  // namespace obadiah
-#endif
+}
+};  // namespace obadiah

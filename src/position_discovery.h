@@ -22,6 +22,7 @@
 #include <map>
 
 namespace obadiah {
+ namespace R {
 
 std::ostream&
 operator<<(std::ostream& stream, Position& p);
@@ -31,7 +32,7 @@ public:
  TradingStrategy(ObjectStream<BidAskSpread>* period, double phi, double rho);
  ObjectStream<Position>& operator >> (Position&);
 
-private:
+protected:
  inline double Interest(InstantPrice a, InstantPrice b) {
   return rho_ * std::abs(b.t - a.t);
  }
@@ -53,5 +54,6 @@ private:
 #endif
 };
 
+}
 }  // namespace obadiah
 #endif

@@ -17,6 +17,8 @@
 #define OBADIAH_BASE_H
 
 #ifndef NDEBUG
+#include <boost/log/attributes/scoped_attribute.hpp>
+#include <boost/log/attributes/timer.hpp>
 #include <boost/log/sources/severity_feature.hpp>
 #include <boost/log/sources/severity_logger.hpp>
 #endif
@@ -33,10 +35,11 @@ namespace logging = boost::log;
 namespace src = boost::log::sources;
 namespace sinks = boost::log::sinks;
 namespace keywords = boost::log::keywords;
+namespace attrs = boost::log::attributes;
 #endif
 
 namespace obadiah {
-
+namespace R {
 
 struct Timestamp {
  Timestamp() : t(0){};
@@ -45,13 +48,63 @@ struct Timestamp {
  inline operator double() { return t; }
  inline double operator-(Timestamp a) { return t - a.t; }
  inline bool operator==(Timestamp a) { return t == a.t; }
+ inline bool operator>(Timestamp a) { return t > a.t; }
  operator char*();
+ constexpr static double kMicrosecond =
+     0.000001;  // the minimal difference between two Timestamps
+
+ inline Timestamp& AlignUp(double frequency) {
+  if (frequency) t = std::ceil((t - kMicrosecond) / frequency) * frequency;
+  return *this;
+ }
+
+ inline Timestamp& AlignDown(double frequency) {
+  if (frequency) t = std::floor((t + kMicrosecond) / frequency) * frequency;
+  return *this;
+ }
 };
 
+using Frequency = double;
+
 using Price = double;
-constexpr double kPricePrecision = 0.00001;
+constexpr double kPricePrecision =
+    0.00001;  // the (theoretical) minimal difference between consequitive
+              // prices
+constexpr double kPricePrecisionFraction =
+    0.000001;  // must be strictly less than a half of kPricePrecision
+
+inline static Price
+AlignUp(Price price, Price tick_size) {
+ return tick_size > kPricePrecision
+            ? std::ceil((price - kPricePrecisionFraction) / tick_size) *
+                  tick_size
+            : price;
+}
+
+inline static Price
+AlignDown(Price price, Price tick_size) {
+ return tick_size > kPricePrecision
+            ? std::floor((price + kPricePrecisionFraction) / tick_size) *
+                  tick_size
+            : price;
+}
+// R's NA value.
+// See R source code: src/main/arithmetics.c R_ValueOfNA()
+#define R_NAREAL std::nan("1954")
 
 using Volume = double;
+
+inline static bool
+geq(Price first, Price second) {
+ return first >= second ||
+        (second - first) / second <= std::numeric_limits<Price>::epsilon();
+}
+
+struct less {
+ bool operator()(const Price& lhs, const Price& rhs) const {
+  return !geq(lhs, rhs);
+ }
+};
 
 enum Side { kBid = 'b', kAsk = 'a' };
 
@@ -112,71 +165,90 @@ operator<<(std::ostream& stream, InstantPrice& p);
 template <typename O>
 class ObjectStream {
 public:
- explicit ObjectStream() : is_all_processed_(true) {};
+ explicit ObjectStream() : is_all_processed_(true){};
  virtual explicit operator bool();
  virtual ObjectStream<O>& operator>>(O&) = 0;
  virtual ~ObjectStream(){};
+
 protected:
  bool is_all_processed_;
+#ifndef NDEBUG
+ src::severity_logger<SeverityLevel> lg;
+#endif
 };
 
+template <typename O>
+ObjectStream<O>::operator bool() {
+ return !is_all_processed_;
+}
 
-template<typename O>
-ObjectStream<O>::operator bool() { return !is_all_processed_; }
-
-
-template <template <typename> class Allocator,
-          typename T = std::pair<const Price, Volume>>
+template <template <typename> class Allocator>
 class OrderBook {
 public:
- OrderBook<Allocator, T>& operator<<(const Level2&);
+ OrderBook<Allocator>& operator<<(const Level2&);
  BidAskSpread GetBidAskSpread(Volume) const;
 
- template <template <typename> class A, typename B>
- friend std::ostream& operator<<(std::ostream&, const OrderBook<A, B>&);
+ template <template <typename> class A>
+ friend std::ostream& operator<<(std::ostream&, const OrderBook<A>&);
 
-private:
- std::map<Price, Volume, std::less<Price>, Allocator<T>> bids_;
- std::map<Price, Volume, std::less<Price>, Allocator<T>> asks_;
+protected:
+ using PriceVolumeMap =
+     std::map<Price, Volume, less, Allocator<std::pair<const Price, Volume>>>;
+ PriceVolumeMap bids_;
+ PriceVolumeMap asks_;
  Timestamp latest_timestamp_;
 #ifndef NDEBUG
  src::severity_logger<SeverityLevel> lg;
 #endif
 };
 
-template <template <typename> class Allocator,
-          typename T = std::pair<const Price, Volume>>
-class TradingPeriod : public ObjectStream<BidAskSpread> {
+template <template <typename> class Allocator, class Output>
+class EpisodeProcessor : public ObjectStream<Output> {
 public:
- TradingPeriod(ObjectStream<Level2>* depth_changes, double volume);
- TradingPeriod<Allocator, T>& operator>>(BidAskSpread&);
+ EpisodeProcessor(ObjectStream<Level2>* depth_changes);
 
 protected:
- bool ProcessNextEpisode();
+ bool ProcessNextEpisode(OrderBook<Allocator>&);
 
- OrderBook<Allocator, T> ob_;
  ObjectStream<Level2>* depth_changes_;
- Volume volume_;
  Level2 unprocessed_;
- BidAskSpread current_;
-
-#ifndef NDEBUG
- src::severity_logger<SeverityLevel> lg;
-#endif
 };
 
-template <template <typename> class Allocator, typename T>
+template <template <typename> class Allocator>
+class TradingPeriod : public EpisodeProcessor<Allocator, BidAskSpread> {
+public:
+ TradingPeriod(ObjectStream<Level2>* depth_changes, double volume)
+     : EpisodeProcessor<Allocator, BidAskSpread>{depth_changes},
+       volume_(volume) {
+  if (volume_ < 0) {
+#ifndef NDEBUG
+   BOOST_LOG_SEV(this->lg, SeverityLevel::kWarning)
+       << "A wrong value for volume (" << volume_
+       << ") was provided. Will use 0.0 instead";
+#endif
+   volume_ = 0;
+  }
+ };
+ TradingPeriod<Allocator>& operator>>(BidAskSpread&);
+
+protected:
+ OrderBook<Allocator> ob_;
+ Volume volume_;
+ BidAskSpread current_;
+};
+
+template <template <typename> class Allocator>
 std::ostream&
-operator<<(std::ostream& stream, const OrderBook<Allocator, T>& ob) {
+operator<<(std::ostream& stream, const OrderBook<Allocator>& ob) {
  stream << " Bids: " << ob.bids_.size() << " Asks: " << ob.asks_.size();
  return stream;
 }
 
-template <template <typename> class Allocator, typename T>
-OrderBook<Allocator, T>&
-OrderBook<Allocator, T>::operator<<(const Level2& next_depth) {
+template <template <typename> class Allocator>
+OrderBook<Allocator>&
+OrderBook<Allocator>::operator<<(const Level2& next_depth) {
  latest_timestamp_ = next_depth.t;
- std::map<Price, Volume, std::less<Price>, Allocator<T>>* side;
+ PriceVolumeMap* side;
  switch (next_depth.s) {
   case Side::kBid:
    side = &bids_;
@@ -185,32 +257,37 @@ OrderBook<Allocator, T>::operator<<(const Level2& next_depth) {
    side = &asks_;
    break;
  }
- if (next_depth.v == 0.0){
+ if (next_depth.v == 0.0) {
   auto search = side->find(next_depth.p);
-  if(search != side->end()) {
+  if (search != side->end()) {
    side->erase(search);
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "From OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+   BOOST_LOG_SEV(this->lg, SeverityLevel::kDebug5)
+       << "From OB " << next_depth.p << " " << static_cast<char>(next_depth.s)
+       << " (" << side->size() << ")";
 #endif
   }
 #ifndef NDEBUG
-  else 
-   BOOST_LOG_SEV(lg, SeverityLevel::kWarning) << "From OB(NOT FOUND!)" << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+  else
+   BOOST_LOG_SEV(this->lg, SeverityLevel::kWarning)
+       << "From OB(NOT FOUND!)" << next_depth.p << " "
+       << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
 #endif
 
- }
- else{
+ } else {
   (*side)[next_depth.p] = next_depth.v;
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, SeverityLevel::kDebug5) << "In OB " << next_depth.p << " " << static_cast<char>(next_depth.s) << " (" << side->size() << ")";
+  BOOST_LOG_SEV(this->lg, SeverityLevel::kDebug5)
+      << "In OB " << next_depth.p << " " << static_cast<char>(next_depth.s)
+      << " (" << side->size() << ")";
 #endif
  }
  return *this;
 };
 
-template <template <typename> class Allocator, typename T>
+template <template <typename> class Allocator>
 BidAskSpread
-OrderBook<Allocator, T>::GetBidAskSpread(Volume volume) const {
+OrderBook<Allocator>::GetBidAskSpread(Volume volume) const {
  // R's NA value.
  // See R source code: src/main/arithmetics.c R_ValueOfNA()
  const double kR_NaReal = std::nan("1954");
@@ -229,7 +306,7 @@ OrderBook<Allocator, T>::GetBidAskSpread(Volume volume) const {
      v += it->second;
     }
    }
-   if (v >= volume)
+   if (v >= volume || std::isinf(volume))
     to_be_returned.p_bid /= v;
    else {
     to_be_returned.p_bid = kR_NaReal;
@@ -249,7 +326,7 @@ OrderBook<Allocator, T>::GetBidAskSpread(Volume volume) const {
      v += it->second;
     }
    }
-   if (v >= volume)
+   if (v >= volume || std::isinf(volume))
     to_be_returned.p_ask /= v;
    else
     to_be_returned.p_ask = kR_NaReal;
@@ -271,24 +348,24 @@ OrderBook<Allocator, T>::GetBidAskSpread(Volume volume) const {
  return to_be_returned;
 };
 
-template <template <typename> class Allocator, typename T>
-TradingPeriod<Allocator, T>::TradingPeriod(ObjectStream<Level2>* depth_changes,
-                                           double volume)
-    : depth_changes_(depth_changes), volume_(volume) {
- if (*depth_changes_ >> unprocessed_) is_all_processed_ = false;
+template <template <typename> class Allocator, class Output>
+EpisodeProcessor<Allocator, Output>::EpisodeProcessor(
+    ObjectStream<Level2>* depth_changes)
+    : depth_changes_{depth_changes} {
+ if (*depth_changes_ >> unprocessed_) this->is_all_processed_ = false;
 }
 
-
-template <template <typename> class Allocator, typename T>
+template <template <typename> class Allocator, class Output>
 bool
-TradingPeriod<Allocator, T>::ProcessNextEpisode() {
+EpisodeProcessor<Allocator, Output>::ProcessNextEpisode(
+    OrderBook<Allocator>& ob) {
  if (unprocessed_) {
   Timestamp current_timestamp = unprocessed_.t;
   bool is_unprocessed_ = false;
-  ob_ << unprocessed_;
+  ob << unprocessed_;
   while (*depth_changes_ >> unprocessed_) {
    if (unprocessed_.t == current_timestamp)
-    ob_ << unprocessed_;
+    ob << unprocessed_;
    else {
     is_unprocessed_ = true;
     break;
@@ -300,31 +377,34 @@ TradingPeriod<Allocator, T>::ProcessNextEpisode() {
   return false;
 };
 
-template <template <typename> class Allocator, typename T>
-TradingPeriod<Allocator, T>&
-TradingPeriod<Allocator, T>::operator>>(BidAskSpread& to_be_returned) {
- if (!is_all_processed_) {
+template <template <typename> class Allocator>
+TradingPeriod<Allocator>&
+TradingPeriod<Allocator>::operator>>(BidAskSpread& to_be_returned) {
+ if (!this->is_all_processed_) {
   to_be_returned = current_;
 #ifndef NDEBUG
-  BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Previous=" << static_cast<char*>(current_);
+  BOOST_LOG_SEV(this->lg, SeverityLevel::kDebug2)
+      << "Previous=" << static_cast<char*>(current_);
 #endif
-  while (ProcessNextEpisode()) {
+  while (this->ProcessNextEpisode(ob_)) {
    current_ = ob_.GetBidAskSpread(volume_);
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, SeverityLevel::kDebug3)
+   BOOST_LOG_SEV(this->lg, SeverityLevel::kDebug3)
        << "Current=" << static_cast<char*>(current_) << ob_;
 #endif
    if (current_ != to_be_returned) break;
   }
   if (current_ != to_be_returned) {
 #ifndef NDEBUG
-   BOOST_LOG_SEV(lg, SeverityLevel::kDebug2) << "Returned=" << static_cast<char*>(current_);
+   BOOST_LOG_SEV(this->lg, SeverityLevel::kDebug2)
+       << "Returned=" << static_cast<char*>(current_);
 #endif
    to_be_returned = current_;
   } else
-   is_all_processed_ = true;
+   this->is_all_processed_ = true;
  }
  return *this;
 }
+}  // namespace R
 }  // namespace obadiah
 #endif

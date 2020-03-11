@@ -24,6 +24,7 @@
 #include <iomanip>
 
 namespace obadiah {
+namespace R {
 TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
                                  double rho)
     : rho_(rho),
@@ -34,9 +35,24 @@ TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
       ss_(0, 0),
       es_(0, 0) {
  BidAskSpread c;
+ if( rho_ < 0 ) {
+#ifndef NDEBUG
+    BOOST_LOG_SEV(lg, SeverityLevel::kWarning)
+        << "A wrong value for rho (" << rho_ << ") was provided. Will use 0.0 instead.";
+#endif
+    rho_ = 0.0;
+ }
+
+ if( phi_ < 0 ) {
+#ifndef NDEBUG
+    BOOST_LOG_SEV(lg, SeverityLevel::kWarning)
+        << "A wrong value for phi (" << phi_ << ") was provided. Will use 0.0 instead.";
+#endif
+    phi_ = 0.0;
+ }
  // Let's find the first BidAskSpread where both prices are not NaN
  while (*trading_period_ >> c) {
-  if (!(std::isnan(c.p_ask) || std::isnan(c.p_bid))) {
+  if (!(std::isnan(c.p_ask) || std::isnan(c.p_bid)) && !(c.p_bid > c.p_ask)) {
    sl_.p = c.p_ask;
    sl_.t = c.t;
 
@@ -59,11 +75,9 @@ TradingStrategy::operator>>(Position& p) {
  BidAskSpread c;
  while (*trading_period_ >> c) {
   // Currently we just skip BidAskSpreads with NaN
-  if ((std::isnan(c.p_ask) || std::isnan(c.p_bid)))
-   continue;  
+  if ((std::isnan(c.p_ask) || std::isnan(c.p_bid))) continue;
   // We also ignore the crossed BidAskSpreads
-  if(c.p_bid > c.p_ask)
-   continue;
+  if (c.p_bid > c.p_ask) continue;
   InstantPrice bid(c.p_bid, c.t);
   InstantPrice ask(c.p_ask, c.t);
 
@@ -225,4 +239,5 @@ TradingStrategy::operator>>(Position& p) {
   }
  }
 }
+}  // namespace R
 }  // namespace obadiah

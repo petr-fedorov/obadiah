@@ -982,8 +982,18 @@ CREATE FUNCTION obanalytics._periods_within_eras(p_start_time timestamp with tim
 	from (
 		select period_start, period_end
 		from (
-			select greatest(get._date_ceiling(era, p_frequency), get._date_floor(p_start_time, p_frequency)) as period_start, 
-					least(coalesce(get._date_floor(level3, p_frequency), get._date_ceiling(era, p_frequency)), get._date_floor(p_end_time, p_frequency)) as period_end
+			select greatest(get._date_ceiling(era, p_frequency),
+							  get._date_floor(p_start_time, p_frequency)
+						   ) as period_start, 
+					least(
+						least(	-- if get._date_ceiling(level3, p_frequency) overlaps with the next era, will effectively take get._date_floor(level3, p_frequency)!
+							coalesce( get._date_ceiling(level3, p_frequency),
+								   	   get._date_ceiling(era, p_frequency)
+									  ),
+							get._date_floor( coalesce( lead(era) over (order by era), 'infinity') , p_frequency)
+						),
+						get._date_floor(p_end_time, p_frequency)
+					) as period_end
 			from obanalytics.level3_eras
 			where pair_id = p_pair_id
 			  and exchange_id = p_exchange_id
@@ -3773,6 +3783,469 @@ ALTER TABLE ONLY obanalytics.level3_bitstamp_btceur_s ALTER COLUMN microtimestam
 ALTER TABLE obanalytics.level3_bitstamp_btceur_s OWNER TO "ob-analytics";
 
 --
+-- Name: level3_moex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.level3 ATTACH PARTITION obanalytics.level3_moex FOR VALUES IN ('4');
+
+
+ALTER TABLE obanalytics.level3_moex OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_sberrub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_sberrub (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 8 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_moex ATTACH PARTITION obanalytics.level3_moex_sberrub FOR VALUES IN ('8');
+ALTER TABLE ONLY obanalytics.level3_moex_sberrub ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_sberrub OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_sberrub_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_sberrub_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 8 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_sberrub ATTACH PARTITION obanalytics.level3_moex_sberrub_b FOR VALUES IN ('b');
+
+
+ALTER TABLE obanalytics.level3_moex_sberrub_b OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_sberrub_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_sberrub_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 8 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_sberrub ATTACH PARTITION obanalytics.level3_moex_sberrub_s FOR VALUES IN ('s');
+ALTER TABLE ONLY obanalytics.level3_moex_sberrub_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_sberrub_s OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_vtbrrub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_vtbrrub (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 9 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_moex ATTACH PARTITION obanalytics.level3_moex_vtbrrub FOR VALUES IN ('9');
+ALTER TABLE ONLY obanalytics.level3_moex_vtbrrub ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_vtbrrub OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_vtbrrub_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_vtbrrub_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 9 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_vtbrrub ATTACH PARTITION obanalytics.level3_moex_vtbrrub_b FOR VALUES IN ('b');
+
+
+ALTER TABLE obanalytics.level3_moex_vtbrrub_b OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_vtbrrub_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_vtbrrub_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 9 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_vtbrrub ATTACH PARTITION obanalytics.level3_moex_vtbrrub_s FOR VALUES IN ('s');
+ALTER TABLE ONLY obanalytics.level3_moex_vtbrrub_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_vtbrrub_s OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_lkohrub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_lkohrub (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 10 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_moex ATTACH PARTITION obanalytics.level3_moex_lkohrub FOR VALUES IN ('10');
+ALTER TABLE ONLY obanalytics.level3_moex_lkohrub ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_lkohrub OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_lkohrub_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_lkohrub_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 10 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_lkohrub ATTACH PARTITION obanalytics.level3_moex_lkohrub_b FOR VALUES IN ('b');
+
+
+ALTER TABLE obanalytics.level3_moex_lkohrub_b OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_lkohrub_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_lkohrub_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 10 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_lkohrub ATTACH PARTITION obanalytics.level3_moex_lkohrub_s FOR VALUES IN ('s');
+ALTER TABLE ONLY obanalytics.level3_moex_lkohrub_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_lkohrub_s OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_gazprub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_gazprub (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 11 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY LIST (side);
+ALTER TABLE ONLY obanalytics.level3_moex ATTACH PARTITION obanalytics.level3_moex_gazprub FOR VALUES IN ('11');
+ALTER TABLE ONLY obanalytics.level3_moex_gazprub ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_gazprub OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_gazprub_b; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_gazprub_b (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 'b'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 11 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_gazprub ATTACH PARTITION obanalytics.level3_moex_gazprub_b FOR VALUES IN ('b');
+
+
+ALTER TABLE obanalytics.level3_moex_gazprub_b OWNER TO "ob-analytics";
+
+--
+-- Name: level3_moex_gazprub_s; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.level3_moex_gazprub_s (
+    microtimestamp timestamp with time zone NOT NULL,
+    order_id bigint NOT NULL,
+    event_no integer NOT NULL,
+    side character(1) DEFAULT 's'::bpchar NOT NULL,
+    price numeric NOT NULL,
+    amount numeric NOT NULL,
+    fill numeric,
+    next_microtimestamp timestamp with time zone NOT NULL,
+    next_event_no integer,
+    pair_id smallint DEFAULT 11 NOT NULL,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    local_timestamp timestamp with time zone,
+    price_microtimestamp timestamp with time zone NOT NULL,
+    price_event_no integer,
+    exchange_microtimestamp timestamp with time zone,
+    is_maker boolean,
+    is_crossed boolean,
+    CONSTRAINT amount_is_not_negative CHECK ((amount >= (0)::numeric)),
+    CONSTRAINT is_crossed_is_always_null CHECK ((is_crossed IS NULL)),
+    CONSTRAINT is_maker_is_always_null CHECK ((is_maker IS NULL)),
+    CONSTRAINT next_event_no CHECK ((((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone) AND (next_event_no IS NOT NULL)) OR ((NOT ((next_microtimestamp < 'infinity'::timestamp with time zone) AND (next_microtimestamp > '-infinity'::timestamp with time zone))) AND (next_event_no IS NULL)))),
+    CONSTRAINT next_is_not_behind CHECK (((next_microtimestamp = '-infinity'::timestamp with time zone) OR (next_microtimestamp >= microtimestamp))),
+    CONSTRAINT price_is_not_negative CHECK ((price >= (0)::numeric))
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.level3_moex_gazprub ATTACH PARTITION obanalytics.level3_moex_gazprub_s FOR VALUES IN ('s');
+ALTER TABLE ONLY obanalytics.level3_moex_gazprub_s ALTER COLUMN microtimestamp SET STATISTICS 1000;
+
+
+ALTER TABLE obanalytics.level3_moex_gazprub_s OWNER TO "ob-analytics";
+
+--
 -- Name: matches_bitfinex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
 --
 
@@ -4107,6 +4580,146 @@ ALTER TABLE ONLY obanalytics.matches_bitstamp ATTACH PARTITION obanalytics.match
 
 
 ALTER TABLE obanalytics.matches_bitstamp_btceur OWNER TO "ob-analytics";
+
+--
+-- Name: matches_moex; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_moex (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    pair_id smallint NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+PARTITION BY LIST (pair_id);
+ALTER TABLE ONLY obanalytics.matches ATTACH PARTITION obanalytics.matches_moex FOR VALUES IN ('4');
+
+
+ALTER TABLE obanalytics.matches_moex OWNER TO "ob-analytics";
+
+--
+-- Name: matches_moex_sberrub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_moex_sberrub (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    pair_id smallint DEFAULT 8 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_moex ATTACH PARTITION obanalytics.matches_moex_sberrub FOR VALUES IN ('8');
+
+
+ALTER TABLE obanalytics.matches_moex_sberrub OWNER TO "ob-analytics";
+
+--
+-- Name: matches_moex_vtbrrub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_moex_vtbrrub (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    pair_id smallint DEFAULT 9 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_moex ATTACH PARTITION obanalytics.matches_moex_vtbrrub FOR VALUES IN ('9');
+
+
+ALTER TABLE obanalytics.matches_moex_vtbrrub OWNER TO "ob-analytics";
+
+--
+-- Name: matches_moex_lkohrub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_moex_lkohrub (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    pair_id smallint DEFAULT 10 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_moex ATTACH PARTITION obanalytics.matches_moex_lkohrub FOR VALUES IN ('10');
+
+
+ALTER TABLE obanalytics.matches_moex_lkohrub OWNER TO "ob-analytics";
+
+--
+-- Name: matches_moex_gazprub; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
+--
+
+CREATE TABLE obanalytics.matches_moex_gazprub (
+    amount numeric NOT NULL,
+    price numeric NOT NULL,
+    side character(1) NOT NULL,
+    microtimestamp timestamp with time zone NOT NULL,
+    buy_order_id bigint,
+    buy_event_no integer,
+    sell_order_id bigint,
+    sell_event_no integer,
+    buy_match_rule smallint,
+    sell_match_rule smallint,
+    local_timestamp timestamp with time zone,
+    exchange_id smallint DEFAULT 4 NOT NULL,
+    pair_id smallint DEFAULT 11 NOT NULL,
+    exchange_side character(1),
+    exchange_trade_id bigint,
+    exchange_microtimestamp timestamp with time zone
+)
+PARTITION BY RANGE (microtimestamp);
+ALTER TABLE ONLY obanalytics.matches_moex ATTACH PARTITION obanalytics.matches_moex_gazprub FOR VALUES IN ('11');
+
+
+ALTER TABLE obanalytics.matches_moex_gazprub OWNER TO "ob-analytics";
 
 --
 -- Name: exchanges; Type: TABLE; Schema: obanalytics; Owner: ob-analytics
