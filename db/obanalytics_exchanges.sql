@@ -39,6 +39,7 @@ COPY obanalytics.exchanges (exchange_id, exchange) FROM stdin;
 1	bitfinex
 2	bitstamp
 3	coinbase
+4	moex
 \.
 
 

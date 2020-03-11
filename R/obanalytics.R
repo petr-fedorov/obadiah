@@ -272,14 +272,14 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
 
 .query.depth.updates <- function(conn, start.time, end.time, exchange, pair, frequency = NULL)   {
   if(is.null(frequency))
-    query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side  FROM get.depth(",
+    query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side  FROM get.depth(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_starting_depth := false, p_depth_changes := true) ORDER BY 1, 2 DESC")
   else
-    query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side  FROM get.depth(",
+    query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side  FROM get.depth(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
@@ -296,13 +296,13 @@ depth <- function(con, start.time, end.time, exchange, pair, frequency=NULL,  tz
 
 .query.initial.depth <- function(conn, start.time, exchange, pair, frequency)   {
   if(is.null(frequency))
-    query <- paste0("SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side FROM get.depth(",
+    query <- paste0("SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side FROM get.depth(",
                     shQuote(format(start.time,usetz=T)), ", NULL, ",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
                     "p_starting_depth := true, p_depth_changes := false) ORDER BY 1, 2 DESC")
   else
-    query <- paste0("SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side FROM get.depth(",
+    query <- paste0("SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, side FROM get.depth(",
                     shQuote(format(start.time,usetz=T)), ", NULL, ",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), "), ",
@@ -550,7 +550,7 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
 
     if(is.null(frequency))
 
-      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\",",
+      query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\",",
                       "\"ask.price\" FROM get.trading_period(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
@@ -559,7 +559,7 @@ trading.period.connection <- function(depth, start.time, end.time, exchange, pai
                       volume_postgres,
                       ")")
     else
-      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\", ",
+      query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\", ",
                       "\"ask.price\" FROM get.trading_period(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
@@ -704,14 +704,14 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
 
   if(is.null(frequency))
 
-    query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
                     "get.exchange_id(", shQuote(exchange), ") ",
                     ")")
   else
-    query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     "get.pair_id(",shQuote(pair),"), " ,
@@ -735,7 +735,7 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
 
   if(is.null(frequency))
 
-    query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
@@ -743,7 +743,7 @@ spread.connection <- function(con, start.time, end.time, exchange, pair, frequen
                     "get.exchange_id(", shQuote(exchange), ") ",
                     ") order by 1")
   else
-    query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
+    query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"best.bid.price\", \"best.bid.volume\",",
                     "\"best.ask.price\", \"best.ask.volume\" FROM get.spread(",
                     shQuote(format(start.time, usetz=T)), ",",
                     shQuote(format(end.time, usetz=T)), ",",
@@ -951,7 +951,7 @@ trades <- function(con, start.time, end.time, exchange, pair, tz='UTC') {
 
 .trades <- function(conn, start.time, end.time, exchange, pair) {
 
-  query <- paste0(" SELECT 	devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, direction, \"maker.event.id\", \"taker.event.id\",",
+  query <- paste0(" SELECT 	get._to_postgres_microseconds(timestamp) as \"timestamp\", price, volume, direction, \"maker.event.id\", \"taker.event.id\",",
                   " maker::numeric, taker::numeric, \"exchange.trade.id\" FROM get.trades(",
                   shQuote(format(start.time, usetz=T)), ",",
                   shQuote(format(end.time, usetz=T)), ",",
@@ -1100,9 +1100,9 @@ queues.connection <- function(depth, start.time, end.time, exchange, pair,  tick
 
     if(is.null(frequency))
 
-      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\",",
+      query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\",",
                       "\"ask.price\",  ", col.list,
-                      " FROM devel_imbalance.queues(",
+                      " FROM get.queues(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
                       "get.pair_id(",shQuote(pair),"), " ,
@@ -1113,9 +1113,9 @@ queues.connection <- function(depth, start.time, end.time, exchange, pair,  tick
                       shQuote(toupper(tick.type)),
                       ")")
     else
-      query <- paste0(" SELECT devel_imbalance._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\", ",
+      query <- paste0(" SELECT get._to_postgres_microseconds(timestamp) as \"timestamp\", \"bid.price\", ",
                       "\"ask.price\",  ", col.list,
-                      " FROM devel_imbalance.queues(",
+                      " FROM get.queues(",
                       shQuote(format(start.time, usetz=T)), ",",
                       shQuote(format(end.time, usetz=T)), ",",
                       "get.pair_id(",shQuote(pair),"), " ,

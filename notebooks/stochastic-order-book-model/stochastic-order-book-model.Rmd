@@ -98,7 +98,16 @@ references:
     issue: 4
     container-title: Quantitative Finance
     type: article-journal
-    
+  - id: feller1950
+    title: "An Introduction to Probability Theory and Its Applications"
+    author: 
+      - family: Feller
+        given: William
+    issued:
+      year: 1950
+    volume: 1
+    type: book
+
 ---
 
 
@@ -118,7 +127,7 @@ library(latex2exp)
 start.time <- ymd_hms("2014-09-01 10:00:00+03")
 end.time <- ymd_hms("2014-09-05 19:00:00:+03")
 
-pair <- 'SBERRUR'
+pair <- 'SBERRUB'
 exchange <- 'Moex'
 
 ```
@@ -127,7 +136,7 @@ exchange <- 'Moex'
 ```{r connect-to-database, eval=FALSE, include=FALSE}
 # This code is required once in order to  load depth and trades from OBADiah database and save them locally
 
-con <- obadiah::connect("192.168.3.5", "5433", dbname = "obadiah-devel", use.cache=F)
+con <- obadiah::connect("192.168.3.5", "5432", dbname = "ob-analytics-prod", use.cache=F)
 depth <- obadiah::depth(con, start.time,end.time,exchange, pair,tz='Europe/Moscow')
 trades <- obadiah::trades(con, start.time, end.time , exchange, pair, tz="Europe/Moscow")[, .(timestamp, price, volume, direction, maker, taker)]
 save(trades, depth, file ="stochastic-order-book-model.bz2")
@@ -590,9 +599,8 @@ limit.order.placed[ side == 'ask',i := ceiling((price-d)/tick.size) - floor((bid
 
 
 ```{r, include=FALSE}
-calc.N <- function(tick.size, data) {
- d <- 0.0000000001 # a magic number for a distance calculation
- rbind(
+calc.distance <- function(data){
+  rbind(
     data[
       side == 'bid',
       .(timestamp,
@@ -604,9 +612,14 @@ calc.N <- function(tick.size, data) {
       .(timestamp,
         i = ceiling((price-d)/tick.size) - floor((bid.price+d)/tick.size),
         chain.id, volume)
-      ])[ , .N, by = i][order(i)] # total number of bid and ask orders at distance i, ordered by i ascending
- }  
+      ])
+}
+  
 
+calc.N <- function(tick.size, data) {
+ d <- 0.0000000001 # a magic number for a distance calculation
+ calc.distance(data)[ , .N, by = i][order(i)] # total number of bid and ask orders at distance i, ordered by i ascending
+}  
 ```
 
 
@@ -657,8 +670,62 @@ knitr::kable(dcast(t, `Distance:`~i), caption="Number of limit order placements 
 
 ```
 
+Let's check whether the distribution of limit order arrival times fits the Poisson distribution as the model assumes. We will use very simple approach from [@feller1950]:
 
-From [@cont2010]:
+> Suppose that a physical experiment is repeated a great number $N$ of times, and that each time we count the number of events in an interval of fixed length $t$. Let $N_k$ be the number of times that exactly $k$ events are observed. Then
+>$$
+ N_0 + N_1 + N_2 + \cdots = N 
+>$$
+>The total number of points observed in the $N$ experiments is
+>$$
+N_1 + 2N_2 + 3N_3 + \cdots = T
+ (\#eq:feller-T)
+$$
+> and $\frac{T}{N}$ is the average. If $N$ is large, we expect that
+>$$
+N_k \approx N \exp^{-\lambda t} \frac{(\lambda t)^k}{k!} 
+ (\#eq:feller-N-k)
+>$$ Substituting from \@ref(eq:feller-N-k) into \@ref(eq:feller-T), we find
+>$$
+T \approx N \exp^{-\lambda t}\lambda t \big( 1 + \frac{\lambda t}{1} + \frac{(\lambda t)^2}{2!} + \cdots ) = N\lambda t
+> $$ and hence
+> $$
+\lambda t \approx \frac{T}{N}
+(\#eq:feller-lambda-t)
+> $$ This relation gives us a means of estimating $\lambda$ from observations and of comparing theory with experiments.
+
+In our case we will repeat the experiment every second ($t = 1$) and will measure the number of limit orders placed at the distance $i$ from the opposite best price per second.
+
+Thus the number of experiments $N$ will be the same for every: $i$ $N = 60T_* = `r prettyNum(60*T, big.mark=",")`$ seconds. The total number of points observed will depend on $i$ as: $T = T_i = N_l(i)$. $\lambda t$ will also depend on $i$: $(\lambda t)_i = \frac{N_l(i)}{60T_*} = \frac{\hat{\lambda}(i)}{60}$. 
+
+Figure \@ref(fig:placement-per-second-1) shows number of experiments (or periods or seconds) $N_k$  with given number of limit order placements $k$ at distance $i=1$ tick from the opposite best price.  Tick size equals 0.1 Russian Ruble. The Poisson distribution is shown for comparison - it is clear that number of limit order placements per second is not sampled from the Poisson distribution.
+
+```{r, echo=FALSE}
+Nks <- calc.distance(limit.order.placed)[, .(placements.per.period=.N), by=.(i, ceiling_date(timestamp, 'seconds'))][, .(periods=.N), by=.(i, placements.per.period)][order(i,placements.per.period)]
+Nks <- rbind(Nks,
+             calc.distance(limit.order.placed)[,.N,by=.(i, ceiling_date(timestamp, 'seconds'))][, .(placements.per.period=0, periods = T*60 - .N), by=i])
+```
+
+
+```{r placement-per-second-1, echo=FALSE, fig.cap=paste0("An empirical distribution of limit order placements is not the Poisson distribution. Red points are empirical numbers of experiments $N_k$ (or periods or seconds) with given number of limit order placements $k$ at distance $i=1$ tick (with tick size = 0.1 Russian Ruble) from the opposite best price. Black points are from the Poisson distribution with $\\lambda t =\\frac{(\\hat{\\lambda} t)_1}{60}=$ ", prettyNum(t[i == 1]$value/60), " for comparison.") }
+ggplot(Nks[i == 1 & placements.per.period <= 20], aes(x=placements.per.period, y=periods)) + geom_point(colour="red") + geom_line(colour="red") +
+  geom_line(data=data.table(i=1, placements.per.period=0:20, periods=T*60*dpois(c(0:20),t[i == 1]$value/60)), colour="black") + geom_point(data=data.table(i=1, placements.per.period=0:20, periods=T*60*dpois(c(0:20),t[i == 1]$value/60))) + 
+  scale_x_continuous(TeX("$k$"), breaks=0:20) + ylab(TeX("$N_k$")) 
+```
+
+Figure \@ref(fig:placement-per-second-2) demonstrates that the situation is similar at distances $i=1,\ldots,8$. From figure \@ref(fig:placement-counts) we see that `r round(N_l[i <= 8, sum(N)]*100/nrow(limit.order.placed))`%  are placed at these levels.
+
+```{r placement-per-second-2, echo=FALSE, fig.cap="Empirical numbers of experiments $N_k$ (or periods or seconds) with given number of limit order placements $k$ at various distances $i$ from ticks from the opposite best price. Tick size is 0.1 Russian Ruble. It appears that none of them is sampled from the Poisson distribution."}
+ggplot(Nks[i <= 8 & placements.per.period <= 20], aes(x=placements.per.period, y=periods, group=as.factor(i), colour=as.factor(i))) + 
+  geom_point() + 
+  geom_line()  + 
+  scale_x_continuous(TeX("$k$"), breaks=0:20) + 
+  scale_y_continuous(TeX("$N_k$"), trans="log", labels=scales::label_number()) +
+  labs(colour=TeX("Distance $i$"))
+```
+
+
+Let's return to [@cont2010]:
 
 > The arrival rate of market orders is then estimated by 
 > $$
