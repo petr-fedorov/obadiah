@@ -19,6 +19,7 @@
 #endif
 
 namespace obadiah {
+namespace R {
 
 std::ostream&
 operator<<(std::ostream& stream, EpsilonDrawUpDowns& p) {
@@ -87,4 +88,5 @@ EpsilonDrawUpDowns::operator>>(Position& pos) {
  return *this;
 }
 
+}  // namespace R
 }  // namespace obadiah

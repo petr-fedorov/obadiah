@@ -3,6 +3,8 @@ title: "Research"
 output: html_document
 ---
 
+2020-03-11 [An empirical evalutation of the Stochastic Model for Order Book Dynamics](stochastic-order-book-model.html)
+
 2020-02-07 [Does Tatneft spike?](tatn-spikes.html)
 
 2020-02-04 [How to locate the largest price spikes](spike-detection.html)

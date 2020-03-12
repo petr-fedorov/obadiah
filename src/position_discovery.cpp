@@ -24,6 +24,7 @@
 #include <iomanip>
 
 namespace obadiah {
+namespace R {
 TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
                                  double rho)
     : rho_(rho),
@@ -34,6 +35,21 @@ TradingStrategy::TradingStrategy(ObjectStream<BidAskSpread>* period, double phi,
       ss_(0, 0),
       es_(0, 0) {
  BidAskSpread c;
+ if( rho_ < 0 ) {
+#ifndef NDEBUG
+    BOOST_LOG_SEV(lg, SeverityLevel::kWarning)
+        << "A wrong value for rho (" << rho_ << ") was provided. Will use 0.0 instead.";
+#endif
+    rho_ = 0.0;
+ }
+
+ if( phi_ < 0 ) {
+#ifndef NDEBUG
+    BOOST_LOG_SEV(lg, SeverityLevel::kWarning)
+        << "A wrong value for phi (" << phi_ << ") was provided. Will use 0.0 instead.";
+#endif
+    phi_ = 0.0;
+ }
  // Let's find the first BidAskSpread where both prices are not NaN
  while (*trading_period_ >> c) {
   if (!(std::isnan(c.p_ask) || std::isnan(c.p_bid)) && !(c.p_bid > c.p_ask)) {
@@ -223,4 +239,5 @@ TradingStrategy::operator>>(Position& p) {
   }
  }
 }
+}  // namespace R
 }  // namespace obadiah
