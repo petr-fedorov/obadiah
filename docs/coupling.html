@@ -11,7 +11,7 @@
 
 <meta name="author" content="Petr Fedorov" />
 
-<meta name="date" content="2020-03-14" />
+<meta name="date" content="2020-03-15" />
 
 <title>A coupling algorithm for quotes and trades streams</title>
 
@@ -365,7 +365,7 @@ summary {
 
 <h1 class="title toc-ignore">A coupling algorithm for quotes and trades streams</h1>
 <h4 class="author">Petr Fedorov</h4>
-<h4 class="date">2020-03-14</h4>
+<h4 class="date">2020-03-15</h4>
 
 </div>
 
@@ -415,8 +415,10 @@ summary {
 <p>As well as at Bitstamp, events in Trades and Raw book channels are not synchronized.</p>
 <p>It should be clear from the short descriptions above that the substantial efforts are required in order to reconstruct from these data the true dynamics of order submission, matching and execution.</p>
 </div>
-<div id="the-coupling-algorithm" class="section level1">
-<h1>The coupling algorithm</h1>
+<div id="the-coupling-problem" class="section level1">
+<h1>The coupling problem</h1>
+<div id="definitions" class="section level2">
+<h2>Definitions</h2>
 <p>From the first glance, an order is a rather simple thing. Consider, for example, the definition given in <span class="citation">(Bouchaud and Bonart 2018)</span>:</p>
 <blockquote>
 <p>An order is a commitment, declared at a given submission time, to buy or sell a given volume of an asset at no worse than a given price. An order <span class="math inline">\(x\)</span> is thus described by four attributes:</p>
@@ -428,7 +430,17 @@ summary {
 </ul>
 <p>We introduce the succinct notation <span class="math inline">\(x := (\epsilon_x , p_x ,v_x, t_x )\)</span>.</p>
 </blockquote>
-<p>Incompleteness of this definition will become obvious if one asks whether this commitment holds indefinitely or for a limited period of time or whether the volume of an order remains the same or changes, etc. Surprisingly, an order appears to be a rather complicated entity if you want to define it rigorously as we do below. We assume that we have a single instrument and a single currency.</p>
+<p>The authors then continue with the description of what they call The Trade-Matching Algorithm:</p>
+<blockquote>
+<p>Whenever a trader submits a buy (respectively, sell) order <span class="math inline">\(x\)</span>, an LOB’s <em>trade-matching algorithm</em> checks whether it is possible for <span class="math inline">\(x\)</span> to match to existing sell (respectively,buy)orders <span class="math inline">\(y\)</span> such that <span class="math inline">\(p_y \leq p_x\)</span> (respectively, <span class="math inline">\(p_y \geq p_x\)</span>). If so, the matching occurs immediately and the relevant traders perform a trade for the agreed amount at the agreed price. Any portion of <span class="math inline">\(x\)</span> that does not match instead becomes active at the price <span class="math inline">\(p_x\)</span>, and it remains active until either it matches to an incoming sell (respectively, buy) order or it is cancelled. Cancellation usually occurs when the owner of an order no longer wishes to offer a trade at the stated price.</p>
+</blockquote>
+<p>The above descriptions are incomplete:</p>
+<ul>
+<li><p>According to the definition, an order seems to be an immutable entity but according the descprition of the Trade-Matching algorithm, a portion of <span class="math inline">\(x\)</span> may become ‘active’ and it is not clear how the quality of being ‘active’ is different from the mere existence since submitted orders are matched to existing orders,</p></li>
+<li><p>At what price traders perform trade - <span class="math inline">\(p_x\)</span> or <span class="math inline">\(p_y\)</span> - is not explicitly stated,</p></li>
+<li><p>It is not said what will happen if <span class="math inline">\(v_x \leq v_y\)</span>, etc.</p></li>
+</ul>
+<p>Surprisingly, an order itself and operations of continous double auction appear to be rather complicated things if one attempts to define them rigorously. We will do that below assuming that we have a single instrument and a single currency.</p>
 
 <div class="definition">
 <p><span id="def:order-event" class="definition"><strong>Definition 1  (Order-related event)  </strong></span>A tuple of four numbers <span class="math inline">\((t^i, n^i, p^i, v^i)\)</span> where (superscript <span class="math inline">\(i\)</span> is assumed)</p>
@@ -485,25 +497,32 @@ Intuitevely, the subset <span class="math inline">\(O^i(t)\)</span> will either 
 <p><span id="def:lob-life-cycle" class="definition"><strong>Definition 5  (Limit Order Book life cycle)  </strong></span>Suppose we are given a set of order life cycles <span class="math inline">\(\mathcal{L} = \{O^i\}\)</span>.</p>
 <p>A (possibly empty) subset <span class="math inline">\(\mathcal{B} =\{O^b\}_{v^b_1 &gt; 0} \subset \mathcal{L}\)</span> is called <em>bids life cycle</em>. The set <span class="math inline">\(\mathcal{B}(t) =\{O^b(t)\}_{v^b_1 &gt; 0}\)</span> is called active bid orders at time <span class="math inline">\(t\)</span>.</p>
 <p>A (possibly empty) subset <span class="math inline">\(\mathcal{A} =\{O^a\}_{v^a_1 &lt; 0} \subset \mathcal{L}\)</span> is called <em>ask life cycle</em>. The set <span class="math inline">\(\mathcal{A}(t) =\{O^a(t)\}_{v^a_1 &gt; 0}\)</span> is called active ask orders at time <span class="math inline">\(t\)</span>.</p>
-<p>We will call <span class="math inline">\(\mathcal{L}\)</span> a (valid) <em>Limit Order Book (LOB) life cycle</em> if the following condition is satisfied:
-<span class="math display">\[
+<p>We will call <span class="math inline">\(\mathcal{L}\)</span> a (valid) <em>Limit Order Book (LOB) life cycle</em> if the following (The Instantaneous Trade Execution) condition is satisfied:
+<span class="math display" id="eq:instant-trade">\[
 \int_{-\infty}^{+\infty} \theta(\max_{O^b \in \mathcal{B} } P_{O^b}(t) - \min_{O^a \in \mathcal{A} } P_{O^a}(t)) dt = 0
+\tag{1}
 \]</span> where <span class="math inline">\(\theta(x)\)</span> is the <a href="https://en.wikipedia.org/wiki/Heaviside_step_function">Heaviside step function</a>.</p>
 </div>
 
+<p>Note that The Instantaneous Trade Execution condition <a href="#eq:instant-trade">(1)</a> is valid because order price <span class="math inline">\(P_{O^i}(t)\)</span> is a càdlàg function.</p>
 
 <div class="definition">
-<p><span id="def:trade-event" class="definition"><strong>Definition 6  (Trade event)  </strong></span>Suppose we are given a LOB life cycle <span class="math inline">\(\mathcal{L}\)</span> and tuple <span class="math inline">\(t^j = (t^j, a^j, r^j, p^j, v^j)\)</span>.</p>
-<p>If <span class="math inline">\(\exists (O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B}) \lor (O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}) , m, n\)</span> such that:</p>
+<p><span id="def:trade-event" class="definition"><strong>Definition 6  (Trade event)  </strong></span>Suppose we are given a LOB life cycle <span class="math inline">\(\mathcal{L}\)</span> and tuple <span class="math inline">\((t^j, a^j, r^j, p^j, v^j)\)</span> called <em>trade event</em>. If <span class="math inline">\(\exists (O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B}) \lor (O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}) , m, n\)</span> such that:</p>
 <ol style="list-style-type: lower-alpha">
 <li><span class="math inline">\(t^{a^j}_m = t^{r^j}_n = t^j\)</span></li>
 <li><span class="math inline">\(\begin{cases} p_m^{a^j} \geq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}\\ p_m^{a^j} \leq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B} \end{cases}\)</span></li>
 <li><span class="math inline">\(p^{r^j}_n = p^j\)</span></li>
 <li><span class="math inline">\(|v_{m-1}^{a^j}| - |v_m^{a^j}| = |v_{n-1}^{r^j}| - |v_n^{r^j}| = v^j\)</span>,</li>
 </ol>
-we will call the tuple <span class="math inline">\(t^j\)</span> a <em>trade event</em>. Here <span class="math inline">\(j\)</span> is an unique trade event identificator (it may be assumed that <span class="math inline">\(j \in \mathbb{Z}\)</span>), <span class="math inline">\(a^j\)</span> is an aggressing order, <span class="math inline">\(r^j\)</span> is a resting order, which determines the price <span class="math inline">\(p^j\)</span> of the trade event. It is said that orders <span class="math inline">\(a^j\)</span> and <span class="math inline">\(r^j\)</span> are <em>matched</em> and <em>executed</em> to produce a trade event. Note that not all matched orders are automatically executed. They may be cancelled too in case both orders are placed by the same trader.
+we will call the tuple a <em>valid trade event</em>. Here <span class="math inline">\(j\)</span> is an unique trade event identificator (it may be assumed that <span class="math inline">\(j \in \mathbb{Z}\)</span>), <span class="math inline">\(a^j\)</span> is an aggressing order, <span class="math inline">\(r^j\)</span> is a resting order, which determines the price <span class="math inline">\(p^j\)</span> of the trade event. It is said that orders <span class="math inline">\(a^j\)</span> and <span class="math inline">\(r^j\)</span> are <em>matched</em> and <em>executed</em> to produce a trade event. Note that not all matched orders are automatically executed. They may be cancelled too in case both orders are placed by the same trader.
 </div>
 
+</div>
+<div id="algorithm" class="section level2">
+<h2>Algorithm</h2>
+<p>Formally speaking, the coupling algorithm is supposed to output LOB life cycle and valid trade events from the data provided by an exchange. The efforts required varies by exchange. For example <a href="https://www.moex.com/">MOEX</a> provides data of almost ideal quality while <a href="https://www.moex.com/">Bitfinex</a> does not report market orders and order ids for trades.</p>
+<p>TBD</p>
+</div>
 </div>
 <div id="references" class="section level1 unnumbered">
 <h1>References</h1>

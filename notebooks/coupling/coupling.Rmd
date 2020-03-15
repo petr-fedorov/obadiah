@@ -64,7 +64,9 @@ As well as at Bitstamp, events in Trades and Raw book channels are not synchroni
 
 It should be clear from the short descriptions above that the substantial efforts are required in order to reconstruct from these data the true dynamics of order submission, matching and execution.
 
-# The coupling algorithm
+# The coupling problem
+
+## Definitions
 
 From the first glance, an order is a rather simple thing. Consider, for example, the definition given in [@bouchaud_trades_2018]:
 
@@ -78,7 +80,19 @@ From the first glance, an order is a rather simple thing. Consider, for example,
 >  
 > We introduce the succinct notation $x := (\epsilon_x , p_x ,v_x, t_x )$.
 
-Incompleteness of this definition will become obvious if one asks whether this commitment holds indefinitely or for a limited period of time  or whether the volume of an order remains the same or changes, etc. Surprisingly, an order appears to be a rather complicated entity if you want to define it rigorously as we do below. We assume that we have a single instrument and a single currency.
+The authors then continue with the description of what they call The Trade-Matching Algorithm:
+
+> Whenever a trader submits a buy (respectively, sell) order $x$, an LOB’s *trade-matching algorithm* checks whether it is possible for $x$ to match to existing sell (respectively,buy)orders $y$ such that $p_y \leq p_x$ (respectively, $p_y \geq p_x$). If so, the matching occurs immediately and the relevant traders perform a trade for the agreed amount at the agreed price. Any portion of $x$ that does not match instead becomes active at the price $p_x$, and it remains active until either it matches to an incoming sell (respectively, buy) order or it is cancelled. Cancellation usually occurs when the owner of an order no longer wishes to offer a trade at the stated price.
+
+The above descriptions are incomplete:
+
+* According to the definition, an order seems to be an immutable entity but according the descprition of the Trade-Matching algorithm, a portion of $x$ may become 'active' and it is not clear how the quality of being 'active' is different from the mere existence since submitted orders are matched to existing orders,
+
+* At what price traders perform trade - $p_x$ or $p_y$ - is not explicitly stated,
+
+* It is not said what will happen if $v_x \leq v_y$, etc. 
+
+Surprisingly, an order itself and operations of continous double auction appear to be rather complicated things if one attempts to define them rigorously. We will do that below assuming that we have a single instrument and a single currency. 
 
 ```{definition, name="Order-related event", label=order-event}
 A tuple of four numbers $(t^i, n^i, p^i, v^i)$  where (superscript $i$ is assumed)
@@ -141,19 +155,18 @@ A (possibly empty) subset $\mathcal{B} =\{O^b\}_{v^b_1 > 0} \subset \mathcal{L}$
 
 A (possibly empty) subset $\mathcal{A} =\{O^a\}_{v^a_1 < 0} \subset \mathcal{L}$ is called *ask life cycle*. The set $\mathcal{A}(t) =\{O^a(t)\}_{v^a_1 > 0}$ is called active ask orders at time $t$.
 
-We will call  $\mathcal{L}$ a (valid) *Limit Order Book (LOB) life cycle* if the following condition is satisfied: 
+We will call  $\mathcal{L}$ a (valid) *Limit Order Book (LOB) life cycle* if the following (The Instantaneous Trade Execution) condition is satisfied: 
 $$
 \int_{-\infty}^{+\infty} \theta(\max_{O^b \in \mathcal{B} } P_{O^b}(t) - \min_{O^a \in \mathcal{A} } P_{O^a}(t)) dt = 0
+(\#eq:instant-trade)
 $$ where $\theta(x)$ is the [Heaviside step function](https://en.wikipedia.org/wiki/Heaviside_step_function).
 
 ```
 
-
+Note that The Instantaneous Trade Execution condition \@ref(eq:instant-trade) is valid because order price $P_{O^i}(t)$ is a càdlàg function.
 
 ```{definition, name="Trade event", label=trade-event}
-Suppose we are given a LOB life cycle $\mathcal{L}$ and tuple $t^j = (t^j, a^j, r^j, p^j, v^j)$.
-
-If $\exists (O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B}) \lor (O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}) , m, n$ such that:
+Suppose we are given a LOB life cycle $\mathcal{L}$ and tuple $(t^j, a^j, r^j, p^j, v^j)$ called *trade event*. If $\exists (O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B}) \lor (O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}) , m, n$ such that:
   
   a. $t^{a^j}_m = t^{r^j}_n = t^j$
   b. $\begin{cases} p_m^{a^j} \geq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}\\
@@ -161,11 +174,15 @@ p_m^{a^j} \leq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{A}, O^{r^j} \in \math
   c. $p^{r^j}_n = p^j$
   d. $|v_{m-1}^{a^j}| - |v_m^{a^j}| = |v_{n-1}^{r^j}| - |v_n^{r^j}| = v^j$,
 
-we will call the tuple $t^j$ a *trade event*. Here $j$ is an unique trade event identificator (it may be assumed that $j \in \mathbb{Z}$), $a^j$ is an aggressing order, $r^j$ is a resting order, which determines the price $p^j$ of the trade event. It is said that orders $a^j$ and $r^j$ are *matched* and *executed* to produce a trade event. Note that not all matched orders are automatically executed. They may be cancelled too in case both orders are placed by the same trader.
+we will call the tuple a *valid trade event*. Here $j$ is an unique trade event identificator (it may be assumed that $j \in \mathbb{Z}$), $a^j$ is an aggressing order, $r^j$ is a resting order, which determines the price $p^j$ of the trade event. It is said that orders $a^j$ and $r^j$ are *matched* and *executed* to produce a trade event. Note that not all matched orders are automatically executed. They may be cancelled too in case both orders are placed by the same trader.
 ```
 
 
+## Algorithm
 
+Formally speaking, the coupling algorithm is supposed to output LOB life cycle and valid trade events from the data provided by an exchange.  The efforts required varies by exchange. For example [MOEX](https://www.moex.com/) provides data of almost ideal quality while [Bitfinex](https://www.moex.com/) does not report market orders and order ids for trades.
+
+TBD
 
 
 
