@@ -127,7 +127,7 @@ library(latex2exp)
 start.time <- ymd_hms("2014-09-01 10:00:00+03")
 end.time <- ymd_hms("2014-09-05 19:00:00:+03")
 
-pair <- 'SBERRUB'
+pair <- 'SBERRUR'
 exchange <- 'Moex'
 
 ```
@@ -136,7 +136,7 @@ exchange <- 'Moex'
 ```{r connect-to-database, eval=FALSE, include=FALSE}
 # This code is required once in order to  load depth and trades from OBADiah database and save them locally
 
-con <- obadiah::connect("192.168.3.5", "5432", dbname = "ob-analytics-prod", use.cache=F)
+con <- obadiah::connect("192.168.3.5", "5433", dbname = "obadiah-devel", use.cache=F)
 depth <- obadiah::depth(con, start.time,end.time,exchange, pair,tz='Europe/Moscow')
 trades <- obadiah::trades(con, start.time, end.time , exchange, pair, tz="Europe/Moscow")[, .(timestamp, price, volume, direction, maker, taker)]
 save(trades, depth, file ="stochastic-order-book-model.bz2")
@@ -183,11 +183,11 @@ From [@cont2010]:
 > Because most of the trading activity takes place in the vicinity of the bid and ask prices, it is useful to keep track of the number of outstanding orders at a given distance from the bid/ask. To this end, we define 
 $$
 \begin{equation}
- Q_i^B(t) =  X_{p_A(t) - i}(t), \quad 1  \leq i < p_A(t) 
+ Q_i^B(t) = \begin{cases} X_{p_A(t) - i}(t), & 1  \leq i < p_A(t) \\  0, & p_A(t) \leq i < n \end{cases}
  (\#eq:que-b-def)
 \end{equation}
 $$ the number of buy orders at a distance $i$ from the ask, and $$
-Q_i^A(t) = X_{p_B(t) + i}(t), \quad 1 \leq i \leq n - p_B(t) 
+Q_i^A(t) = \begin{cases} X_{p_B(t) + i}(t), & 1 \leq i \leq n - p_B(t)  \\ 0, & n - p_B(t) \leq i < n  \end{cases}
 $$ the number $Q_i^A(t)$ of sell orders at a distance $i$ from the bid 
 
 It is often said that the dynamics of a limit order book resembles in many aspects that of a queuing system. Limit orders wait in a queue to be executed against market orders (or canceled). We guess that it explains the choice of the letter $Q$ in $Q_i^B(t)$ and $Q_i^A(t)$. 
@@ -342,7 +342,7 @@ knitr::include_graphics('table_1_snapshot.png')
 
 The sample seems to be an incomplete one.  A direction of a trade (i.e. buy or sell) is not shown, the currency used is not specified, a tick size is not provided, and it is not even clear whether 74,300 means 74 thousands 300 hundreads or 74.30. The total number of records in the data set is not specified either.
 
-Sky Perfect Communication ceased to exists in 2007 due to [merger with JSAT Corporation](https://www.skyperfectjsat.space/en/company/mission/) so today it is difficult to find the information about prices of its shares in 2006. Yahoo Finance tell us that "close" price of SKY Perfect JSAT Holdings Inc. (9412.T) on August 22, 2006 was [742.50 JPY](https://finance.yahoo.com/quote/9412.T/history?period1=1154390400&period2=1164931200&interval=1d&filter=history&frequency=1d), which is either ten times higher or hundread times lower than the average price in the Table 1. 
+Sky Perfect Communication ceased in 2007 due to [merger with JSAT Corporation](https://www.skyperfectjsat.space/en/company/mission/) so today it is difficult to find the information about prices of its shares in 2006. Yahoo Finance tell us that "close" price of SKY Perfect JSAT Holdings Inc. (9412.T) on August 22, 2006 was [742.50 JPY](https://finance.yahoo.com/quote/9412.T/history?period1=1154390400&period2=1164931200&interval=1d&filter=history&frequency=1d), which is either ten times higher or hundread times lower than the average price in the Table 1. 
 
 If we used today's [trading rules](https://www.jpx.co.jp/english/equities/trading/domestic/07.html) of domestic stocks at Japan Exchange Group, we would think that the tick size would be 0.1 JPY if the share price were 74.30 or 5 JPY if the share price were 74300.
 
@@ -524,17 +524,26 @@ Let's stop for a moment and think whether it is a good idea to calculate the abo
 > Many empirical quantities cluster around a typical value. The speeds of cars on a highway, the weights of apples in a store, air pressure, sea level, the temperature in New York at noon on a midsummer’s day: all of these things vary somewhat, but their distributions place a negligible amount of probability far from the typical value, making the typical value representative of most observations. For instance, it is a useful statement to say that an adult male American is about 180cm tall because no one deviates very far from this height. Even the largest deviations,which are exceptionally rare, are still only about a factor of two from the mean in either direction and hence the distribution can be well characterized by quoting just its mean and standard deviation.
 
 Our data set contains `r prettyNum(nrow(market.orders), big.mark=",")` market orders. Their average volume is 
+
+```{r S_m, echo=FALSE}
+S_m <- round(mean(market.orders$volume))
+```
 $$
-S_m = `r prettyNum(S_m <- round(mean(market.orders$volume)), big.mark=",")` 
+S_m = `r prettyNum(S_m, big.mark=",")` 
 $$ shares.The largest volume is `r prettyNum(max(market.orders$volume), big.mark=",")` shares or `r round(max(market.orders$volume)/mean(market.orders$volume))` times larger than the average market order. The smallest volume is `r min(market.orders$volume)` shares or `r round(mean(market.orders$volume)/min(market.orders$volume))` times smaller than the average. The standard deviation of market order volume is `r prettyNum(sd(market.orders$volume), big.mark=",")` shares. Clearly, the average volume is not a good characterization of a "typical" market order.
 
 The same holds true for limit order placements and cancellation. Our data set contains information about placement of `r prettyNum(nrow(limit.order.placed), big.mark=",")` limit orders and about `r prettyNum(nrow(limit.order.cancelled), big.mark=",")` cancellations. The average volume of placed limit order is
+```{r S_l, echo=FALSE}
+S_l <- round(mean(limit.order.placed$volume))
+```
 $$
-S_l = `r prettyNum(S_l <- round(mean(limit.order.placed$volume)), big.mark=",")`
+S_l = `r prettyNum(S_l, big.mark=",")`
 $$ shares. The largest volume is  `r prettyNum(max(limit.order.placed$volume), big.mark=",")` shares or `r round(max(limit.order.placed$volume)/mean(limit.order.placed$volume))` times larger than the average. The smallest volume is `r min(limit.order.placed$volume)` shares  or `r round(mean(limit.order.placed$volume)/min(limit.order.placed$volume))` times smaller than the average. The standard deviation of placed limit order volume is `r prettyNum(sd(limit.order.placed$volume), big.mark=",")` shares.
-
+```{r S_c, echo=FALSE}
+S_c <- round(mean(limit.order.cancelled$volume))
+```
 The average volume of cancelled limit orders is $$
-S_c = `r prettyNum(S_c <- round(mean(limit.order.cancelled$volume)), big.mark=",")`
+S_c = `r prettyNum(S_c, big.mark=",")`
 $$ shares, the largest volume is  `r prettyNum(max(limit.order.cancelled$volume), big.mark=",")` shares or `r round(max(limit.order.cancelled$volume)/mean(limit.order.cancelled$volume))` times larger than the average. The smallest volume is `r min(limit.order.cancelled$volume)` shares or `r round(mean(limit.order.cancelled$volume)/min(limit.order.cancelled$volume))` times smaller than the average. The standard deviation of cancelled limit order volume is `r prettyNum(sd(limit.order.cancelled$volume), big.mark=",")` shares
 
 
@@ -555,8 +564,12 @@ where $N_l(i)$ is the total number of limit orders that arrived at a distance $i
 \end{equation}
 >$$ (suggested by [@zovko2002] or [@bouchaud2002]). The power law parameters $k$ and $\alpha$  are obtained by a least-squares fit $$ \min_{k, \alpha}\sum_{i=1}^{5}\Big(\hat{\lambda}(i) - \frac{k}{i^\alpha} \Big)^2 $$ 
 
+```{r tick.size, echo=FALSE}
+tick.size <- 0.1
+```
 
-Let's start from the counting $N_l(i)$ using Limit orders placements data set . To do that we need to count the number of times when a limit order was placed at the distance $i$ from the opposite best price. We choose `tick.size` to be `r (tick.size <- 0.1)` or approximately  $\frac{1}{74}$ of the share price, i.e. the same as in the article. It is ten time bigger than the actual tick size, so we need to round prices. We calculate distance $i$ separately for "ask" and "bid" orders as show in tables \@ref(tab:sample-bid-distance) and \@ref(tab:sample-ask-distance) below:
+
+Let's start from the counting $N_l(i)$ using Limit orders placements data set . To do that we need to count the number of times when a limit order was placed at the distance $i$ from the opposite best price. We choose `tick.size` to be `r tick.size` or approximately  $\frac{1}{74}$ of the share price, i.e. the same as in the article. It is ten time bigger than the actual tick size, so we need to round prices. We calculate distance $i$ separately for "ask" and "bid" orders as show in tables \@ref(tab:sample-bid-distance) and \@ref(tab:sample-ask-distance) below:
 
 ```{r sample-bid-distance, echo=FALSE}
 d <- 0.0000000001 # a magic number for a distance calculation
@@ -631,10 +644,10 @@ N_l <- calc.N(tick.size, limit.order.placed)
 ```
 
 
-```{r, include=FALSE}
-plot.N <- function(data) {
+```{r , include=FALSE}
+plot.N <- function(data, multi=FALSE) {
   l <- coef(lm(log(N) ~ log(i), data)) # l now contains estimates of alpha and log(k T_*)
-  ggplot(data,aes(x=i, y=N)) + 
+  (if(!multi) ggplot(data,aes(x=i, y=N)) else ggplot(data,aes(x=i, y=N, group=t, colour=t))) + 
     geom_point() + 
     geom_line() + 
     geom_abline(slope = l[2], intercept = l[1]) +
@@ -659,8 +672,11 @@ plot.N(N_l[between(i, 1, 20)]) + scale_y_continuous(TeX("$N_l(i)$"), trans="log"
     scale_x_continuous(TeX("$i$"), trans="log", breaks=seq(0, 20, 1)) +theme(axis.text = element_text(size=6))
 ```
 
+```{r, echo=FALSE}
+T <- 5*(8*60+45)
+```
 
-In our case $T_*$ equals `r prettyNum(T <- 5*(8*60+45), big.mark=",")` minutes,  calculated arrival rates $\hat{\lambda}(i)$ are shown in the table \@ref(tab:emp-lambda) below. 
+In our case $T_*$ equals `r prettyNum(T, big.mark=",")` minutes,  calculated arrival rates $\hat{\lambda}(i)$ are shown in the table \@ref(tab:emp-lambda) below. 
 
 ```{r emp-lambda, echo=FALSE}
 t <- melt(N_l[1:10,.(i, Lambda=N/T)],measure.vars=c("Lambda"), variable.name="Distance:")
@@ -700,11 +716,26 @@ Thus the number of experiments $N$ will be the same for every: $i$ $N = 60T_* = 
 
 Figure \@ref(fig:placement-per-second-1) shows number of experiments (or periods or seconds) $N_k$  with given number of limit order placements $k$ at distance $i=1$ tick from the opposite best price.  Tick size equals 0.1 Russian Ruble. The Poisson distribution is shown for comparison - it is clear that number of limit order placements per second is not sampled from the Poisson distribution.
 
-```{r, echo=FALSE}
+```{r Nks, echo=FALSE}
 Nks <- calc.distance(limit.order.placed)[, .(placements.per.period=.N), by=.(i, ceiling_date(timestamp, 'seconds'))][, .(periods=.N), by=.(i, placements.per.period)][order(i,placements.per.period)]
 Nks <- rbind(Nks,
              calc.distance(limit.order.placed)[,.N,by=.(i, ceiling_date(timestamp, 'seconds'))][, .(placements.per.period=0, periods = T*60 - .N), by=i])
 ```
+
+
+```{r, echo=FALSE, eval=FALSE}
+Mks <- takers[, .(placements.per.period=.N), by=.(ceiling_date(timestamp, 'seconds'))][, .(periods=.N), by=placements.per.period]
+Mks <- rbind(Mks, takers[, .(placements.per.period=.N), by=.(ceiling_date(timestamp, 'seconds'))][, .(placements.per.period=0, periods = T*60 - .N)])[order(placements.per.period)]
+```
+
+
+
+```{r market-per-second-1, echo=FALSE, eval=FALSE, fig.cap=paste0("An empirical distribution of limit order placements is not the Poisson distribution. Red points are empirical numbers of experiments $N_k$ (or periods or seconds) with given number of limit order placements $k$ at distance $i=1$ tick (with tick size = 0.1 Russian Ruble) from the opposite best price. Black points are from the Poisson distribution with $\\lambda t =\\frac{(\\hat{\\lambda} t)_1}{60}=$ ", prettyNum(t[i == 1]$value/60), " for comparison.") }
+ggplot(Mks[placements.per.period <= 20], aes(x=placements.per.period, y=periods)) + geom_point(colour="red") + geom_line(colour="red") +
+  geom_line(data=data.table(i=1, placements.per.period=0:20, periods=T*60*dpois(c(0:20),t[i == 1]$value/60)), colour="black") + geom_point(data=data.table(i=1, placements.per.period=0:20, periods=T*60*dpois(c(0:20),t[i == 1]$value/60))) + 
+  scale_x_continuous(TeX("$k$"), breaks=0:20) + ylab(TeX("$N_k$")) 
+```
+
 
 
 ```{r placement-per-second-1, echo=FALSE, fig.cap=paste0("An empirical distribution of limit order placements is not the Poisson distribution. Red points are empirical numbers of experiments $N_k$ (or periods or seconds) with given number of limit order placements $k$ at distance $i=1$ tick (with tick size = 0.1 Russian Ruble) from the opposite best price. Black points are from the Poisson distribution with $\\lambda t =\\frac{(\\hat{\\lambda} t)_1}{60}=$ ", prettyNum(t[i == 1]$value/60), " for comparison.") }
@@ -753,13 +784,15 @@ $$
 
 As shown on the figure \@ref(fig:sample-sky-data), the time interval between quote rows is not always the same but the formula \@ref(eq:que-est) does not take the interval into consideration.
 
-Comparing formulas \@ref(eq:que-est) and \@ref(eq:que-b-def) we see that:
+Note that $Q_i^B$ is measured in "orders" while $S_i^B(j)$ is measured in "shares". The conversion rate between these units of measure is $1 \text{ order } = S_l \text{ share }$, so  $Q_i^B(j)$ - the number of *orders* bid at a distance of $i$ ticks from the ask on the $j$th row may be calculated as shown in formula \@ref(eq:que-b-emp):
+
 $$
 \begin{equation}
 Q_i^B(j) = \frac{S_i^B(j)}{S_l}
 (#eq:que-b-emp)
 \end{equation}
 $$
+
 
 
 Table \@ref(tab:queues-example) below.shows an example of $S_i^B(t)$ and $S_i^A(t)$ evolution as it is returned by the function `obadiah::queues()` which calculates them from Depth changes data set. Note that when `bid.price` has increased from $72.88$ to $72.89$ the whole ask queue `a2` has jumped temporarily to `a1` and then returned back when `bid.price` became $72.88$ again. Thus a queue size changes not only when a limit order is placed or cancelled but also when the best bid or ask price changes.
@@ -812,22 +845,25 @@ $$ where $N_c(i)$ is obtained by counting the number of times that a quote decre
 
 In our case we are not limited by five ticks. Otherwise we calculate $\hat{\theta(i)}$ in accordance with the equation \@ref(eq:theta-est). 
 
-But before we do that let's have a look at the figure \@ref(fig:cancellation-counts) where we plotted $\log{N_c(i)} \sim \log{i}$. The striking similarity with the figure \@ref(fig:placement-counts) is obvious so the idea to model the order placements and cancellations as independent random variables is at least doubtfull. Today HFT traders cancel almost every placed order soon after it has been placed. 
+But before we do that let's have a look at the figure \@ref(fig:cancellation-counts-plot) where we plotted $\log{N_c(i)} \sim \log{i}$. The striking similarity with the figure \@ref(fig:placement-counts) is obvious so the idea to model the order placements and cancellations as independent random variables is at least doubtfull. Today HFT traders cancel almost every placed order soon after it has been placed. 
 
 
 
-```{r, echo=FALSE}
-tick.size <- 0.1
+```{r N_c, echo=FALSE}
 N_c <- calc.N(tick.size, limit.order.cancelled)
 ```
 
 
-```{r cancellation-counts, echo=FALSE, fig.cap="Number of limit order cancellations by distance from the opposite best price in ticks. Tick size is 0.1 Russian Ruble"}
-plot.N(N_c[between(i, 1, 20)])+ scale_y_continuous(TeX("$N_c(i)$"), trans="log", breaks=N_c[i %in% c(1, 3, 4, 5, 7, 8,9, 10, 12,15, 18), N]) + 
-    scale_x_continuous(TeX("$i$"), trans="log", breaks=seq(0, 20, 1)) +theme(axis.text = element_text(size=6))
+```{r cancellation-counts-plot, echo=FALSE, fig.cap="Number of limit order cancellations by distance from the opposite best price in ticks is almost exactly the same as the number of limit order placements. Tick size is 0.1 Russian Ruble"}
+plot.N(rbind(N_c[between(i, 1, 20), .(i, N, t="cancellations")],
+             N_l[between(i, 1, 20), .(i, N, t="placements")]), T) + 
+  scale_y_continuous(TeX("$N_c(i)$"), trans="log", breaks=N_c[i %in% c(1, 3, 4, 5, 7, 8,9, 10, 12,15, 18), N]) + 
+  scale_x_continuous(TeX("$i$"), trans="log", breaks=seq(0, 20, 1)) +
+  labs(colour="") +
+  theme(axis.text = element_text(size=6), legend.position = "bottom" )
 ```
 
-The calculated values of $\hat{\theta}(i)$ are shown on the figure \@ref(fig:thetas). While it is easy to see the similarities between figures \@ref(fig:cancellation-counts) and \@ref(fig:placement-counts), almost nothing can be said about the calculated values of  $\hat{\theta}(i)$. It appears that the inclusion of queue sizes $Q_i$ into the calculation of $\hat{\theta}(i)$ is not empirically justified. 
+The calculated values of $\hat{\theta}(i)$ are shown on the figure \@ref(fig:thetas). While it is easy to see the similarities between figures \@ref(fig:cancellation-counts-plot) and \@ref(fig:placement-counts), almost nothing can be said about the calculated values of  $\hat{\theta}(i)$. It appears that the inclusion of queue sizes $Q_i$ into the calculation of $\hat{\theta}(i)$ is not empirically justified. 
 
 ```{r thetas, fig.cap="Calculated values of cancellation rate. In our opinion, the inclusion of queue sizes into the calculation formula is not justified", echo=FALSE }
 thetas <- N_c[Q[side == 'c'], .(i, theta=N/orders*(S_c/S_l/T)) , on=.(i == distance), nomatch=NULL]
