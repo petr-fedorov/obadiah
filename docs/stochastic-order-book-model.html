@@ -11,7 +11,7 @@
 
 <meta name="author" content="Petr Fedorov" />
 
-<meta name="date" content="2020-03-16" />
+<meta name="date" content="2020-03-17" />
 
 <title>An empirical evalutation of the Stochastic Model for Order Book Dynamics</title>
 
@@ -365,7 +365,7 @@ summary {
 
 <h1 class="title toc-ignore">An empirical evalutation of the Stochastic Model for Order Book Dynamics</h1>
 <h4 class="author">Petr Fedorov</h4>
-<h4 class="date">2020-03-16</h4>
+<h4 class="date">2020-03-17</h4>
 
 </div>
 
@@ -398,10 +398,8 @@ summary {
 <blockquote>
 <p>Because most of the trading activity takes place in the vicinity of the bid and ask prices, it is useful to keep track of the number of outstanding orders at a given distance from the bid/ask. To this end, we define
 <span class="math display" id="eq:que-b-def">\[
-\begin{equation}
 Q_i^B(t) = \begin{cases} X_{p_A(t) - i}(t), &amp; 1  \leq i &lt; p_A(t) \\  0, &amp; p_A(t) \leq i &lt; n \end{cases}
 \tag{1}
-\end{equation}
 \]</span> the number of buy orders at a distance <span class="math inline">\(i\)</span> from the ask, and <span class="math display">\[
 Q_i^A(t) = \begin{cases} X_{p_B(t) + i}(t), &amp; 1 \leq i \leq n - p_B(t)  \\ 0, &amp; n - p_B(t) \leq i &lt; n  \end{cases}
 \]</span> the number <span class="math inline">\(Q_i^A(t)\)</span> of sell orders at a distance <span class="math inline">\(i\)</span> from the bid</p>
@@ -851,8 +849,8 @@ Figure 3: A copy of Table 1 from the article
 <li><strong>Market order</strong> - an entity produced by summation of <code>volume</code> of several trades with the same <code>timestamp</code>, <code>price</code> and <code>direction</code> columns. Note that a single market order may combine several taker orders that arrived at the same time and executed at the same price.</li>
 <li><strong>Trade</strong> - a usual trade, i.e. a match of a single taker against a single maker order.</li>
 </ul>
-<p>The market order defined as above will be the closes fit into the model’s assumptions about ‘market order’ (except for independency and volume as noted above and discussed below).</p>
-<p>Thus in order to produce the Market orders dataset we take Trades data set and combine all trades with the same <code>timestamp</code>, <code>price</code>, <code>direction</code> and <code>taker</code> columns into a single market order with the <code>volume</code> equal to the sum of trades’ <code>volume</code>s. This procedure transforms the table <a href="#tab:sample-trades">2</a> of trades into the table <a href="#tab:sample-market-order">4</a> of market orders and into the table <a href="#tab:sample-taker-order">5</a> of taker orders. In our analysis we will note use taker orders though since the authors does not use them.</p>
+<p>The market order defined as above will be the closest fit to the model’s assumptions about ‘market order’ (except for independency and volume as noted above and discussed below).</p>
+<p>Thus in order to produce the Market orders dataset we take Trades data set and combine all trades with the same <code>timestamp</code>, <code>price</code>, <code>direction</code> and <code>taker</code> columns into a single market order with the <code>volume</code> equal to the sum of trades’ <code>volume</code>s. This procedure transforms the table <a href="#tab:sample-trades">2</a> of trades into the table <a href="#tab:sample-market-order">4</a> of market orders and into the table <a href="#tab:sample-taker-order">5</a> of taker orders. In our analysis we will not use taker orders as the authors themselves have not used them.</p>
 <table>
 <caption><span id="tab:sample-market-order">Table 4: </span>Market orders produced by taker with id 3247013529504000. Their volume equals to the sum of volumes of trades combined into them.</caption>
 <thead>
@@ -896,7 +894,7 @@ Figure 3: A copy of Table 1 from the article
 </tbody>
 </table>
 <table>
-<caption><span id="tab:sample-taker-order">Table 5: </span>A single taker order with id 3247013529504000. Its volume equals to sum of volumes of trades it generated. Note that the real market order impacted 4 price levels contrary to the assumption in the model</caption>
+<caption><span id="tab:sample-taker-order">Table 5: </span>A single taker order with id 3247013529504000. Its volume equals to sum of volumes of trades it generated. Note that the real market order impacted 4 price levels contrary to the assumption in section 1.2 Dynamics of the Order Book saying that a market order decreases the quantity at the best price only.</caption>
 <thead>
 <tr class="header">
 <th align="left">timestamp</th>
@@ -1061,17 +1059,13 @@ S_c = 13,750
 <blockquote>
 <p>The limit order arrival rate function for <span class="math inline">\(1 \leq i \leq 5\)</span> can be estimated by<br />
 <span class="math display" id="eq:lambda-emp">\[
-\begin{equation} 
 \hat{\lambda}(i) = \frac{N_l(i)}{T_*} 
 \tag{2}
-\end{equation}
 \]</span>
-where <span class="math inline">\(N_l(i)\)</span> is the total number of limit orders that arrived at a distance <span class="math inline">\(i\)</span> from the opposite best quote, and <span class="math inline">\(T_∗\)</span> is the total trading time in the sample (in minutes). <span class="math inline">\(N_l(i)\)</span> is obtained by enumerating the number of times that a quote increases in size at a distance of <span class="math inline">\(1 \leq i \leq 5\)</span> ticks from the opposite best quote. We then extrapolate by fitting a power law function of the form
+where <span class="math inline">\(N_l(i)\)</span> is the total number of limit orders that arrived at a distance <span class="math inline">\(i\)</span> from the opposite best quote, and <span class="math inline">\(T_*\)</span> is the total trading time in the sample (in minutes). <span class="math inline">\(N_l(i)\)</span> is obtained by enumerating the number of times that a quote increases in size at a distance of <span class="math inline">\(1 \leq i \leq 5\)</span> ticks from the opposite best quote. We then extrapolate by fitting a power law function of the form
 <span class="math display" id="eq:lambda-power-law">\[
-\begin{equation}
 \hat{\lambda}(i) = \frac{k}{i^\alpha}
 \tag{3}
-\end{equation}
 \]</span> (suggested by <span class="citation">(Zovko and Farmer 2002)</span> or <span class="citation">(Bouchaud, Mézard, and Potters 2002)</span>). The power law parameters <span class="math inline">\(k\)</span> and <span class="math inline">\(\alpha\)</span> are obtained by a least-squares fit <span class="math display">\[ \min_{k, \alpha}\sum_{i=1}^{5}\Big(\hat{\lambda}(i) - \frac{k}{i^\alpha} \Big)^2 \]</span></p>
 </blockquote>
 <p>Let’s start from the counting <span class="math inline">\(N_l(i)\)</span> using Limit orders placements data set . To do that we need to count the number of times when a limit order was placed at the distance <span class="math inline">\(i\)</span> from the opposite best price. We choose <code>tick.size</code> to be 0.1 or approximately <span class="math inline">\(\frac{1}{74}\)</span> of the share price, i.e. the same as in the article. It is ten time bigger than the actual tick size, so we need to round prices. We calculate distance <span class="math inline">\(i\)</span> separately for “ask” and “bid” orders as show in tables <a href="#tab:sample-bid-distance">7</a> and <a href="#tab:sample-ask-distance">8</a> below:</p>
@@ -1347,20 +1341,16 @@ N_m = 305,687  \\
 <blockquote>
 <p>Because the cancellation rate in our model is proportional to the number of orders at a particular price level, in order to estimate the cancellation rates we first need to estimate the steady-state shape of the order book <span class="math inline">\(Q_i\)</span> , which is the average number of orders at a distance of <span class="math inline">\(i\)</span> ticks from the opposite best quote, for <span class="math inline">\(1 \leq i \leq 5\)</span>. If <span class="math inline">\(M\)</span> is the number of quote rows and <span class="math inline">\(S_i^B(j)\)</span> the number of shares bid at a distance of <span class="math inline">\(i\)</span> ticks from the ask on the <span class="math inline">\(j\)</span>th row, for <span class="math inline">\(1 \leq j \leq M\)</span>, we have
 <span class="math display" id="eq:que-est">\[
-\begin{equation}
 Q_i^B = \frac{1}{S_l}\frac{1}{M}\sum_{j=1}^{M}S_i^B(j)
 \tag{8}
-\end{equation}
 \]</span>
 The vector <span class="math inline">\(Q_i^A\)</span> is obtained analogously, and <span class="math inline">\(Q_i\)</span> is the average of <span class="math inline">\(Q_i^A\)</span> and <span class="math inline">\(Q_i^B\)</span>.</p>
 </blockquote>
 <p>As shown on the figure <a href="#fig:sample-sky-data">3</a>, the time interval between quote rows is not always the same but the formula <a href="#eq:que-est">(8)</a> does not take the interval into consideration.</p>
 <p>Note that <span class="math inline">\(Q_i^B\)</span> is measured in “orders” while <span class="math inline">\(S_i^B(j)\)</span> is measured in “shares”. The conversion rate between these units of measure is <span class="math inline">\(1 \text{ order } = S_l \text{ share }\)</span>, so <span class="math inline">\(Q_i^B(j)\)</span> - the number of <em>orders</em> bid at a distance of <span class="math inline">\(i\)</span> ticks from the ask on the <span class="math inline">\(j\)</span>th row may be calculated as shown in formula <a href="#eq:que-b-emp">(9)</a>:</p>
 <p><span class="math display" id="eq:que-b-emp">\[
-\begin{equation}
 Q_i^B(j) = \frac{S_i^B(j)}{S_l}
 \tag{9}
-\end{equation}
 \]</span></p>
 <p>Table <a href="#tab:queues-example">10</a> below.shows an example of <span class="math inline">\(S_i^B(t)\)</span> and <span class="math inline">\(S_i^A(t)\)</span> evolution as it is returned by the function <code>obadiah::queues()</code> which calculates them from Depth changes data set. Note that when <code>bid.price</code> has increased from <span class="math inline">\(72.88\)</span> to <span class="math inline">\(72.89\)</span> the whole ask queue <code>a2</code> has jumped temporarily to <code>a1</code> and then returned back when <code>bid.price</code> became <span class="math inline">\(72.88\)</span> again. Thus a queue size changes not only when a limit order is placed or cancelled but also when the best bid or ask price changes.</p>
 <table>
@@ -1561,11 +1551,9 @@ Figure 7: Average number of orders. The order size is 12708 shares.
 <blockquote>
 <p>An estimator for the cancellation rate function is then given by
 <span class="math display" id="eq:theta-est">\[
-\begin{equation}
 \hat{\theta}(i) = \frac{N_c(i)}{T_*Q_i}\frac{S_c}{S_l} \text{ for } i \leq 5 \text{ and } \\
 \hat{\theta}(i) = \hat{\theta}(5) \text{ for } i &gt; 5
 \tag{10}
-\end{equation}
 \]</span> where <span class="math inline">\(N_c(i)\)</span> is obtained by counting the number of times that a quote decreases in size at a distance of <span class="math inline">\(1 \leq i \leq 5\)</span> ticks from the opposite best quote, excluding decreases due to market orders.</p>
 </blockquote>
 <p>In our case we are not limited by five ticks. Otherwise we calculate <span class="math inline">\(\hat{\theta(i)}\)</span> in accordance with the equation <a href="#eq:theta-est">(10)</a>.</p>

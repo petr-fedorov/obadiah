@@ -182,10 +182,8 @@ From [@cont2010]:
 
 > Because most of the trading activity takes place in the vicinity of the bid and ask prices, it is useful to keep track of the number of outstanding orders at a given distance from the bid/ask. To this end, we define 
 $$
-\begin{equation}
  Q_i^B(t) = \begin{cases} X_{p_A(t) - i}(t), & 1  \leq i < p_A(t) \\  0, & p_A(t) \leq i < n \end{cases}
  (\#eq:que-b-def)
-\end{equation}
 $$ the number of buy orders at a distance $i$ from the ask, and $$
 Q_i^A(t) = \begin{cases} X_{p_B(t) + i}(t), & 1 \leq i \leq n - p_B(t)  \\ 0, & n - p_B(t) \leq i < n  \end{cases}
 $$ the number $Q_i^A(t)$ of sell orders at a distance $i$ from the bid 
@@ -415,9 +413,9 @@ We will use the following terms to refer to all these significantly different en
 * **Market order** - an entity produced by summation of `volume` of several trades with the same `timestamp`, `price` and `direction` columns. Note that a single market order may combine several taker orders that arrived at the same time and executed at the same price.
 * **Trade** - a usual trade, i.e. a match of a single taker against a single maker order. 
 
-The market order defined as above will be the closes fit into the model's assumptions about 'market order' (except for independency and volume as noted above and discussed below).
+The market order defined as above will be the closest fit to the model's assumptions about 'market order' (except for independency and volume as noted above and discussed below).
 
-Thus in order to produce the Market orders dataset we take Trades data set and combine all trades with the same `timestamp`, `price`, `direction` and `taker` columns into a single market order with the `volume` equal to the sum of trades' `volume`s. This procedure transforms the table \@ref(tab:sample-trades) of trades into the table \@ref(tab:sample-market-order) of market orders and into the table \@ref(tab:sample-taker-order) of taker orders. In our analysis we will note use taker orders though since the authors does not use them.
+Thus in order to produce the Market orders dataset we take Trades data set and combine all trades with the same `timestamp`, `price`, `direction` and `taker` columns into a single market order with the `volume` equal to the sum of trades' `volume`s. This procedure transforms the table \@ref(tab:sample-trades) of trades into the table \@ref(tab:sample-market-order) of market orders and into the table \@ref(tab:sample-taker-order) of taker orders. In our analysis we will not use taker orders as the authors themselves have not used them.
 
 ```{r, include=FALSE}
 market.orders <- rbind(trades[direction == 'sell',.(volume=sum(volume)), by=.(timestamp, price, taker, direction) ], 
@@ -439,7 +437,7 @@ knitr::kable(market.orders[timestamp == ymd_hms('2014-09-01 13:12:14.142+04'), ]
 
 
 ```{r sample-taker-order, echo=FALSE}
-knitr::kable(takers[taker == 3247013529504000, ], caption="A single taker order with id 3247013529504000. Its volume equals to sum of volumes of trades it generated. Note that the real market order impacted 4 price levels contrary to the assumption in the model")
+knitr::kable(takers[taker == 3247013529504000, ], caption="A single taker order with id 3247013529504000. Its volume equals to sum of volumes of trades it generated. Note that the real market order impacted 4 price levels contrary to the assumption in section 1.2 Dynamics of the Order Book saying that a market order decreases the quantity at the best price only.")
 ```
 
 
@@ -551,17 +549,13 @@ From [@cont2010]:
 
 > The limit order arrival rate function for $1 \leq i \leq 5$ can be estimated by 	
 >$$
-\begin{equation} 
   \hat{\lambda}(i) = \frac{N_l(i)}{T_*} 
   (\#eq:lambda-emp)
-\end{equation}
 >$$
-where $N_l(i)$ is the total number of limit orders that arrived at a distance $i$ from the opposite best quote, and $T_∗$ is the total trading time in the sample (in minutes). $N_l(i)$ is obtained by enumerating the number of times that a quote increases in size at a distance of $1 \leq i \leq 5$ ticks from the opposite best quote. We then extrapolate by fitting a power law function of the form 
+where $N_l(i)$ is the total number of limit orders that arrived at a distance $i$ from the opposite best quote, and $T_*$ is the total trading time in the sample (in minutes). $N_l(i)$ is obtained by enumerating the number of times that a quote increases in size at a distance of $1 \leq i \leq 5$ ticks from the opposite best quote. We then extrapolate by fitting a power law function of the form 
 >$$
-\begin{equation}
 \hat{\lambda}(i) = \frac{k}{i^\alpha}
 (\#eq:lambda-power-law)
-\end{equation}
 >$$ (suggested by [@zovko2002] or [@bouchaud2002]). The power law parameters $k$ and $\alpha$  are obtained by a least-squares fit $$ \min_{k, \alpha}\sum_{i=1}^{5}\Big(\hat{\lambda}(i) - \frac{k}{i^\alpha} \Big)^2 $$ 
 
 ```{r tick.size, echo=FALSE}
@@ -775,10 +769,8 @@ From [@cont2010]:
 
 > Because the cancellation rate in our model is proportional to the number of orders at a particular price level, in order to estimate the cancellation rates we first need to estimate the steady-state shape of the order book $Q_i$ , which is the average number of orders at a distance of $i$ ticks from the opposite best quote, for $1 \leq i \leq 5$. If $M$ is the number of quote rows and $S_i^B(j)$ the number of shares bid at a distance of $i$ ticks from the ask on the $j$th row, for $1 \leq j \leq M$, we have
 >$$
-\begin{equation}
 Q_i^B = \frac{1}{S_l}\frac{1}{M}\sum_{j=1}^{M}S_i^B(j)
 (\#eq:que-est)
-\end{equation}
 $$
 > The vector $Q_i^A$ is obtained analogously, and $Q_i$ is the average of $Q_i^A$ and $Q_i^B$.
 
@@ -787,10 +779,8 @@ As shown on the figure \@ref(fig:sample-sky-data), the time interval between quo
 Note that $Q_i^B$ is measured in "orders" while $S_i^B(j)$ is measured in "shares". The conversion rate between these units of measure is $1 \text{ order } = S_l \text{ share }$, so  $Q_i^B(j)$ - the number of *orders* bid at a distance of $i$ ticks from the ask on the $j$th row may be calculated as shown in formula \@ref(eq:que-b-emp):
 
 $$
-\begin{equation}
 Q_i^B(j) = \frac{S_i^B(j)}{S_l}
-(#eq:que-b-emp)
-\end{equation}
+(\#eq:que-b-emp)
 $$
 
 
@@ -836,11 +826,9 @@ From [@cont2010]:
 
 > An estimator for the cancellation rate function is then given by
 >$$
-\begin{equation}
  \hat{\theta}(i) = \frac{N_c(i)}{T_*Q_i}\frac{S_c}{S_l} \text{ for } i \leq 5 \text{ and } \\
  \hat{\theta}(i) = \hat{\theta}(5) \text{ for } i > 5
- (#eq:theta-est)
-\end{equation}
+ (\#eq:theta-est)
 $$ where $N_c(i)$ is obtained by counting the number of times that a quote decreases in size at a distance of $1 \leq i \leq 5$ ticks from the opposite best quote, excluding decreases due to market orders.
 
 In our case we are not limited by five ticks. Otherwise we calculate $\hat{\theta(i)}$ in accordance with the equation \@ref(eq:theta-est). 
