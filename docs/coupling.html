@@ -11,7 +11,7 @@
 
 <meta name="author" content="Petr Fedorov" />
 
-<meta name="date" content="2020-03-15" />
+<meta name="date" content="2020-03-18" />
 
 <title>A coupling algorithm for quotes and trades streams</title>
 
@@ -365,7 +365,7 @@ summary {
 
 <h1 class="title toc-ignore">A coupling algorithm for quotes and trades streams</h1>
 <h4 class="author">Petr Fedorov</h4>
-<h4 class="date">2020-03-15</h4>
+<h4 class="date">2020-03-18</h4>
 
 </div>
 
@@ -377,10 +377,10 @@ summary {
 <ol style="list-style-type: decimal">
 <li>Traders submit <em>limit orders</em> also called <em>quotes</em> and <em>market</em> or <em>market-limit</em> orders (i.e. quotes with the limit price better than the opposite quote best price already in LOB)</li>
 <li><em>Market</em> or <em>market-limit</em> orders are <a href="https://www.investopedia.com/terms/m/matchingorders.asp">matched</a> with <em>quotes</em> and executed to produce <em>trades</em>.</li>
-<li>Unmatched <em>quotes</em> or unmatched amounts of <em>market-limit</em> orders are resides in LOB’s queues until matched with another <em>market</em> or <em>market-limit</em> order or cancelled by the participant who placed it.</li>
+<li>Unmatched <em>quotes</em> or unmatched amounts of <em>market-limit</em> orders reside in LOB’s queues until matched with another <em>market</em> or <em>market-limit</em> order or cancelled by the participant who placed it.</li>
 </ol>
 <p>Market or market-limit orders are also often called the <em>aggressing</em> orders while the limit orders sitting in queues are called <em>resting</em> orders.</p>
-<p>Note that not all matched orders are executed and produce trades. This happens due to self-match or self-trade prevention rules. See for example <a href="CME%20Globex%20Self-Match%20Prevention">CME Globex Self-Match Prevention</a> or <a href="https://www.coinbase.com/legal/trading_rules">Coinbase Markets Trading Rules 2.4 Self-trade prevention</a>.</p>
+<p>Note that not all matched orders are executed and produce trades. This happens due to self-match or self-trade prevention rules. See for example <a href="https://www.cmegroup.com/globex/trade-on-cme-globex/self-match-faq.html">CME Globex Self-Match Prevention</a> or <a href="https://www.coinbase.com/legal/trading_rules">Coinbase Markets Trading Rules 2.4 Self-trade prevention</a>.</p>
 <p>Thus in order to reconstruct the dynamics of the trading process and order book one needs information about submitted quotes, market and market-limit orders and trades produced. As we will see below this information is not always provided by exchanges.</p>
 </div>
 <div id="the-available-data-sets" class="section level1">
@@ -410,16 +410,16 @@ summary {
 <p>Similarly [Websocket API version 2.0] of the cryptocurrency exchange Bitfinex have the following channels (for every instrument traded):</p>
 <ul>
 <li><strong>Trades</strong> channel - information about trades. Ids of participating quote and market orders are not reported</li>
-<li><strong>Raw book</strong> channel - provides information about 100 best bid and 100 ask quotes. Market orders are not reported. Quotes reported as deleted when they fall beyond 100+ best quotes and created again with the same id when they return back. What was happening between these moments is not known.</li>
+<li><strong>Raw book</strong> channel - provides information about 100 best bid and 100 ask quotes. Market orders are not reported. Quotes reported as deleted when they fall beyond 100+ best quotes and created again with the same id when they return back. What was happening to them between these moments is not known. Since Bitfinex allows traders to change the price and volume of submitted quotes, the quotes may be changed or just cancelled.</li>
 </ul>
 <p>As well as at Bitstamp, events in Trades and Raw book channels are not synchronized.</p>
-<p>It should be clear from the short descriptions above that the substantial efforts are required in order to reconstruct from these data the true dynamics of order submission, matching and execution.</p>
+<p>It should be clear from the short descriptions above that substantial effort is required to reconstruct from these data the true dynamics of order submission, matching and execution from the supplied data.</p>
 </div>
 <div id="the-coupling-problem" class="section level1">
 <h1>The coupling problem</h1>
 <div id="definitions" class="section level2">
 <h2>Definitions</h2>
-<p>From the first glance, an order is a rather simple thing. Consider, for example, the definition given in <span class="citation">(Bouchaud and Bonart 2018)</span>:</p>
+<p>Consider the definition given in <span class="citation">(Bouchaud and Bonart 2018)</span>:</p>
 <blockquote>
 <p>An order is a commitment, declared at a given submission time, to buy or sell a given volume of an asset at no worse than a given price. An order <span class="math inline">\(x\)</span> is thus described by four attributes:</p>
 <ul>
@@ -443,84 +443,94 @@ summary {
 <p>Surprisingly, an order itself and operations of continous double auction appear to be rather complicated things if one attempts to define them rigorously. We will do that below assuming that we have a single instrument and a single currency.</p>
 
 <div class="definition">
-<p><span id="def:order-event" class="definition"><strong>Definition 1  (Order-related event)  </strong></span>A tuple of four numbers <span class="math inline">\((t^i, n^i, p^i, v^i)\)</span> where (superscript <span class="math inline">\(i\)</span> is assumed)</p>
+<p><span id="def:order" class="definition"><strong>Definition 1  (Order)  </strong></span>A vector-valued function <span class="math inline">\(\mathbf{o}^i: \mathbb{R}_{&gt;0} \rightarrow \mathbb{R}_{&gt;0} \times \mathbb{R}\)</span> representing a commitment to buy or sell a given volume <span class="math inline">\(v\)</span> of an asset at no worse than a given price <span class="math inline">\(p\)</span> at a particular time <span class="math inline">\(t\)</span> is called an <em>order</em> and <span class="math inline">\(i \in \mathbb{Z}\)</span> is called an <em>unique order identification</em>. Suppose that:</p>
 <ol style="list-style-type: lower-alpha">
-<li><span class="math inline">\(t \in \mathbb{R}_{&gt;0}\)</span> is a timestamp or a moment in time when the event has happened</li>
-<li><span class="math inline">\(n \in \mathbb{R}_{&gt;0} \cup \{-\infty\, +\infty\}\)</span> is a timestamp of the next (see definition <a href="#def:order-life-cycle">2</a>) event with the same <span class="math inline">\(i\)</span> or <span class="math inline">\(\pm \infty\)</span> if there is no such event</li>
-<li><span class="math inline">\(\forall n \neq -\infty: t \leq n\)</span></li>
-<li><span class="math inline">\(p \in \mathbb{R}_{&gt; 0}\)</span></li>
-<li><span class="math inline">\(v \in \mathbb{R}\)</span></li>
+<li><p><span class="math inline">\(\mathcal{T^i}\)</span> is a set of intervals <span class="math inline">\(\mathcal{T^i} = \{T_k^i\}_{k=0}^{N^i}\)</span> called <em>order intervals</em> where each <span class="math inline">\(T_k^i\)</span> is either a proper interval with endpoints <span class="math inline">\(s_k^i \in \mathbb{R}_{&gt;0}\)</span>, <span class="math inline">\(e_k^i \in \mathbb{R}_{&gt;0} \cup \{+\infty\}\)</span>, <span class="math inline">\(s_k^i &lt; e_k^i\)</span> or a degenerate interval <span class="math inline">\(\{s_k^i\}, s_k^i \in \mathbb{R}_{&gt;0}\)</span> and <span class="math inline">\(\forall m \neq n : T_m^i \cap T_n^i = \emptyset\)</span></p></li>
+<li><p><span class="math inline">\(\chi_{T_k^i} : \mathbb{R} \mapsto \{0,1\}\)</span> is an indicator function of sets in <span class="math inline">\(\mathcal{T^i}\)</span>:
+<span class="math inline">\(\chi_{T_k^i}(t) = \begin{cases} 1, &amp; t \in T_k^i \\ 0, &amp; \text{otherwise} \end{cases}\)</span>.</p></li>
+<li><p><span class="math inline">\(\mathcal{P}^i = \{p_k^i\}_{k=0}^{N^i}\)</span> is a set of constants called <em>order prices</em>, such that <span class="math inline">\(p_k^i \in \mathbb{R}_{&gt;0}\)</span>.</p></li>
+<li><p><span class="math inline">\(\mathcal{V}^i = \{v_k^i\}_{k=0}^{N^i}\)</span> is a set of constants called <em>order volumes</em>, such that either <span class="math inline">\(\forall k : v_k^i \in \mathbb{R}_{&lt;0}\)</span> and in this case the order is a commitment to <em>sell</em> and is called <em>sell order</em> or <span class="math inline">\(\forall k: v_k^i \in \mathbb{R}_{&gt;0}\)</span> and in this case the order is a commitment to <em>buy</em> and is callded <em>buy order</em>.</p></li>
+<li><p>Sets <span class="math inline">\(\mathcal{P}^i\)</span> and <span class="math inline">\(\mathcal{V}^i\)</span> satisfy the following condition <span class="math inline">\(\forall k &lt; N^i : (p_k^i, v_k^i) \neq (p_{k+1}^i, v_{k+1}^i)\)</span>.</p></li>
 </ol>
-<p>is called an <em>event, related to order</em> <span class="math inline">\(i\)</span> or an <em>order-related event</em> or simply an <em>event</em>. Here <span class="math inline">\(i\)</span> is an unique order identification (it may be assumed that <span class="math inline">\(i \in \mathbb{Z}\)</span>), <span class="math inline">\(t\)</span> , <span class="math inline">\(n\)</span> , <span class="math inline">\(p\)</span> is a price, <span class="math inline">\(v\)</span> is a volume.</p>
-We will sometimes succintly write the event related to order <span class="math inline">\(i\)</span> as <span class="math inline">\(e^i\)</span>.
-</div>
-
-
-<div class="definition">
-<p><span id="def:order-life-cycle" class="definition"><strong>Definition 2  (Order life cycle)  </strong></span>A set <span class="math inline">\(O^i = \{e_k^i \}_{k = 0}^{k=N^i} = \{ (t_k^i, n_k^i, p_k^i, v_k^i) \}_{k = 0}^{k=N^i}, k \in \mathbb{Z}_{\geq 0}\)</span> of events related to order <span class="math inline">\(i\)</span>, where (superscript <span class="math inline">\(i\)</span> is assumed)</p>
-<ol style="list-style-type: lower-alpha">
-<li><span class="math inline">\(\forall k &lt; N: n_k = t_{k+1} \lor -\infty\)</span></li>
-<li><span class="math inline">\(n_{N} = \pm \infty\)</span></li>
-<li><span class="math inline">\(\forall k_1, k_2, 0 \leq k_1,k_2 \leq N: \text{sgn}(v_{k_1}) = \text{sgn}(v_{k_2})\)</span></li>
-<li><span class="math inline">\(\forall k &lt; N: v_k \neq 0\)</span></li>
-</ol>
-<p>is called an <em>order <span class="math inline">\(i\)</span> life cycle</em>. We will denote <span class="math inline">\(O^i(t)\)</span> the subset of <span class="math inline">\(O^i\)</span> which satisfies the additional condition:</p>
-<ol start="5" style="list-style-type: lower-alpha">
-<li><span class="math inline">\(t_k^i \leq t &lt; n_k^i\)</span></li>
-</ol>
-Intuitevely, the subset <span class="math inline">\(O^i(t)\)</span> will either include a single event which we will call an <em>active order at time <span class="math inline">\(t\)</span></em> or will be empty.
+Then function <span class="math inline">\(\mathbf{o}^i(t)\)</span> is defined as follows:
+<span class="math display">\[
+  \mathbf{o}^i(t) = (p^i(t), v^i(t)) = \Big( \sum_{k=1}^{N^i} p_k^i \chi_{T_k^i}(t),  \sum_{k=1}^{N^i} v_k^i \chi_{T_k^i}(t) \Big)
+\]</span>
 </div>
 
 <p>Now we can define</p>
 
 <div class="definition">
-<span id="def:order-volume" class="definition"><strong>Definition 3  (Order Volume)  </strong></span>An volume of order <span class="math inline">\(i\)</span> is a function of time <span class="math inline">\(t\)</span> defined as follows:
+<span id="def:order-volume" class="definition"><strong>Definition 2  (Order Volume)  </strong></span>The function <span class="math inline">\(v^i(t)\)</span> in the definition <a href="#def:order">1</a> is called an <em>order volume</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:fill-volume" class="definition"><strong>Definition 3  (Filled Volume)  </strong></span>The filled volume <span class="math inline">\(f^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
 <span class="math display">\[
-  V_{O^i}(t) = \begin{cases} |v^i_m|, \text{ if } O^i(t) = \{e^i_m\}  \\ 0, \text{ otherwise } \end{cases}
-\]</span>
+  f^i(t) = v^i(t) - \lim_{t^{'} \downarrow t} v^i(t^{'})
+  \]</span>
 </div>
 
-<p>Similarly, we define</p>
 
 <div class="definition">
-<span id="def:order-price" class="definition"><strong>Definition 4  (Order Price)  </strong></span>A price of order <span class="math inline">\(i\)</span> is a function of time <span class="math inline">\(t\)</span> defined as follows:
+<span id="def:cancelled-volume" class="definition"><strong>Definition 4  (Cancelled Volume)  </strong></span>The cancelled volume <span class="math inline">\(c^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
 <span class="math display">\[
-  P_{O^i}(t) = \begin{cases} p_m^i, \text{ if } \text{ if } O^i(t) = \{e^i_m\} \\ 
-  0, \text{ otherwise }
-\end{cases}
-\]</span>
+  c^i(t) = \lim_{t^{'} \uparrow t} v^i(t^{'}) - v^i(t)
+  \]</span>
 </div>
 
-<p>Note that both <span class="math inline">\(V_{O_i}(t)\)</span> and <span class="math inline">\(P_{O_i}(t)\)</span> are <a href="https://en.wikipedia.org/wiki/C%C3%A0dl%C3%A0g">càdlàg</a> functions.</p>
 
 <div class="definition">
-<p><span id="def:lob-life-cycle" class="definition"><strong>Definition 5  (Limit Order Book life cycle)  </strong></span>Suppose we are given a set of order life cycles <span class="math inline">\(\mathcal{L} = \{O^i\}\)</span>.</p>
-<p>A (possibly empty) subset <span class="math inline">\(\mathcal{B} =\{O^b\}_{v^b_1 &gt; 0} \subset \mathcal{L}\)</span> is called <em>bids life cycle</em>. The set <span class="math inline">\(\mathcal{B}(t) =\{O^b(t)\}_{v^b_1 &gt; 0}\)</span> is called active bid orders at time <span class="math inline">\(t\)</span>.</p>
-<p>A (possibly empty) subset <span class="math inline">\(\mathcal{A} =\{O^a\}_{v^a_1 &lt; 0} \subset \mathcal{L}\)</span> is called <em>ask life cycle</em>. The set <span class="math inline">\(\mathcal{A}(t) =\{O^a(t)\}_{v^a_1 &gt; 0}\)</span> is called active ask orders at time <span class="math inline">\(t\)</span>.</p>
-<p>We will call <span class="math inline">\(\mathcal{L}\)</span> a (valid) <em>Limit Order Book (LOB) life cycle</em> if the following (The Instantaneous Trade Execution) condition is satisfied:
-<span class="math display" id="eq:instant-trade">\[
-\int_{-\infty}^{+\infty} \theta(\max_{O^b \in \mathcal{B} } P_{O^b}(t) - \min_{O^a \in \mathcal{A} } P_{O^a}(t)) dt = 0
-\tag{1}
-\]</span> where <span class="math inline">\(\theta(x)\)</span> is the <a href="https://en.wikipedia.org/wiki/Heaviside_step_function">Heaviside step function</a>.</p>
+<span id="def:order-price" class="definition"><strong>Definition 5  (Order Price)  </strong></span>The function <span class="math inline">\(p^i(t)\)</span> in the definition <a href="#def:order">1</a> is called an <em>order price</em>.
 </div>
 
-<p>Note that The Instantaneous Trade Execution condition <a href="#eq:instant-trade">(1)</a> is valid because order price <span class="math inline">\(P_{O^i}(t)\)</span> is a càdlàg function.</p>
 
 <div class="definition">
-<p><span id="def:trade-event" class="definition"><strong>Definition 6  (Trade event)  </strong></span>Suppose we are given a LOB life cycle <span class="math inline">\(\mathcal{L}\)</span> and tuple <span class="math inline">\((t^j, a^j, r^j, p^j, v^j)\)</span> called <em>trade event</em>. If <span class="math inline">\(\exists (O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B}) \lor (O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}) , m, n\)</span> such that:</p>
+<span id="def:best-bid-price" class="definition"><strong>Definition 6  (Best Bid Price)  </strong></span>Suppose we are given a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i\}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{B} =\{\mathbf{o}^b\}_{v_k^b &gt; 0} \subset \mathcal{L}\)</span> of buy orders is called <em>bids</em> and the function <span class="math inline">\(b(t)\)</span> is defined as:
+<span class="math display">\[
+  b_{\mathcal{L}}(t) = \begin{cases} \max_{\mathbf{o}^b \in \mathcal{B}} p^b(t), &amp; \text{ if } \mathcal{B} \neq \emptyset \\0, &amp; \text{ otherwise }  \end{cases}
+  \]</span> is called <em>best bid price</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:best-ask-price" class="definition"><strong>Definition 7  (Best Ask Price)  </strong></span>Suppose we are given a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i\}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{A} =\{\mathbf{o}^a\}_{v_k^a &lt; 0} \subset \mathcal{L}\)</span> of sell orders is called <em>asks</em> and the function <span class="math inline">\(a(t)\)</span> is defined as:
+<span class="math display">\[
+  a_{\mathcal{L}}(t) = \begin{cases} \min_{\mathbf{o}^a \in \mathcal{A}} p^a(t) &amp; \text{ if } \mathcal{A} \neq \emptyset \\ +\infty, &amp; \text{ otherwise } \end{cases}
+  \]</span> is called <em>best ask price</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:match" class="definition"><strong>Definition 8  (Matched Orders)  </strong></span>A buy order <span class="math inline">\(\mathbf{o}^b\)</span> and a sell order <span class="math inline">\(\mathbf{o}^s\)</span> are called <em>matched</em> if <span class="math inline">\(\exists t : p^b(t) \geq p^s(t)\)</span>. If <span class="math display">\[\lim_{t^{'} \uparrow t} p^s(t) \neq p^s(t)\]</span> then <span class="math inline">\(\mathbf{o}^s\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^b\)</span> is called a <em>resting</em> order. Otherwise, <span class="math inline">\(\mathbf{o}^b\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^s\)</span> is called a <em>resting</em> order.
+The set of matched buy orders at time <span class="math inline">\(t\)</span> we will denote <span class="math inline">\(\mathcal{M}_{\text{bid}}(t)\)</span> and the set of matched sell orders - <span class="math inline">\(\mathcal{M}_{\text{ask}}(t)\)</span>.
+</div>
+
+
+<div class="definition">
+<p><span id="def:trade" class="definition"><strong>Definition 9  (Trade)  </strong></span>Suppose a buy order <span class="math inline">\(\mathbf{o}^b\)</span> is matched to a sell order <span class="math inline">\(\mathbf{o}^s\)</span> at time <span class="math inline">\(t\)</span>. Let <span class="math inline">\(f\)</span> be the fill at time <span class="math inline">\(t\)</span> of the resting order, <span class="math inline">\(p\)</span> be the price at time <span class="math inline">\(t\)</span> of the resting order. Let <span class="math inline">\(d\)</span> called <em>direction</em> be equal to <span class="math inline">\(1\)</span> if the resting order is a buy order and <span class="math inline">\(-1\)</span> otherwise. Then the tuple <span class="math inline">\((t, b, s, f, d)\)</span> is called <em>trade</em>.</p>
+</div>
+
+
+<div class="definition">
+<p><span id="def:iob" class="definition"><strong>Definition 10  (Ideal Order Book)  </strong></span>Suppose we are given a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i\}\)</span>. We will call <span class="math inline">\(\mathcal{L}\)</span> an <em>Ideal Order Book (IOB)</em> if the following conditions are satisfied:</p>
 <ol style="list-style-type: lower-alpha">
-<li><span class="math inline">\(t^{a^j}_m = t^{r^j}_n = t^j\)</span></li>
-<li><span class="math inline">\(\begin{cases} p_m^{a^j} \geq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}\\ p_m^{a^j} \leq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B} \end{cases}\)</span></li>
-<li><span class="math inline">\(p^{r^j}_n = p^j\)</span></li>
-<li><span class="math inline">\(|v_{m-1}^{a^j}| - |v_m^{a^j}| = |v_{n-1}^{r^j}| - |v_n^{r^j}| = v^j\)</span>,</li>
+<li>Instantaneous Match Execution
+<span class="math display" id="eq:instant-trade">\[ \lambda \Big( \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\}\Big) = 0
+\tag{1}
+  \]</span> where <span class="math inline">\(\lambda(X)\)</span> is the Lebesgue measure of set <span class="math inline">\(X\)</span>.</li>
+<li>Volume Conservation
+<span class="math display">\[
+    \forall t \in \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\} : \sum_{\mathbf{o}^b(t) \in \mathcal{M}_{\text{bid}}(t)} f^b(t) = \sum_{\mathbf{o}^s(t) \in \mathcal{M}_{\text{ask}}(t)} |f^s(t)|
+    \]</span></li>
 </ol>
-we will call the tuple a <em>valid trade event</em>. Here <span class="math inline">\(j\)</span> is an unique trade event identificator (it may be assumed that <span class="math inline">\(j \in \mathbb{Z}\)</span>), <span class="math inline">\(a^j\)</span> is an aggressing order, <span class="math inline">\(r^j\)</span> is a resting order, which determines the price <span class="math inline">\(p^j\)</span> of the trade event. It is said that orders <span class="math inline">\(a^j\)</span> and <span class="math inline">\(r^j\)</span> are <em>matched</em> and <em>executed</em> to produce a trade event. Note that not all matched orders are automatically executed. They may be cancelled too in case both orders are placed by the same trader.
 </div>
 
 </div>
 <div id="algorithm" class="section level2">
 <h2>Algorithm</h2>
-<p>Formally speaking, the coupling algorithm is supposed to output LOB life cycle and valid trade events from the data provided by an exchange. The efforts required varies by exchange. For example <a href="https://www.moex.com/">MOEX</a> provides data of almost ideal quality while <a href="https://www.moex.com/">Bitfinex</a> does not report market orders and order ids for trades.</p>
+<p>Formally speaking, the coupling algorithm is supposed to produce an Ideal Order Book from non-ideal data provided by an exchange. The efforts required varies by exchange. For example <a href="https://www.moex.com/">MOEX</a> provides data of almost ideal quality while <a href="https://www.moex.com/">Bitfinex</a> does not report market orders and order ids for trades.</p>
 <p>TBD</p>
 </div>
 </div>

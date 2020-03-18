@@ -18,11 +18,11 @@ The mechanics of the countinous double auction or LOB trading may be briefly des
 
 1. Traders submit *limit orders* also called *quotes* and *market* or *market-limit* orders (i.e. quotes with the limit price better than the opposite quote best price already in LOB) 
 2. *Market* or *market-limit* orders are [matched](https://www.investopedia.com/terms/m/matchingorders.asp) with *quotes*  and executed to produce *trades*.
-3. Unmatched *quotes* or unmatched amounts of *market-limit* orders are resides in LOB's queues until matched with another *market* or *market-limit* order or cancelled by the participant who placed it.
+3. Unmatched *quotes* or unmatched amounts of *market-limit* orders reside in LOB's queues until matched with another *market* or *market-limit* order or cancelled by the participant who placed it.
 
 Market or market-limit orders are also often called the *aggressing* orders while the limit orders sitting in queues are called *resting* orders.
 
-Note that not all matched orders are executed and produce trades. This happens due to self-match or self-trade prevention rules. See for example [CME Globex Self-Match Prevention](CME Globex Self-Match Prevention) or [Coinbase Markets Trading Rules 2.4 Self-trade prevention](https://www.coinbase.com/legal/trading_rules).
+Note that not all matched orders are executed and produce trades. This happens due to self-match or self-trade prevention rules. See for example [CME Globex Self-Match Prevention](https://www.cmegroup.com/globex/trade-on-cme-globex/self-match-faq.html) or [Coinbase Markets Trading Rules 2.4 Self-trade prevention](https://www.coinbase.com/legal/trading_rules).
 
 Thus in order to reconstruct the dynamics of the trading process and order book one needs  information about submitted quotes, market and market-limit orders and trades produced. As we will see below this information is not always provided by exchanges.
 
@@ -32,7 +32,7 @@ Thus in order to reconstruct the dynamics of the trading process and order book 
 Most of the data sets containing information about quotes and trades consist of two separate loosely coupled files: a **trades** file recording  trades and an **quotes** file recording quote placement, changes and cancellations. Loosely coupled in this context means that records in **trades** file do not always have a clearly identifiable corresponding records in **quotes** file as one would expect since by definition every trade shoud change some quote(s). So some matching or *coupling* procedure is usually required in order to establish such a link between the **trades** and **quotes** files. This link is necessary to:
 
 * Distinguish between quote changes due to limit order cancellations and market order executions
-* Estimate the size of market orders placed
+* Estimate the size of market orders placed 
 * Distinquish between limit order placements and market limit order placements
 
 and, overall, to achieve the ultimate goal - to perform a complete order book reconstruction at every moment of time.
@@ -58,17 +58,17 @@ As we will see later, events in these channels are not always sent in correct ti
 Similarly [Websocket API version 2.0] of the cryptocurrency exchange Bitfinex have the following channels (for every instrument traded):
 
  * **Trades** channel - information about trades. Ids of participating quote and market orders are not reported
- * **Raw book** channel - provides information about 100 best bid and 100 ask quotes. Market orders are not reported. Quotes reported as deleted when they fall beyond 100+ best quotes and created again with the same id when they return back. What was happening between these moments is not known.
+ * **Raw book** channel - provides information about 100 best bid and 100 ask quotes. Market orders are not reported. Quotes reported as deleted when they fall beyond 100+ best quotes and created again with the same id when they return back. What was happening to them between these moments is not known. Since Bitfinex allows traders to change the price and volume of submitted quotes, the quotes may be changed or just cancelled. 
  
 As well as at Bitstamp, events in Trades and Raw book channels are not synchronized.
 
-It should be clear from the short descriptions above that the substantial efforts are required in order to reconstruct from these data the true dynamics of order submission, matching and execution.
+It should be clear from the short descriptions above that substantial effort is required to reconstruct from these data the true dynamics of order submission, matching and execution from the supplied data.
 
 # The coupling problem
 
 ## Definitions
 
-From the first glance, an order is a rather simple thing. Consider, for example, the definition given in [@bouchaud_trades_2018]:
+Consider the definition given in [@bouchaud_trades_2018]:
 
 
 > An order is a commitment, declared at a given submission time, to buy or sell a given volume of an asset at no worse than a given price. An order $x$ is thus described by four attributes:
@@ -92,95 +92,105 @@ The above descriptions are incomplete:
 
 * It is not said what will happen if $v_x \leq v_y$, etc. 
 
-Surprisingly, an order itself and operations of continous double auction appear to be rather complicated things if one attempts to define them rigorously. We will do that below assuming that we have a single instrument and a single currency. 
-
-```{definition, name="Order-related event", label=order-event}
-A tuple of four numbers $(t^i, n^i, p^i, v^i)$  where (superscript $i$ is assumed)
-
- a. $t \in \mathbb{R}_{>0}$ is a timestamp or a moment in time when the event has happened 
- b. $n \in \mathbb{R}_{>0} \cup \{-\infty\, +\infty\}$ is a timestamp of the next (see definition \@ref(def:order-life-cycle)) event  with the same $i$ or $\pm \infty$ if there is no such event
- c. $\forall n \neq -\infty: t \leq n$
- d. $p \in \mathbb{R}_{> 0}$
- e. $v \in \mathbb{R}$
-   
-is called an *event, related to order* $i$ or an *order-related event* or simply an *event*. Here $i$ is an unique order identification (it may be assumed that $i \in \mathbb{Z}$), $t$  , $n$ , $p$ is a price, $v$ is a volume.
-
-We will sometimes succintly write the event related to order $i$ as $e^i$.
-```
+Surprisingly, an order itself and operations of continous double auction appear to be rather complicated things if one attempts to define them rigorously. We will do that below assuming that we have a single instrument and a single currency.
 
 
 
-```{definition, name="Order life cycle", label=order-life-cycle}
-A set $O^i = \{e_k^i \}_{k = 0}^{k=N^i} = \{ (t_k^i, n_k^i, p_k^i, v_k^i) \}_{k = 0}^{k=N^i}, k \in \mathbb{Z}_{\geq 0}$ of events related to order $i$, where (superscript $i$ is assumed)
+```{definition, name="Order", label=order}
+A vector-valued function $\mathbf{o}^i: \mathbb{R}_{>0} \rightarrow \mathbb{R}_{>0} \times \mathbb{R}$ representing a commitment to buy or sell a given volume $v$ of an asset at no worse than a given price $p$ at a particular time $t$ is called an *order* and $i \in \mathbb{Z}$ is called an *unique order identification*. Suppose that:
 
- a. $\forall k < N: n_k = t_{k+1} \lor -\infty$
- b. $n_{N} = \pm \infty$
- c. $\forall k_1, k_2, 0 \leq k_1,k_2 \leq N: \text{sgn}(v_{k_1}) = \text{sgn}(v_{k_2})$
- d. $\forall k < N: v_k \neq 0$
+a. $\mathcal{T^i}$ is a set of intervals $\mathcal{T^i} = \{T_k^i\}_{k=0}^{N^i}$ called *order intervals* where each $T_k^i$ is either a proper interval with endpoints $s_k^i \in \mathbb{R}_{>0}$, $e_k^i \in \mathbb{R}_{>0} \cup \{+\infty\}$, $s_k^i < e_k^i$  or a degenerate interval $\{s_k^i\}, s_k^i \in \mathbb{R}_{>0}$ and $\forall m \neq n : T_m^i \cap T_n^i = \emptyset$
 
-is called an *order $i$ life cycle*. We will denote $O^i(t)$ the subset of $O^i$ which satisfies the additional condition:
-   
- e. $t_k^i \leq t < n_k^i$
-   
-Intuitevely, the subset $O^i(t)$ will either include a single event which we will call an *active order at time $t$* or will be empty.
+b. $\chi_{T_k^i} : \mathbb{R} \mapsto \{0,1\}$ is an indicator function of sets in $\mathcal{T^i}$: 
+$\chi_{T_k^i}(t) = \begin{cases} 1, & t \in T_k^i \\ 0, & \text{otherwise} \end{cases}$.
+
+b. $\mathcal{P}^i = \{p_k^i\}_{k=0}^{N^i}$ is a set of constants called *order prices*, such that $p_k^i \in \mathbb{R}_{>0}$.
+
+c. $\mathcal{V}^i = \{v_k^i\}_{k=0}^{N^i}$ is a set of constants called *order volumes*, such that either $\forall k : v_k^i \in \mathbb{R}_{<0}$ and in this case the order is a commitment to *sell* and is called *sell order* or $\forall k:  v_k^i \in \mathbb{R}_{>0}$ and in this case the order is a commitment to *buy* and is callded *buy order*.
+  
+d. Sets $\mathcal{P}^i$ and $\mathcal{V}^i$  satisfy the following condition $\forall k < N^i : (p_k^i, v_k^i) \neq (p_{k+1}^i, v_{k+1}^i)$.
+
+Then function $\mathbf{o}^i(t)$ is defined as follows:
+$$
+  \mathbf{o}^i(t) = (p^i(t), v^i(t)) = \Big( \sum_{k=1}^{N^i} p_k^i \chi_{T_k^i}(t),  \sum_{k=1}^{N^i} v_k^i \chi_{T_k^i}(t) \Big)
+$$
+  
 ```
 
 Now we can define
 
 ```{definition, name="Order Volume", label=order-volume}
-An volume of order $i$ is a function of time $t$ defined as follows:
-$$
-  V_{O^i}(t) = \begin{cases} |v^i_m|, \text{ if } O^i(t) = \{e^i_m\}  \\ 0, \text{ otherwise } \end{cases}
-$$
+The function $v^i(t)$ in the definition \@ref(def:order) is called an *order volume*.
 ```
 
-Similarly, we define
+```{definition, name="Filled Volume", label=fill-volume}
+The filled volume $f^i(t)$ of an order $i$ at time $t$ is defined as: 
+  $$
+  f^i(t) = v^i(t) - \lim_{t^{'} \downarrow t} v^i(t^{'})
+  $$
+  
+```
+
+```{definition, name="Cancelled Volume", label=cancelled-volume}
+The cancelled volume $c^i(t)$ of an order $i$ at time $t$ is defined as: 
+  $$
+  c^i(t) = \lim_{t^{'} \uparrow t} v^i(t^{'}) - v^i(t)
+  $$
+  
+```
+
+
 
 ```{definition, name="Order Price", label=order-price}
-A price of order $i$ is a function of time $t$ defined as follows:
-$$
-  P_{O^i}(t) = \begin{cases} p_m^i, \text{ if } \text{ if } O^i(t) = \{e^i_m\} \\ 
-  0, \text{ otherwise }
-\end{cases}
-$$
+The function $p^i(t)$ in the definition \@ref(def:order) is called an *order price*.
 ```
 
-Note that both $V_{O_i}(t)$ and $P_{O_i}(t)$ are [càdlàg](https://en.wikipedia.org/wiki/C%C3%A0dl%C3%A0g) functions.
+```{definition, name="Best Bid Price", label=best-bid-price}
+Suppose we are given a set of orders $\mathcal{L} = \{\mathbf{o}^i\}$. A (possibly empty) subset $\mathcal{B} =\{\mathbf{o}^b\}_{v_k^b > 0} \subset \mathcal{L}$ of buy orders is called *bids* and the function $b(t)$ is defined as:
+  $$
+  b_{\mathcal{L}}(t) = \begin{cases} \max_{\mathbf{o}^b \in \mathcal{B}} p^b(t), & \text{ if } \mathcal{B} \neq \emptyset \\0, & \text{ otherwise }  \end{cases}
+  $$ is called *best bid price*.
+```
 
 
-```{definition, name="Limit Order Book life cycle", label=lob-life-cycle}
-Suppose we are given a set of order life cycles $\mathcal{L} = \{O^i\}$. 
+```{definition, name="Best Ask Price", label=best-ask-price}
+Suppose we are given a set of orders $\mathcal{L} = \{\mathbf{o}^i\}$. A (possibly empty) subset $\mathcal{A} =\{\mathbf{o}^a\}_{v_k^a < 0} \subset \mathcal{L}$ of sell orders is called *asks* and the function $a(t)$ is defined as:
+  $$
+  a_{\mathcal{L}}(t) = \begin{cases} \min_{\mathbf{o}^a \in \mathcal{A}} p^a(t) & \text{ if } \mathcal{A} \neq \emptyset \\ +\infty, & \text{ otherwise } \end{cases}
+  $$ is called *best ask price*.
+```
 
-A (possibly empty) subset $\mathcal{B} =\{O^b\}_{v^b_1 > 0} \subset \mathcal{L}$ is called *bids life cycle*. The set $\mathcal{B}(t) =\{O^b(t)\}_{v^b_1 > 0}$ is called active bid orders at time $t$. 
+```{definition, name="Matched Orders", label=match}
+A buy order $\mathbf{o}^b$ and a sell order $\mathbf{o}^s$ are called *matched* if $\exists t : p^b(t) \geq p^s(t)$. If $$\lim_{t^{'} \uparrow t} p^s(t) \neq p^s(t)$$ then $\mathbf{o}^s$ is called an *agressing* order and $\mathbf{o}^b$ is called a *resting* order. Otherwise, $\mathbf{o}^b$ is called an *agressing* order and $\mathbf{o}^s$ is called a *resting* order.
+The set of matched buy orders at time $t$ we will denote $\mathcal{M}_{\text{bid}}(t)$ and the set of matched sell orders - $\mathcal{M}_{\text{ask}}(t)$.
+```
 
-A (possibly empty) subset $\mathcal{A} =\{O^a\}_{v^a_1 < 0} \subset \mathcal{L}$ is called *ask life cycle*. The set $\mathcal{A}(t) =\{O^a(t)\}_{v^a_1 > 0}$ is called active ask orders at time $t$.
 
-We will call  $\mathcal{L}$ a (valid) *Limit Order Book (LOB) life cycle* if the following (The Instantaneous Trade Execution) condition is satisfied: 
-$$
-\int_{-\infty}^{+\infty} \theta(\max_{O^b \in \mathcal{B} } P_{O^b}(t) - \min_{O^a \in \mathcal{A} } P_{O^a}(t)) dt = 0
-(\#eq:instant-trade)
-$$ where $\theta(x)$ is the [Heaviside step function](https://en.wikipedia.org/wiki/Heaviside_step_function).
+```{definition, name="Trade", label=trade}
+Suppose a buy order $\mathbf{o}^b$ is matched to a sell order $\mathbf{o}^s$ at time $t$. Let $f$ be the fill at time $t$ of the resting order, $p$ be the price at time $t$ of the resting order. Let $d$ called *direction* be equal to $1$ if the resting order is a buy order and $-1$ otherwise.  Then the tuple $(t, b, s, f, d)$ is called *trade*.
 
 ```
 
-Note that The Instantaneous Trade Execution condition \@ref(eq:instant-trade) is valid because order price $P_{O^i}(t)$ is a càdlàg function.
 
-```{definition, name="Trade event", label=trade-event}
-Suppose we are given a LOB life cycle $\mathcal{L}$ and tuple $(t^j, a^j, r^j, p^j, v^j)$ called *trade event*. If $\exists (O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B}) \lor (O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}) , m, n$ such that:
+```{definition, name="Ideal Order Book", label=iob}
+Suppose we are given a set of orders $\mathcal{L} = \{\mathbf{o}^i\}$. We will call  $\mathcal{L}$ an *Ideal Order Book (IOB)* if the following conditions are satisfied: 
   
-  a. $t^{a^j}_m = t^{r^j}_n = t^j$
-  b. $\begin{cases} p_m^{a^j} \geq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{B}, O^{r^j} \in \mathcal{A}\\
-p_m^{a^j} \leq p_n^{r^j}, \text{ if } O^{a^j} \in \mathcal{A}, O^{r^j} \in \mathcal{B} \end{cases}$ 
-  c. $p^{r^j}_n = p^j$
-  d. $|v_{m-1}^{a^j}| - |v_m^{a^j}| = |v_{n-1}^{r^j}| - |v_n^{r^j}| = v^j$,
+  a. Instantaneous Match Execution
+$$ \lambda \Big( \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\}\Big) = 0
+(\#eq:instant-trade)
+  $$ where $\lambda(X)$ is the Lebesgue measure of set $X$.
+  b. Volume Conservation 
+  $$
+    \forall t \in \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\} : \sum_{\mathbf{o}^b(t) \in \mathcal{M}_{\text{bid}}(t)} f^b(t) = \sum_{\mathbf{o}^s(t) \in \mathcal{M}_{\text{ask}}(t)} |f^s(t)|
+    $$
 
-we will call the tuple a *valid trade event*. Here $j$ is an unique trade event identificator (it may be assumed that $j \in \mathbb{Z}$), $a^j$ is an aggressing order, $r^j$ is a resting order, which determines the price $p^j$ of the trade event. It is said that orders $a^j$ and $r^j$ are *matched* and *executed* to produce a trade event. Note that not all matched orders are automatically executed. They may be cancelled too in case both orders are placed by the same trader.
 ```
+
 
 
 ## Algorithm
 
-Formally speaking, the coupling algorithm is supposed to output LOB life cycle and valid trade events from the data provided by an exchange.  The efforts required varies by exchange. For example [MOEX](https://www.moex.com/) provides data of almost ideal quality while [Bitfinex](https://www.moex.com/) does not report market orders and order ids for trades.
+Formally speaking, the coupling algorithm is supposed to produce an Ideal Order Book from non-ideal data provided by an exchange.  The efforts required varies by exchange. For example [MOEX](https://www.moex.com/) provides data of almost ideal quality while [Bitfinex](https://www.moex.com/) does not report market orders and order ids for trades.
 
 TBD
 
