@@ -2,7 +2,7 @@
 title: "Research"
 output: html_document
 ---
-2020-03-14 [WIP: A coupling algorithm for quotes and trades streams](coupling.html)
+2020-03-14 [WIP: Order book reconstruction from quotes and trades streams](coupling/introduction.html)
 
 2020-03-11 [An empirical evalutation of the Stochastic Model for Order Book Dynamics](stochastic-order-book-model.html)
 

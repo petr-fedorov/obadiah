@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="" xml:lang="">
+<head>
+
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>2 Reconstruction algorithm | Order book reconstruction from quotes and trades streams</title>
+  <meta name="description" content="2 Reconstruction algorithm | Order book reconstruction from quotes and trades streams" />
+  <meta name="generator" content="bookdown 0.17 and GitBook 2.6.7" />
+
+  <meta property="og:title" content="2 Reconstruction algorithm | Order book reconstruction from quotes and trades streams" />
+  <meta property="og:type" content="book" />
+  
+  
+  
+  
+
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="2 Reconstruction algorithm | Order book reconstruction from quotes and trades streams" />
+  
+  
+  
+
+<meta name="author" content="Petr Fedorov" />
+
+
+<meta name="date" content="2020-03-20" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  
+  
+<link rel="prev" href="introduction.html"/>
+<link rel="next" href="results.html"/>
+<script src="libs/jquery-2.2.3/jquery.min.js"></script>
+<link href="libs/gitbook-2.6.7/css/style.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-table.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-bookdown.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-highlight.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-search.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-fontsettings.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-clipboard.css" rel="stylesheet" />
+
+
+
+
+
+
+
+
+
+
+
+
+</head>
+
+<body>
+
+
+
+  <div class="book without-animation with-summary font-size-2 font-family-1" data-basepath=".">
+
+    <div class="book-summary">
+      <nav role="navigation">
+
+<ul class="summary">
+<li class="chapter" data-level="1" data-path="introduction.html"><a href="introduction.html"><i class="fa fa-check"></i><b>1</b> Introduction</a><ul>
+<li class="chapter" data-level="1.1" data-path="introduction.html"><a href="introduction.html#continous-time-double-auction-and-lob"><i class="fa fa-check"></i><b>1.1</b> Continous-time double auction and LOB</a></li>
+<li class="chapter" data-level="1.2" data-path="introduction.html"><a href="introduction.html#available-data-sets"><i class="fa fa-check"></i><b>1.2</b> Available data sets</a></li>
+</ul></li>
+<li class="chapter" data-level="2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html"><i class="fa fa-check"></i><b>2</b> Reconstruction algorithm</a><ul>
+<li class="chapter" data-level="2.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#ideal-order-book-iob"><i class="fa fa-check"></i><b>2.1</b> Ideal Order Book (IOB)</a><ul>
+<li class="chapter" data-level="2.1.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#definitions"><i class="fa fa-check"></i><b>2.1.1</b> Definitions</a></li>
+<li class="chapter" data-level="2.1.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#example"><i class="fa fa-check"></i><b>2.1.2</b> Example</a></li>
+</ul></li>
+<li class="chapter" data-level="2.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#empirical-order-book-eob"><i class="fa fa-check"></i><b>2.2</b> Empirical Order Book (EOB)</a></li>
+<li class="chapter" data-level="2.3" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-ime-condition-in-eob"><i class="fa fa-check"></i><b>2.3</b> Enforcement of IME condition in EOB</a></li>
+<li class="chapter" data-level="2.4" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-vc-condition-in-eob"><i class="fa fa-check"></i><b>2.4</b> Enforcement of VC condition in EOB</a></li>
+</ul></li>
+<li class="chapter" data-level="3" data-path="results.html"><a href="results.html"><i class="fa fa-check"></i><b>3</b> Results</a><ul>
+<li class="chapter" data-level="3.1" data-path="results.html"><a href="results.html#application-to-bitstamp-data"><i class="fa fa-check"></i><b>3.1</b> Application to Bitstamp data</a></li>
+<li class="chapter" data-level="3.2" data-path="results.html"><a href="results.html#application-to-bitfinex-data"><i class="fa fa-check"></i><b>3.2</b> Application to Bitfinex data</a></li>
+</ul></li>
+<li class="chapter" data-level="4" data-path="discussion.html"><a href="discussion.html"><i class="fa fa-check"></i><b>4</b> Discussion</a></li>
+<li class="chapter" data-level="" data-path="references.html"><a href="references.html"><i class="fa fa-check"></i>References</a></li>
+</ul>
+
+      </nav>
+    </div>
+
+    <div class="book-body">
+      <div class="body-inner">
+        <div class="book-header" role="navigation">
+          <h1>
+            <i class="fa fa-circle-o-notch fa-spin"></i><a href="./">Order book reconstruction from quotes and trades streams</a>
+          </h1>
+        </div>
+
+        <div class="page-wrapper" tabindex="-1" role="main">
+          <div class="page-inner">
+
+            <section class="normal" id="section-">
+<div id="reconstruction-algorithm" class="section level1">
+<h1><span class="header-section-number">2</span> Reconstruction algorithm</h1>
+<div id="ideal-order-book-iob" class="section level2">
+<h2><span class="header-section-number">2.1</span> Ideal Order Book (IOB)</h2>
+<p>Consider a definition given in <span class="citation">(Bouchaud and Bonart 2018)</span>:</p>
+<blockquote>
+<p>An order is a commitment, declared at a given submission time, to buy or sell a given volume of an asset at no worse than a given price. An order <span class="math inline">\(x\)</span> is thus described by four attributes:</p>
+<ul>
+<li>its sign (or direction) <span class="math inline">\(\epsilon = \pm 1\)</span>, (<span class="math inline">\(\epsilon_x = +1\)</span> for buy orders; <span class="math inline">\(\epsilon_x = −1\)</span> for sell orders),</li>
+<li>its price <span class="math inline">\(p_x\)</span> ,</li>
+<li>its volume <span class="math inline">\(v_x &gt; 0\)</span>, and</li>
+<li>its submission time <span class="math inline">\(t_x\)</span>.</li>
+</ul>
+<p>We introduce the succinct notation <span class="math inline">\(x := (\epsilon_x , p_x ,v_x, t_x )\)</span>.</p>
+</blockquote>
+<p><span class="citation">(Bouchaud and Bonart 2018)</span> then continues with a description of what they call The Trade-Matching Algorithm:</p>
+<blockquote>
+<p>Whenever a trader submits a buy (respectively, sell) order <span class="math inline">\(x\)</span>, an LOB’s <em>trade-matching algorithm</em> checks whether it is possible for <span class="math inline">\(x\)</span> to match to existing sell (respectively,buy)orders <span class="math inline">\(y\)</span> such that <span class="math inline">\(p_y \leq p_x\)</span> (respectively, <span class="math inline">\(p_y \geq p_x\)</span>). If so, the matching occurs immediately and the relevant traders perform a trade for the agreed amount at the agreed price. Any portion of <span class="math inline">\(x\)</span> that does not match instead becomes active at the price <span class="math inline">\(p_x\)</span>, and it remains active until either it matches to an incoming sell (respectively, buy) order or it is cancelled. Cancellation usually occurs when the owner of an order no longer wishes to offer a trade at the stated price.</p>
+</blockquote>
+<p>Above definition and description are incomplete:</p>
+<ul>
+<li><p>According to the definition, an order <span class="math inline">\(x\)</span> seems to be an immutable entity. But according to the Trade-Matching algorithm, a portion of <span class="math inline">\(x\)</span> may become ‘active’ and it is not clear how the quality of being ‘active’ is different from the mere existence of submitted orders,</p></li>
+<li><p>At what price the trade is performed - <span class="math inline">\(p_x\)</span> or <span class="math inline">\(p_y\)</span> - is not explicitly stated,</p></li>
+<li><p>It is not stated what will happen if <span class="math inline">\(v_x \leq v_y\)</span>, etc.</p></li>
+</ul>
+<p>Surprisingly, the concept of order and operations of a continous double auction appear to be rather complicated things if one attempts to define them rigorously!</p>
+<div id="definitions" class="section level3">
+<h3><span class="header-section-number">2.1.1</span> Definitions</h3>
+<p>Hereafter is assumed that a single asset is traded and a single currency is used.</p>
+
+<div class="definition">
+<p><span id="def:order" class="definition"><strong>Definition 2.1  (Order)  </strong></span>Suppose that:</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(i \in \mathbb{Z}\)</span> is called an <em>unique order identification</em>,</li>
+<li><p><span class="math inline">\(\mathcal{T^i}\)</span> is a set of intervals <span class="math inline">\(\mathcal{T^i} = \{T_k^i\}_{k=0}^{N^i}\)</span> called <em>order intervals</em> where each <span class="math inline">\(T_k^i\)</span> is either a proper interval with endpoints <span class="math inline">\(s_k^i \in \mathbb{R}_{&gt;0}\)</span>, <span class="math inline">\(e_k^i \in \mathbb{R}_{&gt;0} \cup \{+\infty\}\)</span>, <span class="math inline">\(s_k^i &lt; e_k^i\)</span> or a degenerate interval <span class="math inline">\(\{s_k^i\}, s_k^i \in \mathbb{R}_{&gt;0}\)</span> and <span class="math inline">\(\forall m \neq n : T_m^i \cap T_n^i = \emptyset\)</span>,</p></li>
+<li><p><span class="math inline">\(\chi_{T_k^i} : \mathbb{R} \mapsto \{0,1\}\)</span> is an indicator function of intervals in <span class="math inline">\(\mathcal{T^i}\)</span>:
+<span class="math inline">\(\chi_{T_k^i}(t) = \begin{cases} 1, &amp; t \in T_k^i \\ 0, &amp; \text{otherwise} \end{cases}\)</span>,</p></li>
+<li><p><span class="math inline">\(\mathcal{P}^i = \{p_k^i\}_{k=0}^{N^i}\)</span> is a set of constants <span class="math inline">\(p_k^i \in \mathbb{R}_{&gt;0}\)</span> called <em>order prices</em>,</p></li>
+<li><p><span class="math inline">\(\mathcal{V}^i = \{v_k^i\}_{k=0}^{N^i}\)</span> is a set of constants called <em>order volumes</em>, such that either <span class="math inline">\(v_k^i \in \mathbb{R}_{&lt;0}\)</span> or <span class="math inline">\(v_k^i \in \mathbb{R}_{&gt;0}\)</span>,</p></li>
+<li><p>Sets <span class="math inline">\(\mathcal{P}^i\)</span> and <span class="math inline">\(\mathcal{V}^i\)</span> satisfy the following condition <span class="math inline">\(\forall k \in [0, \ldots, N_i) : (p_k^i, v_k^i) \neq (p_{k+1}^i, v_{k+1}^i)\)</span>,</p></li>
+</ol>
+Then a vector-valued function <span class="math inline">\(\mathbf{o}^i(t) : \mathbb{R}_{&gt;0} \mapsto \mathbb{R}_{&gt;0} \times \mathbb{R}\)</span> representing a commitment to buy or sell a given volume <span class="math inline">\(v\)</span> of an asset at no worse than a given price <span class="math inline">\(p\)</span> at a particular time <span class="math inline">\(t\)</span> with a closed form:
+<span class="math display">\[
+  \mathbf{o}^i(t) = (p^i(t), v^i(t)) = \Big( \sum_{k=1}^{N^i} p_k^i \chi_{T_k^i}(t),  \sum_{k=1}^{N^i} v_k^i \chi_{T_k^i}(t) \Big)
+\]</span> is called an <em>order</em>. If <span class="math inline">\(v_k^i \in \mathbb{R}_{&lt;0}\)</span> the order is a commitment to <em>sell</em> and is also called a <em>sell order</em>. If <span class="math inline">\(v_k^i \in \mathbb{R}_{&gt;0}\)</span> the order is a commitment to <em>buy</em> and is also called a <em>buy order</em>.
+</div>
+
+<p>Whenever it is clear from the context, we may also use the word order for:</p>
+<ul>
+<li>An unique order identification <span class="math inline">\(i\)</span> number</li>
+<li>An order as defined in <span class="citation">(Bouchaud and Bonart 2018)</span> (see above)</li>
+<li>The value of tuple <span class="math inline">\((i, p^i(t_0), v^i(t_0))\)</span> at the particular time <span class="math inline">\(t_0\)</span></li>
+</ul>
+<p>Now we can define</p>
+
+<div class="definition">
+<span id="def:order-volume" class="definition"><strong>Definition 2.2  (Order Volume)  </strong></span>The function <span class="math inline">\(v^i(t)\)</span> in definition <a href="reconstruction-algorithm.html#def:order">2.1</a> is called an <em>order volume</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:fill-volume" class="definition"><strong>Definition 2.3  (Filled Volume and Trade)  </strong></span>The filled volume <span class="math inline">\(f^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
+<span class="math display">\[
+  f^i(t) = v^i(t) - \lim_{t^{&#39;} \downarrow t} v^i(t^{&#39;})
+  \]</span>
+The tuple <span class="math inline">\((t, f^i(t), p^i(t))\)</span> is called a <em>trade</em>. If order <span class="math inline">\(i\)</span> is a buy order then the trade is called a <em>sell trade</em>. Otherwise it is a <em>buy trade</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:cancelled-volume" class="definition"><strong>Definition 2.4  (Cancelled Volume)  </strong></span>The cancelled volume <span class="math inline">\(c^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
+<span class="math display">\[
+  c^i(t) = \lim_{t^{&#39;} \uparrow t} v^i(t^{&#39;}) - v^i(t)
+  \]</span>
+</div>
+
+
+<div class="definition">
+<span id="def:order-price" class="definition"><strong>Definition 2.5  (Order Price)  </strong></span>The function <span class="math inline">\(p^i(t)\)</span> in definition <a href="reconstruction-algorithm.html#def:order">2.1</a> is called an <em>order price</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:best-bid-price" class="definition"><strong>Definition 2.6  (Best Bid Price)  </strong></span>Suppose we are given a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i(t)\}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{B} =\{\mathbf{o}^b(t)\}_{v_k^b &gt; 0} \subset \mathcal{L}\)</span> of buy orders is called <em>bids</em> and the function <span class="math inline">\(b(t)\)</span> is defined as:
+<span class="math display">\[
+  b_{\mathcal{L}}(t) = \begin{cases} \max_{\mathbf{o}^b(t) \in \mathcal{B}} p^b(t), &amp; \text{ if } \mathcal{B} \neq \emptyset \\0, &amp; \text{ otherwise }  \end{cases}
+  \]</span> is called <em>best bid price</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:best-ask-price" class="definition"><strong>Definition 2.7  (Best Ask Price)  </strong></span>Suppose we are given a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i(t)\}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{A} =\{\mathbf{o}^a(t)\}_{v_k^a &lt; 0} \subset \mathcal{L}\)</span> of sell orders is called <em>asks</em> and the function <span class="math inline">\(a(t)\)</span> is defined as:
+<span class="math display">\[
+  a_{\mathcal{L}}(t) = \begin{cases} \min_{\mathbf{o}^a(t) \in \mathcal{A}} p^a(t) &amp; \text{ if } \mathcal{A} \neq \emptyset \\ +\infty, &amp; \text{ otherwise } \end{cases}
+  \]</span> is called <em>best ask price</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:match" class="definition"><strong>Definition 2.8  (Matched Orders)  </strong></span>A buy order <span class="math inline">\(\mathbf{o}^b(t)\)</span> and a sell order <span class="math inline">\(\mathbf{o}^s(t)\)</span> are called <em>matched</em> if <span class="math inline">\(\exists t : p^b(t) \geq p^s(t)\)</span>. If <span class="math display">\[\lim_{t^{&#39;} \uparrow t} p^s(t) \neq p^s(t)\]</span> then <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called a <em>resting</em> order. Otherwise, <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called a <em>resting</em> order.
+The set of matched buy orders at time <span class="math inline">\(t\)</span> we will denote <span class="math inline">\(\mathcal{M}_{\text{bid}}(t)\)</span> and the set of matched sell orders - <span class="math inline">\(\mathcal{M}_{\text{ask}}(t)\)</span>.
+</div>
+
+
+<div class="definition">
+<p><span id="def:iob" class="definition"><strong>Definition 2.9  (Ideal Order Book)  </strong></span>Suppose a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i(t)\}\)</span> is given. <span class="math inline">\(\mathcal{L}\)</span> is called <em>Ideal Order Book (IOB)</em> if the following conditions are satisfied:</p>
+<ol style="list-style-type: lower-alpha">
+<li>Instantaneous Match Execution (IME)
+<span class="math display" id="eq:instant-match">\[ \lambda \Big( \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\}\Big) = 0
+\tag{2.1}
+  \]</span> where <span class="math inline">\(\lambda(X)\)</span> is the Lebesgue measure of set <span class="math inline">\(X\)</span>.</li>
+<li>Volume Conservation (VC)
+<span class="math display" id="eq:volume-conservation">\[
+    \forall t \in \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\} : \sum_{\mathbf{o}^b(t) \in \mathcal{M}_{\text{bid}}(t)} f^b(t) = \sum_{\mathbf{o}^s(t) \in \mathcal{M}_{\text{ask}}(t)} |f^s(t)|
+    \tag{2.2}
+    \]</span></li>
+</ol>
+</div>
+
+
+<div class="definition">
+<span id="def:order-placement-policy" class="definition"><strong>Definition 2.10  (Order Placement Policy)  </strong></span>Suppose that <span class="math inline">\(\mathbb{L}\)</span> is a set of all Ideal Order Books <span class="math inline">\(\mathcal{L}\)</span> as defined by <a href="reconstruction-algorithm.html#def:iob">2.9</a>. The function <span class="math inline">\(\mathcal{P}(\mathcal{L},t, p, v) : \mathbb{L} \times \mathbb{R}_{&gt;0} \times \mathbb{R}_{&gt;0} \times \mathbb{R}_{\neq 0} \mapsto \mathbb{L}\)</span> is called an <em>order placement policy</em>. It defines how a new order submitted at time <span class="math inline">\(t\)</span> with price <span class="math inline">\(p\)</span> and volume <span class="math inline">\(v\)</span> is added to IOB <span class="math inline">\(\mathcal{L}\)</span> and how the existing orders in <span class="math inline">\(\mathcal{L}\)</span> are modified, if necessesary.
+</div>
+
+</div>
+<div id="example" class="section level3">
+<h3><span class="header-section-number">2.1.2</span> Example</h3>
+<p>To make these definitions intuitevely clear, let’s consider how IOB <span class="math inline">\(\mathcal{L}\)</span> would evolve under some order placement policy <span class="math inline">\(\mathcal{P}\)</span> in a typical scenario of placing several buy and sell orders.</p>
+<ol style="list-style-type: decimal">
+<li><p>A buy order is submitted at time <span class="math inline">\(t_1\)</span> with the price <span class="math inline">\(p_1\)</span> and volume <span class="math inline">\(v_1\)</span> and is transformed by <span class="math inline">\(\mathcal{P}\)</span> into <span class="math inline">\(\mathbf{o}^1(t)\)</span>:</p>
+<ul>
+<li><span class="math inline">\(\mathbf{o}^1(t)\)</span> is added to <span class="math inline">\(\mathcal{L}\)</span>: <span class="math display">\[
+\mathbf{o}^1(t) = \left[
+ \begin{eqnarray}
+\mathcal{T}^1 &amp; = &amp; \{ [t_1, +\infty) \} \\
+\mathcal{P}^1 &amp; = &amp; \{ p_1 \} \\
+\mathcal{V}^1 &amp; = &amp; \{ v_1 \}
+ \end{eqnarray} 
+ \right.
+ \]</span></li>
+</ul></li>
+<li><p>A sell order with price <span class="math inline">\(p_2 &lt; p_1\)</span> and volume <span class="math inline">\(|v_2| &lt; |v_1|\)</span> is submitted and transformed into <span class="math inline">\(\mathbf{o}^2(t)\)</span>, matched with <span class="math inline">\(\mathbf{o}^1(t)\)</span> so the latter is partially filled at time <span class="math inline">\(t_2\)</span>. All these actions are performed by <span class="math inline">\(\mathcal{P}\)</span>. Note that the right endpoint <span class="math inline">\(t_2\)</span> below is included:</p>
+<ul>
+<li><span class="math inline">\(\mathbf{o}^1(t)\)</span> is changed: <span class="math display">\[
+\mathbf{o}^1(t) = \left[
+ \begin{eqnarray}
+\mathcal{T}^1 &amp; = &amp; \{ [t_1, t_2], (t_2, +\infty] \} \\
+\mathcal{P}^1 &amp; = &amp; \{ p_1, p_1 \} \\
+\mathcal{V}^1 &amp; = &amp; \{ v_1, v_1 - v_2 \}
+\end{eqnarray}
+\right.
+\]</span></li>
+<li><span class="math inline">\(\mathbf{o}^2(t)\)</span> is added to <span class="math inline">\(\mathcal{L}\)</span>: <span class="math display">\[
+\mathbf{o}^2(t) = \left[
+ \begin{eqnarray}
+\mathcal{T}^2 &amp; = &amp; \{ {t_2} \} \\
+\mathcal{P}^2 &amp; = &amp; \{ p_2 \} \\
+\mathcal{V}^2 &amp; = &amp; \{ v_2 \}
+\end{eqnarray}
+\right.
+\]</span></li>
+</ul></li>
+<li>A sell order with price <span class="math inline">\(p_3 &lt; p_1\)</span> and volume <span class="math inline">\(v_3\)</span> is submitted by the same trader as the one who submitted <span class="math inline">\(\mathbf{o}^1(t)\)</span>. The order is transformed into <span class="math inline">\(\mathbf{o}^3(t)\)</span> and <span class="math inline">\(\mathbf{o}^1(t)\)</span> is cancelled (note that the right endpoint <span class="math inline">\(t_3\)</span> below is not included) due to self-trade prevention policy, which is part of <span class="math inline">\(\mathcal{P}\)</span>, at time <span class="math inline">\(t_3\)</span> (as, for example, CME Globex would do by default):
+<ul>
+<li><span class="math inline">\(\mathbf{o}^1(t)\)</span> is changed: <span class="math display">\[
+\mathbf{o}^1(t) = \left[
+ \begin{eqnarray}
+\mathcal{T}^1 &amp; = &amp; \{ [t_1, t_2], (t_2, t_3) \} \\
+\mathcal{P}^1 &amp; = &amp; \{ p_1, p_1 \} \\
+\mathcal{V}^1 &amp; = &amp; \{ v_1, v_1 - v_2 \}
+\end{eqnarray}
+\right.
+\]</span></li>
+<li><span class="math inline">\(\mathbf{o}^2(t)\)</span> remains the same,</li>
+<li><span class="math inline">\(\mathbf{o}^3(t)\)</span> is added to <span class="math inline">\(\mathcal{L}\)</span>: <span class="math display">\[
+\mathbf{o}^3(t) = \left[
+ \begin{eqnarray}
+\mathcal{T}^3 &amp; = &amp; \{ [t_3, +\infty) \} \\
+\mathcal{P}^3 &amp; = &amp; \{ p_3 \} \\
+\mathcal{V}^3 &amp; = &amp; \{ v_3 \}
+\end{eqnarray}
+\right.
+\]</span></li>
+</ul></li>
+</ol>
+</div>
+</div>
+<div id="empirical-order-book-eob" class="section level2">
+<h2><span class="header-section-number">2.2</span> Empirical Order Book (EOB)</h2>
+<p>Formally speaking, the reconstruction algorithm is supposed to produce Ideal Order Book from non-ideal data provided by an exchange. The effort required varies by an exchange. For example <a href="https://www.moex.com/">MOEX</a> provides data of close to ideal quality while <a href="https://www.moex.com/">Bitfinex</a> does not report unique order identifications for trades and omits market orders altogether.</p>
+<p>In order to do that we need some more definitions.</p>
+
+<div class="definition">
+<span id="def:order-events" class="definition"><strong>Definition 2.11  (Order Events)  </strong></span>Suppose we are given an order <span class="math inline">\(i\)</span> as defined in <a href="reconstruction-algorithm.html#def:order">2.1</a>.
+A set of order <span class="math inline">\(i\)</span> instants <span class="math inline">\(\mathcal{I}^i\)</span> is defined as:
+<span class="math display">\[
+  \mathcal{I}^i = \{t^i_m\}_{m=0}^{M^i}, \forall m \exists k: t^i_m = s^i_k \lor e^i_k
+  \]</span> where <span class="math inline">\(s^i_k\)</span> and <span class="math inline">\(e^i_k\)</span> are endpoints of some interval in <span class="math inline">\(\mathcal{T}^i\)</span>.
+A set of tuples
+<span class="math display">\[
+  \mathcal{E}^i = \{(t^i_m, p^i(e^i_m), v^i(e^i_m))\}_{m=0}^{M_i} = \{e^i_m\}_{m=0}^{M_i}
+  \]</span> is called <em>order events</em>.
+</div>
+
+<p>Intuitevely, <span class="math inline">\(t^i_m\)</span> is a moment in time when the price and/or the volume of the order <span class="math inline">\(i\)</span> has changed and the order event <span class="math inline">\(e^i_m\)</span> tells us new price and volume of the order from this instance untill the next one.</p>
+
+<div class="definition">
+<span id="def:trades" class="definition"><strong>Definition 2.12  (Trades)  </strong></span>Suppose we are given an order <span class="math inline">\(i\)</span> as defined in <a href="reconstruction-algorithm.html#def:order">2.1</a> and a subset of order <span class="math inline">\(i\)</span> instants <span class="math inline">\(\{t^i_n\}_{n=0}^{N_i} : t^i_n \in \mathcal{I}^i\)</span> such that <span class="math inline">\(\forall n: f^i(t^i_n) \neq 0\)</span>. Then a set of trades as defined in <a href="reconstruction-algorithm.html#def:fill-volume">2.3</a> is called an <em>order <span class="math inline">\(i\)</span> trades</em>.
+</div>
+
+<p>A typical exchange gives us some kind of event stream and, separately, some kind of trade stream with various level of details. Starting from them we can build</p>
+
+<div class="definition">
+<span id="def:eob" class="definition"><strong>Definition 2.13  (Empirical Order Book)  </strong></span>TBD
+</div>
+
+</div>
+<div id="enforcement-of-ime-condition-in-eob" class="section level2">
+<h2><span class="header-section-number">2.3</span> Enforcement of IME condition in EOB</h2>
+<p>TBD</p>
+</div>
+<div id="enforcement-of-vc-condition-in-eob" class="section level2">
+<h2><span class="header-section-number">2.4</span> Enforcement of VC condition in EOB</h2>
+<p>TBD</p>
+</div>
+</div>
+            </section>
+
+          </div>
+        </div>
+      </div>
+<a href="introduction.html" class="navigation navigation-prev " aria-label="Previous page"><i class="fa fa-angle-left"></i></a>
+<a href="results.html" class="navigation navigation-next " aria-label="Next page"><i class="fa fa-angle-right"></i></a>
+    </div>
+  </div>
+<script src="libs/gitbook-2.6.7/js/app.min.js"></script>
+<script src="libs/gitbook-2.6.7/js/lunr.js"></script>
+<script src="libs/gitbook-2.6.7/js/clipboard.min.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-search.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-sharing.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-fontsettings.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-bookdown.js"></script>
+<script src="libs/gitbook-2.6.7/js/jquery.highlight.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-clipboard.js"></script>
+<script>
+gitbook.require(["gitbook"], function(gitbook) {
+gitbook.start({
+"sharing": {
+"github": false,
+"facebook": true,
+"twitter": true,
+"linkedin": false,
+"weibo": false,
+"instapaper": false,
+"vk": false,
+"all": ["facebook", "twitter", "linkedin", "weibo", "instapaper"]
+},
+"fontsettings": {
+"theme": "white",
+"family": "sans",
+"size": 2
+},
+"edit": {
+"link": null,
+"text": null
+},
+"history": {
+"link": null,
+"text": null
+},
+"view": {
+"link": null,
+"text": null
+},
+"download": null,
+"toc": {
+"collapse": "subsection"
+},
+"search": false
+});
+});
+</script>
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    var src = "true";
+    if (src === "" || src === "true") src = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-MML-AM_CHTML";
+    if (location.protocol !== "file:")
+      if (/^https?:/.test(src))
+        src = src.replace(/^https?:/, '');
+    script.src = src;
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+</body>
+
+</html>

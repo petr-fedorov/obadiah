@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="" xml:lang="">
+<head>
+
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>Order book reconstruction from quotes and trades streams</title>
+  <meta name="description" content="Order book reconstruction from quotes and trades streams" />
+  <meta name="generator" content="bookdown 0.17 and GitBook 2.6.7" />
+
+  <meta property="og:title" content="Order book reconstruction from quotes and trades streams" />
+  <meta property="og:type" content="book" />
+  
+  
+  
+  
+
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="Order book reconstruction from quotes and trades streams" />
+  
+  
+  
+
+<meta name="author" content="Petr Fedorov" />
+
+
+<meta name="date" content="2020-03-20" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  
+  
+
+<link rel="next" href="reconstruction-algorithm.html"/>
+<script src="libs/jquery-2.2.3/jquery.min.js"></script>
+<link href="libs/gitbook-2.6.7/css/style.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-table.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-bookdown.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-highlight.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-search.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-fontsettings.css" rel="stylesheet" />
+<link href="libs/gitbook-2.6.7/css/plugin-clipboard.css" rel="stylesheet" />
+
+
+
+
+
+
+
+
+
+
+
+
+</head>
+
+<body>
+
+
+
+  <div class="book without-animation with-summary font-size-2 font-family-1" data-basepath=".">
+
+    <div class="book-summary">
+      <nav role="navigation">
+
+<ul class="summary">
+<li class="chapter" data-level="1" data-path="introduction.html"><a href="introduction.html"><i class="fa fa-check"></i><b>1</b> Introduction</a><ul>
+<li class="chapter" data-level="1.1" data-path="introduction.html"><a href="introduction.html#continous-time-double-auction-and-lob"><i class="fa fa-check"></i><b>1.1</b> Continous-time double auction and LOB</a></li>
+<li class="chapter" data-level="1.2" data-path="introduction.html"><a href="introduction.html#available-data-sets"><i class="fa fa-check"></i><b>1.2</b> Available data sets</a></li>
+</ul></li>
+<li class="chapter" data-level="2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html"><i class="fa fa-check"></i><b>2</b> Reconstruction algorithm</a><ul>
+<li class="chapter" data-level="2.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#ideal-order-book-iob"><i class="fa fa-check"></i><b>2.1</b> Ideal Order Book (IOB)</a><ul>
+<li class="chapter" data-level="2.1.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#definitions"><i class="fa fa-check"></i><b>2.1.1</b> Definitions</a></li>
+<li class="chapter" data-level="2.1.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#example"><i class="fa fa-check"></i><b>2.1.2</b> Example</a></li>
+</ul></li>
+<li class="chapter" data-level="2.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#empirical-order-book-eob"><i class="fa fa-check"></i><b>2.2</b> Empirical Order Book (EOB)</a></li>
+<li class="chapter" data-level="2.3" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-ime-condition-in-eob"><i class="fa fa-check"></i><b>2.3</b> Enforcement of IME condition in EOB</a></li>
+<li class="chapter" data-level="2.4" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-vc-condition-in-eob"><i class="fa fa-check"></i><b>2.4</b> Enforcement of VC condition in EOB</a></li>
+</ul></li>
+<li class="chapter" data-level="3" data-path="results.html"><a href="results.html"><i class="fa fa-check"></i><b>3</b> Results</a><ul>
+<li class="chapter" data-level="3.1" data-path="results.html"><a href="results.html#application-to-bitstamp-data"><i class="fa fa-check"></i><b>3.1</b> Application to Bitstamp data</a></li>
+<li class="chapter" data-level="3.2" data-path="results.html"><a href="results.html#application-to-bitfinex-data"><i class="fa fa-check"></i><b>3.2</b> Application to Bitfinex data</a></li>
+</ul></li>
+<li class="chapter" data-level="4" data-path="discussion.html"><a href="discussion.html"><i class="fa fa-check"></i><b>4</b> Discussion</a></li>
+<li class="chapter" data-level="" data-path="references.html"><a href="references.html"><i class="fa fa-check"></i>References</a></li>
+</ul>
+
+      </nav>
+    </div>
+
+    <div class="book-body">
+      <div class="body-inner">
+        <div class="book-header" role="navigation">
+          <h1>
+            <i class="fa fa-circle-o-notch fa-spin"></i><a href="./">Order book reconstruction from quotes and trades streams</a>
+          </h1>
+        </div>
+
+        <div class="page-wrapper" tabindex="-1" role="main">
+          <div class="page-inner">
+
+            <section class="normal" id="section-">
+<div id="header">
+<h1 class="title">Order book reconstruction from quotes and trades streams</h1>
+<p class="author"><em>Petr Fedorov</em></p>
+<p class="date"><em>2020-03-20</em></p>
+</div>
+<div id="introduction" class="section level1">
+<h1><span class="header-section-number">1</span> Introduction</h1>
+<div id="continous-time-double-auction-and-lob" class="section level2">
+<h2><span class="header-section-number">1.1</span> Continous-time double auction and LOB</h2>
+<p>Today, most liquid markets – including stocks, futures, and foreign exchange – are electronic, and adopt a continuous-time double auction mechanism using a limit order book (LOB), in which a transaction occurs whenever a buyer and a seller agree on a price<span class="citation">(Bouchaud and Bonart 2018)</span>. Cryptocurrenices are not exception.</p>
+<p>The mechanics of the countinous double auction or LOB trading may be briefly described as follows:</p>
+<ol style="list-style-type: decimal">
+<li>Traders submit <em>limit orders</em> also called <em>quotes</em> and <em>market</em> or <em>market-limit</em> orders (i.e. quotes with the limit price better than the opposite quote best price already in LOB)</li>
+<li><em>Market</em> or <em>market-limit</em> orders are <a href="https://www.investopedia.com/terms/m/matchingorders.asp">matched</a> with <em>quotes</em> and executed to produce <em>trades</em>.</li>
+<li>Unmatched <em>quotes</em> or unmatched amounts of <em>market-limit</em> orders reside in LOB’s queues until matched with another <em>market</em> or <em>market-limit</em> order or cancelled by the participant who submitted it.</li>
+</ol>
+<p>Market or market-limit orders are also often called the <em>aggressing</em> orders while the limit orders sitting in queues are called <em>resting</em> orders.</p>
+<p>Note that not all matched orders are executed and produce trades. This happens due to self-match or self-trade prevention rules. See for example <a href="https://www.cmegroup.com/globex/trade-on-cme-globex/self-match-faq.html">CME Globex Self-Match Prevention</a> or <a href="https://www.coinbase.com/legal/trading_rules">Coinbase Markets Trading Rules 2.4 Self-trade prevention</a>.</p>
+<p>Thus in order to reconstruct the dynamics of the trading process and order book one needs information about submitted quotes, market and market-limit orders and trades produced. As we will see below this information is not always provided by exchanges.</p>
+</div>
+<div id="available-data-sets" class="section level2">
+<h2><span class="header-section-number">1.2</span> Available data sets</h2>
+<p>Most of data sets containing information about quotes and trades consist of two separate loosely coupled files: a <strong>trades</strong> file recording trades and an <strong>quotes</strong> file recording quote placements, changes and cancellations. Loosely coupled in this context means that records in <strong>trades</strong> file do not always have clearly identifiable corresponding records in <strong>quotes</strong> file as one would expect. By definition every trade shoud change some quote in LOB. So a matching or <em>coupling</em> procedure is required in order to establish the link between the <strong>trades</strong> and <strong>quotes</strong> files. This link is necessary to:</p>
+<ul>
+<li>Distinguish between quote changes due to limit order cancellation and market order execution</li>
+<li>Estimate size of submitted market orders</li>
+<li>Distinquish between limit order placements and market limit order placements</li>
+</ul>
+<p>and, overall, to achieve the ultimate goal - to perform a complete order book reconstruction at every moment of time.</p>
+<p>A recently published book <span class="citation">(Abergel 2016)</span> uses the <a href="https://www.refinitiv.com/en/financial-data/market-data/tick-history">Thomson Reuters Tick History (TRTH)</a> database tells us that</p>
+<blockquote>
+<p>Because one cannot distinguish market orders from cancellations just by observing changes in the limit order book (the “event” file), and since, the timestamps of the “trade” and “event” files are asynchronous, we use a matching procedure to reconstruct the order book events.</p>
+</blockquote>
+<p>The reported matching rate of the above procedure is about 85% for CAC 40 stocks and as a byproduct the procedure outputs the sign of each matched trade, that is whether it is a buyer or a seller initiated trade. Note that TRTH data set does not even provide information about trade direction, it has to be deduced!</p>
+<p>The description of similar issues we find in <span class="citation">(Hautsch 2004)</span>:</p>
+<blockquote>
+<p>A typical problem occurs when trades and quotes are recorded in separate trade and quote databases, like, for example, in the Trade and Quote (TAQ) database released by the NYSE. In this case, it is not directly identifiable whether a quote which has been posted some seconds before a transaction was already valid at the corresponding trade.</p>
+</blockquote>
+<p><a href="https://www.bitstamp.net/websocket/v2/">Websocket API v2</a> of the cryptocurrency exchange Bitstamp gives access to the following information for every instrument traded:</p>
+<ul>
+<li><strong>Live ticker</strong> channel - information about trades. Unique ids of participating quote and market order are provided for each trade.</li>
+<li><strong>Live orders</strong> channel - information about quotes and market orders (all order creation, change and deletion events are reported).</li>
+</ul>
+<p>As we will see later, events in these channels are not always sent in correct time order. It seems that some events are ommitted. Timestamps in Live tickers and Live orders channels are not synchronized: market order, changes of quotes and of market order itself caused by the execution of the market order, trades produced - all may have different timestamps. Substantial amount of matched orders are not executed due to <a href="https://www.reddit.com/r/Bitstamp/comments/bbvut2/bitstamp_api_behaviour/?utm_source=share&amp;utm_medium=web2x">self-trade prevention</a> policy of Bitstamp.</p>
+<p>Similarly [Websocket API version 2.0] of the cryptocurrency exchange Bitfinex have the following channels (for every instrument traded):</p>
+<ul>
+<li><strong>Trades</strong> channel - information about trades. Ids of participating quote and market orders are not reported</li>
+<li><strong>Raw book</strong> channel - provides information about 100 best bid and 100 ask quotes. Market orders are not reported. Quotes reported as deleted when they fall beyond 100+ best quotes and created again with the same id when they return back. What was happening to them between these moments is not known. Since Bitfinex allows traders to change the price and volume of submitted quotes, the quotes may be changed or just cancelled.</li>
+</ul>
+<p>As well as at Bitstamp, records in Trades and Raw book channels are not synchronized.</p>
+<p>It should be clear from the above that substantial effort is required to reconstruct the true dynamics of order submission, matching and execution.</p>
+</div>
+</div>
+            </section>
+
+          </div>
+        </div>
+      </div>
+
+<a href="reconstruction-algorithm.html" class="navigation navigation-next navigation-unique" aria-label="Next page"><i class="fa fa-angle-right"></i></a>
+    </div>
+  </div>
+<script src="libs/gitbook-2.6.7/js/app.min.js"></script>
+<script src="libs/gitbook-2.6.7/js/lunr.js"></script>
+<script src="libs/gitbook-2.6.7/js/clipboard.min.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-search.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-sharing.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-fontsettings.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-bookdown.js"></script>
+<script src="libs/gitbook-2.6.7/js/jquery.highlight.js"></script>
+<script src="libs/gitbook-2.6.7/js/plugin-clipboard.js"></script>
+<script>
+gitbook.require(["gitbook"], function(gitbook) {
+gitbook.start({
+"sharing": {
+"github": false,
+"facebook": true,
+"twitter": true,
+"linkedin": false,
+"weibo": false,
+"instapaper": false,
+"vk": false,
+"all": ["facebook", "twitter", "linkedin", "weibo", "instapaper"]
+},
+"fontsettings": {
+"theme": "white",
+"family": "sans",
+"size": 2
+},
+"edit": {
+"link": null,
+"text": null
+},
+"history": {
+"link": null,
+"text": null
+},
+"view": {
+"link": null,
+"text": null
+},
+"download": null,
+"toc": {
+"collapse": "subsection"
+},
+"search": false
+});
+});
+</script>
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    var src = "true";
+    if (src === "" || src === "true") src = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-MML-AM_CHTML";
+    if (location.protocol !== "file:")
+      if (/^https?:/.test(src))
+        src = src.replace(/^https?:/, '');
+    script.src = src;
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+</body>
+
+</html>
