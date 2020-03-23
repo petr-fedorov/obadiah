@@ -6,7 +6,7 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge" />
   <title>2 Reconstruction algorithm | Order book reconstruction from quotes and trades streams</title>
   <meta name="description" content="2 Reconstruction algorithm | Order book reconstruction from quotes and trades streams" />
-  <meta name="generator" content="bookdown 0.17 and GitBook 2.6.7" />
+  <meta name="generator" content="bookdown 0.18 and GitBook 2.6.7" />
 
   <meta property="og:title" content="2 Reconstruction algorithm | Order book reconstruction from quotes and trades streams" />
   <meta property="og:type" content="book" />
@@ -24,7 +24,7 @@
 <meta name="author" content="Petr Fedorov" />
 
 
-<meta name="date" content="2020-03-20" />
+<meta name="date" content="2020-03-23" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -52,6 +52,68 @@
 
 
 
+<style type="text/css">
+a.sourceLine { display: inline-block; line-height: 1.25; }
+a.sourceLine { pointer-events: none; color: inherit; text-decoration: inherit; }
+a.sourceLine:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode { white-space: pre; position: relative; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+code.sourceCode { white-space: pre-wrap; }
+a.sourceLine { text-indent: -1em; padding-left: 1em; }
+}
+pre.numberSource a.sourceLine
+  { position: relative; left: -4em; }
+pre.numberSource a.sourceLine::before
+  { content: attr(title);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; pointer-events: all; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+    color: #aaaaaa;
+  }
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+div.sourceCode
+  {  }
+@media screen {
+a.sourceLine::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+code span.at { color: #7d9029; } /* Attribute */
+code span.bn { color: #40a070; } /* BaseN */
+code span.bu { } /* BuiltIn */
+code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+code span.ch { color: #4070a0; } /* Char */
+code span.cn { color: #880000; } /* Constant */
+code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+code span.dt { color: #902000; } /* DataType */
+code span.dv { color: #40a070; } /* DecVal */
+code span.er { color: #ff0000; font-weight: bold; } /* Error */
+code span.ex { } /* Extension */
+code span.fl { color: #40a070; } /* Float */
+code span.fu { color: #06287e; } /* Function */
+code span.im { } /* Import */
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+code span.op { color: #666666; } /* Operator */
+code span.ot { color: #007020; } /* Other */
+code span.pp { color: #bc7a00; } /* Preprocessor */
+code span.sc { color: #4070a0; } /* SpecialChar */
+code span.ss { color: #bb6688; } /* SpecialString */
+code span.st { color: #4070a0; } /* String */
+code span.va { color: #19177c; } /* Variable */
+code span.vs { color: #4070a0; } /* VerbatimString */
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+</style>
 
 </head>
 
@@ -70,13 +132,13 @@
 <li class="chapter" data-level="1.2" data-path="introduction.html"><a href="introduction.html#available-data-sets"><i class="fa fa-check"></i><b>1.2</b> Available data sets</a></li>
 </ul></li>
 <li class="chapter" data-level="2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html"><i class="fa fa-check"></i><b>2</b> Reconstruction algorithm</a><ul>
-<li class="chapter" data-level="2.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#ideal-order-book-iob"><i class="fa fa-check"></i><b>2.1</b> Ideal Order Book (IOB)</a><ul>
-<li class="chapter" data-level="2.1.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#definitions"><i class="fa fa-check"></i><b>2.1.1</b> Definitions</a></li>
-<li class="chapter" data-level="2.1.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#example"><i class="fa fa-check"></i><b>2.1.2</b> Example</a></li>
-</ul></li>
-<li class="chapter" data-level="2.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#empirical-order-book-eob"><i class="fa fa-check"></i><b>2.2</b> Empirical Order Book (EOB)</a></li>
-<li class="chapter" data-level="2.3" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-ime-condition-in-eob"><i class="fa fa-check"></i><b>2.3</b> Enforcement of IME condition in EOB</a></li>
-<li class="chapter" data-level="2.4" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-vc-condition-in-eob"><i class="fa fa-check"></i><b>2.4</b> Enforcement of VC condition in EOB</a></li>
+<li class="chapter" data-level="2.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#order"><i class="fa fa-check"></i><b>2.1</b> Order</a></li>
+<li class="chapter" data-level="2.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#order-book"><i class="fa fa-check"></i><b>2.2</b> Order Book</a></li>
+<li class="chapter" data-level="2.3" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#empirical-order-and-order-book"><i class="fa fa-check"></i><b>2.3</b> Empirical Order and Order Book</a></li>
+<li class="chapter" data-level="2.4" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#initial-reconstruction"><i class="fa fa-check"></i><b>2.4</b> Initial Reconstruction</a></li>
+<li class="chapter" data-level="2.5" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#quotes-and-trades-coupling"><i class="fa fa-check"></i><b>2.5</b> Quotes and Trades Coupling</a></li>
+<li class="chapter" data-level="2.6" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-ime-condition-in-eob"><i class="fa fa-check"></i><b>2.6</b> Enforcement of IME condition in EOB</a></li>
+<li class="chapter" data-level="2.7" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-vc-condition-in-eob"><i class="fa fa-check"></i><b>2.7</b> Enforcement of VC condition in EOB</a></li>
 </ul></li>
 <li class="chapter" data-level="3" data-path="results.html"><a href="results.html"><i class="fa fa-check"></i><b>3</b> Results</a><ul>
 <li class="chapter" data-level="3.1" data-path="results.html"><a href="results.html#application-to-bitstamp-data"><i class="fa fa-check"></i><b>3.1</b> Application to Bitstamp data</a></li>
@@ -103,8 +165,8 @@
             <section class="normal" id="section-">
 <div id="reconstruction-algorithm" class="section level1">
 <h1><span class="header-section-number">2</span> Reconstruction algorithm</h1>
-<div id="ideal-order-book-iob" class="section level2">
-<h2><span class="header-section-number">2.1</span> Ideal Order Book (IOB)</h2>
+<div id="order" class="section level2">
+<h2><span class="header-section-number">2.1</span> Order</h2>
 <p>Consider a definition given in <span class="citation">(Bouchaud and Bonart 2018)</span>:</p>
 <blockquote>
 <p>An order is a commitment, declared at a given submission time, to buy or sell a given volume of an asset at no worse than a given price. An order <span class="math inline">\(x\)</span> is thus described by four attributes:</p>
@@ -127,24 +189,22 @@
 <li><p>It is not stated what will happen if <span class="math inline">\(v_x \leq v_y\)</span>, etc.</p></li>
 </ul>
 <p>Surprisingly, the concept of order and operations of a continous double auction appear to be rather complicated things if one attempts to define them rigorously!</p>
-<div id="definitions" class="section level3">
-<h3><span class="header-section-number">2.1.1</span> Definitions</h3>
 <p>Hereafter is assumed that a single asset is traded and a single currency is used.</p>
 
 <div class="definition">
 <p><span id="def:order" class="definition"><strong>Definition 2.1  (Order)  </strong></span>Suppose that:</p>
 <ol style="list-style-type: lower-alpha">
 <li><span class="math inline">\(i \in \mathbb{Z}\)</span> is called an <em>unique order identification</em>,</li>
-<li><p><span class="math inline">\(\mathcal{T^i}\)</span> is a set of intervals <span class="math inline">\(\mathcal{T^i} = \{T_k^i\}_{k=0}^{N^i}\)</span> called <em>order intervals</em> where each <span class="math inline">\(T_k^i\)</span> is either a proper interval with endpoints <span class="math inline">\(s_k^i \in \mathbb{R}_{&gt;0}\)</span>, <span class="math inline">\(e_k^i \in \mathbb{R}_{&gt;0} \cup \{+\infty\}\)</span>, <span class="math inline">\(s_k^i &lt; e_k^i\)</span> or a degenerate interval <span class="math inline">\(\{s_k^i\}, s_k^i \in \mathbb{R}_{&gt;0}\)</span> and <span class="math inline">\(\forall m \neq n : T_m^i \cap T_n^i = \emptyset\)</span>,</p></li>
+<li><p><span class="math inline">\(\mathcal{T^i}\)</span> is a set of intervals <span class="math inline">\(\mathcal{T^i} = \{T_k^i\}_{k=0}^{K^i}\)</span> called <em>order intervals</em> where each <span class="math inline">\(T_k^i\)</span> is either a proper interval with endpoints <span class="math inline">\(s_k^i \in \mathbb{R}_{&gt;0}\)</span>, <span class="math inline">\(e_k^i \in \mathbb{R}_{&gt;0} \cup \{+\infty\}\)</span>, <span class="math inline">\(s_k^i &lt; e_k^i\)</span> or a degenerate interval <span class="math inline">\(\{s_k^i\}, s_k^i \in \mathbb{R}_{&gt;0}\)</span> and <span class="math inline">\(\forall m \neq n : T_m^i \cap T_n^i = \emptyset\)</span>,</p></li>
 <li><p><span class="math inline">\(\chi_{T_k^i} : \mathbb{R} \mapsto \{0,1\}\)</span> is an indicator function of intervals in <span class="math inline">\(\mathcal{T^i}\)</span>:
 <span class="math inline">\(\chi_{T_k^i}(t) = \begin{cases} 1, &amp; t \in T_k^i \\ 0, &amp; \text{otherwise} \end{cases}\)</span>,</p></li>
-<li><p><span class="math inline">\(\mathcal{P}^i = \{p_k^i\}_{k=0}^{N^i}\)</span> is a set of constants <span class="math inline">\(p_k^i \in \mathbb{R}_{&gt;0}\)</span> called <em>order prices</em>,</p></li>
-<li><p><span class="math inline">\(\mathcal{V}^i = \{v_k^i\}_{k=0}^{N^i}\)</span> is a set of constants called <em>order volumes</em>, such that either <span class="math inline">\(v_k^i \in \mathbb{R}_{&lt;0}\)</span> or <span class="math inline">\(v_k^i \in \mathbb{R}_{&gt;0}\)</span>,</p></li>
+<li><p><span class="math inline">\(\mathcal{P}^i = \{p_k^i\}_{k=0}^{K^i}\)</span> is a set of constants <span class="math inline">\(p_k^i \in \mathbb{R}_{&gt;0}\)</span> called <em>order prices</em>,</p></li>
+<li><p><span class="math inline">\(\mathcal{V}^i = \{v_k^i\}_{k=0}^{K^i}\)</span> is a set of constants called <em>order volumes</em>, such that either <span class="math inline">\(v_k^i \in \mathbb{R}_{&lt;0}\)</span> or <span class="math inline">\(v_k^i \in \mathbb{R}_{&gt;0}\)</span>,</p></li>
 <li><p>Sets <span class="math inline">\(\mathcal{P}^i\)</span> and <span class="math inline">\(\mathcal{V}^i\)</span> satisfy the following condition <span class="math inline">\(\forall k \in [0, \ldots, N_i) : (p_k^i, v_k^i) \neq (p_{k+1}^i, v_{k+1}^i)\)</span>,</p></li>
 </ol>
 Then a vector-valued function <span class="math inline">\(\mathbf{o}^i(t) : \mathbb{R}_{&gt;0} \mapsto \mathbb{R}_{&gt;0} \times \mathbb{R}\)</span> representing a commitment to buy or sell a given volume <span class="math inline">\(v\)</span> of an asset at no worse than a given price <span class="math inline">\(p\)</span> at a particular time <span class="math inline">\(t\)</span> with a closed form:
 <span class="math display">\[
-  \mathbf{o}^i(t) = (p^i(t), v^i(t)) = \Big( \sum_{k=1}^{N^i} p_k^i \chi_{T_k^i}(t),  \sum_{k=1}^{N^i} v_k^i \chi_{T_k^i}(t) \Big)
+  \mathbf{o}^i(t) = (p^i(t), v^i(t)) = \Big( \sum_{k=1}^{K^i} p_k^i \chi_{T_k^i}(t),  \sum_{k=1}^{K^i} v_k^i \chi_{T_k^i}(t) \Big)
 \]</span> is called an <em>order</em>. If <span class="math inline">\(v_k^i \in \mathbb{R}_{&lt;0}\)</span> the order is a commitment to <em>sell</em> and is also called a <em>sell order</em>. If <span class="math inline">\(v_k^i \in \mathbb{R}_{&gt;0}\)</span> the order is a commitment to <em>buy</em> and is also called a <em>buy order</em>.
 </div>
 
@@ -162,7 +222,12 @@ Then a vector-valued function <span class="math inline">\(\mathbf{o}^i(t) : \mat
 
 
 <div class="definition">
-<span id="def:fill-volume" class="definition"><strong>Definition 2.3  (Filled Volume and Trade)  </strong></span>The filled volume <span class="math inline">\(f^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
+<span id="def:order-price" class="definition"><strong>Definition 2.3  (Order Price)  </strong></span>The function <span class="math inline">\(p^i(t)\)</span> in definition <a href="reconstruction-algorithm.html#def:order">2.1</a> is called an <em>order price</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:fill-volume" class="definition"><strong>Definition 2.4  (Filled Volume and Trade)  </strong></span>The filled volume <span class="math inline">\(f^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
 <span class="math display">\[
   f^i(t) = v^i(t) - \lim_{t^{&#39;} \downarrow t} v^i(t^{&#39;})
   \]</span>
@@ -171,68 +236,68 @@ The tuple <span class="math inline">\((t, f^i(t), p^i(t))\)</span> is called a <
 
 
 <div class="definition">
-<span id="def:cancelled-volume" class="definition"><strong>Definition 2.4  (Cancelled Volume)  </strong></span>The cancelled volume <span class="math inline">\(c^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
+<span id="def:cancelled-volume" class="definition"><strong>Definition 2.5  (Cancelled Volume)  </strong></span>The cancelled volume <span class="math inline">\(c^i(t)\)</span> of an order <span class="math inline">\(i\)</span> at time <span class="math inline">\(t\)</span> is defined as:
 <span class="math display">\[
   c^i(t) = \lim_{t^{&#39;} \uparrow t} v^i(t^{&#39;}) - v^i(t)
   \]</span>
 </div>
 
+</div>
+<div id="order-book" class="section level2">
+<h2><span class="header-section-number">2.2</span> Order Book</h2>
 
 <div class="definition">
-<span id="def:order-price" class="definition"><strong>Definition 2.5  (Order Price)  </strong></span>The function <span class="math inline">\(p^i(t)\)</span> in definition <a href="reconstruction-algorithm.html#def:order">2.1</a> is called an <em>order price</em>.
+<span id="def:order-book" class="definition"><strong>Definition 2.6  (Order Book)  </strong></span>A set of orders <span class="math inline">\(\mathcal{O} = \{\mathbf{o}^i(t)\}_i\)</span> is called an <em>order book</em>.
 </div>
 
 
 <div class="definition">
-<span id="def:best-bid-price" class="definition"><strong>Definition 2.6  (Best Bid Price)  </strong></span>Suppose we are given a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i(t)\}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{B} =\{\mathbf{o}^b(t)\}_{v_k^b &gt; 0} \subset \mathcal{L}\)</span> of buy orders is called <em>bids</em> and the function <span class="math inline">\(b(t)\)</span> is defined as:
+<span id="def:order-placement-policy" class="definition"><strong>Definition 2.7  (Order Placement Policy)  </strong></span>Suppose that <span class="math inline">\(\mathbb{O}\)</span> is a set of all Order Books <span class="math inline">\(\mathcal{O}\)</span> as defined by <a href="reconstruction-algorithm.html#def:order-book">2.6</a>. The function <span class="math display">\[\mathcal{P}(\mathcal{O},i, t, p, v) : \mathbb{O} \times \mathbb{Z} \times  \mathbb{R}_{&gt;0} \times \mathbb{R}_{&gt;0} \times \mathbb{R}_{\neq 0} \mapsto \mathbb{O}\]</span> is called an <em>order placement policy</em>. It defines how order <span class="math inline">\(i\)</span> placement or update submitted at time <span class="math inline">\(t\)</span> with price <span class="math inline">\(p\)</span> and volume <span class="math inline">\(v\)</span> is added to the order book <span class="math inline">\(\mathcal{O}\)</span> and how the existing orders in <span class="math inline">\(\mathcal{O}\)</span> are modified, if necessesary.
+</div>
+
+
+<div class="definition">
+<span id="def:best-bid-price" class="definition"><strong>Definition 2.8  (Best Bid Price)  </strong></span>Suppose we are given an order book <span class="math inline">\(\mathcal{O}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{B} =\{\mathbf{o}^b(t)\}_{v_k^b &gt; 0} \subset \mathcal{O}\)</span> of buy orders is called <em>bids</em> and the function <span class="math inline">\(b(t)\)</span> is defined as:
 <span class="math display">\[
-  b_{\mathcal{L}}(t) = \begin{cases} \max_{\mathbf{o}^b(t) \in \mathcal{B}} p^b(t), &amp; \text{ if } \mathcal{B} \neq \emptyset \\0, &amp; \text{ otherwise }  \end{cases}
+  b_{\mathcal{O}}(t) = \begin{cases} \max_{\mathbf{o}^b(t) \in \mathcal{B}} p^b(t), &amp; \text{ if } \mathcal{B} \neq \emptyset \\0, &amp; \text{ otherwise }  \end{cases}
   \]</span> is called <em>best bid price</em>.
 </div>
 
 
 <div class="definition">
-<span id="def:best-ask-price" class="definition"><strong>Definition 2.7  (Best Ask Price)  </strong></span>Suppose we are given a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i(t)\}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{A} =\{\mathbf{o}^a(t)\}_{v_k^a &lt; 0} \subset \mathcal{L}\)</span> of sell orders is called <em>asks</em> and the function <span class="math inline">\(a(t)\)</span> is defined as:
+<span id="def:best-ask-price" class="definition"><strong>Definition 2.9  (Best Ask Price)  </strong></span>Suppose we are given an order book <span class="math inline">\(\mathcal{O}\)</span>. A (possibly empty) subset <span class="math inline">\(\mathcal{A} =\{\mathbf{o}^a(t)\}_{v_k^a &lt; 0} \subset \mathcal{O}\)</span> of sell orders is called <em>asks</em> and the function <span class="math inline">\(a(t)\)</span> is defined as:
 <span class="math display">\[
-  a_{\mathcal{L}}(t) = \begin{cases} \min_{\mathbf{o}^a(t) \in \mathcal{A}} p^a(t) &amp; \text{ if } \mathcal{A} \neq \emptyset \\ +\infty, &amp; \text{ otherwise } \end{cases}
+  a_{\mathcal{O}}(t) = \begin{cases} \min_{\mathbf{o}^a(t) \in \mathcal{A}} p^a(t) &amp; \text{ if } \mathcal{A} \neq \emptyset \\ +\infty, &amp; \text{ otherwise } \end{cases}
   \]</span> is called <em>best ask price</em>.
 </div>
 
 
 <div class="definition">
-<span id="def:match" class="definition"><strong>Definition 2.8  (Matched Orders)  </strong></span>A buy order <span class="math inline">\(\mathbf{o}^b(t)\)</span> and a sell order <span class="math inline">\(\mathbf{o}^s(t)\)</span> are called <em>matched</em> if <span class="math inline">\(\exists t : p^b(t) \geq p^s(t)\)</span>. If <span class="math display">\[\lim_{t^{&#39;} \uparrow t} p^s(t) \neq p^s(t)\]</span> then <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called a <em>resting</em> order. Otherwise, <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called a <em>resting</em> order.
+<span id="def:match" class="definition"><strong>Definition 2.10  (Matched Orders)  </strong></span>Suppose we are given an order book <span class="math inline">\(\mathcal{O}\)</span>. A buy order <span class="math inline">\(\mathbf{o}^b(t) \in \mathcal{O}\)</span> and a sell order <span class="math inline">\(\mathbf{o}^s(t) \in \mathcal{O}\)</span> are called <em>matched</em> if <span class="math inline">\(\exists t : p^b(t) \geq p^s(t)\)</span>. If <span class="math display">\[\lim_{t^{&#39;} \uparrow t} p^s(t) \neq p^s(t)\]</span> then <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called a <em>resting</em> order. Otherwise, <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called a <em>resting</em> order.
 The set of matched buy orders at time <span class="math inline">\(t\)</span> we will denote <span class="math inline">\(\mathcal{M}_{\text{bid}}(t)\)</span> and the set of matched sell orders - <span class="math inline">\(\mathcal{M}_{\text{ask}}(t)\)</span>.
 </div>
 
 
 <div class="definition">
-<p><span id="def:iob" class="definition"><strong>Definition 2.9  (Ideal Order Book)  </strong></span>Suppose a set of orders <span class="math inline">\(\mathcal{L} = \{\mathbf{o}^i(t)\}\)</span> is given. <span class="math inline">\(\mathcal{L}\)</span> is called <em>Ideal Order Book (IOB)</em> if the following conditions are satisfied:</p>
+<p><span id="def:iob" class="definition"><strong>Definition 2.11  (Ideal Order Book)  </strong></span>Suppose we are given an order book <span class="math inline">\(\mathcal{O}\)</span>. Then <span class="math inline">\(\mathcal{O}\)</span> is called <em>Ideal Order Book (IOB)</em> if the following conditions are satisfied:</p>
 <ol style="list-style-type: lower-alpha">
 <li>Instantaneous Match Execution (IME)
-<span class="math display" id="eq:instant-match">\[ \lambda \Big( \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\}\Big) = 0
+<span class="math display" id="eq:instant-match">\[ \lambda \Big( \{t : b_{\mathcal{O}}(t) \geq a_{\mathcal{O}}(t)\}\Big) = 0
 \tag{2.1}
   \]</span> where <span class="math inline">\(\lambda(X)\)</span> is the Lebesgue measure of set <span class="math inline">\(X\)</span>.</li>
 <li>Volume Conservation (VC)
 <span class="math display" id="eq:volume-conservation">\[
-    \forall t \in \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\} : \sum_{\mathbf{o}^b(t) \in \mathcal{M}_{\text{bid}}(t)} f^b(t) = \sum_{\mathbf{o}^s(t) \in \mathcal{M}_{\text{ask}}(t)} |f^s(t)|
+    \forall t \in \{t : b_{\mathcal{O}}(t) \geq a_{\mathcal{O}}(t)\} : \sum_{\mathbf{o}^b(t) \in \mathcal{M}_{\text{bid}}(t)} f^b(t) = \sum_{\mathbf{o}^s(t) \in \mathcal{M}_{\text{ask}}(t)} |f^s(t)|
     \tag{2.2}
     \]</span></li>
 </ol>
 </div>
 
-
-<div class="definition">
-<span id="def:order-placement-policy" class="definition"><strong>Definition 2.10  (Order Placement Policy)  </strong></span>Suppose that <span class="math inline">\(\mathbb{L}\)</span> is a set of all Ideal Order Books <span class="math inline">\(\mathcal{L}\)</span> as defined by <a href="reconstruction-algorithm.html#def:iob">2.9</a>. The function <span class="math inline">\(\mathcal{P}(\mathcal{L},t, p, v) : \mathbb{L} \times \mathbb{R}_{&gt;0} \times \mathbb{R}_{&gt;0} \times \mathbb{R}_{\neq 0} \mapsto \mathbb{L}\)</span> is called an <em>order placement policy</em>. It defines how a new order submitted at time <span class="math inline">\(t\)</span> with price <span class="math inline">\(p\)</span> and volume <span class="math inline">\(v\)</span> is added to IOB <span class="math inline">\(\mathcal{L}\)</span> and how the existing orders in <span class="math inline">\(\mathcal{L}\)</span> are modified, if necessesary.
-</div>
-
-</div>
-<div id="example" class="section level3">
-<h3><span class="header-section-number">2.1.2</span> Example</h3>
-<p>To make these definitions intuitevely clear, let’s consider how IOB <span class="math inline">\(\mathcal{L}\)</span> would evolve under some order placement policy <span class="math inline">\(\mathcal{P}\)</span> in a typical scenario of placing several buy and sell orders.</p>
+<p>To make these definitions intuitevely clear, let’s consider how IOB <span class="math inline">\(\mathcal{O}\)</span> would evolve under some order placement policy <span class="math inline">\(\mathcal{P}\)</span> in a typical scenario of placing several buy and sell orders. Note that our policy <span class="math inline">\(\mathcal{P}\)</span> given IOB retuns IOB. It is not the case in general and another order placement policy could retrun order book which is not IOB.</p>
 <ol style="list-style-type: decimal">
 <li><p>A buy order is submitted at time <span class="math inline">\(t_1\)</span> with the price <span class="math inline">\(p_1\)</span> and volume <span class="math inline">\(v_1\)</span> and is transformed by <span class="math inline">\(\mathcal{P}\)</span> into <span class="math inline">\(\mathbf{o}^1(t)\)</span>:</p>
 <ul>
-<li><span class="math inline">\(\mathbf{o}^1(t)\)</span> is added to <span class="math inline">\(\mathcal{L}\)</span>: <span class="math display">\[
+<li><span class="math inline">\(\mathbf{o}^1(t)\)</span> is added to <span class="math inline">\(\mathcal{O}\)</span>: <span class="math display">\[
 \mathbf{o}^1(t) = \left[
  \begin{eqnarray}
 \mathcal{T}^1 &amp; = &amp; \{ [t_1, +\infty) \} \\
@@ -253,7 +318,7 @@ The set of matched buy orders at time <span class="math inline">\(t\)</span> we 
 \end{eqnarray}
 \right.
 \]</span></li>
-<li><span class="math inline">\(\mathbf{o}^2(t)\)</span> is added to <span class="math inline">\(\mathcal{L}\)</span>: <span class="math display">\[
+<li><span class="math inline">\(\mathbf{o}^2(t)\)</span> is added to <span class="math inline">\(\mathcal{O}\)</span>: <span class="math display">\[
 \mathbf{o}^2(t) = \left[
  \begin{eqnarray}
 \mathcal{T}^2 &amp; = &amp; \{ {t_2} \} \\
@@ -275,7 +340,7 @@ The set of matched buy orders at time <span class="math inline">\(t\)</span> we 
 \right.
 \]</span></li>
 <li><span class="math inline">\(\mathbf{o}^2(t)\)</span> remains the same,</li>
-<li><span class="math inline">\(\mathbf{o}^3(t)\)</span> is added to <span class="math inline">\(\mathcal{L}\)</span>: <span class="math display">\[
+<li><span class="math inline">\(\mathbf{o}^3(t)\)</span> is added to <span class="math inline">\(\mathcal{O}\)</span>: <span class="math display">\[
 \mathbf{o}^3(t) = \left[
  \begin{eqnarray}
 \mathcal{T}^3 &amp; = &amp; \{ [t_3, +\infty) \} \\
@@ -287,43 +352,68 @@ The set of matched buy orders at time <span class="math inline">\(t\)</span> we 
 </ul></li>
 </ol>
 </div>
-</div>
-<div id="empirical-order-book-eob" class="section level2">
-<h2><span class="header-section-number">2.2</span> Empirical Order Book (EOB)</h2>
+<div id="empirical-order-and-order-book" class="section level2">
+<h2><span class="header-section-number">2.3</span> Empirical Order and Order Book</h2>
 <p>Formally speaking, the reconstruction algorithm is supposed to produce Ideal Order Book from non-ideal data provided by an exchange. The effort required varies by an exchange. For example <a href="https://www.moex.com/">MOEX</a> provides data of close to ideal quality while <a href="https://www.moex.com/">Bitfinex</a> does not report unique order identifications for trades and omits market orders altogether.</p>
-<p>In order to do that we need some more definitions.</p>
 
 <div class="definition">
-<span id="def:order-events" class="definition"><strong>Definition 2.11  (Order Events)  </strong></span>Suppose we are given an order <span class="math inline">\(i\)</span> as defined in <a href="reconstruction-algorithm.html#def:order">2.1</a>.
-A set of order <span class="math inline">\(i\)</span> instants <span class="math inline">\(\mathcal{I}^i\)</span> is defined as:
-<span class="math display">\[
-  \mathcal{I}^i = \{t^i_m\}_{m=0}^{M^i}, \forall m \exists k: t^i_m = s^i_k \lor e^i_k
-  \]</span> where <span class="math inline">\(s^i_k\)</span> and <span class="math inline">\(e^i_k\)</span> are endpoints of some interval in <span class="math inline">\(\mathcal{T}^i\)</span>.
-A set of tuples
-<span class="math display">\[
-  \mathcal{E}^i = \{(t^i_m, p^i(e^i_m), v^i(e^i_m))\}_{m=0}^{M_i} = \{e^i_m\}_{m=0}^{M_i}
-  \]</span> is called <em>order events</em>.
+<p><span id="def:quotes-stream" class="definition"><strong>Definition 2.12  (Quotes Stream)  </strong></span>A set of tuples <span class="math display">\[\mathcal{S}_Q = \bigcup_i \{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i} = \bigcup_i \mathcal{S}_Q^i\]</span> where</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(t_k^i\)</span> is a timestamp of the order <span class="math inline">\(i\)</span> update.</li>
+<li><span class="math inline">\(i\)</span> is an identification number of the order.</li>
+<li><span class="math inline">\(p_k^i \geq 0\)</span> is an order price at <span class="math inline">\(t_k^i\)</span>. If <span class="math inline">\(p_k^i = 0\)</span> then the order <span class="math inline">\(i\)</span> is deleted at <span class="math inline">\(t_k^i\)</span> (executed or cancelled).</li>
+<li><span class="math inline">\(v_k^i \neq 0\)</span> is a order volume at <span class="math inline">\(t_k^i\)</span>. If <span class="math inline">\(v_k^i &lt; 0\)</span> then it is a sell order. Otherwise it is a buy order.</li>
+</ol>
+is called <em>Quotes Stream</em>. The set <span class="math inline">\(\mathcal{S}_Q^i = \{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i}\)</span> is called an <em>order <span class="math inline">\(i\)</span> stream</em>.
 </div>
 
-<p>Intuitevely, <span class="math inline">\(t^i_m\)</span> is a moment in time when the price and/or the volume of the order <span class="math inline">\(i\)</span> has changed and the order event <span class="math inline">\(e^i_m\)</span> tells us new price and volume of the order from this instance untill the next one.</p>
 
 <div class="definition">
-<span id="def:trades" class="definition"><strong>Definition 2.12  (Trades)  </strong></span>Suppose we are given an order <span class="math inline">\(i\)</span> as defined in <a href="reconstruction-algorithm.html#def:order">2.1</a> and a subset of order <span class="math inline">\(i\)</span> instants <span class="math inline">\(\{t^i_n\}_{n=0}^{N_i} : t^i_n \in \mathcal{I}^i\)</span> such that <span class="math inline">\(\forall n: f^i(t^i_n) \neq 0\)</span>. Then a set of trades as defined in <a href="reconstruction-algorithm.html#def:fill-volume">2.3</a> is called an <em>order <span class="math inline">\(i\)</span> trades</em>.
+<p><span id="def:trades-stream" class="definition"><strong>Definition 2.13  (Trades Stream)  </strong></span>A set of tuples <span class="math inline">\(\mathcal{S}_T = \{(t_r, b_r, s_r, p_r, v_r)\}_{r=0}^{R}\)</span> where</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(t_r\)</span> is a timestamp of the trade</li>
+<li><span class="math inline">\(b_r\)</span> is a buy order identification number</li>
+<li><span class="math inline">\(s_r\)</span> is a sell order identification number</li>
+<li><span class="math inline">\(m \neq n \implies \ (b_m, s_m) \neq (b_n, s_n)\)</span></li>
+<li><span class="math inline">\(p_r &gt; 0\)</span> is a trade price</li>
+<li><span class="math inline">\(v_r \neq 0\)</span> is a trade volume. If <span class="math inline">\(v_r &gt; 0\)</span> then it is a buy trade. Otherwise it is a sell trade</li>
+</ol>
+is called <em>Trades Stream</em>.
 </div>
 
-<p>A typical exchange gives us some kind of event stream and, separately, some kind of trade stream with various level of details. Starting from them we can build</p>
 
 <div class="definition">
-<span id="def:eob" class="definition"><strong>Definition 2.13  (Empirical Order Book)  </strong></span>TBD
+<span id="def:empirical-order" class="definition"><strong>Definition 2.14  (Empirical Order)  </strong></span>An order <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> as defined by <a href="reconstruction-algorithm.html#def:order">2.1</a> which has been in some way constructed from the <em>order stream</em> <span class="math inline">\(\{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i} \in \mathcal{S}_Q\)</span> as defined by <a href="reconstruction-algorithm.html#def:quotes-stream">2.12</a> is called an <em>empirical order</em>.
 </div>
 
+
+<div class="definition">
+<span id="def:eob" class="definition"><strong>Definition 2.15  (Empirical Order Book)  </strong></span>A set of empirical orders <span class="math inline">\(\hat{\mathcal{O}} = \{\hat{\mathbf{o}}^i(t)\}_i\)</span> is called <em>Empirical Order Book(EOB)</em>.
+</div>
+
+<p>A typical exchange gives us some kind of event stream and, separately, some kind of trade stream with various level of details.</p>
+</div>
+<div id="initial-reconstruction" class="section level2">
+<h2><span class="header-section-number">2.4</span> Initial Reconstruction</h2>
+<p>To reconstruct an empirical order <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> as defined by <a href="reconstruction-algorithm.html#def:empirical-order">2.14</a> from the <em>order stream</em> <span class="math inline">\(\mathcal{S}_Q^i = \{(t_l^i, i, p_l^i, v_l^i)\}_{l=1}^{L^i}\)</span> as defined by <a href="reconstruction-algorithm.html#def:quotes-stream">2.12</a> one needs to define the set of intervals <span class="math inline">\(\mathcal{T^i}\)</span> since order prices <span class="math inline">\(\mathcal{P}^i\)</span> and order volumes <span class="math inline">\(\mathcal{V}^i\)</span> are unambiguously defined by the order stream <span class="math inline">\(\mathcal{S}_Q^i\)</span>.</p>
+<p>It appears that timestamps <span class="math inline">\(t_l^i\)</span> of the order <span class="math inline">\(i\)</span> updates (<a href="reconstruction-algorithm.html#def:quotes-stream">2.12</a>) gives us some endpoints of order intervals as defined by the rules below.</p>
+<ol style="list-style-type: lower-alpha">
+<li>The first interval is <span class="math inline">\([t_1^i, t_2^i)\)</span>.</li>
+<li>If <span class="math inline">\(l \geq 2 \land v_{l-1}^i \leq v_l^i\)</span> then <span class="math inline">\(l\)</span>’s interval is <span class="math inline">\([t_{l}^i, t_{l+1}^i)\)</span> since either the price of order <span class="math inline">\(i\)</span> has been changed or its volume has been increased</li>
+<li>If <span class="math inline">\(l \geq 2 \land v_{l-1}^i &gt; v_l^i\)</span> then <span class="math inline">\(l\)</span>’s interval is <span class="math inline">\((t_{l}^i, t_{l+1}^i)\)</span> for it is not possible to say based solely on the Quotes Stream data whether order <span class="math inline">\(i\)</span> volume has been decreased due cancellation or fill at time <span class="math inline">\(t_l^i\)</span>.</li>
+</ol>
+<p>Note that <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> has not been defined yet at points <span class="math inline">\(t_{l}^i : v_{l-1}^i &gt; v_l^i\)</span> so the data provided by Trades Stream need to be used, i.e. a coupling of quotes and trades streams need to be performed.</p>
+</div>
+<div id="quotes-and-trades-coupling" class="section level2">
+<h2><span class="header-section-number">2.5</span> Quotes and Trades Coupling</h2>
+<p>TBD</p>
 </div>
 <div id="enforcement-of-ime-condition-in-eob" class="section level2">
-<h2><span class="header-section-number">2.3</span> Enforcement of IME condition in EOB</h2>
+<h2><span class="header-section-number">2.6</span> Enforcement of IME condition in EOB</h2>
 <p>TBD</p>
 </div>
 <div id="enforcement-of-vc-condition-in-eob" class="section level2">
-<h2><span class="header-section-number">2.4</span> Enforcement of VC condition in EOB</h2>
+<h2><span class="header-section-number">2.7</span> Enforcement of VC condition in EOB</h2>
 <p>TBD</p>
 </div>
 </div>

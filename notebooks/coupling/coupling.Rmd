@@ -17,7 +17,7 @@ Today, most liquid markets â€“ including stocks, futures, and foreign exchange â
 The mechanics of the countinous double auction or LOB trading may be briefly described as follows: 
 
 1. Traders submit *limit orders* also called *quotes* and *market* or *market-limit* orders (i.e. quotes with the limit price better than the opposite quote best price already in LOB) 
-2. *Market* or *market-limit* orders are [matched](https://www.investopedia.com/terms/m/matchingorders.asp) with *quotes*  and executed to produce *trades*.
+<!-- 2. *Market* or *market-limit* orders are [matched](https://www.investopedia.com/terms/m/matchingorders.asp) with *quotes*  and executed to produce *trades*. -->
 3. Unmatched *quotes* or unmatched amounts of *market-limit* orders reside in LOB's queues until matched with another *market* or *market-limit* order or cancelled by the participant who submitted it.
 
 Market or market-limit orders are also often called the *aggressing* orders while the limit orders sitting in queues are called *resting* orders.
@@ -66,7 +66,7 @@ It should be clear from the above that substantial effort is required to reconst
 
 # Reconstruction algorithm
 
-## Ideal Order Book (IOB)
+## Order
 
 Consider a definition given in [@bouchaud_trades_2018]:
 
@@ -94,28 +94,26 @@ Above definition and description are incomplete:
 
 Surprisingly, the concept of order and operations of a continous double auction appear to be rather complicated things if one attempts to define them rigorously!
 
-### Definitions
-
 Hereafter is assumed that a single asset is traded and a single currency is used. 
 
 ```{definition Order, name="Order", label=order}
 Suppose that:
 
 a. $i \in \mathbb{Z}$ is called an *unique order identification*, 
-a. $\mathcal{T^i}$ is a set of intervals $\mathcal{T^i} = \{T_k^i\}_{k=0}^{N^i}$ called *order intervals* where each $T_k^i$ is either a proper interval with endpoints $s_k^i \in \mathbb{R}_{>0}$, $e_k^i \in \mathbb{R}_{>0} \cup \{+\infty\}$, $s_k^i < e_k^i$  or a degenerate interval $\{s_k^i\}, s_k^i \in \mathbb{R}_{>0}$ and $\forall m \neq n : T_m^i \cap T_n^i = \emptyset$,
+a. $\mathcal{T^i}$ is a set of intervals $\mathcal{T^i} = \{T_k^i\}_{k=0}^{K^i}$ called *order intervals* where each $T_k^i$ is either a proper interval with endpoints $s_k^i \in \mathbb{R}_{>0}$, $e_k^i \in \mathbb{R}_{>0} \cup \{+\infty\}$, $s_k^i < e_k^i$  or a degenerate interval $\{s_k^i\}, s_k^i \in \mathbb{R}_{>0}$ and $\forall m \neq n : T_m^i \cap T_n^i = \emptyset$,
 
 b. $\chi_{T_k^i} : \mathbb{R} \mapsto \{0,1\}$ is an indicator function of intervals in $\mathcal{T^i}$: 
 $\chi_{T_k^i}(t) = \begin{cases} 1, & t \in T_k^i \\ 0, & \text{otherwise} \end{cases}$,
 
-b. $\mathcal{P}^i = \{p_k^i\}_{k=0}^{N^i}$ is a set of constants $p_k^i \in \mathbb{R}_{>0}$ called *order prices*,
+b. $\mathcal{P}^i = \{p_k^i\}_{k=0}^{K^i}$ is a set of constants $p_k^i \in \mathbb{R}_{>0}$ called *order prices*,
 
-c. $\mathcal{V}^i = \{v_k^i\}_{k=0}^{N^i}$ is a set of constants called *order volumes*, such that either  $v_k^i \in \mathbb{R}_{<0}$ or $v_k^i \in \mathbb{R}_{>0}$,
+c. $\mathcal{V}^i = \{v_k^i\}_{k=0}^{K^i}$ is a set of constants called *order volumes*, such that either  $v_k^i \in \mathbb{R}_{<0}$ or $v_k^i \in \mathbb{R}_{>0}$,
   
 d. Sets $\mathcal{P}^i$ and $\mathcal{V}^i$  satisfy the following condition $\forall k  \in [0, \ldots, N_i) : (p_k^i, v_k^i) \neq (p_{k+1}^i, v_{k+1}^i)$,
 
 Then a vector-valued function $\mathbf{o}^i(t) : \mathbb{R}_{>0} \mapsto \mathbb{R}_{>0} \times \mathbb{R}$ representing a commitment to buy or sell a given volume $v$ of an asset at no worse than a given price $p$ at a particular time $t$  with a closed form:
 $$
-  \mathbf{o}^i(t) = (p^i(t), v^i(t)) = \Big( \sum_{k=1}^{N^i} p_k^i \chi_{T_k^i}(t),  \sum_{k=1}^{N^i} v_k^i \chi_{T_k^i}(t) \Big)
+  \mathbf{o}^i(t) = (p^i(t), v^i(t)) = \Big( \sum_{k=1}^{K^i} p_k^i \chi_{T_k^i}(t),  \sum_{k=1}^{K^i} v_k^i \chi_{T_k^i}(t) \Big)
 $$ is called an *order*. If $v_k^i \in \mathbb{R}_{<0}$ the order is a commitment to *sell* and is also called a *sell order*. If $v_k^i \in \mathbb{R}_{>0}$ the order is a commitment to *buy* and is also called a *buy order*.
 ```
 
@@ -130,6 +128,12 @@ Now we can define
 ```{definition Order Volume, name="Order Volume", label=order-volume}
 The function $v^i(t)$ in definition \@ref(def:order) is called an *order volume*.
 ```
+
+
+```{definition Order Price, name="Order Price", label=order-price}
+The function $p^i(t)$ in definition \@ref(def:order) is called an *order price*.
+```
+
 
 ```{definition Filled Volume and Trade, name="Filled Volume and Trade", label=fill-volume}
 The filled volume $f^i(t)$ of an order $i$ at time $t$ is defined as: 
@@ -149,59 +153,63 @@ The cancelled volume $c^i(t)$ of an order $i$ at time $t$ is defined as:
 
 
 
-```{definition Order Price, name="Order Price", label=order-price}
-The function $p^i(t)$ in definition \@ref(def:order) is called an *order price*.
+
+## Order Book
+
+```{definition Order Book, name="Order Book", label=order-book}
+A set of orders $\mathcal{O} = \{\mathbf{o}^i(t)\}_i$ is called an *order book*.
 ```
 
+
+```{definition Order Placement Policy, name="Order Placement Policy", label=order-placement-policy}
+Suppose that $\mathbb{O}$ is a set of all Order Books $\mathcal{O}$ as defined by \@ref(def:order-book). The function $$\mathcal{P}(\mathcal{O},i, t, p, v) : \mathbb{O} \times \mathbb{Z} \times  \mathbb{R}_{>0} \times \mathbb{R}_{>0} \times \mathbb{R}_{\neq 0} \mapsto \mathbb{O}$$ is called an *order placement policy*. It defines how order $i$ placement or update submitted at time $t$ with price $p$ and volume $v$ is added to the order book $\mathcal{O}$ and how the existing orders in $\mathcal{O}$ are modified, if necessesary. 
+```
+
+
 ```{definition Best Bid Price, name="Best Bid Price", label=best-bid-price}
-Suppose we are given a set of orders $\mathcal{L} = \{\mathbf{o}^i(t)\}$. A (possibly empty) subset $\mathcal{B} =\{\mathbf{o}^b(t)\}_{v_k^b > 0} \subset \mathcal{L}$ of buy orders is called *bids* and the function $b(t)$ is defined as:
+Suppose we are given an order book $\mathcal{O}$.  A (possibly empty) subset $\mathcal{B} =\{\mathbf{o}^b(t)\}_{v_k^b > 0} \subset \mathcal{O}$ of buy orders is called *bids* and the function $b(t)$ is defined as:
   $$
-  b_{\mathcal{L}}(t) = \begin{cases} \max_{\mathbf{o}^b(t) \in \mathcal{B}} p^b(t), & \text{ if } \mathcal{B} \neq \emptyset \\0, & \text{ otherwise }  \end{cases}
+  b_{\mathcal{O}}(t) = \begin{cases} \max_{\mathbf{o}^b(t) \in \mathcal{B}} p^b(t), & \text{ if } \mathcal{B} \neq \emptyset \\0, & \text{ otherwise }  \end{cases}
   $$ is called *best bid price*.
 ```
 
 
 ```{definition Best Ask Price, name="Best Ask Price", label=best-ask-price}
-Suppose we are given a set of orders $\mathcal{L} = \{\mathbf{o}^i(t)\}$. A (possibly empty) subset $\mathcal{A} =\{\mathbf{o}^a(t)\}_{v_k^a < 0} \subset \mathcal{L}$ of sell orders is called *asks* and the function $a(t)$ is defined as:
+Suppose we are given an order book $\mathcal{O}$. A (possibly empty) subset $\mathcal{A} =\{\mathbf{o}^a(t)\}_{v_k^a < 0} \subset \mathcal{O}$ of sell orders is called *asks* and the function $a(t)$ is defined as:
   $$
-  a_{\mathcal{L}}(t) = \begin{cases} \min_{\mathbf{o}^a(t) \in \mathcal{A}} p^a(t) & \text{ if } \mathcal{A} \neq \emptyset \\ +\infty, & \text{ otherwise } \end{cases}
+  a_{\mathcal{O}}(t) = \begin{cases} \min_{\mathbf{o}^a(t) \in \mathcal{A}} p^a(t) & \text{ if } \mathcal{A} \neq \emptyset \\ +\infty, & \text{ otherwise } \end{cases}
   $$ is called *best ask price*.
 ```
 
 ```{definition Matched Orders, name="Matched Orders", label=match}
-A buy order $\mathbf{o}^b(t)$ and a sell order $\mathbf{o}^s(t)$ are called *matched* if $\exists t : p^b(t) \geq p^s(t)$. If $$\lim_{t^{'} \uparrow t} p^s(t) \neq p^s(t)$$ then $\mathbf{o}^s(t)$ is called an *agressing* order and $\mathbf{o}^b(t)$ is called a *resting* order. Otherwise, $\mathbf{o}^b(t)$ is called an *agressing* order and $\mathbf{o}^s(t)$ is called a *resting* order.
+Suppose we are given an order book $\mathcal{O}$. A buy order $\mathbf{o}^b(t) \in \mathcal{O}$ and a sell order $\mathbf{o}^s(t) \in \mathcal{O}$ are called *matched* if $\exists t : p^b(t) \geq p^s(t)$. If $$\lim_{t^{'} \uparrow t} p^s(t) \neq p^s(t)$$ then $\mathbf{o}^s(t)$ is called an *agressing* order and $\mathbf{o}^b(t)$ is called a *resting* order. Otherwise, $\mathbf{o}^b(t)$ is called an *agressing* order and $\mathbf{o}^s(t)$ is called a *resting* order.
 The set of matched buy orders at time $t$ we will denote $\mathcal{M}_{\text{bid}}(t)$ and the set of matched sell orders - $\mathcal{M}_{\text{ask}}(t)$.
 ```
 
 
 
 ```{definition Ideal Order Book, name="Ideal Order Book", label=iob}
-Suppose a set of orders $\mathcal{L} = \{\mathbf{o}^i(t)\}$ is given. $\mathcal{L}$ is called *Ideal Order Book (IOB)* if the following conditions are satisfied: 
+Suppose we are given an order book $\mathcal{O}$.  Then $\mathcal{O}$ is called *Ideal Order Book (IOB)* if the following conditions are satisfied: 
   
   a. Instantaneous Match Execution (IME)
-$$ \lambda \Big( \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\}\Big) = 0
+$$ \lambda \Big( \{t : b_{\mathcal{O}}(t) \geq a_{\mathcal{O}}(t)\}\Big) = 0
 (\#eq:instant-match)
   $$ where $\lambda(X)$ is the Lebesgue measure of set $X$.
   b. Volume Conservation (VC)
   $$
-    \forall t \in \{t : b_{\mathcal{L}}(t) \geq a_{\mathcal{L}}(t)\} : \sum_{\mathbf{o}^b(t) \in \mathcal{M}_{\text{bid}}(t)} f^b(t) = \sum_{\mathbf{o}^s(t) \in \mathcal{M}_{\text{ask}}(t)} |f^s(t)|
+    \forall t \in \{t : b_{\mathcal{O}}(t) \geq a_{\mathcal{O}}(t)\} : \sum_{\mathbf{o}^b(t) \in \mathcal{M}_{\text{bid}}(t)} f^b(t) = \sum_{\mathbf{o}^s(t) \in \mathcal{M}_{\text{ask}}(t)} |f^s(t)|
     (\#eq:volume-conservation)
     $$
 
 ```
 
 
-```{definition Order Placement Policy, name="Order Placement Policy", label=order-placement-policy}
-Suppose that $\mathbb{L}$ is a set of all Ideal Order Books $\mathcal{L}$ as defined by \@ref(def:iob). The function $\mathcal{P}(\mathcal{L},t, p, v) : \mathbb{L} \times \mathbb{R}_{>0} \times \mathbb{R}_{>0} \times \mathbb{R}_{\neq 0} \mapsto \mathbb{L}$ is called an *order placement policy*. It defines how a new order submitted at time $t$ with price $p$ and volume $v$ is added to IOB $\mathcal{L}$ and how the existing orders in $\mathcal{L}$ are modified, if necessesary.
-```
 
-### Example 
-
-To make these definitions intuitevely clear, let's consider how IOB $\mathcal{L}$ would evolve under some  order placement policy $\mathcal{P}$ in a typical scenario of placing several buy and sell orders. 
+To make these definitions intuitevely clear, let's consider how IOB $\mathcal{O}$ would evolve under some  order placement policy $\mathcal{P}$ in a typical scenario of placing several buy and sell orders.  Note that our policy $\mathcal{P}$ given IOB retuns IOB. It is not the case in general and another order placement policy could retrun order book which is not IOB.
 
  1. A buy order is submitted at time $t_1$ with the price $p_1$ and volume $v_1$ and is transformed by $\mathcal{P}$ into $\mathbf{o}^1(t)$:
  
-    + $\mathbf{o}^1(t)$ is added to $\mathcal{L}$: $$
+    + $\mathbf{o}^1(t)$ is added to $\mathcal{O}$: $$
 \mathbf{o}^1(t) = \left[
  \begin{eqnarray}
   \mathcal{T}^1 & = & \{ [t_1, +\infty) \} \\
@@ -221,7 +229,7 @@ To make these definitions intuitevely clear, let's consider how IOB $\mathcal{L}
     \end{eqnarray}
     \right.
   $$
-    + $\mathbf{o}^2(t)$ is added to $\mathcal{L}$: $$
+    + $\mathbf{o}^2(t)$ is added to $\mathcal{O}$: $$
     \mathbf{o}^2(t) = \left[
      \begin{eqnarray}
       \mathcal{T}^2 & = & \{ {t_2} \} \\
@@ -241,7 +249,7 @@ To make these definitions intuitevely clear, let's consider how IOB $\mathcal{L}
     \right.
   $$
     + $\mathbf{o}^2(t)$ remains the same,
-    + $\mathbf{o}^3(t)$ is added to $\mathcal{L}$: $$
+    + $\mathbf{o}^3(t)$ is added to $\mathcal{O}$: $$
     \mathbf{o}^3(t) = \left[
      \begin{eqnarray}
       \mathcal{T}^3 & = & \{ [t_3, +\infty) \} \\
@@ -252,37 +260,70 @@ To make these definitions intuitevely clear, let's consider how IOB $\mathcal{L}
   $$
 
 
-## Empirical Order Book (EOB)
+## Empirical Order and Order Book
 
 Formally speaking, the reconstruction algorithm is supposed to produce Ideal Order Book from non-ideal data provided by an exchange.  The effort required varies by an exchange. For example [MOEX](https://www.moex.com/) provides data of close to ideal quality while [Bitfinex](https://www.moex.com/) does not report unique order identifications for trades and omits market orders altogether.
 
-In order to do that we need some more definitions.
 
-```{definition Order Events, name="Order Events", label=order-events}
-Suppose we are given an order $i$ as defined in \@ref(def:order).
-A set of order $i$ instants $\mathcal{I}^i$ is defined as:
-  $$
-  \mathcal{I}^i = \{t^i_m\}_{m=0}^{M^i}, \forall m \exists k: t^i_m = s^i_k \lor e^i_k
-  $$ where $s^i_k$  and  $e^i_k$ are endpoints of some interval in $\mathcal{T}^i$.
-A set of tuples 
-$$
-  \mathcal{E}^i = \{(t^i_m, p^i(e^i_m), v^i(e^i_m))\}_{m=0}^{M_i} = \{e^i_m\}_{m=0}^{M_i}
-  $$ is called *order events*.
+
+```{definition Quotes Stream, name="Quotes Stream", label=quotes-stream}
+A set of tuples $$\mathcal{S}_Q = \bigcup_i \{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i} = \bigcup_i \mathcal{S}_Q^i$$ where
+
+ a. $t_k^i$ is a timestamp of the order $i$ update.
+ b. $i$ is an identification number of the order.
+ c. $p_k^i \geq 0$ is an order price at $t_k^i$. If $p_k^i = 0$ then the order $i$ is deleted at $t_k^i$ (executed or cancelled).
+ d. $v_k^i \neq 0$ is a order volume at $t_k^i$. If $v_k^i < 0$ then it is a sell order. Otherwise it is a buy order.
+ 
+is called *Quotes Stream*. The set $\mathcal{S}_Q^i = \{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i}$ is called an *order $i$ stream*.
 ```
 
-Intuitevely, $t^i_m$ is a moment in time when the price and/or the volume of the order $i$ has changed and the order event $e^i_m$ tells us new price and volume of the order from this instance untill the next one. 
+```{definition Trades Stream, name="Trades Stream", label=trades-stream}
+A set of tuples $\mathcal{S}_T = \{(t_r, b_r, s_r, p_r, v_r)\}_{r=0}^{R}$ where
 
-```{definition Trades, name="Trades", label=trades}
-Suppose we are given an order $i$ as defined in \@ref(def:order) and a subset of order $i$ instants $\{t^i_n\}_{n=0}^{N_i} : t^i_n \in \mathcal{I}^i$ such that $\forall n: f^i(t^i_n) \neq 0$. Then a set of trades as defined in \@ref(def:fill-volume) is called an *order $i$ trades*.
+ a. $t_r$ is a timestamp of the trade
+ b. $b_r$ is a buy order identification number 
+ b. $s_r$ is a sell order identification number 
+ b. $m \neq n \implies \ (b_m, s_m) \neq (b_n, s_n)$
+ b. $p_r > 0$ is a trade price
+ b. $v_r \neq 0$ is a trade volume. If $v_r > 0$ then it is a buy trade. Otherwise it is a sell trade
+ 
+is called *Trades Stream*.
 ```
 
 
-A typical exchange gives us some kind of event stream and, separately, some kind of trade stream with various level of details. Starting from them we can build
+
+
+```{definition Empirical Order, name="Empirical Order", label=empirical-order}
+An order $\hat{\mathbf{o}}^{i}(t)$ as defined by \@ref(def:order) which has been in some way constructed from the *order stream* $\{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i} \in \mathcal{S}_Q$ as defined by \@ref(def:quotes-stream) is called an *empirical order*.
+```
+
 
 ```{definition Empirical Order Book, name="Empirical Order Book", label=eob}
-TBD
+A set of empirical orders $\hat{\mathcal{O}} = \{\hat{\mathbf{o}}^i(t)\}_i$ is called *Empirical Order Book(EOB)*.
 ```
 
+
+
+
+A typical exchange gives us some kind of event stream and, separately, some kind of trade stream with various level of details. 
+
+
+## Initial Reconstruction
+
+To reconstruct an empirical order $\hat{\mathbf{o}}^{i}(t)$ as defined by \@ref(def:empirical-order) from the *order stream* $\mathcal{S}_Q^i = \{(t_l^i, i, p_l^i, v_l^i)\}_{l=1}^{L^i}$ as defined by \@ref(def:quotes-stream) one needs to define the set of intervals $\mathcal{T^i}$ since order prices $\mathcal{P}^i$ and order volumes $\mathcal{V}^i$ are unambiguously defined by the order stream $\mathcal{S}_Q^i$.
+
+It appears that timestamps $t_l^i$ of the order $i$ updates (\@ref(def:quotes-stream)) gives us some endpoints of order intervals as defined by the rules below.
+
+ a. The first interval is $[t_1^i, t_2^i)$.
+ a. If $l \geq 2 \land v_{l-1}^i \leq v_l^i$ then $l$'s interval is $[t_{l}^i, t_{l+1}^i)$ since either the price of order $i$ has been changed or its volume has been increased 
+ a. If $l \geq 2 \land v_{l-1}^i > v_l^i$ then $l$'s interval is $(t_{l}^i, t_{l+1}^i)$ for it is not possible to say based solely on the Quotes Stream data whether order $i$ volume has been decreased due cancellation or fill at time $t_l^i$.
+ 
+Note that $\hat{\mathbf{o}}^{i}(t)$ has not been defined yet at points $t_{l}^i : v_{l-1}^i > v_l^i$ so the data provided by Trades Stream need to be used, i.e. a coupling of quotes and trades streams need to be performed.
+ 
+ 
+## Quotes and Trades Coupling 
+
+TBD
 
 
 ## Enforcement of IME condition in EOB
@@ -308,6 +349,10 @@ TBD
 # Discussion
 
 TBD
+
+```{r}
+sum(36*1/1:36)
+```
 
 
 
