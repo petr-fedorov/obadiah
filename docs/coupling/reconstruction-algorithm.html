@@ -24,7 +24,7 @@
 <meta name="author" content="Petr Fedorov" />
 
 
-<meta name="date" content="2020-03-23" />
+<meta name="date" content="2020-03-30" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -134,15 +134,26 @@ code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warni
 <li class="chapter" data-level="2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html"><i class="fa fa-check"></i><b>2</b> Reconstruction algorithm</a><ul>
 <li class="chapter" data-level="2.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#order"><i class="fa fa-check"></i><b>2.1</b> Order</a></li>
 <li class="chapter" data-level="2.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#order-book"><i class="fa fa-check"></i><b>2.2</b> Order Book</a></li>
-<li class="chapter" data-level="2.3" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#empirical-order-and-order-book"><i class="fa fa-check"></i><b>2.3</b> Empirical Order and Order Book</a></li>
-<li class="chapter" data-level="2.4" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#initial-reconstruction"><i class="fa fa-check"></i><b>2.4</b> Initial Reconstruction</a></li>
-<li class="chapter" data-level="2.5" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#quotes-and-trades-coupling"><i class="fa fa-check"></i><b>2.5</b> Quotes and Trades Coupling</a></li>
+<li class="chapter" data-level="2.3" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#quotes-and-trades-streams"><i class="fa fa-check"></i><b>2.3</b> Quotes and Trades Streams</a></li>
+<li class="chapter" data-level="2.4" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#coupling"><i class="fa fa-check"></i><b>2.4</b> Coupling</a><ul>
+<li class="chapter" data-level="2.4.1" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#makers"><i class="fa fa-check"></i><b>2.4.1</b> Makers</a></li>
+<li class="chapter" data-level="2.4.2" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#takers"><i class="fa fa-check"></i><b>2.4.2</b> Takers</a></li>
+</ul></li>
+<li class="chapter" data-level="2.5" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#order-intervals-reconstruction"><i class="fa fa-check"></i><b>2.5</b> Order Intervals Reconstruction</a></li>
 <li class="chapter" data-level="2.6" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-ime-condition-in-eob"><i class="fa fa-check"></i><b>2.6</b> Enforcement of IME condition in EOB</a></li>
 <li class="chapter" data-level="2.7" data-path="reconstruction-algorithm.html"><a href="reconstruction-algorithm.html#enforcement-of-vc-condition-in-eob"><i class="fa fa-check"></i><b>2.7</b> Enforcement of VC condition in EOB</a></li>
 </ul></li>
 <li class="chapter" data-level="3" data-path="results.html"><a href="results.html"><i class="fa fa-check"></i><b>3</b> Results</a><ul>
-<li class="chapter" data-level="3.1" data-path="results.html"><a href="results.html#application-to-bitstamp-data"><i class="fa fa-check"></i><b>3.1</b> Application to Bitstamp data</a></li>
-<li class="chapter" data-level="3.2" data-path="results.html"><a href="results.html#application-to-bitfinex-data"><i class="fa fa-check"></i><b>3.2</b> Application to Bitfinex data</a></li>
+<li class="chapter" data-level="3.1" data-path="results.html"><a href="results.html#fragments-of-quotes-and-trades-streams"><i class="fa fa-check"></i><b>3.1</b> Fragments of Quotes and Trades Streams</a><ul>
+<li class="chapter" data-level="3.1.1" data-path="results.html"><a href="results.html#bitstamp-quotes"><i class="fa fa-check"></i><b>3.1.1</b> Bitstamp Quotes</a></li>
+<li class="chapter" data-level="3.1.2" data-path="results.html"><a href="results.html#bitstamp-trades"><i class="fa fa-check"></i><b>3.1.2</b> Bitstamp Trades</a></li>
+<li class="chapter" data-level="3.1.3" data-path="results.html"><a href="results.html#bitfinex-quotes"><i class="fa fa-check"></i><b>3.1.3</b> Bitfinex Quotes</a></li>
+<li class="chapter" data-level="3.1.4" data-path="results.html"><a href="results.html#bitfinex-trades"><i class="fa fa-check"></i><b>3.1.4</b> Bitfinex Trades</a></li>
+</ul></li>
+<li class="chapter" data-level="3.2" data-path="results.html"><a href="results.html#optimal-maker-coupling-for-fragments"><i class="fa fa-check"></i><b>3.2</b> Optimal Maker Coupling for Fragments</a><ul>
+<li class="chapter" data-level="3.2.1" data-path="results.html"><a href="results.html#bitstamp"><i class="fa fa-check"></i><b>3.2.1</b> Bitstamp</a></li>
+<li class="chapter" data-level="3.2.2" data-path="results.html"><a href="results.html#bitfinex"><i class="fa fa-check"></i><b>3.2.2</b> Bitfinex</a></li>
+</ul></li>
 </ul></li>
 <li class="chapter" data-level="4" data-path="discussion.html"><a href="discussion.html"><i class="fa fa-check"></i><b>4</b> Discussion</a></li>
 <li class="chapter" data-level="" data-path="references.html"><a href="references.html"><i class="fa fa-check"></i>References</a></li>
@@ -194,7 +205,7 @@ code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warni
 <div class="definition">
 <p><span id="def:order" class="definition"><strong>Definition 2.1  (Order)  </strong></span>Suppose that:</p>
 <ol style="list-style-type: lower-alpha">
-<li><span class="math inline">\(i \in \mathbb{Z}\)</span> is called an <em>unique order identification</em>,</li>
+<li><span class="math inline">\(i \in \mathbb{N}\)</span> is called an <em>unique order identification</em>,</li>
 <li><p><span class="math inline">\(\mathcal{T^i}\)</span> is a set of intervals <span class="math inline">\(\mathcal{T^i} = \{T_k^i\}_{k=0}^{K^i}\)</span> called <em>order intervals</em> where each <span class="math inline">\(T_k^i\)</span> is either a proper interval with endpoints <span class="math inline">\(s_k^i \in \mathbb{R}_{&gt;0}\)</span>, <span class="math inline">\(e_k^i \in \mathbb{R}_{&gt;0} \cup \{+\infty\}\)</span>, <span class="math inline">\(s_k^i &lt; e_k^i\)</span> or a degenerate interval <span class="math inline">\(\{s_k^i\}, s_k^i \in \mathbb{R}_{&gt;0}\)</span> and <span class="math inline">\(\forall m \neq n : T_m^i \cap T_n^i = \emptyset\)</span>,</p></li>
 <li><p><span class="math inline">\(\chi_{T_k^i} : \mathbb{R} \mapsto \{0,1\}\)</span> is an indicator function of intervals in <span class="math inline">\(\mathcal{T^i}\)</span>:
 <span class="math inline">\(\chi_{T_k^i}(t) = \begin{cases} 1, &amp; t \in T_k^i \\ 0, &amp; \text{otherwise} \end{cases}\)</span>,</p></li>
@@ -252,7 +263,7 @@ The tuple <span class="math inline">\((t, f^i(t), p^i(t))\)</span> is called a <
 
 
 <div class="definition">
-<span id="def:order-placement-policy" class="definition"><strong>Definition 2.7  (Order Placement Policy)  </strong></span>Suppose that <span class="math inline">\(\mathbb{O}\)</span> is a set of all Order Books <span class="math inline">\(\mathcal{O}\)</span> as defined by <a href="reconstruction-algorithm.html#def:order-book">2.6</a>. The function <span class="math display">\[\mathcal{P}(\mathcal{O},i, t, p, v) : \mathbb{O} \times \mathbb{Z} \times  \mathbb{R}_{&gt;0} \times \mathbb{R}_{&gt;0} \times \mathbb{R}_{\neq 0} \mapsto \mathbb{O}\]</span> is called an <em>order placement policy</em>. It defines how order <span class="math inline">\(i\)</span> placement or update submitted at time <span class="math inline">\(t\)</span> with price <span class="math inline">\(p\)</span> and volume <span class="math inline">\(v\)</span> is added to the order book <span class="math inline">\(\mathcal{O}\)</span> and how the existing orders in <span class="math inline">\(\mathcal{O}\)</span> are modified, if necessesary.
+<span id="def:order-placement-policy" class="definition"><strong>Definition 2.7  (Order Placement Policy)  </strong></span>Suppose that <span class="math inline">\(\mathbb{O}\)</span> is a set of all Order Books <span class="math inline">\(\mathcal{O}\)</span> as defined by <a href="reconstruction-algorithm.html#def:order-book">2.6</a>. The function <span class="math display">\[\mathcal{P}(\mathcal{O},i, t, p, v) : \mathbb{O} \times \mathbb{N} \times  \mathbb{R}_{&gt;0} \times \mathbb{R}_{&gt;0} \times \mathbb{R}_{\neq 0} \mapsto \mathbb{O}\]</span> is called an <em>order placement policy</em>. It defines how order <span class="math inline">\(i\)</span> placement or update submitted at time <span class="math inline">\(t\)</span> with price <span class="math inline">\(p\)</span> and volume <span class="math inline">\(v\)</span> is added to the order book <span class="math inline">\(\mathcal{O}\)</span> and how the existing orders in <span class="math inline">\(\mathcal{O}\)</span> are modified, if necessesary.
 </div>
 
 
@@ -273,7 +284,7 @@ The tuple <span class="math inline">\((t, f^i(t), p^i(t))\)</span> is called a <
 
 
 <div class="definition">
-<span id="def:match" class="definition"><strong>Definition 2.10  (Matched Orders)  </strong></span>Suppose we are given an order book <span class="math inline">\(\mathcal{O}\)</span>. A buy order <span class="math inline">\(\mathbf{o}^b(t) \in \mathcal{O}\)</span> and a sell order <span class="math inline">\(\mathbf{o}^s(t) \in \mathcal{O}\)</span> are called <em>matched</em> if <span class="math inline">\(\exists t : p^b(t) \geq p^s(t)\)</span>. If <span class="math display">\[\lim_{t^{&#39;} \uparrow t} p^s(t) \neq p^s(t)\]</span> then <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called a <em>resting</em> order. Otherwise, <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called an <em>agressing</em> order and <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called a <em>resting</em> order.
+<span id="def:match" class="definition"><strong>Definition 2.10  (Matched Orders)  </strong></span>Suppose we are given an order book <span class="math inline">\(\mathcal{O}\)</span>. A buy order <span class="math inline">\(\mathbf{o}^b(t) \in \mathcal{O}\)</span> and a sell order <span class="math inline">\(\mathbf{o}^s(t) \in \mathcal{O}\)</span> are called <em>matched</em> if <span class="math inline">\(\exists t : p^b(t) \geq p^s(t)\)</span>. If <span class="math display">\[\lim_{t^{&#39;} \uparrow t} p^s(t) \neq p^s(t)\]</span> then <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called a <em>taker</em> order and <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called a <em>maker</em> order. Otherwise, <span class="math inline">\(\mathbf{o}^b(t)\)</span> is called a <em>taker</em> order and <span class="math inline">\(\mathbf{o}^s(t)\)</span> is called a <em>maker</em> order.
 The set of matched buy orders at time <span class="math inline">\(t\)</span> we will denote <span class="math inline">\(\mathcal{M}_{\text{bid}}(t)\)</span> and the set of matched sell orders - <span class="math inline">\(\mathcal{M}_{\text{ask}}(t)\)</span>.
 </div>
 
@@ -352,60 +363,173 @@ The set of matched buy orders at time <span class="math inline">\(t\)</span> we 
 </ul></li>
 </ol>
 </div>
-<div id="empirical-order-and-order-book" class="section level2">
-<h2><span class="header-section-number">2.3</span> Empirical Order and Order Book</h2>
-<p>Formally speaking, the reconstruction algorithm is supposed to produce Ideal Order Book from non-ideal data provided by an exchange. The effort required varies by an exchange. For example <a href="https://www.moex.com/">MOEX</a> provides data of close to ideal quality while <a href="https://www.moex.com/">Bitfinex</a> does not report unique order identifications for trades and omits market orders altogether.</p>
+<div id="quotes-and-trades-streams" class="section level2">
+<h2><span class="header-section-number">2.3</span> Quotes and Trades Streams</h2>
+<p>Formally speaking, the reconstruction algorithm is supposed to produce Ideal Order Book from non-ideal data - Quotes and Trades Streams - provided by an exchange. The effort required varies by an exchange. For example <a href="https://www.moex.com/">MOEX</a> provides data of close to ideal quality while <a href="https://www.moex.com/">Bitfinex</a> does not report unique order identifications for trades and omits market orders altogether.</p>
 
 <div class="definition">
-<p><span id="def:quotes-stream" class="definition"><strong>Definition 2.12  (Quotes Stream)  </strong></span>A set of tuples <span class="math display">\[\mathcal{S}_Q = \bigcup_i \{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i} = \bigcup_i \mathcal{S}_Q^i\]</span> where</p>
+<p><span id="def:quote-event" class="definition"><strong>Definition 2.12  (Quote Event)  </strong></span>A tuple <span class="math inline">\(\mathcal{S}_Q^i[k] = (t_k^i, i, k, p_k^i, v_k^i, e^k_i)\)</span> where</p>
 <ol style="list-style-type: lower-alpha">
-<li><span class="math inline">\(t_k^i\)</span> is a timestamp of the order <span class="math inline">\(i\)</span> update.</li>
-<li><span class="math inline">\(i\)</span> is an identification number of the order.</li>
-<li><span class="math inline">\(p_k^i \geq 0\)</span> is an order price at <span class="math inline">\(t_k^i\)</span>. If <span class="math inline">\(p_k^i = 0\)</span> then the order <span class="math inline">\(i\)</span> is deleted at <span class="math inline">\(t_k^i\)</span> (executed or cancelled).</li>
-<li><span class="math inline">\(v_k^i \neq 0\)</span> is a order volume at <span class="math inline">\(t_k^i\)</span>. If <span class="math inline">\(v_k^i &lt; 0\)</span> then it is a sell order. Otherwise it is a buy order.</li>
+<li><span class="math inline">\(t_k^i \in \mathbb{R}_{&gt; 0}\)</span> is a timestamp,</li>
+<li><span class="math inline">\(i \in \mathbb{N}\)</span> is an identification number of the quote,</li>
+<li><span class="math inline">\(k \in \mathbb{N}\)</span> is a quote event number,</li>
+<li><span class="math inline">\(p_k^i \in \mathbb{R}_{\geq 0}\)</span> is a quote price at <span class="math inline">\(t_k^i\)</span>,</li>
+<li><span class="math inline">\(v_k^i \in \mathbb{R}\)</span> is a quote volume since <span class="math inline">\(t_k^i\)</span>,</li>
+<li><span class="math inline">\(e_k^i \in \{ A, C, D \}\)</span> is an event type: <span class="math inline">\(A\)</span> stands for addition to an order book event, <span class="math inline">\(C\)</span> stands for change event and <span class="math inline">\(D\)</span> stands for deletion from an order book,</li>
 </ol>
-is called <em>Quotes Stream</em>. The set <span class="math inline">\(\mathcal{S}_Q^i = \{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i}\)</span> is called an <em>order <span class="math inline">\(i\)</span> stream</em>.
+is called <em>quote <span class="math inline">\(i\)</span> event number <span class="math inline">\(k\)</span></em>.
 </div>
 
 
 <div class="definition">
-<p><span id="def:trades-stream" class="definition"><strong>Definition 2.13  (Trades Stream)  </strong></span>A set of tuples <span class="math inline">\(\mathcal{S}_T = \{(t_r, b_r, s_r, p_r, v_r)\}_{r=0}^{R}\)</span> where</p>
+<p><span id="def:quote" class="definition"><strong>Definition 2.13  (Quote)  </strong></span>A set of quote event tuples <span class="math inline">\(\mathcal{S}_Q^i =\{\mathcal{S}_Q^i[k] \}_{k=1}^{K^i} = \{(t_k^i, i, k, p_k^i, v_k^i, e^k_i)\}_{k=1}^{K^i}\)</span> where</p>
 <ol style="list-style-type: lower-alpha">
-<li><span class="math inline">\(t_r\)</span> is a timestamp of the trade</li>
-<li><span class="math inline">\(b_r\)</span> is a buy order identification number</li>
-<li><span class="math inline">\(s_r\)</span> is a sell order identification number</li>
-<li><span class="math inline">\(m \neq n \implies \ (b_m, s_m) \neq (b_n, s_n)\)</span></li>
-<li><span class="math inline">\(p_r &gt; 0\)</span> is a trade price</li>
-<li><span class="math inline">\(v_r \neq 0\)</span> is a trade volume. If <span class="math inline">\(v_r &gt; 0\)</span> then it is a buy trade. Otherwise it is a sell trade</li>
+<li><span class="math inline">\(k_1 &lt; k_2 \implies t_{k_1}^i \leq t_{k_2}^i\)</span>,</li>
+<li>all <span class="math inline">\(v_k^i\)</span> are either non-negative or non-positive</li>
 </ol>
-is called <em>Trades Stream</em>.
+<p>is called <em>quote <span class="math inline">\(i\)</span></em>. If all <span class="math inline">\(v_k^i \leq 0\)</span> then the quote is a <em>sell quote</em>. Otherwise it is a <em>buy quote</em>.</p>
 </div>
 
 
 <div class="definition">
-<span id="def:empirical-order" class="definition"><strong>Definition 2.14  (Empirical Order)  </strong></span>An order <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> as defined by <a href="reconstruction-algorithm.html#def:order">2.1</a> which has been in some way constructed from the <em>order stream</em> <span class="math inline">\(\{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i} \in \mathcal{S}_Q\)</span> as defined by <a href="reconstruction-algorithm.html#def:quotes-stream">2.12</a> is called an <em>empirical order</em>.
+<span id="def:volume-decreasing-quote-event" class="definition"><strong>Definition 2.14  (Volume Decreasing Quote Event)  </strong></span>
+Suppose a quote <span class="math inline">\(\mathcal{S}_Q^i =\{\mathcal{S}_Q^i[k] \}_{k=1}^{K^i} = \{(t_k^i, i, k, p_k^i, v_k^i, e^k_i)\}_{k=1}^{K^i}\)</span> as defined by <a href="reconstruction-algorithm.html#def:quote">2.13</a> is given. The value <span class="math display">\[\Delta v_k^i = |v_{k-1}^i| - |v_k^i|, k &gt; 1\]</span> is called a <em>volume decrease of quote <span class="math inline">\(i\)</span> event <span class="math inline">\(k\)</span></em>. A volume decrease of quote <span class="math inline">\(i\)</span> event <span class="math inline">\(1\)</span> is undefined. A quote event <span class="math inline">\(\mathcal{S}_Q^i[k] \in \mathcal{S}_Q^i\)</span> is called a <em>volume decreasing quote event</em> if it has a positive volume decrease, i.e. if <span class="math inline">\(|v_k^i| &lt; |v_{k-1}^i|\)</span>.
 </div>
 
 
 <div class="definition">
-<span id="def:eob" class="definition"><strong>Definition 2.15  (Empirical Order Book)  </strong></span>A set of empirical orders <span class="math inline">\(\hat{\mathcal{O}} = \{\hat{\mathbf{o}}^i(t)\}_i\)</span> is called <em>Empirical Order Book(EOB)</em>.
+<span id="def:quotes-stream" class="definition"><strong>Definition 2.15  (Quotes Stream)  </strong></span>A union of quotes <span class="math display">\[\mathcal{S}_Q = \bigcup_i \mathcal{S}_Q^i = \bigcup_i \{(t_k^i, i, k, p_k^i, v_k^i, e^k_i)\}_{k=1}^{K^i}\]</span> is called <em>Quotes Stream</em>.
+</div>
+
+<p>Table <a href="results.html#tab:stamp-quote-frag">3.1</a> in section <a href="results.html#fragments-of-quotes-and-trades-streams">Fragments of Quotes and Trades Streams</a> shows a fragment of ETHUSD Quotes Stream generated by Bitstamp during 1 second<br />
+while table <a href="results.html#tab:finex-quote-frag">3.3</a> shows similar fragment generated by Bitfinex. They should be taken as a raw dataset for illustrations of reconstruction algorithm performance hereafter.</p>
+
+<div class="definition">
+<p><span id="def:trade" class="definition"><strong>Definition 2.16  (Trade)  </strong></span>A tuple <span class="math inline">\(\mathcal{S}_T[j] = (t_j, j, a_j, r_j, d_j, p_j, v_j)\)</span> where</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(t_j \in \mathbb{R}_{&gt;0}\)</span> is a timestamp of the trade,</li>
+<li><span class="math inline">\(j \in \mathbb{N}\)</span> is a unque trade identification number,</li>
+<li><span class="math inline">\(a_j \in \mathbb{N} \cup \{0\}\)</span> is an optional taker (aggressing) quote identification number: if <span class="math inline">\(a_j =`\{0\}\)</span> then the number is not known,</li>
+<li><span class="math inline">\(r_j \in \mathbb{N} \cup \{0\}\)</span> is an optional maker (resting) quote identification number: if <span class="math inline">\(a_j =\{0\}\)</span> then the number is not known,</li>
+<li><span class="math inline">\(d_j \in \{-1, +1\}\)</span> is the side of the maker quote (if <span class="math inline">\(d_j = -1\)</span> then ‘ask’, otherwise ‘bid’)</li>
+<li><span class="math inline">\(p_j \in \mathbb{R}_{&gt;0}\)</span> is a trade price,</li>
+<li><span class="math inline">\(v_j \in \mathbb{R}_{\neq 0}\)</span> is a trade volume</li>
+</ol>
+is called <em>trade</em>. If <span class="math inline">\(d_j = -1\)</span> then the trade is a <em>buy trade</em>. Otherwise it is a <em>sell trade</em>.
+</div>
+
+
+<div class="definition">
+<p><span id="def:trades-stream" class="definition"><strong>Definition 2.17  (Trades Stream)  </strong></span>A set of trades <span class="math display">\[\mathcal{S}_T = \{\mathcal{S}_T[j]\}_{j=1}^{J} = \{(t_j, j, a_j, r_j, d_j, p_j, v_j)\}_{j=0}^{J}\]</span> where</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(j_1 \neq j_2 \implies \ (a_{j_1}, r_{j_1}) \neq (a_{j_2}, r_{j_2})\)</span></li>
+<li><span class="math inline">\(j_1 &lt; j_2 \implies t_{j_1} \leq t_{j_2}\)</span></li>
+</ol>
+<p>is called a <em>Trades Stream</em>.</p>
+</div>
+
+<p>Table <a href="results.html#tab:stamp-trade-frag">3.2</a> in section <a href="results.html#fragments-of-quotes-and-trades-streams">Fragments of Quotes and Trades Streams</a> shows a fragment of ETHUSD Trades Stream generated by Bitstamp during 1 second while table <a href="results.html#tab:finex-trade-frag">3.4</a> shows similar fragment generated by Bitfinex.</p>
+
+<div class="definition">
+<span id="def:empirical-order" class="definition"><strong>Definition 2.18  (Empirical Order)  </strong></span>An order <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> as defined by <a href="reconstruction-algorithm.html#def:order">2.1</a> which has been in some way constructed from the <em>quote</em> <span class="math inline">\(\{(t_k^i, i, p_k^i, v_k^i)\}_{k=1}^{K^i} \in \mathcal{S}_Q\)</span> as defined by <a href="reconstruction-algorithm.html#def:quote">2.13</a> is called an <em>empirical order</em>.
+</div>
+
+
+<div class="definition">
+<span id="def:eob" class="definition"><strong>Definition 2.19  (Empirical Order Book)  </strong></span>A set of empirical orders <span class="math inline">\(\hat{\mathcal{O}} = \{\hat{\mathbf{o}}^i(t)\}_i\)</span> is called <em>Empirical Order Book(EOB)</em>.
 </div>
 
 <p>A typical exchange gives us some kind of event stream and, separately, some kind of trade stream with various level of details.</p>
-</div>
-<div id="initial-reconstruction" class="section level2">
-<h2><span class="header-section-number">2.4</span> Initial Reconstruction</h2>
-<p>To reconstruct an empirical order <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> as defined by <a href="reconstruction-algorithm.html#def:empirical-order">2.14</a> from the <em>order stream</em> <span class="math inline">\(\mathcal{S}_Q^i = \{(t_l^i, i, p_l^i, v_l^i)\}_{l=1}^{L^i}\)</span> as defined by <a href="reconstruction-algorithm.html#def:quotes-stream">2.12</a> one needs to define the set of intervals <span class="math inline">\(\mathcal{T^i}\)</span> since order prices <span class="math inline">\(\mathcal{P}^i\)</span> and order volumes <span class="math inline">\(\mathcal{V}^i\)</span> are unambiguously defined by the order stream <span class="math inline">\(\mathcal{S}_Q^i\)</span>.</p>
-<p>It appears that timestamps <span class="math inline">\(t_l^i\)</span> of the order <span class="math inline">\(i\)</span> updates (<a href="reconstruction-algorithm.html#def:quotes-stream">2.12</a>) gives us some endpoints of order intervals as defined by the rules below.</p>
+<p>As it is shown below, most of quote events may be uniquely utilized for construction of an empirical order since those quote events can be caused by unique actions. The only ambiguous exception is a volume decreasing quote event which may originate from</p>
 <ol style="list-style-type: lower-alpha">
-<li>The first interval is <span class="math inline">\([t_1^i, t_2^i)\)</span>.</li>
-<li>If <span class="math inline">\(l \geq 2 \land v_{l-1}^i \leq v_l^i\)</span> then <span class="math inline">\(l\)</span>’s interval is <span class="math inline">\([t_{l}^i, t_{l+1}^i)\)</span> since either the price of order <span class="math inline">\(i\)</span> has been changed or its volume has been increased</li>
-<li>If <span class="math inline">\(l \geq 2 \land v_{l-1}^i &gt; v_l^i\)</span> then <span class="math inline">\(l\)</span>’s interval is <span class="math inline">\((t_{l}^i, t_{l+1}^i)\)</span> for it is not possible to say based solely on the Quotes Stream data whether order <span class="math inline">\(i\)</span> volume has been decreased due cancellation or fill at time <span class="math inline">\(t_l^i\)</span>.</li>
+<li>A single fill</li>
+<li>Multiple fills (i.e. several taker orders matched with a single maker order simultaneously)</li>
+<li>A cancellation</li>
+<li>Combination of the above (i.e. <a href="https://www.investopedia.com/terms/i/immediateorcancel.asp">Immediate or Cancel Order</a>)</li>
 </ol>
-<p>Note that <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> has not been defined yet at points <span class="math inline">\(t_{l}^i : v_{l-1}^i &gt; v_l^i\)</span> so the data provided by Trades Stream need to be used, i.e. a coupling of quotes and trades streams need to be performed.</p>
+<p>These ambiguous volume decreasing quote events need, well, to be disambiguated before an empirical order can be constructed from the quote.</p>
 </div>
-<div id="quotes-and-trades-coupling" class="section level2">
-<h2><span class="header-section-number">2.5</span> Quotes and Trades Coupling</h2>
+<div id="coupling" class="section level2">
+<h2><span class="header-section-number">2.4</span> Coupling</h2>
+<div id="makers" class="section level3">
+<h3><span class="header-section-number">2.4.1</span> Makers</h3>
+
+<div class="definition">
+<p><span id="def:linkable-makers" class="definition"><strong>Definition 2.20  (Linkable Makers)  </strong></span>Suppose that Quotes Stream <span class="math inline">\(\mathcal{S}_Q\)</span> and Trades Stream <span class="math inline">\(\mathcal{S}_T\)</span> are given. For each trade <span class="math inline">\(\mathcal{S}_T[j] \in \mathcal{S}_T\)</span> as defined by <a href="reconstruction-algorithm.html#def:trade">2.16</a>, a (possibly empty) set <span class="math inline">\(\mathcal{L}_R[\mathcal{S}_T[j]] = \{\mathcal{S}_Q^r[k]\}_{r, k}\)</span> of a volume-decreasing quote events <span class="math inline">\(\mathcal{S}_Q^r[k] \in \mathcal{S}_Q^r \in \mathcal{S}_Q\)</span> as defined by <a href="reconstruction-algorithm.html#def:volume-decreasing-quote-event">2.14</a> that satisfy the following conditions:</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(\text{sgn}(v_k^r) = d_j\)</span>, i.e. <span class="math inline">\(\mathcal{S}_Q^r\)</span> is a resting (maker) quote for trade <span class="math inline">\(j\)</span>,</li>
+<li><span class="math inline">\(r = r_j \lor r = 0\)</span>, i.e if trade <span class="math inline">\(j\)</span> contains maker quote identification number <span class="math inline">\(r_j &gt; 0\)</span> then <span class="math inline">\(\mathcal{S}_Q^r[k]\)</span> must belong to quote <span class="math inline">\(r_j\)</span>; otherwise it may belong to any other quote satisfying the other conditions of this definition,</li>
+<li><span class="math inline">\(t_k^r - t_j &lt; \tau\)</span>, quote event <span class="math inline">\(\mathcal{S}_Q^r[k]\)</span> is no more than <span class="math inline">\(\tau \in \mathbb{R}_{&gt;0}\)</span> seconds later than trade <span class="math inline">\(j\)</span> and <em>delay tolerance</em> <span class="math inline">\(\tau\)</span> is usually small,</li>
+<li><span class="math inline">\(p_k^r = p_j\)</span>,</li>
+<li><span class="math inline">\(\begin{cases} \Delta v_k^i \geq v_j, &amp; k &gt; 1 \\ e^i_k = D, &amp; k = 1 \end{cases}\)</span>, i.e. the volume of trade <span class="math inline">\(j\)</span> is <em>smaller</em> that the volume decrease of quote <span class="math inline">\(\mathcal{S}_Q^r\)</span> at time <span class="math inline">\(t_k^r\)</span> or volume decrease is not defined and event type is a deletion,</li>
+</ol>
+<p>is called <em>linkable makers (‘resting’ quotes) for trade <span class="math inline">\(j\)</span></em>. The set <span class="math inline">\(\mathcal{L}_R = \bigcup_j \mathcal{L}_R[\mathcal{S}_T[j]]\)</span> is called <em>linkable makers</em>.</p>
+</div>
+
+
+<div class="definition">
+<p><span id="def:hidden-makers" class="definition"><strong>Definition 2.21  (Hidden Makers)  </strong></span>Suppose that Quotes Stream <span class="math inline">\(\mathcal{S}_Q\)</span> and Trades Stream <span class="math inline">\(\mathcal{S}_T\)</span> are given. For each trade <span class="math inline">\(\mathcal{S}_T[j] \in \mathcal{S}_T\)</span> as defined by <a href="reconstruction-algorithm.html#def:trade">2.16</a>, a set <span class="math inline">\(\mathcal{H}_R[\mathcal{S}_T[j]]\)</span> defined as follows <span class="math display">\[
+\mathcal{H}_R[\mathcal{S}_T[j]] = \mathcal{H}_R[(t_j, j, a_j, r_j, d_j, p_j, v_j)] = \{(t_j, j, 1, p_j, v_j, D)\}\]</span> is called <em>hidden maker for trade <span class="math inline">\(j\)</span></em>. The tuple <span class="math inline">\(\{(t_j, j, 1, p_j, v_j, D)\} = \{\mathcal{S}_Q^j[1]\}\)</span> is called a <em>hidden quote event for trade <span class="math inline">\(j\)</span></em>. The set <span class="math inline">\(\mathcal{H}_R = \bigcup_j \mathcal{H}_R[\mathcal{S}_T[j]]\)</span> is called <em>hidden makers</em>.</p>
+</div>
+
+
+<div class="definition">
+<span id="def:maker-coupling" class="definition"><strong>Definition 2.22  (Maker Coupling)  </strong></span>Suppose that Quotes Stream <span class="math inline">\(\mathcal{S}_Q\)</span> and Trades Stream <span class="math inline">\(\mathcal{S}_T\)</span> are given. A function <span class="math display">\[
+  \mathbf{l}_R(\cdot) :  \mathcal{S}_T \mapsto \mathcal{L}_R \cup \mathcal{H}_R
+\]</span> such that <span class="math inline">\(\forall j: \mathbf{l}_R(\mathcal{S}_T[j]) \in \mathcal{L}_R[\mathcal{S}_T[j]] \cup \mathcal{H}_R[\mathcal{S}_T[j]]\)</span> is called a <em>maker coupling</em>. The symbol <span class="math inline">\(\mathcal{L}_R^{\mathbf{l}_R}\)</span> denotes the image of <span class="math inline">\(\mathbf{l}_R(\cdot)\)</span> function.
+</div>
+
+<p>If for some <span class="math inline">\(j\)</span> the cardinality of <span class="math inline">\(\mathcal{L}_R[\mathcal{S}_T[j]]\)</span> is greater than one then there are more than one different maker coupling <span class="math inline">\(\mathbf{l}_R(\mathcal{S}_T[j])\)</span> of Trade Stream <span class="math inline">\(\mathcal{S}_T\)</span> to Quotes Stream <span class="math inline">\(\mathcal{S}_Q\)</span>.</p>
+
+<div class="definition">
+<span id="def:inverse-maker-coupling" class="definition"><strong>Definition 2.23  (Inverse Maker Coupling)  </strong></span>The (possibly empty) set <span class="math display">\[\mathbf{l}_R^{-1}(\mathcal{S}^r_Q[k]) = \{ \mathcal{S}_T[j] : \mathbf{l}_R(\mathcal{S}_T[j]) = \mathcal{S}^r_Q[k] \in \mathcal{S}_Q \cup \mathcal{H}_R \}\]</span> is called an <em>inverse maker coupling set for quote event <span class="math inline">\(\mathcal{S}^r_Q[k]\)</span></em>.
+</div>
+
+
+<div class="definition">
+<span id="def:concordance-volumes" class="definition"><strong>Definition 2.24  (Concordance of Volumes)  </strong></span>Suppose a maker coupling <span class="math inline">\(\mathbf{l}_R(\mathcal{S}_T[j])\)</span> as defined by <a href="reconstruction-algorithm.html#def:maker-coupling">2.22</a> is given. The functional <span class="math inline">\(\mathscr{Q}(\mathbf{l}_R)_V\)</span> calculated as <span class="math display">\[\mathscr{Q}_V(\mathbf{l}_R) = \sum_{\mathcal{S}^r_Q[k] \in \mathcal{L}_R^{\mathbf{l}_R}} \begin{cases} 0, &amp; \text{ if }  \sum_{\mathcal{S}_T[j] \in \mathbf{l}_R^{-1}(\mathcal{S}^r_Q[k])} v_j 
+ = v^i_k \land \mathcal{S}^r_Q[k] \not \in \mathcal{H}_R \\ -1, &amp; \text{ if }  \sum_{\mathcal{S}_T[j] \in \mathbf{l}_R^{-1}(\mathcal{S}^r_Q[k])} v_j 
+ = v^i_k \land \mathcal{S}^r_Q[k] \in \mathcal{H}_R \\  -1, &amp; \text{ if } k = 1 \land e^i_k = D \\ -1, &amp; \text{ if }  \sum_{\mathcal{S}_T[j] \in \mathbf{l}_R^{-1}(\mathcal{S}^r_Q[k])} v_j 
+ &lt; v^i_k \\ -\infty, &amp; \text{ otherwise} \end{cases}\]</span> is called a <em>concordance of volumes</em>
+</div>
+
+<p>The condition <span class="math inline">\(k = 1 \land e^i_k = D\)</span> in defintion <a href="reconstruction-algorithm.html#def:concordance-volumes">2.24</a> means that Quotes Stream has a deletion event for order <span class="math inline">\(i\)</span> without previous addition and/or change event(s). The volume decrease of the quote <span class="math inline">\(i\)</span> event <span class="math inline">\(1\)</span> is not defined and the reasonable decision in this situation is to assume that it is equal to the volume of the linked trade.</p>
+
+<div class="definition">
+<span id="def:concordance-timestamps" class="definition"><strong>Definition 2.25  (Concordance of Timestamps)  </strong></span>Suppose a maker coupling <span class="math inline">\(\mathbf{l}_R(\mathcal{S}_T[j])\)</span> as defined by <a href="reconstruction-algorithm.html#def:maker-coupling">2.22</a> is given. The functional <span class="math inline">\(\mathscr{Q}(\mathbf{l}_R)_T\)</span> calculated as <span class="math display">\[\mathscr{Q}_T(\mathbf{l}_R) = -\sum_{(\mathcal{S}_T[j], \mathbf{l}_R(\mathcal{S}_T[j])) }t^r_k - t_j\]</span>
+is called a <em>concordance of timestamps</em>
+</div>
+
+<p><span class="math inline">\(\DeclareMathOperator*{\argmax}{arg\,max}\)</span></p>
+
+<div class="definition">
+<p><span id="def:optimal-maker-coupling" class="definition"><strong>Definition 2.26  (Optimal Maker Coupling)  </strong></span>Suppose that Quotes Stream <span class="math inline">\(\mathcal{S}_Q\)</span> and Trades Stream <span class="math inline">\(\mathcal{S}_T\)</span> are given. The maker coupling
+<span class="math display">\[ \mathbf{l}_R^* = \argmax_{\argmax_{\mathbf{l}_R} \mathscr{Q}_V(\mathbf{l}_R)}\, \mathscr{Q}_T(\mathbf{l}_R)  \]</span> is called the <em>optimal maker copling</em>.</p>
+</div>
+
+</div>
+<div id="takers" class="section level3">
+<h3><span class="header-section-number">2.4.2</span> Takers</h3>
+<p>Bitfinex does not provide quote events for takers while MOEX and Bitstamp do provide.</p>
+
+<div class="definition">
+<p><span id="def:linkable-takers" class="definition"><strong>Definition 2.27  (Linkable Takers)  </strong></span>Suppose that Quotes Stream <span class="math inline">\(\mathcal{S}_Q\)</span> and Trades Stream <span class="math inline">\(\mathcal{S}_T\)</span> are given. For each trade <span class="math inline">\(\mathcal{S}_T[j] \in \mathcal{S}_T\)</span> as defined by <a href="reconstruction-algorithm.html#def:trade">2.16</a>, a non-empty set of a volume-decreasing quote events <span class="math inline">\(\mathcal{S}_Q^i[k] \in \mathcal{S}_Q^i \in \mathcal{S}_Q\)</span> as defined by <a href="reconstruction-algorithm.html#def:volume-decreasing-quote-event">2.14</a> that satisfy the following conditions:</p>
+<ol style="list-style-type: lower-alpha">
+<li><span class="math inline">\(|t_j - t_k^i| &lt; \tau\)</span>, where <span class="math inline">\(\tau\)</span> is a constant,</li>
+<li><span class="math inline">\(i = a_j\)</span> if the trade contains taker quote identification number,</li>
+<li><span class="math inline">\(p_k^i d_j \leq p_j d_j\)</span>,</li>
+<li><span class="math inline">\(\text{sgn}(v_k^i) = -d_j\)</span>,</li>
+<li><span class="math inline">\(|v_k^i - v_{k-1}^i| \geq v_j\)</span></li>
+</ol>
+<p>is called <em>linkable takers for trade <span class="math inline">\(j\)</span></em>.</p>
+</div>
+
+<p>TBD</p>
+</div>
+</div>
+<div id="order-intervals-reconstruction" class="section level2">
+<h2><span class="header-section-number">2.5</span> Order Intervals Reconstruction</h2>
+<p>To reconstruct an empirical order <span class="math inline">\(\hat{\mathbf{o}}^{i}(t)\)</span> as defined by <a href="reconstruction-algorithm.html#def:empirical-order">2.18</a> from the <em>Quotes Stream</em> <span class="math inline">\(\mathcal{S}_Q^i\)</span> as defined by <a href="reconstruction-algorithm.html#def:quotes-stream">2.15</a> one needs to define the set of intervals <span class="math inline">\(\mathcal{T^i}\)</span> since order prices <span class="math inline">\(\mathcal{P}^i\)</span> and order volumes <span class="math inline">\(\mathcal{V}^i\)</span> are unambiguously defined by the Quotes Stream <span class="math inline">\(\mathcal{S}_Q^i\)</span>.</p>
 <p>TBD</p>
 </div>
 <div id="enforcement-of-ime-condition-in-eob" class="section level2">
