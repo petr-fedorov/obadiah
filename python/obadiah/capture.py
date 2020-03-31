@@ -14,7 +14,6 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 
-
 import asyncio
 import asyncpg
 import websockets
@@ -40,7 +39,7 @@ class QueueSizeLogger:
 
         if bl > self.max_queue:
             self.logger.warning(
-                f'{self.exchange} {self.pair} {self.queue_name} queue size: %i',
+                f'{self.exchange} {self.pair} {self.queue_name} que size: %i',
                 bl)
             self.max_queue = bl*1.25
         elif (bl >= self.min_max_queue and
@@ -50,9 +49,11 @@ class QueueSizeLogger:
                 f'{self.queue_name} queue size: {bl} (decreasing)')
             self.max_queue = bl
 
+
 class MessageHandler:
 
-    def __init__(self, ws, exchange, exchange_id, pair, pair_id, pool, q):
+    def __init__(self, ws, exchange, exchange_id, pair, pair_id, pool, q,
+                 type_field_name='event'):
         self.ws = ws
         self.exchange = exchange
         self.exchange_id = exchange_id
@@ -60,21 +61,20 @@ class MessageHandler:
         self.pair_id = pair_id
         self.pool = pool
         self.q = q
+        self.type_field_name = type_field_name
 
         # Wait for the book subscription up to 5 sec (then less -- see below)
         self.timeout = 30
 
-
     async def subscribe_channels(self):
         return
-
 
     async def data(self, lts, message):
         return
 
-
     async def process_messages(self):
-        clean = lambda varStr: re.sub('\W|^(?=\d)','_', varStr)
+        def clean(varStr):
+            return re.sub('\W|^(?=\d)', '_', varStr)
 
         async with self.pool.acquire() as con:
             await con.execute(
@@ -87,13 +87,13 @@ class MessageHandler:
                 message = json.loads(message)
                 self.logger.debug(message)
                 if isinstance(message, dict):
-                    await getattr(self, clean(message['event']))(lts, message)
+                    await getattr(self, clean(message[self.type_field_name])
+                                  )(lts, message)
                 else:
                     await self.data(lts, message)
                 lts, message = await self.q.get()
                 qsl.log(self.q.qsize())
             await asyncio.shield(self.close())
-
 
 
 async def capture(exchange, pair, user, database, port, url, message_handler):
@@ -125,7 +125,7 @@ async def capture(exchange, pair, user, database, port, url, message_handler):
                                               max_queue=2**20) as ws:
                     q = asyncio.Queue()
                     wqsl = QueueSizeLogger(exchange, pair,
-                                       "websocket", logger, 100)
+                                           "websocket", logger, 100)
                     mh = message_handler(ws, exchange, exchange_id, pair,
                                          pair_id, pool, q)
                     mh.task = asyncio.ensure_future(mh.process_messages())

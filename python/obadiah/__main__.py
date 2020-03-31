@@ -14,8 +14,6 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 
-
-
 import logging
 import logging.handlers
 import signal
@@ -23,10 +21,12 @@ import argparse
 import sys
 from obadiah.bitstamp import BitstampMessageHandler
 from obadiah.bitfinex import BitfinexMessageHandler, monitor
+from obadiah.coinbase import CoinbaseMessageHandler
 from obadiah.capture import capture
 import asyncio
 import functools
 import sslkeylog
+
 
 def main():
     parser = argparse.ArgumentParser(description="Gather high-frequency trade "
@@ -54,7 +54,8 @@ def main():
                         "PostgreSQL database role to be used to save the data"
                         "(default: ob-analytics),",
                         default="ob-analytics")
-    parser.add_argument("-p", "--port", help="where PORT is the listening port "
+    parser.add_argument("-p", "--port",
+                        help="where PORT is the listening port "
                         "of the PostgreSQL server (default 5432)",
                         default="5432")
     args = parser.parse_args()
@@ -68,6 +69,9 @@ def main():
         elif stream[1] == 'BITFINEX':
             ws_url = "wss://api-pub.bitfinex.com/ws/2"
             mh = BitfinexMessageHandler
+        elif stream[1] == 'COINBASE':
+            ws_url = "wss://ws-feed.pro.coinbase.com"
+            mh = CoinbaseMessageHandler
         else:
             print('Exchange %s is not supported (yet)' % stream[1])
             exitcode = 1
@@ -84,12 +88,12 @@ def main():
         logger = logging.getLogger(__name__ + ".main")
 
         task = asyncio.ensure_future(capture(stream[1],
-                                                stream[0],
-                                                args.user,
-                                                args.dbname,
-                                                args.port,
-                                                ws_url,
-                                                mh))
+                                             stream[0],
+                                             args.user,
+                                             args.dbname,
+                                             args.port,
+                                             ws_url,
+                                             mh))
         loop = asyncio.get_event_loop()
         #  loop.set_debug(True)
         loop.add_signal_handler(getattr(signal, 'SIGINT'),
